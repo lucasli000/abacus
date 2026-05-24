@@ -933,6 +933,8 @@ pub struct AppState {
     pub streaming_text: String,
     /// 流式输出累积的思考文本
     pub streaming_thinking: String,
+    /// V37: 是否展示 thinking/tools 流式内容（Ctrl+O 切换，默认隐藏，与 Claude Code 一致）
+    pub show_streaming_trace: bool,
     /// V29.5: 本轮 streaming 是否已收到首条非空 TextDelta（用于触发"开始输出"事件）
     /// 替代 `streaming_text.is_empty()` 判定 — provider 推空 delta 心跳时不再误识别
     /// 生命周期: reset_streaming 时清 false; 首条非空 TextDelta 抵达时置 true
@@ -2070,6 +2072,7 @@ impl AppState {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
+            show_streaming_trace: false, // V37: 默认隐藏 thinking/tools（Ctrl+O 切换）
             // V29.5: 首次 chunk 触发标志（替代 is_empty 判定, 防空 delta 心跳误判）
             streaming_text_started: false,
             streaming_thinking_started: false,

@@ -367,6 +367,15 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
         return true;
     }
 
+    // Ctrl+T: 切换 Thinking/Tools 流式展示（默认隐藏，与 Claude Code Ctrl+O 等效）
+    if code == KeyCode::Char('t') && mods.contains(KeyModifiers::CONTROL) {
+        state.show_streaming_trace = !state.show_streaming_trace;
+        let mode = if state.show_streaming_trace { "显示" } else { "隐藏" };
+        state.add_toast(format!("Thinking/Tools 流式展示已{}", mode), Duration::from_secs(2));
+        state.rendered_lines_dirty.set(true);
+        return true;
+    }
+
     // ── 权限确认弹窗键盘拦截（优先级最高）──
     // 响应类型：
     //   Y=单次允许, A=总是允许, N/Esc=拒绝, D=查看详情（英文 IME 字母快捷）
