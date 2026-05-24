@@ -74,11 +74,34 @@ cargo install --path crates/abacus-server   # abacus-server（HTTP）
 # 或直接复制：cp ./target/release/abacus ~/.local/bin/
 ```
 
-### 4. 配置 API Key
+### 4. 首次启动 — TUI 配置向导
 
 ```bash
-export ABACUS_API_KEY=sk-xxx                # 或
-export DEEPSEEK_API_KEY=sk-xxx
+abacus
+```
+
+首次运行检测无配置文件，自动进入「首次配置」卡片：
+
+```
+┌─ 首次配置 ────────────────────────────────────┐
+│ 使用须知（数据安全 / 人工审查 / 合规 / 免责）  │
+│                                              │
+│ API URL    https://api.deepseek.com         │
+│ API Key    sk-···                            │
+│ Model      deepseek-v4-flash                 │
+│                                              │
+│ Enter 接受条款 + 保存 · Esc 退出               │
+└──────────────────────────────────────────────┘
+```
+
+- URL 自动识别 9 种 provider：DeepSeek / OpenAI / Anthropic / 通义千问 / Moonshot / 智谱 / SiliconFlow / Groq / OpenAI-Compatible
+- 配置写入 `~/.abacus/config.yaml`（权限 0o600）
+- Enter 后直接进入 TUI 主界面（默认 Clarify 模式）
+
+#### 跳过向导（CI / 无头部署）
+
+```bash
+export ABACUS_API_KEY=sk-xxx                # 或 DEEPSEEK_API_KEY=sk-xxx
 ```
 
 ### 5. 验证安装
@@ -117,7 +140,7 @@ rm -rf ~/.abacus/                           # 清理配置 + sessions + sqlite
 | 方式 | 示例 |
 |------|------|
 | 环境变量 | `ABACUS_API_KEY=sk-xxx` `ABACUS_SERVER_TOKEN=secret` |
-| config.yaml | `~/.abacus/config.yaml`（首次启动自动生成） |
+| config.yaml | `~/.abacus/config.yaml`（首次启动 TUI 向导生成，权限 0o600） |
 | CLI | `abacus config list-keys` / `abacus config set key val` |
 
 完整配置模板见 [`config.example.toml`](config.example.toml)。
