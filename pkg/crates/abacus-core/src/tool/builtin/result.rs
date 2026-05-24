@@ -39,9 +39,9 @@ pub type ResultStoreEntry = (Value, String);
 pub type ResultStore = Arc<RwLock<HashMap<String, ResultStoreEntry>>>;
 
 /// 大结果阈值（字节数）。超过则截断 + 存 store。
-/// V38: 从 8KB 提升到 32KB——8KB 对文件读取场景过小，
+/// V38: 从 8KB 提升到 64KB——8KB 对文件读取场景过小，
 /// 频繁触发 result.expand 增加不必要的工具调用轮次。
-pub const RESULT_TRUNCATE_THRESHOLD: usize = 32768;
+pub const RESULT_TRUNCATE_THRESHOLD: usize = 65536;
 
 /// 截断后 head/tail 各保留的字节数（合计 ~2KB）。
 pub const RESULT_TRUNCATE_KEEP: usize = 1024;
