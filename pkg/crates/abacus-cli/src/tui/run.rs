@@ -1169,8 +1169,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // Gap A 修复：把 state.thinking_depth 转为 per-turn RequestContext.thinking_intent
                             // 引用关系：ThinkingIntent::from_str_loose 接受 off/low/medium/high/max/adaptive/整数
                             // 生命周期：仅此 spawn 内本轮有效；下轮重新取 state.thinking_depth
+                            // V38: 注入模式上下文到 system prompt override
+                            // 让 LLM 知道当前模式 + 可用的 mode_switch 工具 + DAG 转移选项
+                            let mode_context = {
+                                let transitions: Vec<&str> = current_mode.transitions().iter()
+                                    .map(|m| m.label()).collect();
+                                format!(
+                                    "\n\n[Mode Context] Current: {} ({}). Available transitions: {:?}. \
+                                     Call mode_switch tool to transition when task requires different collaboration style.",
+                                    current_mode.display_zh(), current_mode.label(), transitions
+                                )
+                            };
                             let chat_req_ctx = abacus_core::core::RequestContext {
                                 thinking_intent: abacus_types::ThinkingIntent::from_str_loose(&state.thinking_depth),
+                                system_prompt_override: Some(mode_context),
                                 ..Default::default()
                             };
 
