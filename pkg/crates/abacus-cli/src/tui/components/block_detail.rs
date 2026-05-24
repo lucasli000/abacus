@@ -561,42 +561,83 @@ fn render_simple_diff<'a>(
     let mut insert_count = 0usize;
     let mut delete_count = 0usize;
 
-    // 收集所有变更 ops, 带上下文(±1 行 Equal)
+    // 收集所有变更 ops, 带上下文(±2 行 Equal)
     let changes: Vec<_> = diff.iter_all_changes().collect();
     let total_changes = changes.len();
-    // 标记哪些 Equal 行要显示(距最近 Insert/Delete ≤1 行)
+    // 标记哪些 Equal 行要显示(距最近 Insert/Delete ≤2 行)
     let mut show_equal = vec![false; total_changes];
     for (i, c) in changes.iter().enumerate() {
         if c.tag() != ChangeTag::Equal {
-            // 标记前后 ±1 行 Equal 为可见
-            if i > 0 && changes[i - 1].tag() == ChangeTag::Equal { show_equal[i - 1] = true; }
-            if i + 1 < total_changes && changes[i + 1].tag() == ChangeTag::Equal { show_equal[i + 1] = true; }
+            for offset in 1..=2 {
+                if i >= offset && changes[i - offset].tag() == ChangeTag::Equal { show_equal[i - offset] = true; }
+                if i + offset < total_changes && changes[i + offset].tag() == ChangeTag::Equal { show_equal[i + offset] = true; }
+            }
         }
     }
+
+    // 计算行号宽度（取 old/new 最大行数）
+    let old_line_count = old.lines().count();
+    let new_line_count = new.lines().count();
+    let max_line_num = old_line_count.max(new_line_count);
+    let num_width = if max_line_num >= 100 { 3 } else if max_line_num >= 10 { 2 } else { 1 };
+
+    // 跟踪行号
+    let mut old_line = 0usize;
+    let mut new_line = 0usize;
 
     let mut skipped_run = false;
     for (i, change) in changes.iter().enumerate() {
         let text = change.value().trim_end_matches('\n');
         match change.tag() {
             ChangeTag::Delete => {
-                if skipped_run { rendered.push(Line::from(vec![Span::styled("  ···", theme.text_style(TextRole::Caption))])); skipped_run = false; }
+                old_line += 1;
+                if skipped_run {
+                    rendered.push(Line::from(vec![Span::styled(
+                        format!("{:>w$}   ···", "", w = num_width),
+                        theme.text_style(TextRole::Caption),
+                    )]));
+                    skipped_run = false;
+                }
+                // 字符级高亮：删除行整体红色，内容加粗
                 rendered.push(Line::from(vec![
-                    Span::styled(format!("- {}", text), Style::default().fg(theme.error)),
+                    Span::styled(format!("{:>w$} ", old_line, w = num_width), Style::default().fg(theme.muted)),
+                    Span::styled("- ", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+                    Span::styled(text.to_string(), Style::default().fg(theme.error)),
                 ]));
                 delete_count += 1;
             }
             ChangeTag::Insert => {
-                if skipped_run { rendered.push(Line::from(vec![Span::styled("  ···", theme.text_style(TextRole::Caption))])); skipped_run = false; }
+                new_line += 1;
+                if skipped_run {
+                    rendered.push(Line::from(vec![Span::styled(
+                        format!("{:>w$}   ···", "", w = num_width),
+                        theme.text_style(TextRole::Caption),
+                    )]));
+                    skipped_run = false;
+                }
+                // 字符级高亮：新增行整体绿色，内容加粗
                 rendered.push(Line::from(vec![
-                    Span::styled(format!("+ {}", text), Style::default().fg(theme.success)),
+                    Span::styled(format!("{:>w$} ", new_line, w = num_width), Style::default().fg(theme.muted)),
+                    Span::styled("+ ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+                    Span::styled(text.to_string(), Style::default().fg(theme.success)),
                 ]));
                 insert_count += 1;
             }
             ChangeTag::Equal => {
+                old_line += 1;
+                new_line += 1;
                 if show_equal[i] {
-                    if skipped_run { rendered.push(Line::from(vec![Span::styled("  ···", theme.text_style(TextRole::Caption))])); skipped_run = false; }
+                    if skipped_run {
+                        rendered.push(Line::from(vec![Span::styled(
+                            format!("{:>w$}   ···", "", w = num_width),
+                            theme.text_style(TextRole::Caption),
+                        )]));
+                        skipped_run = false;
+                    }
                     rendered.push(Line::from(vec![
-                        Span::styled(format!("  {}", text), Style::default().fg(theme.muted)),
+                        Span::styled(format!("{:>w$} ", new_line, w = num_width), Style::default().fg(theme.muted)),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(text.to_string(), Style::default().fg(theme.muted)),
                     ]));
                 } else {
                     skipped_run = true;
@@ -610,7 +651,7 @@ fn render_simple_diff<'a>(
         let mut truncated: Vec<Line<'a>> = rendered.into_iter().take(max_total_lines).collect();
         truncated.push(Line::from(vec![
             Span::styled(
-                format!("  ↳ ... 省略 (总 {} 行 diff)", total_changes),
+                format!("{:>w$}   ↳ 省略 (总 {} 行 diff)", "", total_changes, w = num_width),
                 theme.text_style(TextRole::Caption),
             ),
         ]));
@@ -623,7 +664,7 @@ fn render_simple_diff<'a>(
     // 统计 footer
     lines.push(Line::from(vec![
         Span::styled(
-            format!("  ↳ + {} 行 / − {} 行", insert_count, delete_count),
+            format!("{:>w$}   ↳ +{} / −{}", "", insert_count, delete_count, w = num_width),
             theme.text_style(TextRole::Caption),
         ),
     ]));
