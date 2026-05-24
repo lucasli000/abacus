@@ -884,6 +884,74 @@ impl<'a> TurnPipeline<'a> {
         }
     }
 
+    /// 根据 400 错误 body 中的线索尝试修复消息序列。
+    /// 返回 true 表示已做出修改（应重试），false 表示无法修复。
+    ///
+    /// ## 修复策略
+    /// 根据错误消息关键词匹配不同修复动作：
+    /// - tool protocol violations → 重跑 sanitize
+    /// - role alternation violations → 合并连续同角色
+    /// - reasoning_content issues → 剥离所有 reasoning_content
+    /// - empty content → 填充占位文本
+    ///
+    /// ## 引用关系
+    /// - 调用点：execute_loop 中 provider 400 响应后
+    /// - 依赖：sanitize_dangling_tool_calls (Case 1-3)
+    fn try_repair_messages(msgs: &mut Vec<Message>, error_body: &str) -> bool {
+        let body_lower = error_body.to_lowercase();
+        let mut repaired = false;
+        let before_len = msgs.len();
+
+        // Strategy 1: tool protocol violations
+        if body_lower.contains("tool") {
+            Self::sanitize_dangling_tool_calls(msgs);
+            repaired |= msgs.len() != before_len;
+        }
+
+        // Strategy 2: role alternation violations — always run sanitize (includes merge)
+        if body_lower.contains("role") || body_lower.contains("alternate")
+            || body_lower.contains("consecutive") || body_lower.contains("preceding")
+        {
+            let pre = msgs.len();
+            Self::sanitize_dangling_tool_calls(msgs);
+            repaired |= msgs.len() != pre;
+        }
+
+        // Strategy 3: reasoning_content / thinking field issues
+        if body_lower.contains("reasoning_content") || body_lower.contains("thinking") {
+            for m in msgs.iter_mut() {
+                if m.role == MessageRole::Assistant && m.reasoning_content.is_some() {
+                    m.reasoning_content = None;
+                    repaired = true;
+                }
+            }
+        }
+
+        // Strategy 4: empty/null content issues
+        if body_lower.contains("content") && (body_lower.contains("required")
+            || body_lower.contains("empty") || body_lower.contains("null"))
+        {
+            for m in msgs.iter_mut() {
+                if m.content.is_none() && m.role != MessageRole::Tool {
+                    m.content = Some(MessageContent::Text("(empty)".into()));
+                    repaired = true;
+                }
+            }
+        }
+
+        // Strategy 5: catch-all — if no specific match but it's a 400, run full sanitize
+        if !repaired {
+            let pre = msgs.len();
+            Self::sanitize_dangling_tool_calls(msgs);
+            repaired = msgs.len() != pre;
+        }
+
+        if repaired {
+            tracing::info!(strategies_applied = true, "try_repair_messages modified {} messages", before_len - msgs.len());
+        }
+        repaired
+    }
+
     async fn execute_loop(&self, ctx: &mut TurnContext) -> Result<Option<TurnResult>, KernelError> {
         const MAX_TOTAL_TOOL_CALLS: u32 = 40;
 
@@ -960,7 +1028,8 @@ impl<'a> TurnPipeline<'a> {
             // 有 tools 时降级为 blocking complete()，避免 tool calls 丢失
             let use_streaming = self.stream_tx.is_some() && ctx.tool_defs.is_empty();
 
-            let response = if use_streaming {
+            // 执行 LLM 请求（streaming 或 blocking），400 错误时尝试自动修复并重试一次
+            let provider_result: Result<crate::llm::LlmResponse, KernelError> = if use_streaming {
                 let stream_tx = self.stream_tx.as_ref().unwrap();
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                 let provider = ctx.provider.clone();
@@ -991,16 +1060,55 @@ impl<'a> TurnPipeline<'a> {
 
                 handle.await
                     .map_err(|e| KernelError::Other(format!("stream task panicked: {e}")))?
-                    ?
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
-                // V29.9: 移除"(thinking with tools)"哨兵 ToolStart —
-                //   原作用是让 UI 显示"工具执行中"占位, 但:
-                //     1) 它没有配对的 ToolEnd, 状态会卡在 Running 直到 reset_streaming
-                //     2) 是一次性哨兵, 无法反映 N 个并行工具的细粒度状态
-                //     3) UI 已通过 is_streaming + 后续 per-tool ToolStart/ToolEnd 表达更准确
-                //   per-tool 配对在下方 for tc in &tool_calls 循环里发(line 845 后)
-                ctx.provider.complete_cancellable(req, self.cancel_token()).await?
+                ctx.provider.complete_cancellable(req.clone(), self.cancel_token()).await
+            };
+
+            // ── 400 Auto-Repair: 检测到 400 时尝试修复消息序列并重试一次 ──
+            let response = match provider_result {
+                Ok(resp) => resp,
+                Err(KernelError::ApiError { status: 400, ref body }) => {
+                    // 尝试根据错误信息修复消息
+                    let mut retry_messages = {
+                        let s = self.session.read().await;
+                        let guard = s.messages.read().await;
+                        guard.clone()
+                    };
+                    let repaired = Self::try_repair_messages(&mut retry_messages, body);
+                    if repaired {
+                        tracing::warn!(
+                            error_body = %body.chars().take(200).collect::<String>(),
+                            "400 detected, attempting message repair and retry"
+                        );
+                        // 写回修复后的消息
+                        {
+                            let s = self.session.read().await;
+                            *s.messages.write().await = retry_messages.clone();
+                        }
+                        // 重建 request 并重试
+                        let retry_req = LlmRequest {
+                            model: req.model.clone(),
+                            messages: retry_messages,
+                            system: req.system.clone(),
+                            system_segments: req.system_segments.clone(),
+                            tools: req.tools.clone(),
+                            temperature: req.temperature,
+                            max_tokens: req.max_tokens,
+                            top_p: req.top_p,
+                            stop: req.stop.clone(),
+                            stream: req.stream,
+                            thinking_intent: req.thinking_intent.clone(),
+                            cache_config: req.cache_config.clone(),
+                            extra_body: req.extra_body.clone(),
+                            user_message_preamble: req.user_message_preamble.clone(),
+                        };
+                        ctx.provider.complete_cancellable(retry_req, self.cancel_token()).await?
+                    } else {
+                        return Err(KernelError::ApiError { status: 400, body: body.clone() });
+                    }
+                }
+                Err(e) => return Err(e),
             };
 
             ctx.prompt_tokens += response.usage.prompt_tokens;
