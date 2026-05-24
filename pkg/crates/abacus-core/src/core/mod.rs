@@ -470,7 +470,7 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             // V29.13: 5 → 25, 同步 config.rs default_config()
-            max_turns_per_request: 25,
+            max_turns_per_request: 200,
             max_tool_calls_per_turn: 8,
             default_model: ModelId("deepseek-v4-flash".into()),
             default_temperature: 0.6,

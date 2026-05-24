@@ -953,7 +953,7 @@ impl<'a> TurnPipeline<'a> {
     }
 
     async fn execute_loop(&self, ctx: &mut TurnContext) -> Result<Option<TurnResult>, KernelError> {
-        const MAX_TOTAL_TOOL_CALLS: u32 = 40;
+        const MAX_TOTAL_TOOL_CALLS: u32 = 200;
 
         for loop_iter in 0..self.core.config.max_turns_per_request {
             // V35-1: messages 改为 mut，便于按需追加 prefix=true 的 assistant message
