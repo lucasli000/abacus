@@ -35,6 +35,41 @@
 
 use serde_json::Value;
 
+/// Maximum token budget for injected knowledge segments.
+/// If total injected text exceeds this (estimated as chars / 2 for CJK-heavy text),
+/// only the most recently refreshed entries (highest TTL) are kept.
+const MAX_KNOWLEDGE_TOKENS: usize = 600;
+
+/// Default TTL for expert role entries: stays alive for 5 turns of non-matching input.
+const DEFAULT_TTL: u32 = 5;
+
+/// Consecutive trigger count threshold before upgrading from brief to full text.
+const FULL_UPGRADE_THRESHOLD: u32 = 3;
+
+/// Knowledge segment with TTL for auto-unload.
+///
+/// ## Lifecycle
+/// - Created: when `detect_expert_role()` matches a keyword in user input
+/// - Active: TTL > 0; decremented each turn if no keyword re-match
+/// - Destroyed: TTL reaches 0 → removed from `active_knowledge`
+/// - Upgrade: `consecutive_hits >= FULL_UPGRADE_THRESHOLD` → `is_brief` flips to false
+///
+/// ## References
+/// - Producer: `DynamicInjector::inject()` (expert_role source)
+/// - Consumer: `DynamicInjector::active_knowledge()` → `PromptAssembly` (Layer 180)
+#[derive(Debug, Clone)]
+struct KnowledgeEntry {
+    segment: PromptSegment,
+    /// Role ID for matching (e.g., "trading_strategist")
+    role_id: String,
+    /// Turns remaining before auto-unload. Decremented each turn if no keyword match.
+    ttl: u32,
+    /// Whether this is the brief version (true) or full version (false)
+    is_brief: bool,
+    /// Consecutive turns this role has been triggered (for brief→full upgrade)
+    consecutive_hits: u32,
+}
+
 /// Priority tier for a prompt segment.
 ///
 /// Higher priority values place the segment closer to the beginning of the
@@ -122,10 +157,23 @@ pub struct InjectionSource {
 /// priority-ordered [`PromptSegment`]s for system prompt injection.
 ///
 /// Maintains cross-turn `active_knowledge` for segments tagged as [`SegmentKind::Knowledge`],
-/// so topic context persists across multiple turns.
+/// so topic context persists across multiple turns with TTL-based auto-unload.
+///
+/// ## State Lifecycle
+/// - `knowledge_entries`: TTL-managed expert role entries (created on keyword match, destroyed on TTL=0)
+/// - `non_role_knowledge`: non-expert Knowledge segments (topic/tool_result), managed by byte-dedup
+/// - `cached_segments`: materialized view of active knowledge, rebuilt on mutation
 pub struct DynamicInjector {
     sources: Vec<InjectionSource>,
-    active_knowledge: Vec<PromptSegment>,
+    /// TTL-managed expert role entries.
+    /// Created: keyword match in inject(). Destroyed: TTL countdown reaches 0.
+    knowledge_entries: Vec<KnowledgeEntry>,
+    /// Non-role Knowledge segments (topic injector, tool_result injector).
+    /// Lifecycle: replaced each turn via byte-dedup comparison.
+    non_role_knowledge: Vec<PromptSegment>,
+    /// Cached materialized segments for backward-compatible `active_knowledge()` getter.
+    /// Rebuilt whenever knowledge_entries or non_role_knowledge mutates.
+    cached_segments: Vec<PromptSegment>,
 }
 
 impl Default for DynamicInjector {
@@ -135,7 +183,12 @@ impl Default for DynamicInjector {
 impl DynamicInjector {
     /// Create an empty injector with no registered sources.
     pub fn new() -> Self {
-        Self { sources: Vec::new(), active_knowledge: Vec::new() }
+        Self {
+            sources: Vec::new(),
+            knowledge_entries: Vec::new(),
+            non_role_knowledge: Vec::new(),
+            cached_segments: Vec::new(),
+        }
     }
 
     /// Register a new injection source.
@@ -146,7 +199,16 @@ impl DynamicInjector {
     /// Evaluate all registered sources against the current input and context.
     ///
     /// Returns segments sorted by priority (highest first).
-    /// Knowledge segments are stored in `active_knowledge` for future turns.
+    ///
+    /// ## TTL Logic (expert role entries)
+    /// 1. If a role keyword matches this turn: reset TTL to DEFAULT_TTL, increment consecutive_hits
+    /// 2. If no role keyword matches: decrement all TTL by 1
+    /// 3. If TTL reaches 0: remove that entry
+    /// 4. First injection uses brief_text; upgrades to full_text after FULL_UPGRADE_THRESHOLD consecutive turns
+    ///
+    /// ## Budget Cap
+    /// After TTL processing, if total token estimate exceeds MAX_KNOWLEDGE_TOKENS,
+    /// entries are sorted by TTL desc and trimmed from the tail.
     pub fn inject(&mut self, input: &str, context: &Value) -> Vec<PromptSegment> {
         let mut segments = Vec::new();
         for source in &self.sources {
@@ -157,44 +219,150 @@ impl DynamicInjector {
             }
         }
         segments.sort_by_key(|s| std::cmp::Reverse(s.kind.priority()));
-        let new_knowledge: Vec<_> = segments.iter()
+
+        // Separate expert_role segments from other Knowledge segments.
+        // Expert role TTL is managed via detect_expert_role_split() below;
+        // here we only collect non-role Knowledge segments for byte-dedup.
+        let new_non_role_knowledge: Vec<PromptSegment> = segments.iter()
             .filter(|s| s.kind == SegmentKind::Knowledge)
+            .filter(|s| !s.text.starts_with("[ExpertRole:") && !s.text.contains("[ExpertRole:"))
             .cloned()
             .collect();
-        if !new_knowledge.is_empty() {
-            // 内容去重：只有当内容真正变化时才替换 active_knowledge。
-            // 防止相同角色内容每 turn 重写导致 KV 缓存前缀不断变化。
-            //
-            // 比较策略：拼接新旧 Knowledge 的所有 text 并比较字符串等值性。
-            // 字符串比较成本极低（不需要哈希函数），且内容正常 < 500 字节。
-            let current_text: String = self.active_knowledge
+
+        // ─── TTL management for expert role entries ───────────────────────────
+        let mut mutated = false;
+
+        // Detect which roles matched this turn via detect_expert_role
+        let lower = input.to_lowercase();
+        let detected = detect_expert_role_split(&lower);
+
+        if let Some((role_id, brief_text, full_text)) = detected {
+            // Role keyword matched: find existing entry or create new
+            if let Some(entry) = self.knowledge_entries.iter_mut().find(|e| e.role_id == role_id) {
+                // Reset TTL and increment hit counter
+                if entry.ttl != DEFAULT_TTL || entry.consecutive_hits < FULL_UPGRADE_THRESHOLD {
+                    entry.ttl = DEFAULT_TTL;
+                    entry.consecutive_hits += 1;
+                    // Upgrade brief→full if threshold reached
+                    if entry.is_brief && entry.consecutive_hits >= FULL_UPGRADE_THRESHOLD {
+                        entry.is_brief = false;
+                        entry.segment = PromptSegment {
+                            kind: SegmentKind::Knowledge,
+                            text: full_text,
+                        };
+                    }
+                    mutated = true;
+                } else {
+                    // TTL already at max and already upgraded — no mutation needed (KV stability)
+                    entry.consecutive_hits += 1;
+                }
+            } else {
+                // New role: inject brief version with TTL
+                self.knowledge_entries.push(KnowledgeEntry {
+                    segment: PromptSegment {
+                        kind: SegmentKind::Knowledge,
+                        text: brief_text,
+                    },
+                    role_id,
+                    ttl: DEFAULT_TTL,
+                    is_brief: true,
+                    consecutive_hits: 1,
+                });
+                mutated = true;
+            }
+        } else {
+            // No role matched: decrement TTL on all entries
+            for entry in &mut self.knowledge_entries {
+                if entry.ttl > 0 {
+                    entry.ttl -= 1;
+                    mutated = true;
+                }
+            }
+            // Remove expired entries (TTL = 0)
+            let before_len = self.knowledge_entries.len();
+            self.knowledge_entries.retain(|e| e.ttl > 0);
+            if self.knowledge_entries.len() != before_len {
+                mutated = true;
+            }
+        }
+
+        // ─── Budget cap: enforce MAX_KNOWLEDGE_TOKENS ─────────────────────────
+        if !self.knowledge_entries.is_empty() {
+            let total_tokens: usize = self.knowledge_entries.iter()
+                .map(|e| estimate_tokens(&e.segment.text))
+                .sum();
+            if total_tokens > MAX_KNOWLEDGE_TOKENS {
+                // Sort by TTL desc (keep highest TTL = most recently refreshed)
+                self.knowledge_entries.sort_by(|a, b| b.ttl.cmp(&a.ttl));
+                let mut budget = 0usize;
+                let mut keep_count = 0;
+                for entry in &self.knowledge_entries {
+                    let cost = estimate_tokens(&entry.segment.text);
+                    if budget + cost > MAX_KNOWLEDGE_TOKENS {
+                        break;
+                    }
+                    budget += cost;
+                    keep_count += 1;
+                }
+                if keep_count < self.knowledge_entries.len() {
+                    self.knowledge_entries.truncate(keep_count);
+                    mutated = true;
+                }
+            }
+        }
+
+        // ─── Non-role knowledge: byte-dedup (topic/tool_result segments) ──────
+        if !new_non_role_knowledge.is_empty() {
+            let current_text: String = self.non_role_knowledge
                 .iter()
-                .filter(|s| s.kind == SegmentKind::Knowledge)
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\x00");
-            let new_text: String = new_knowledge
+            let new_text: String = new_non_role_knowledge
                 .iter()
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join("\x00");
             if current_text != new_text {
-                self.active_knowledge.retain(|a| a.kind != SegmentKind::Knowledge);
-                self.active_knowledge.extend(new_knowledge);
+                self.non_role_knowledge = new_non_role_knowledge;
+                mutated = true;
             }
-            // 相同内容时跳过更新，保持 active_knowledge 不变 → KV 前缀稳定
+        } else if !self.non_role_knowledge.is_empty() {
+            // No new non-role knowledge this turn but we had some — keep existing (sticky)
+            // (topic context persists; only replaced when new topic detected)
         }
+
+        // ─── Rebuild cached_segments if any mutation occurred ─────────────────
+        if mutated {
+            self.rebuild_cache();
+        }
+
         segments
     }
 
     /// Get the cross-turn knowledge segments from previous injections.
+    ///
+    /// Returns a slice of `PromptSegment` for backward compatibility.
+    /// Internally extracts segments from TTL-managed `KnowledgeEntry` + non-role knowledge.
     pub fn active_knowledge(&self) -> &[PromptSegment] {
-        &self.active_knowledge
+        &self.cached_segments
     }
 
-    /// Clear all accumulated active knowledge.
+    /// Clear all accumulated active knowledge (both expert role entries and non-role knowledge).
     pub fn clear_active_knowledge(&mut self) {
-        self.active_knowledge.clear();
+        self.knowledge_entries.clear();
+        self.non_role_knowledge.clear();
+        self.cached_segments.clear();
+    }
+
+    /// Rebuild the cached_segments vector from current state.
+    /// Called after any mutation to knowledge_entries or non_role_knowledge.
+    fn rebuild_cache(&mut self) {
+        self.cached_segments.clear();
+        for entry in &self.knowledge_entries {
+            self.cached_segments.push(entry.segment.clone());
+        }
+        self.cached_segments.extend(self.non_role_knowledge.clone());
     }
 
     /// 注册专家角色注入源（10 个领域角色，Layer 180）。
@@ -295,16 +463,35 @@ impl DynamicInjector {
     }
 }
 
+// ─── Helper functions ────────────────────────────────────────────────────
+
+/// Estimate token count for a text string.
+/// Uses a simple heuristic: CJK characters count as ~1.5 tokens each,
+/// ASCII words count as ~1 token per 4 chars. Simplified to chars/2 for mixed text.
+fn estimate_tokens(text: &str) -> usize {
+    // Rough estimate: 1 token per 2 characters for CJK-heavy text
+    (text.len() + 1) / 2
+}
+
+
 // ─── 专家角色内容库 ───────────────────────────────────────────────────
 
-/// 根据输入内容检测并返回对应专家角色的活化提示词。
+/// 根据输入内容检测并返回对应专家角色的 brief + full 提示词。
 ///
 /// ## 返回格式
-/// `[ExpertRole: <ID>] <角色简述>\n<思维框架>\n<行为约束>\n<工具使用偏好>`
+/// `Option<(role_id, brief_text, full_text)>`
+/// - brief_text: ~50 tokens, 单行角色标题 + 核心约束
+/// - full_text: 完整多行格式 `[ExpertRole: <ID>] <角色简述>\n<思维框架>\n<行为约束>\n<工具使用偏好>`
 ///
 /// ## 与 abacusbr.md 子场景的分工
-/// - 此函数：轻量角色激活提示（Layer 180，跨 turn 持久）
+/// - 此函数：轻量角色激活提示（Layer 180，跨 turn 持久，TTL 管理）
 /// - abacusbr.md 子场景：完整领域行为规范（Layer 230，按 TaskKind 写入）
+fn detect_expert_role_split(lower: &str) -> Option<(String, String, String)> {
+    detect_expert_role_inner(lower)
+}
+
+/// Legacy wrapper: returns only the full text for backward compatibility with inject closure.
+/// Used by the `expert_role` InjectionSource's inject closure.
 fn detect_expert_role(lower: &str) -> Option<&'static str> {
     // 优先级：精确多词组先检测，再检测单词
 
@@ -488,6 +675,162 @@ fn detect_expert_role(lower: &str) -> Option<&'static str> {
 - 加密建议必须指明使用场景和密鑰管理方案。
 - 输入验证: 必须指出验证层级（客户端还是服务端）和拒绝策略。
 工具偏好: fs.grep（模式扫描）、kb.query（安全知识库）。");
+    }
+
+    None
+}
+
+/// Returns `(role_id, brief_text, full_text)` for the matched expert role.
+///
+/// - brief_text: single-line, ~50 tokens — role title + core constraints
+/// - full_text: multi-line format with full thinking framework and behavioral constraints
+///
+/// Mirror of `detect_expert_role` logic but returns structured tuple for TTL management.
+fn detect_expert_role_inner(lower: &str) -> Option<(String, String, String)> {
+    // 交易策略
+    if lower.contains("回测") || lower.contains("backtest")
+        || lower.contains("alpha") || lower.contains("做多") || lower.contains("做空")
+        || lower.contains("仓位管理") || lower.contains("position sizing")
+        || lower.contains("开仓") || lower.contains("平仓") || lower.contains("sharpe")
+    {
+        return Some((
+            "trading_strategist".into(),
+            "[trading_strategist] 策略假设→信号质素→风险定量→执行路径。禁止未来数据泄露，Kelly分数控仓。".into(),
+            "[ExpertRole: trading_strategist] 交易策略专家\n思维框架: 策略假设副题驗证 → 信号素质评估 → 风险定量 → 执行路径设计。\n行为约束:\n- 回测必须北废: 分离训练集/测试集，禁止未来数据泄露。\n- 信号分析必须包含: 信号强度、宽度、衰减、市场制度四个维度。\n- 风险控制先于收益: Kelly 分数/半 Kelly，强调最大回撤和浮动盗上限。\n- 波动率调整: Sharpe、Sortino、回撤比这三个指标必须同时呈现。\n工具偏好: code.execute（数值计算）、db.query（历史行情）、kb.query（策略知识）。".into(),
+        ));
+    }
+
+    // 安全审计
+    if lower.contains("漏洞") || lower.contains("vulnerability") || lower.contains("pentest")
+        || lower.contains("渗透") || lower.contains("exploit") || lower.contains("owasp")
+        || lower.contains("xss") || lower.contains("sql注入") || lower.contains("sql injection")
+        || lower.contains("安全审查") || lower.contains("security audit")
+    {
+        return Some((
+            "security_analyst".into(),
+            "[security_analyst] 威胁建模(STRIDE)→攻击面→漏洞验证→修复优先级。拒绝指导攻击，PoC必附环境限制。".into(),
+            "[ExpertRole: security_analyst] 安全审计专家\n思维框架: 威胁建模（STRIDE）→ 攻击面识别 → 漏洞验证 → 修复方案优先级。\n行为约束:\n- 永远提供技术鉴定和防御视角，拒绝指导实际攻击操作。\n- 浏览器/输入辽渗点用 OWASP Top 10 进行完整密度检查。\n- 加密建议必须指明算法强度和证书链完整性。\n- 输出验证方法: PoC 一定要指定环境和限制条件。\n工具偏好: fs.grep（模式扫描）、code.execute（沙盒验证）、kb.query（CVE知识库）。".into(),
+        ));
+    }
+
+    // 系统架构
+    if lower.contains("分布式系统") || lower.contains("微服务") || lower.contains("microservice")
+        || lower.contains("ddd") || lower.contains("事件溯源") || lower.contains("event sourcing")
+        || lower.contains("cqrs") || lower.contains("容灾") || lower.contains("高可用")
+    {
+        return Some((
+            "system_architect".into(),
+            "[system_architect] 业务边界→CAP权衡→数据流建模→故障隔离→ADR。禁止跨服务直连DB，容量估算必附假设。".into(),
+            "[ExpertRole: system_architect] 系统架构师\n思维框架: 业务边界划分 → CAP/PACELC 权衡判断 → 数据流建模 → 故障隔离 → ADR 冒。\n行为约束:\n- 每个架构决策必须输出 ADR（底层/备选/得失）三要素。\n- 识别共享数据边界，不允许跨服务直接访问内部 DB。\n- 一致性和延迟必须同时建模：最终一致还是强一致？为什么？\n- 容量估算必须附归假设： QPS/DAU/数据增长率。\n工具偏好: fs.read（现有架构）、lsp.workspace_symbol（依赖图）、kb.query（模式库）。".into(),
+        ));
+    }
+
+    // 数据科学
+    if lower.contains("机器学习") || lower.contains("machine learning") || lower.contains("deep learning")
+        || lower.contains("特征工程") || lower.contains("feature engineering")
+        || lower.contains("过拟合") || lower.contains("overfitting")
+        || lower.contains("神经网络") || lower.contains("neural network")
+        || lower.contains("模型训练") || lower.contains("model training")
+    {
+        return Some((
+            "data_scientist".into(),
+            "[data_scientist] EDA→特征工程→基线模型→迭代优化→可解释性。禁止训练集含未来信息，简单基线先跑。".into(),
+            "[ExpertRole: data_scientist] 数据科学家\n思维框架: 问题建模 → 数据探索(EDA) → 特征工程 → 基线模型 → 迭代优化 → 可解释性分析。\n行为约束:\n- 评估指标必须匹配业务目标（精度还是召回率？为什么？）。\n- 数据泄露检查: 训练集中禁止包含未来信息。\n- 模型复杂度 vs 效果的对比：简单基线模型必须先跑。\n- 不确定性量化: 置信区间和检验集表现必须展示。\n工具偏好: code.execute（Rhai 计算）、db.query（算法指标）、kb.query（学术方法）。".into(),
+        ));
+    }
+
+    // 产品经理
+    if lower.contains("prd") || lower.contains("用户故事") || lower.contains("user story")
+        || lower.contains("需求文档") || lower.contains("product requirement")
+        || lower.contains("迭代计划") || lower.contains("sprint planning") || lower.contains("mvp")
+    {
+        return Some((
+            "product_manager".into(),
+            "[product_manager] 痛点定义→范围边界→RICE评估→验收标准。需求MECE分层，用户故事三段式。".into(),
+            "[ExpertRole: product_manager] 产品经理\n思维框架: 用户痛点定义 → 问题范围边界 → 方案评估（RICE/ICE）→ 验收标准 → 上线日期。\n行为约束:\n- 需求必须区分: 功能需求 vs 约束条件，每条采用 MECE 层次写。\n- 带出成功标准（定量）和验证方法同时展示。\n- 用户故事格式: 作为「角色」，我希望「行为」，以便「价値」。\n- 优先级必须伴随依据：数据估算、技术成本、业务影响。\n工具偏好: kb.query（竞品分析）、fs.read（现有需求文档）。".into(),
+        ));
+    }
+
+    // DevOps
+    if lower.contains("docker") || lower.contains("kubernetes") || lower.contains("k8s")
+        || lower.contains("流水线") || lower.contains("pipeline") || lower.contains("helm")
+        || lower.contains("terraform") || lower.contains("ansible")
+    {
+        return Some((
+            "devops_engineer".into(),
+            "[devops_engineer] 环境差异→流水线→幂等性→回滚安全网→可观测性。镜像版本锁定，non-root运行。".into(),
+            "[ExpertRole: devops_engineer] DevOps / 基础设施工程师\n思维框架: 环境差异分析 → 流水线设计 → 幂等性验证 → 回滚安全网 → 可观测性。\n行为约束:\n- Dockerfile 必须指定基础镜像版本，使用最小权限 non-root 用户。\n- 幂等性验证: 重复执行 apply 必须无副作用。\n- 销毁操作（drain/delete）必须附带回滚方案和记录备份验证。\n- 资源定频和限制必须同时展示: CPU/内存/并发三个维度。\n工具偏好: fs.read（配置文件）、bash.exec（验证命令）、kb.query（最佳实践）。".into(),
+        ));
+    }
+
+    // 代码审查
+    if lower.contains("代码审查") || lower.contains("code review") || lower.contains("代码质量")
+        || lower.contains("技术债") || lower.contains("technical debt")
+        || lower.contains("重构方案") || lower.contains("solid原则") || lower.contains("solid principle")
+    {
+        return Some((
+            "code_reviewer".into(),
+            "[code_reviewer] 正确性→可读性→性能→安全→测试覆盖。评论三级(Blocker/Major/Nit)，重构必评成本收益。".into(),
+            "[ExpertRole: code_reviewer] 代码审查専家\n思维框架: 正确性 → 延伸性和可读性 → 性能隐患 → 安全风险 → 测试覆盖。\n行为约束:\n- 审查评论分三级: Blocker（阅考前必修）／Major（建议修）／Nit（风格建议）。\n- 必须指出为什么是问题，不能只说\"应该改\"。\n- 建议重构时必须评估: 改动成本 × 风险 ÷ 收益。\n- 覆盖测试评估: 单元测试对领域概念的覆盖率是否足够。\n工具偏好: lsp.find_references（引用分析）、lsp.call_hierarchy_incoming（调用链）。".into(),
+        ));
+    }
+
+    // 金融分析（精确）
+    if lower.contains("dcf") || lower.contains("irr") || lower.contains("ebitda")
+        || lower.contains("金融建模") || lower.contains("估値模型") || lower.contains("valuation model")
+        || lower.contains("财务报表") || lower.contains("利润表") || lower.contains("资产负债表")
+    {
+        return Some((
+            "financial_analyst".into(),
+            "[financial_analyst] 数据质检→可比分析→假设设定→敏感性分析→情景建模。指标必对标行业，区分公告/估算数据。".into(),
+            "[ExpertRole: financial_analyst] 金融分析师\n思维框架: 财务数据质量检验 → 可比性分析 → 假设设定 → 模型橁鸟 → 敖事性和数字并行。\n行为约束:\n- 关键指标必须附带行业平均对标。\n- 假设必须明确标注并进行敏感性分析。\n- 不确定性必须用情景分析（基准/乐观/悲观）表现。\n- 标注数据来源时间戳，区分公告数据和估算数据。\n工具偏好: code.execute（DCF/估值计算）、db.query（财务数据）。".into(),
+        ));
+    }
+
+    // 法务合规
+    if lower.contains("gdpr") || lower.contains("合规性") || lower.contains("数据主权")
+        || lower.contains("开源许可") || lower.contains("license") || lower.contains("隐私政策")
+        || lower.contains("regulation") || lower.contains("法律验证")
+    {
+        return Some((
+            "legal_compliance".into(),
+            "[legal_compliance] 法规映射→场景确认→差距分析→修复优先级。附条款编号+生效日期，禁止具体法律建议。".into(),
+            "[ExpertRole: legal_compliance] 法务合规专家\n思维框架: 法规映射 → 应用场景确认 → 差距分析 → 修复方案优先级 → 封项记录。\n行为约束:\n- 定论必须附属具体法律条款编号和生效日期。\n- 法律风险估算必须展示为最小化路径和接受路径两种方案。\n- 隐私数据识别: 区分 PII/敏感数据/匹名化数据，说明处理要求。\n- 禁止给出属于法律领域范围的具体建议，请务必提示孙证。\n工具偏好: kb.query（法规知识库）、fs.read（合同和指南文件）。".into(),
+        ));
+    }
+
+    // 技术写作
+    if lower.contains("api文档") || lower.contains("openapi") || lower.contains("swagger")
+        || lower.contains("技术规范") || lower.contains("changelog") || lower.contains("接口文档")
+        || lower.contains("api spec") || lower.contains("文档注释") || lower.contains("docstring")
+    {
+        return Some((
+            "tech_writer".into(),
+            "[tech_writer] 读者画像→信息层次→示例第一→可发现性。API文档必含请求/响应/错误码，示例必须可运行。".into(),
+            "[ExpertRole: tech_writer] 技术文档専家\n思维框架: 读者画像 → 信息层次设计 → 示例第一 → 可发现性 → 小处细节与大局观并行。\n行为约束:\n- API 文档必须包含: 请求示例、响应示例、错误码表三部分。\n- README 结构: 快速开始(一命令) → 核心功能 → 配置项 → FAQ。\n- 长度安全处理: 单一概念 ≤ 300 字，超出时分页。\n- 每个示例必须是可运行的，不允许出现 `your-value-here` 占位符。\n工具偏好: fs.read（现有代码理解接口）、lsp.hover（类型提取）。".into(),
+        ));
+    }
+
+    // 通用金融分析（单词匹配）
+    if lower.contains("金融") || lower.contains("财务") || lower.contains("量化")
+        || lower.contains("finance") || lower.contains("financial")
+    {
+        return Some((
+            "financial_analyst".into(),
+            "[financial_analyst] 问题定义→数据收集→量化建模→验证→阈值配置。结论附数据来源+时间界，情景分析非单点预测。".into(),
+            "[ExpertRole: financial_analyst] 金融分析师\n思维框架: 定义问题 → 收集制度数据 → 量化模型架构 → 迟饢性验证 → 阈值配置。\n行为约束:\n- 每个金融结论必须附带数据来源和时间界。\n- 关键指标必须对标市场基准/行业均値。\n- 不确定性必须用情景分析展现而非单点预测。\n- 标注数据时间戳和来源（市场数据还是公序数据）。\n工具偏好: code.execute（金融模型计算）、db.query（历史数据）。".into(),
+        ));
+    }
+
+    // 通用安全（单词）
+    if lower.contains("安全") || lower.contains("security") || lower.contains("加密")
+        || lower.contains("认证") || lower.contains("权限")
+    {
+        return Some((
+            "security_analyst".into(),
+            "[security_analyst] 威胁建模→攻击面→防御控制→深层防御。拒绝指导攻击，加密必附密钥管理方案。".into(),
+            "[ExpertRole: security_analyst] 安全专家\n思维框架: 威胁建模 → 攻击面识别 → 防御控制评估 → 深层防御设计。\n行为约束:\n- 点出安全问题时必须同时给出缓解方案。\n- 永远提供防御视角，拒绝指导实际攻击。\n- 加密建议必须指明使用场景和密鑰管理方案。\n- 输入验证: 必须指出验证层级（客户端还是服务端）和拒绝策略。\n工具偏好: fs.grep（模式扫描）、kb.query（安全知识库）。".into(),
+        ));
     }
 
     None

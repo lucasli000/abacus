@@ -595,18 +595,15 @@ fn fetch_model_list_sync(base_url: &str, api_key: &str) -> Vec<String> {
         format!("{}/models", base_url)
     };
 
-    // 使用 ureq（同步 HTTP）— 如果没有 ureq，用 std::process::Command 调 curl
-    // 这里用 std::net 最小实现，避免额外依赖
-    match std::process::Command::new("curl")
-        .args(["-s", "-H", &format!("Authorization: Bearer {}", api_key), &url])
-        .output()
+    // Phase1-1.1: ureq 同步 HTTP 替代 curl 子进程
+    // 引用关系：ureq crate (Cargo.toml) → 此处唯一调用点
+    // 生命周期：每次调用创建临时连接，函数返回后释放
+    match ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", api_key))
+        .call()
     {
-        Ok(output) => {
-            if !output.status.success() {
-                return Vec::new();
-            }
-            let body = String::from_utf8_lossy(&output.stdout);
-            // 解析 OpenAI 格式响应: {"data": [{"id": "model-name"}, ...]}
+        Ok(resp) => {
+            let body = resp.into_string().unwrap_or_default();
             parse_models_response(&body)
         }
         Err(_) => Vec::new(),

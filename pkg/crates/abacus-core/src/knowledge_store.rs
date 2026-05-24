@@ -27,6 +27,8 @@ use serde_json::{json, Value};
 use sha2::{Sha256, Digest};
 use tokio::sync::Mutex;
 
+use crate::memory_palace::{self, MemoryEmbedder};
+
 // ─── 数据结构 ───────────────────────────────────────────────────────────
 
 /// 一个知识块
@@ -90,6 +92,11 @@ pub struct KnowledgeStore {
     /// 生命周期：随 KnowledgeStore 生死；TTL 120s 让长期不查的文件自然降温。
     /// 容量 512 — 多文件场景留余量；hot files 始终占据 LRU 头部。
     chunks_cache: Arc<crate::cache::L1MemoryCache>,
+    /// Optional embedding service for semantic search during ingest.
+    ///
+    /// 引用关系：set_embedder() 注入；ingest() 路径在 chunk 写入后调用
+    /// 生命周期：由调用方（CoreLoop）创建并注入，随 KnowledgeStore 生死
+    embedder: Option<Arc<dyn MemoryEmbedder>>,
 }
 
 impl KnowledgeStore {
@@ -119,6 +126,7 @@ impl KnowledgeStore {
                 512,
                 std::time::Duration::from_secs(120),
             )),
+            embedder: None,
         })
     }
 
@@ -134,6 +142,7 @@ impl KnowledgeStore {
                 512,
                 std::time::Duration::from_secs(120),
             )),
+            embedder: None,
         })
     }
 
@@ -181,6 +190,23 @@ impl KnowledgeStore {
                 VALUES (new.rowid, new.content, new.heading_path);
             END;"
         ).map_err(|e| format!("schema init failed: {e}"))?;
+
+        // Migration: add embedding BLOB column to chunks (idempotent)
+        // SQLite lacks IF NOT EXISTS for ADD COLUMN; check pragma table_info first.
+        let has_embedding: bool = conn.prepare("PRAGMA table_info(chunks)")
+            .and_then(|mut stmt| {
+                let found = stmt.query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .any(|col| col == "embedding");
+                Ok(found)
+            })
+            .unwrap_or(false);
+        if !has_embedding {
+            conn.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN embedding BLOB;"
+            ).map_err(|e| format!("migrate chunks.embedding column: {e}"))?;
+        }
+
         Ok(())
     }
 
@@ -267,6 +293,12 @@ impl KnowledgeStore {
         ).map_err(|e| format!("upsert file_meta: {e}"))?;
 
         conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        drop(conn); // Release lock before async embedding
+
+        // Auto-embed chunks if embedder is available (best-effort, non-blocking for ingest result)
+        if self.embedder.is_some() {
+            self.embed_chunks(&chunks).await;
+        }
 
         Ok(json!({
             "file": file_path,
@@ -423,6 +455,139 @@ impl KnowledgeStore {
                 .await;
         }
         Ok(chunks)
+    }
+
+    // ─── Embedder ───────────────────────────────────────────────────────
+
+    /// Inject an embedder for auto-embedding during ingest and semantic search.
+    ///
+    /// 引用关系：CoreLoop 初始化时调用注入；ingest/semantic_search 消费
+    /// 生命周期：注入后与 KnowledgeStore 同生死
+    pub fn set_embedder(&mut self, embedder: Arc<dyn MemoryEmbedder>) {
+        self.embedder = Some(embedder);
+    }
+
+    /// Embed and persist a single chunk's embedding in the DB.
+    ///
+    /// 引用关系：ingest_with_embeddings 调用
+    /// 生命周期：纯操作，无持有状态
+    async fn persist_chunk_embedding(&self, chunk_id: &str, embedding: &[f32]) -> Result<(), String> {
+        let blob = memory_palace::f32_slice_to_blob(embedding);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE chunks SET embedding = ?1 WHERE id = ?2",
+            params![blob, chunk_id],
+        ).map_err(|e| format!("persist_chunk_embedding: {e}"))?;
+        Ok(())
+    }
+
+    /// After ingest completes, embed all newly inserted chunks (best-effort).
+    ///
+    /// Called internally after successful ingest when embedder is available.
+    /// Failures are logged but do not fail the ingest operation.
+    ///
+    /// 引用关系：ingest() 调用
+    /// 生命周期：临时操作，不持有状态
+    async fn embed_chunks(&self, chunks: &[Chunk]) {
+        let embedder = match &self.embedder {
+            Some(e) => e.clone(),
+            None => return,
+        };
+        for chunk in chunks {
+            match embedder.embed_text(&chunk.content).await {
+                Ok(vec) => {
+                    if let Err(e) = self.persist_chunk_embedding(&chunk.id, &vec).await {
+                        tracing::warn!("embed_chunks: failed to persist embedding for {}: {e}", chunk.id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("embed_chunks: embedder failed for {}: {e}", chunk.id);
+                }
+            }
+        }
+    }
+
+    // ─── Semantic Search ────────────────────────────────────────────────
+
+    /// Semantic search using stored embeddings.
+    /// Falls back to FTS5 if no embedder is set or no embeddings exist.
+    ///
+    /// 引用关系：被 kb.search 工具的语义搜索路径调用
+    /// 生命周期：纯查询，无持有状态
+    pub async fn semantic_search(&self, query: &str, top_k: usize) -> Vec<QueryResult> {
+        // 1. Require embedder for query embedding
+        let embedder = match &self.embedder {
+            Some(e) => e.clone(),
+            None => {
+                // Fallback to FTS5
+                return self.query(query, top_k, None).await.unwrap_or_default();
+            }
+        };
+
+        // 2. Embed query
+        let query_vec = match embedder.embed_text(query).await {
+            Ok(v) => v,
+            Err(_) => {
+                return self.query(query, top_k, None).await.unwrap_or_default();
+            }
+        };
+
+        // 3. Load all chunk embeddings from DB
+        let chunk_embeddings: Vec<(String, String, usize, String, String, Vec<f32>)> = {
+            let conn = self.conn.lock().await;
+            let mut stmt = match conn.prepare(
+                "SELECT id, file, chunk_idx, content, heading_path, embedding
+                 FROM chunks WHERE embedding IS NOT NULL"
+            ) {
+                Ok(s) => s,
+                Err(_) => return self.query(query, top_k, None).await.unwrap_or_default(),
+            };
+            let rows = match stmt.query_map([], |row| {
+                let id: String = row.get(0)?;
+                let file: String = row.get(1)?;
+                let chunk_idx: i64 = row.get(2)?;
+                let content: String = row.get(3)?;
+                let heading_path: String = row.get(4)?;
+                let blob: Vec<u8> = row.get(5)?;
+                Ok((id, file, chunk_idx as usize, content, heading_path, blob))
+            }) {
+                Ok(r) => r,
+                Err(_) => return self.query(query, top_k, None).await.unwrap_or_default(),
+            };
+            rows.filter_map(|r| r.ok())
+                .map(|(id, file, idx, content, hp, blob)| {
+                    (id, file, idx, content, hp, memory_palace::blob_to_f32_vec(&blob))
+                })
+                .collect()
+        };
+
+        // If no embeddings stored, fallback
+        if chunk_embeddings.is_empty() {
+            return self.query(query, top_k, None).await.unwrap_or_default();
+        }
+
+        // 4. Cosine similarity rank
+        let mut scored: Vec<(f64, &(String, String, usize, String, String, Vec<f32>))> =
+            chunk_embeddings.iter()
+                .map(|entry| {
+                    let sim = memory_palace::cosine_similarity(&query_vec, &entry.5);
+                    (sim, entry)
+                })
+                .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 5. Return top_k
+        scored.into_iter()
+            .take(top_k)
+            .map(|(score, entry)| QueryResult {
+                chunk_id: entry.0.clone(),
+                file: entry.1.clone(),
+                chunk_idx: entry.2,
+                content: entry.3.clone(),
+                heading_path: entry.4.clone(),
+                score,
+            })
+            .collect()
     }
 }
 

@@ -11,6 +11,7 @@ pub mod api;
 pub mod clipboard;
 pub mod components;
 pub mod cost;
+pub mod i18n;
 pub mod effects;
 pub mod event;
 pub mod layout;

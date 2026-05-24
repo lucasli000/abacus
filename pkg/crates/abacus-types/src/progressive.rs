@@ -74,11 +74,83 @@ pub struct Checklist {
 
 impl Checklist {
     /// 创建占位清单（Gate 决策时用，后由 LLM 填充）
+    ///
+    /// ## 引用关系
+    /// - 被 `from_task()` 取代作为首选；保留用于无上下文时的降级入口
+    /// - 消费方：ProgressiveGate::decide*（已迁移至 from_task）
     pub fn placeholder() -> Self {
         Self {
             info_items: Vec::new(),
             decisions: Vec::new(),
             context_digest: String::new(),
+            timeout: Some(Duration::from_secs(300)),
+            blocking: true,
+        }
+    }
+
+    /// 基于任务描述和复杂度分数生成有意义的验证清单
+    ///
+    /// ## 引用关系
+    /// - 被 ProgressiveGate::decide / decide_with_task_type / decide_post_execution 调用
+    /// - 依赖 ChecklistItem / ChecklistCategory
+    ///
+    /// ## 生成规则
+    /// - 始终添加"验证输出正确性"项
+    /// - complexity > 0.5 时追加"副作用检查"项
+    /// - complexity > 0.7 时追加"测试覆盖确认"项
+    pub fn from_task(task_description: &str, complexity_score: f64) -> Self {
+        let mut items = Vec::new();
+        let mut next_id: u32 = 1;
+
+        // 始终添加：验证输出是否符合目标
+        items.push(ChecklistItem {
+            id: next_id,
+            category: ChecklistCategory::NeedsVerification,
+            label: "Verify output matches the stated goal".into(),
+            detail: if task_description.is_empty() {
+                None
+            } else {
+                Some(format!("Task: {}", task_description))
+            },
+            source: None,
+            response: None,
+        });
+        next_id += 1;
+
+        // complexity > 0.5：检查副作用
+        if complexity_score > 0.5 {
+            items.push(ChecklistItem {
+                id: next_id,
+                category: ChecklistCategory::NeedsVerification,
+                label: "Check for unintended side effects on related components".into(),
+                detail: None,
+                source: None,
+                response: None,
+            });
+            next_id += 1;
+        }
+
+        // complexity > 0.7：确认测试覆盖
+        if complexity_score > 0.7 {
+            items.push(ChecklistItem {
+                id: next_id,
+                category: ChecklistCategory::NeedsVerification,
+                label: "Confirm test coverage for changed behavior".into(),
+                detail: None,
+                source: None,
+                response: None,
+            });
+            let _ = next_id; // suppress unused warning on last increment
+        }
+
+        Self {
+            info_items: items,
+            decisions: Vec::new(),
+            context_digest: if task_description.is_empty() {
+                "Gate triggered by complexity threshold".into()
+            } else {
+                format!("Gate triggered for: {}", task_description)
+            },
             timeout: Some(Duration::from_secs(300)),
             blocking: true,
         }
@@ -305,8 +377,8 @@ impl AutonomyLevel {
         match self {
             AutonomyLevel::Full => (1.0, 1.0),    // 全放行
             AutonomyLevel::High => (0.70, 0.90),
-            AutonomyLevel::Medium => (0.30, 0.70),
-            AutonomyLevel::Low => (0.15, 0.40),
+            AutonomyLevel::Medium => (0.30, 0.50), // Gated 从 0.70 降至 0.50：中等复杂度任务更早触发门控
+            AutonomyLevel::Low => (0.30, 0.40),    // PT 从 0.15 升至 0.30：简单任务仍能 PassThrough
         }
     }
 
@@ -552,8 +624,8 @@ mod tests {
     #[test]
     fn test_autonomy_thresholds() {
         assert_eq!(AutonomyLevel::High.to_thresholds(), (0.70, 0.90));
-        assert_eq!(AutonomyLevel::Medium.to_thresholds(), (0.30, 0.70));
-        assert_eq!(AutonomyLevel::Low.to_thresholds(), (0.15, 0.40));
+        assert_eq!(AutonomyLevel::Medium.to_thresholds(), (0.30, 0.50));
+        assert_eq!(AutonomyLevel::Low.to_thresholds(), (0.30, 0.40));
     }
 
     #[test]

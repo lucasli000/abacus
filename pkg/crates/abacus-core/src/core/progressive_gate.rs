@@ -45,7 +45,7 @@ impl Default for GateConfig {
         Self {
             enabled: true,
             threshold_passthrough: 0.30,
-            threshold_gated: 0.70,
+            threshold_gated: 0.50,
             forced_gated_types: vec![
                 "prd".into(), "sop".into(), "architecture_design".into(),
                 "financial_report".into(), "compliance_doc".into(),
@@ -163,6 +163,10 @@ impl ProgressiveGate {
     /// 4. 强制门控类型 → Gated
     /// 5. Low + has_decisions → Gated（跳过 Staged）
     /// 6. 阈值判断
+    ///
+    /// ## 引用关系
+    /// - Checklist 由 `Checklist::from_task()` 生成（取代旧 placeholder）
+    /// - 无 task_description 时传空字符串，仅依赖 complexity_score 决定清单深度
     pub fn decide(
         &self,
         profile: &ComplexityProfile,
@@ -197,7 +201,7 @@ impl ProgressiveGate {
         if autonomy == AutonomyLevel::Low && profile.has_decisions
             && profile.score >= self.config.threshold_passthrough {
                 return OutputStrategy::Gated {
-                    checklist: Checklist::placeholder(),
+                    checklist: Checklist::from_task("", profile.score),
                 };
             }
 
@@ -209,12 +213,16 @@ impl ProgressiveGate {
             OutputStrategy::Staged { sections: Vec::new() }
         } else {
             OutputStrategy::Gated {
-                checklist: Checklist::placeholder(),
+                checklist: Checklist::from_task("", profile.score),
             }
         }
     }
 
     /// 带任务类型的决策（完整版）
+    ///
+    /// ## 引用关系
+    /// - Checklist 由 `Checklist::from_task(task_type, score)` 生成
+    /// - task_type 同时作为清单的上下文描述传入
     pub fn decide_with_task_type(
         &self,
         profile: &ComplexityProfile,
@@ -238,7 +246,7 @@ impl ProgressiveGate {
         let forced_types = autonomy.forced_gated_types();
         if forced_types.contains(&task_type) {
             return OutputStrategy::Gated {
-                checklist: Checklist::placeholder(),
+                checklist: Checklist::from_task(task_type, profile.score),
             };
         }
 
@@ -247,7 +255,7 @@ impl ProgressiveGate {
             && profile.score >= self.config.threshold_passthrough
         {
             return OutputStrategy::Gated {
-                checklist: Checklist::placeholder(),
+                checklist: Checklist::from_task(task_type, profile.score),
             };
         }
 
@@ -259,12 +267,16 @@ impl ProgressiveGate {
             OutputStrategy::Staged { sections: Vec::new() }
         } else {
             OutputStrategy::Gated {
-                checklist: Checklist::placeholder(),
+                checklist: Checklist::from_task(task_type, profile.score),
             }
         }
     }
 
     /// 执行后门控：基于偏差严重程度决定
+    ///
+    /// ## 引用关系
+    /// - Checklist 由 `Checklist::from_task()` 生成，描述为偏差摘要
+    /// - deviation severity 映射为 complexity_score：Low=0.4, Medium=0.6, High=0.9
     pub fn decide_post_execution(
         &self,
         deviations: &[Deviation],
@@ -287,8 +299,17 @@ impl ProgressiveGate {
         };
 
         if should_gate {
+            // 将 severity 映射为 complexity_score 以决定清单深度
+            let severity_score = match max_severity {
+                DeviationSeverity::Low => 0.4,
+                DeviationSeverity::Medium => 0.6,
+                DeviationSeverity::High => 0.9,
+            };
             OutputStrategy::Gated {
-                checklist: Checklist::placeholder(),
+                checklist: Checklist::from_task(
+                    "Post-execution deviation detected",
+                    severity_score,
+                ),
             }
         } else {
             OutputStrategy::PassThrough
@@ -471,7 +492,7 @@ mod tests {
     fn test_low_autonomy_decision_gate() {
         let gate = ProgressiveGate::from_autonomy(AutonomyLevel::Low);
         let profile = ComplexityProfile {
-            score: 0.25, // above Low's PT(0.15)
+            score: 0.35, // above Low's PT(0.30)
             dimensions: ComplexityDimensions {
                 input_length: 0.1, structural: 0.1, domain_crossing: 0.1,
                 decision_density: 0.4, output_scale: 0.2,
@@ -484,8 +505,13 @@ mod tests {
             assessment_confidence: 0.3,
         };
         let result = gate.decide(&profile, AutonomyLevel::Low, GateScope::SingleAgent);
-        // Low + has_decisions + score >= PT → Gated
+        // Low + has_decisions + score >= PT(0.30) → Gated with real checklist
         assert!(matches!(result, OutputStrategy::Gated { .. }));
+        // Verify the checklist is actually populated
+        if let OutputStrategy::Gated { checklist } = result {
+            assert!(checklist.is_valid(), "Checklist should have items");
+            assert!(!checklist.info_items.is_empty(), "Should have verification items");
+        }
     }
 
     #[test]
@@ -512,12 +538,13 @@ mod tests {
     fn test_calibrator_drift_limit() {
         let mut cal = ThresholdCalibrator::from_autonomy(AutonomyLevel::Medium, 0.1, 0.10);
         // Repeatedly skip → should not exceed drift limit
+        // Medium base gated = 0.50, drift_limit = 0.10 → range [0.40, 0.60]
         for _ in 0..20 {
             cal.on_skipped(0.9);
         }
         let (_, gated) = cal.thresholds();
-        assert!(gated <= 0.80, "gated should not exceed base+drift, got {}", gated);
-        assert!(gated >= 0.60, "gated should not go below base-drift, got {}", gated);
+        assert!(gated <= 0.60 + f64::EPSILON, "gated should not exceed base+drift, got {}", gated);
+        assert!(gated >= 0.40 - f64::EPSILON, "gated should not go below base-drift, got {}", gated);
     }
 
     #[test]

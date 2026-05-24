@@ -296,7 +296,7 @@ pub struct CoreConfig {
     pub thinking_intent: Option<abacus_types::ThinkingIntent>,
     /// Enable Silent Router (semantic + experience fusion for tool ordering).
     ///
-    /// **Default: false** (C 方案 KV cache 修复)
+    /// **Default: true** (默认开启——工具路由智能优先；需保护 prefix cache 时显式关闭)
     ///
     /// ## KV cache 影响
     /// SilentRouter 用 session_tools / experience_signal 等**每轮变化的状态**重排 tools 数组。
@@ -348,6 +348,21 @@ pub struct CoreConfig {
     /// 工具集 ≥ 30 且任务类型差异明显（code/debug/analysis）→ 启用可显著缩短 LLM 选择空间，
     /// 配合工具的 applicable_task_kinds 白名单使用。
     pub task_kind_routing_enabled: bool,
+    /// Phase α-S：是否启用场景化工具加载（只发场景相关工具的完整 schema）
+    ///
+    /// **Default: true**
+    ///
+    /// ## 设计
+    /// 启用后，build_tool_definitions_for 在 β-D 之后、γ-I 之前按 task_kind 的 scene_active_prefixes
+    /// 做前缀过滤：仅匹配前缀的工具发送完整 ToolDefinition 到 LLM，其余通过 system prompt
+    /// 中的 tool catalog 告知存在（On-Demand Expansion）。
+    ///
+    /// 三重保留规则：前缀匹配 / 最近 5 turn 调用过 / applicable_task_kinds 显式命中。
+    ///
+    /// ## 引用关系
+    /// - 消费方：build_tool_definitions_for（Phase α-S 分支）
+    /// - 依赖：scene_active_prefixes() helper + tool_last_invoked
+    pub scene_tool_loading_enabled: bool,
     /// Phase γ-I：基于使用频率的 pruning 阈值（turn 数）
     ///
     /// **Default: None**（不修剪）
@@ -478,13 +493,17 @@ impl Default for CoreConfig {
             system_prompt: String::new(),
             model_spec: None,
             thinking_intent: None,
-            silent_router_enabled: false, // C 方案：默认关——保护 prefix cache（用户可显式 opt-in）
+            silent_router_enabled: true, // 默认开启：工具路由智能优先（需保护 prefix cache 时显式 opt-out）
             model_catalog: None,
             tool_visibility_threshold: abacus_types::VisibilityTier::D, // 默认 D：等价不过滤
             // Phase β-D 默认开启（Task #84）：按 task_kind 过滤工具，每轮省 1k-3k tokens
             // 引用关系：被 build_tool_definitions_for 在 routing_active 路径消费
             // 副作用：未标 applicable_task_kinds 的工具仍全可见——透明降级
             task_kind_routing_enabled: true,
+            // Phase α-S 默认开启：场景化工具加载——按 task_kind 前缀过滤，每轮省 2k-5k tokens
+            // 引用关系：被 build_tool_definitions_for（Phase α-S 分支）消费
+            // 三重保留：前缀匹配 / 最近 5 turn 调用 / applicable_task_kinds 命中
+            scene_tool_loading_enabled: true,
             // Phase γ-I 默认开启 N=20（Task #87）：N turn 未调用即隐藏，每轮省 0.8k-2k tokens
             // 新工具（last_invoked == None）不会被剪掉——新工具友好
             tool_frequency_pruning_turns: Some(20),
@@ -1010,6 +1029,14 @@ pub struct CoreLoop {
     /// 厂商分组注册表（按模型名查找 provider）
     provider_groups: RwLock<Vec<ProviderGroup>>,
     config: CoreConfig,
+    /// Runtime config overrides written by config_set tool, read by pipeline.
+    ///
+    /// ## 引用关系
+    /// - 创建：CoreLoop::new()（Arc::new(RwLock::new(HashMap::new()))）
+    /// - 写入：ConfigToolExecutor (config_set)
+    /// - 读取：pipeline 消费点 + ConfigToolExecutor (config_get) + get_effective_* helpers
+    /// - 销毁：随 CoreLoop drop（Arc 引用计数归零）
+    pub runtime_overrides: crate::tool::builtin::config::RuntimeOverrides,
     model_override: RwLock<Option<ModelId>>,
     deduction_engine: Arc<DeductionEngine>,
     sandbox_engine: Arc<SandboxOrchestrator>,
@@ -1378,7 +1405,13 @@ impl CoreLoop {
                 None
             }
         };
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(HashMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()) };
+        let runtime_overrides: crate::tool::builtin::config::RuntimeOverrides =
+            Arc::new(std::sync::RwLock::new(HashMap::new()));
+        // config tool executor 注册（依赖 runtime_overrides Arc + base config 快照）
+        crate::tool::builtin::config::register_executors(
+            &registry, runtime_overrides.clone(), config.clone(),
+        ).await;
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(HashMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()) };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -3022,6 +3055,127 @@ impl CoreLoop {
                 })
             }
         };
+        // ─── Awareness Block（全维度态势感知）──────────────────────────────────────
+        // LLM 每轮获得紧凑的状态快照（~60-80 tokens），覆盖三个维度：
+        //   1. 自我感知：当前轮次、token 消耗、剩余预算、已用工具
+        //   2. 环境感知：工作目录、session 模式、task_kind、用户角色
+        //   3. 能力感知：可用模型、thinking 级别、工具集规模、升级余量
+        //
+        // ## 位置：非缓存段（每轮 byte 变化），放 catalog 之后、focus 之前。
+        // ## Token 成本：~60-80 tokens/turn（远小于旧 session_context 的冗余注入）
+        let (mut awareness_block, last_tool_name) = {
+            let s = session.read().await;
+            let current_turn = s.turn_count + 1;
+
+            // 自我感知
+            let tool_calls_used: u32 = {
+                let msgs = s.messages.read().await;
+                msgs.iter().filter(|m| matches!(m.role, crate::llm::provider::MessageRole::Tool)).count() as u32
+            };
+            let model_name = self.config.default_model.0.as_str();
+            let thinking_mode = self.config.thinking_intent.as_ref()
+                .map(|t| format!("{:?}", t))
+                .unwrap_or_else(|| "off".into());
+
+            // 环境感知
+            let task_kind_str = {
+                let locked = s.task_kind_locked.read().await;
+                locked.as_ref().map(|k| k.label().to_string()).unwrap_or_else(|| "unclassified".into())
+            };
+            let user_role = format!("{:?}", s.user_role);
+
+            // 能力感知
+            let max_turns = self.config.max_turns_per_request;
+            let max_tool_calls = self.config.max_tool_calls_per_turn;
+            let max_tokens = self.config.default_max_tokens;
+            let escalations_left = self.config.max_escalations;
+
+            // 获取最近调用的工具名（供 palace recommendations 使用）
+            let last_tool = {
+                let map = s.interaction_map.read().await;
+                map.recent_tools(1).into_iter().next().map(|tid| tid.0)
+            };
+
+            let block = format!(
+                "[Awareness]\n\
+                 Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
+                 Task: {} | Role: {} | Max output: {}tok\n\
+                 Capabilities: {} tools/turn, {} escalations available | scene_loading: {} | router: {}",
+                current_turn, max_turns,
+                tool_calls_used,
+                model_name,
+                thinking_mode,
+                task_kind_str,
+                user_role,
+                max_tokens,
+                max_tool_calls,
+                escalations_left,
+                if self.config.scene_tool_loading_enabled { "on" } else { "off" },
+                if self.config.silent_router_enabled { "on" } else { "off" },
+            );
+            (block, last_tool)
+        };
+
+        // Palace Memory recommendations 注入（LLM 看到上下文相关的工具使用建议）
+        //
+        // ## 引用关系
+        // - 依赖：self.memory_palace (Option<Arc<RwLock<DualPalaceMemory>>>)
+        // - 依赖：last_tool_name（来自 session interaction_map）
+        // - 消费方：LLM（通过 awareness_block 末尾 "Palace hints:" 行）
+        //
+        // ## 生命周期
+        // - 创建：每次 build_system_output 调用时按需追加
+        // - 销毁：随 awareness_block String drop（无副作用）
+        if let Some(ref palace_arc) = self.memory_palace {
+            if let Some(ref tool_name) = last_tool_name {
+                let palace = palace_arc.read().await;
+                let recs = palace.recommend_next_tools(tool_name).await;
+                if !recs.is_empty() {
+                    let rec_str: String = recs.iter()
+                        .take(3) // 最多 3 条，控制 token 开销
+                        .map(|(tool, score)| format!("{}({:.0}%)", tool, score * 100.0))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    awareness_block.push_str(&format!("\nPalace hints: {}", rec_str));
+                }
+            }
+        }
+
+        // Deduction Engine 结构化提醒（让 LLM 知道 Layer 160 有需要注意的推理告警）
+        //
+        // ## 引用关系
+        // - 依赖：deduction_block (Option<String>，来自 self.deduction_engine.build_injection())
+        // - 消费方：LLM（通过 awareness_block 末尾告警行）
+        //
+        // ## 设计
+        // 不修改 deduction_engine 本身的输出格式，仅在 awareness 层追加一行 actionable 提示。
+        // 阈值 20 bytes 过滤掉空或极短（无实质内容）的 deduction block。
+        if let Some(ref ded) = deduction_block {
+            if ded.len() > 20 {
+                awareness_block.push_str(
+                    "\n\u{26A0} Deduction alert active \u{2014} check Layer 160 for details and take corrective action"
+                );
+            }
+        }
+
+        // ─── Tool Catalog 注入（场景化加载配套）──────────────────────────────────
+        // 当 scene_tool_loading_enabled 时，LLM 只收到场景相关工具的完整 schema。
+        // 此 catalog 提供全量工具名索引（~200 tokens），让 LLM 知道可用工具全集，
+        // 需要时可直接按名调用（On-Demand Expansion）。
+        //
+        // ## KV Cache 影响
+        // catalog 在 session 内 byte-stable（工具注册后不变），放在 assembled 之后、focus 之前。
+        // focus 每轮变化已在末尾隔离，catalog 不破坏稳定前缀。
+        let catalog_block = if self.config.scene_tool_loading_enabled {
+            let all_tools = self.registry
+                .list_visible(self.config.tool_visibility_threshold.clone())
+                .await;
+            let catalog = crate::llm::tool_catalog::generate_catalog(&all_tools);
+            Some(catalog)
+        } else {
+            None
+        };
+
         // ─── 构建 text（单 String，用于非 Anthropic）────────────────────────────
         // 【KV Cache 修复】focus 追加到 assembled 末尾（与 segments 路径对齐）
         // 之前 focus 顶在最前（primacy），但 focus.render_with_age(age) 每轮 byte 都变（age 增长）
@@ -3029,7 +3183,16 @@ impl CoreLoop {
         // 移到末尾后：stable prefix（Kernel + abacusbr_core + Strategy + Constraints）byte-identical
         //   → DeepSeek 命中率应从 ~0% 提升到接近 prompt_tokens（按 64-token 块对齐）
         // 对 LLM 注意力的影响：focus 仍在 system prompt 内、紧邻用户消息（recency-adjacent），不弱于 primacy
-        let text = compose_system_text_with_focus(assembled, focus_block.as_deref());
+        let assembled_with_context = {
+            let mut s = assembled;
+            if let Some(ref cat) = catalog_block {
+                s = format!("{}\n\n---\n\n{}", s, cat);
+            }
+            // Awareness block 每轮变化（turn/tool_calls 递增）→ 放在动态段
+            s = format!("{}\n\n---\n\n{}", s, awareness_block);
+            s
+        };
+        let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());
 
         // ─── 构建 segments（多 block，用于 Anthropic cache）────────────────────
         let mut segments = self.prompt_assembly.assemble_segments(
@@ -3687,6 +3850,47 @@ Output JSON:
             }
         }).collect();
 
+        // Phase α-S：Scene-active tool set filtering
+        //
+        // 只对场景相关工具发送完整 schema 到 LLM（ToolDefinition[]）。
+        // 其余工具通过 system prompt 中的 tool catalog 索引告知 LLM 其存在，
+        // LLM 可直接按名字调用（On-Demand Expansion）。
+        //
+        // 三重保留规则：
+        // 1. 名字前缀匹配 scene_active_prefixes
+        // 2. 最近 5 轮内调用过（recently active）
+        // 3. task_kind routing 已通过（applicable_task_kinds 命中）
+        //
+        // 引用关系：
+        // - 依赖：scene_active_prefixes() 自由函数、self.tool_last_invoked、self.config.scene_tool_loading_enabled
+        // - 消费方：下游 Phase γ-I 和段 K3 接收过滤后的 tools Vec
+        let tools: Vec<_> = if self.config.scene_tool_loading_enabled && task_kind_label.is_some() {
+            let prefixes = scene_active_prefixes(task_kind_label.unwrap());
+            let last = self.tool_last_invoked.read().await;
+            let cur = current_turn.unwrap_or(0);
+            tools.into_iter().filter(|t| {
+                // Rule 1: name prefix match
+                if prefixes.iter().any(|p| t.schema.name.starts_with(p)) {
+                    return true;
+                }
+                // Rule 2: recently invoked (last 5 turns)
+                if let Some(&prev) = last.get(&t.id) {
+                    if prev > 0 && cur.saturating_sub(prev) <= 5 {
+                        return true;
+                    }
+                }
+                // Rule 3: explicitly marked for this task_kind (already passed β-D filter above)
+                if let Some(ref kinds) = t.schema.applicable_task_kinds {
+                    if kinds.iter().any(|k| k == task_kind_label.unwrap()) {
+                        return true;
+                    }
+                }
+                false
+            }).collect()
+        } else {
+            tools
+        };
+
         // Phase γ-I：frequency-based pruning
         //
         // 只在 (current_turn, tool_frequency_pruning_turns) 都 Some 时生效。
@@ -3824,9 +4028,42 @@ Output JSON:
         // 让 LLM 看到"协议同构簇"信息：同簇兄弟工具 + 自身的 differentiator。
         // 不在 cluster 中的工具不影响（render_hint_for 返 None）。
         // byte-stable：同一组工具集 + 同一 ClusterRegistry → byte-identical 输出，不破 KV cache 前缀。
+        // 段 K6：Effectiveness tier label 注入
+        //
+        // Pre-compute effectiveness tiers for all visible tools (avoids async in map closure).
+        // LLM sees a compact tier badge in tool description → quality signal for tool selection.
+        //
+        // ## 引用关系
+        // - 依赖：self.effectiveness (Arc<RwLock<EffectivenessTracker>>)
+        // - 消费方：LLM（通过 ToolDefinition.description suffix）
+        //
+        // ## 生命周期
+        // - 创建：每次 build_tool_definitions_for 调用时临时计算
+        // - 销毁：函数返回后 drop（无副作用）
+        let tier_map: std::collections::HashMap<ToolId, abacus_types::VisibilityTier> = {
+            let eff = self.effectiveness.read().await;
+            let cur = current_turn.unwrap_or(0);
+            tools.iter().filter_map(|t| {
+                let eval = eff.evaluate_at_turn(&t.id, &t.provider, cur);
+                if eval.insufficient_data { None }
+                else { Some((t.id.clone(), eval.tier)) }
+            }).collect()
+        };
+
         let cluster_registry = self.cluster_registry.clone();
         let mut defs: Vec<ToolDefinition> = tools.into_iter()
             .map(|mut t| {
+                // Effectiveness tier badge (before cluster hint so LLM sees quality first)
+                if let Some(tier) = tier_map.get(&t.id) {
+                    let label = match tier {
+                        abacus_types::VisibilityTier::S => "\u{2605}",  // ★
+                        abacus_types::VisibilityTier::A => "\u{25C6}",  // ◆
+                        abacus_types::VisibilityTier::B => "\u{25CF}",  // ●
+                        abacus_types::VisibilityTier::C => "\u{25CB}",  // ○
+                        abacus_types::VisibilityTier::D => "\u{25B3}",  // △
+                    };
+                    t.schema.description.push_str(&format!(" [{}]", label));
+                }
                 if let Some(hint) = cluster_registry.render_hint_for(&t.schema.name) {
                     t.schema.description.push_str(&hint);
                 }
@@ -3852,6 +4089,35 @@ Output JSON:
         // 同一组工具集（相同 name 集合）→ 此函数输出 byte-identical，与 HashMap 内部状态/进程实例无关。
         defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         defs
+    }
+}
+
+/// Phase α-S: Scene-active tool prefixes by TaskKind.
+///
+/// Only tools matching these prefixes get full schema sent to LLM (ToolDefinition[]).
+/// Other tools appear in the catalog (system prompt) but not as ToolDefinition,
+/// enabling On-Demand Expansion when LLM requests them by name.
+///
+/// ## 引用关系
+/// - 消费方：CoreLoop::build_tool_definitions_for（Phase α-S 分支）
+/// - 依赖方：无（纯函数，无副作用）
+///
+/// ## 生命周期
+/// - 静态映射，编译期确定
+/// - 返回 &'static 切片，无分配
+fn scene_active_prefixes(task_kind: &str) -> &'static [&'static str] {
+    match task_kind {
+        "code_writing" | "code_reading" => &["filengine_fs", "filengine_file", "filengine_dir", "code", "cargo"],
+        "debugging" => &["filengine_fs", "filengine_file", "code", "cargo", "test"],
+        "web_search" => &["web", "fetch", "search", "browse"],
+        "file_edit" => &["filengine_fs", "filengine_file", "filengine_dir"],
+        "data_analysis" => &["filengine_fs", "filengine_file", "code", "db", "data"],
+        "mathematics" => &["code", "math", "calculate"],
+        "architecture" => &["filengine_fs", "filengine_file", "filengine_dir", "code", "diagram"],
+        "review" => &["filengine_fs", "filengine_file", "code", "lint", "test"],
+        "knowledge_query" => &["kb", "search", "web", "fetch"],
+        // general_chat, linguistics 等 → 空前缀列表（仅最近调用 / 显式 task_kind 命中可保留）
+        _ => &[],
     }
 }
 
@@ -4883,12 +5149,12 @@ mod tests {
             "默认 skip_decay_router 必须是 true——保护 DeepSeek/OpenAI prefix cache");
     }
 
-    /// KV cache 回归（C 方案）：CoreConfig::default 默认关闭 SilentRouter。
+    /// SilentRouter 默认开启（子系统联动补强：工具路由智能化默认生效）
     #[test]
-    fn core_config_default_disables_silent_router() {
+    fn core_config_default_enables_silent_router() {
         let cfg = CoreConfig::default();
-        assert!(!cfg.silent_router_enabled,
-            "默认 silent_router_enabled 必须是 false——保护 tools 段 prefix cache");
+        assert!(cfg.silent_router_enabled,
+            "默认 silent_router_enabled 应为 true——提供工具路由智能化");
     }
 
     /// KV cache 回归：tool definitions 必须按 name 字典序输出。
@@ -5136,8 +5402,10 @@ mod tests {
         let se = Arc::new(RwLock::new(SkillEngine::new()));
         let hub = Arc::new(make_hub());
         // Task #84：default 改为 true 后必须显式关——这条用例验证关闭语义不变
+        // 同时关闭 scene_tool_loading 以隔离测试 β-D
         let mut cfg = CoreConfig::default();
         cfg.task_kind_routing_enabled = false;
+        cfg.scene_tool_loading_enabled = false;
         let core = CoreLoop::new(reg, se, hub, make_ctx(), cfg).await;
         let defs = core.build_tool_definitions_for(Some("code_writing"), None).await;
         let names: Vec<String> = defs.iter().map(|d| d.function.name.clone()).collect();
@@ -5183,6 +5451,7 @@ mod tests {
         let hub = Arc::new(make_hub());
         let mut cfg = CoreConfig::default();
         cfg.task_kind_routing_enabled = true;
+        cfg.scene_tool_loading_enabled = false; // 隔离测试 β-D，不受 α-S 前缀过滤干扰
         let core = CoreLoop::new(reg, se, hub, make_ctx(), cfg).await;
         // 当前任务 code_writing → only_for_debug 应被过滤
         let defs = core.build_tool_definitions_for(Some("code_writing"), None).await;

@@ -712,6 +712,7 @@ impl AbacusServer {
             tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(256),
             adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(false),
             event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
+            scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
         };
 
         // ─── Progressive Gate config ────────────────────────────────────

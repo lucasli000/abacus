@@ -36,6 +36,7 @@ async fn main() {
         model_catalog: None,
         tool_visibility_threshold: abacus_types::VisibilityTier::D,
         task_kind_routing_enabled: true,
+        scene_tool_loading_enabled: true,
         tool_frequency_pruning_turns: Some(20),
         palace_sync_interval_turns: None,
         default_compress_level: abacus_core::core::context::CompressLevel::Brief,

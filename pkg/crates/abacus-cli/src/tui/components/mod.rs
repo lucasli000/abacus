@@ -66,7 +66,7 @@ const CODE_BLOCK_MAX_LINES: u32 = 20;
 /// 元素: (line_idx_in_returned_lines, msg_idx_in_messages_slice, part_idx_for_toggle_block)
 /// part_idx 计数语义: Block + Trace 共用空间(同 toggle_block 内部计数),Stream 不计入。
 fn build_message_lines(
-    messages: &[crate::tui::state::Message],
+    messages: &std::collections::VecDeque<crate::tui::state::Message>,
     scroll: usize,
     theme: &Theme,
     selection: &Option<crate::tui::state::TextSelection>,
@@ -75,6 +75,7 @@ fn build_message_lines(
     compact: bool,
     code_blocks_expanded: bool,
     trace_events: &[crate::tui::state::TraceEvent],
+    trace_event_index: &std::collections::HashMap<u64, usize>,
     trace_part_positions: &mut Vec<(usize, usize, usize)>,
     // V28.4: focused event 锚点 — 双视图同步高亮该 event（消息侧 Trace 子块加 bg）
     // 引用关系：被 line ~290 处 `focused_event_id == Some(*id)` 用于 is_focused 判定
@@ -194,7 +195,7 @@ fn build_message_lines(
                         let line_w = rline.spans.iter()
                             .map(|s| crate::tui::util::display_width(s.content.as_ref()))
                             .sum::<usize>();
-                        if line_w <= content_width + bar_indent {
+                        if line_w <= content_width {
                             lines.push(rline);
                         } else {
                             // 超宽行需要拆分：提取纯文本内容并 word-wrap
@@ -209,35 +210,14 @@ fn build_message_lines(
                             let text_style = styled.spans.first()
                                 .map(|s| s.style)
                                 .unwrap_or(Style::default().fg(theme.text));
-                            // word-wrap
-                            let wrap_width = content_width;
-                            let mut remaining = full_text.as_str();
-                            while !remaining.is_empty() {
-                                let mut width = 0;
-                                let mut take = 0;
-                                let mut last_boundary = 0;
-                                for (i, ch) in remaining.char_indices() {
-                                    let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-                                    if width + ch_w > wrap_width { break; }
-                                    width += ch_w;
-                                    take = i + ch.len_utf8();
-                                    if ch == ' ' || ch == '-' || ch == '/'
-                                        || unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1 {
-                                        last_boundary = take;
-                                    }
-                                }
-                                if take < remaining.len() && last_boundary > 0 && last_boundary > take / 2 {
-                                    take = last_boundary;
-                                }
-                                if take == 0 {
-                                    take = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len());
-                                }
+                            // word-wrap: 统一调用 util::word_wrap_segments
+                            let segments = crate::tui::util::word_wrap_segments(&full_text, content_width);
+                            for (seg_start, seg_end) in segments {
                                 lines.push(Line::from(vec![
                                     bar.clone(),
                                     Span::raw(indent_str.to_string()),
-                                    Span::styled(remaining[..take].to_string(), text_style),
+                                    Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
                                 ]));
-                                remaining = &remaining[take..];
                             }
                         }
                     }
@@ -295,7 +275,7 @@ fn build_message_lines(
 
                     // 聚合摘要数字 — 按 ids 反查 trace_events,miss 跳过(悬挂引用降级)
                     let referenced: Vec<&crate::tui::state::TraceEvent> = event_ids.iter()
-                        .filter_map(|id| trace_events.iter().find(|e| e.id == *id))
+                        .filter_map(|id| trace_event_index.get(id).and_then(|&i| trace_events.get(i)))
                         .collect();
                     let mut think_lines = 0usize;
                     let mut tool_count = 0usize;
@@ -347,7 +327,7 @@ fn build_message_lines(
                     // V29.12: 连续同名 ToolCall 合并展示 — 渲染层分组,不改数据结构
                     if effectively_expanded {
                         // ── 分组: 连续同名 ToolCall id 归入同一 run ──
-                        let runs = group_consecutive_tool_runs(event_ids, trace_events);
+                        let runs = group_consecutive_tool_runs(event_ids, trace_events, trace_event_index);
 
                         for run in &runs {
                             let event_start = lines.len();
@@ -357,7 +337,7 @@ fn build_message_lines(
                             if run.len() == 1 {
                                 // ── 单条: 原样渲染 ──
                                 let id = &run[0];
-                                let ev = trace_events.iter().find(|e| e.id == *id);
+                                let ev = trace_event_index.get(id).and_then(|&i| trace_events.get(i));
                                 match ev {
                                     None => {
                                         lines.push(Line::from(vec![
@@ -382,7 +362,7 @@ fn build_message_lines(
                             } else {
                                 // ── 多条合并: ⚙ name ×N · 状态聚合 · 总耗时 ──
                                 render_merged_tool_run(
-                                    run, trace_events, &bar, theme,
+                                    run, trace_events, trace_event_index, &bar, theme,
                                     code_blocks_expanded, expanded_event_ids,
                                     &mut lines,
                                 );
@@ -561,7 +541,7 @@ pub(crate) fn screen_row_to_msg_idx(
     row: u16,
     terminal_rows: u16,
     scroll: usize,
-    messages: &[crate::tui::state::Message],
+    messages: &std::collections::VecDeque<crate::tui::state::Message>,
     chat_width: u16,
 ) -> Option<usize> {
     let msg_area_start = 1u16; // after top bar
@@ -607,7 +587,7 @@ pub(crate) fn screen_pos_to_msg_char(
     col: u16,
     terminal_rows: u16,
     scroll: usize,
-    messages: &[crate::tui::state::Message],
+    messages: &std::collections::VecDeque<crate::tui::state::Message>,
     chat_width: u16,
 ) -> Option<(usize, usize)> {
     use crate::tui::state::MsgContent;
@@ -844,7 +824,7 @@ pub fn render_messages(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines = build_message_lines(
         &state.messages, 0, &state.theme, &state.text_selection, inner.width,
         state.stream_cursor, state.compact, state.code_blocks_expanded,
-        &state.trace_events, &mut _trace_pos_unused, state.focused_event_id,
+        &state.trace_events, &state.trace_event_index, &mut _trace_pos_unused, state.focused_event_id,
     );
 
     // Auto-scroll to bottom
@@ -984,7 +964,7 @@ pub fn render_messages_in_card(
     let mut lines = build_message_lines(
         &state.messages, 0, &state.theme, &state.text_selection, inner.width,
         state.stream_cursor, state.compact, state.code_blocks_expanded,
-        &state.trace_events, &mut trace_part_positions, state.focused_event_id,
+        &state.trace_events, &state.trace_event_index, &mut trace_part_positions, state.focused_event_id,
     );
 
     // ── 流式消息：追加 streaming 状态（thinking + tools + text）──
@@ -1072,7 +1052,7 @@ pub fn render_messages_in_card(
                 ]));
                 stream_offset += 1;
 
-                if let Some(ev) = state.trace_events.iter().find(|e| e.id == *trace_id) {
+                if let Some(ev) = state.trace_event_index.get(trace_id).and_then(|&i| state.trace_events.get(i)) {
                     if let crate::tui::state::TraceKind::ToolCall { args, output, .. } = &ev.kind {
                         let name_lower = name.to_lowercase();
 
@@ -1192,43 +1172,27 @@ pub fn render_messages_in_card(
             let think_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
             let mut row_offset = 0usize;
             for tline in visible.iter() {
-                let mut remaining = *tline;
+                let remaining = *tline;
                 if remaining.is_empty() {
                     // 空行也保留视觉留白
                     lines.insert(insert_pos + 1 + row_offset, Line::from(vec![bar.clone()]));
                     row_offset += 1;
                     continue;
                 }
-                while !remaining.is_empty() {
-                    // 取至 content_w 宽（display width，处理中文双宽）
-                    let mut width = 0usize;
-                    let mut take = 0usize;
-                    let mut last_break = 0usize;
-                    for (i, ch) in remaining.char_indices() {
-                        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-                        if width + cw > content_w { break; }
-                        width += cw;
-                        take = i + ch.len_utf8();
-                        if ch == ' ' || cw > 1 {
-                            last_break = take;
-                        }
-                    }
-                    // 没切到任何字符 → 至少切一字符避免死循环
-                    if take == 0 {
-                        take = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len());
-                    }
-                    // 优先在空格/中文边界折行（last_break > 50% 才用）
-                    if take < remaining.len() && last_break > 0 && last_break > take / 2 {
-                        take = last_break;
-                    }
-                    let chunk = &remaining[..take];
+                let segments = crate::tui::util::word_wrap_segments(remaining, content_w);
+                for (idx, (seg_start, seg_end)) in segments.iter().enumerate() {
+                    // 首 segment 保留原始缩进，后续 wrap 行 trim 前导空格
+                    let chunk = if idx == 0 {
+                        &remaining[*seg_start..*seg_end]
+                    } else {
+                        remaining[*seg_start..*seg_end].trim_start()
+                    };
                     lines.insert(insert_pos + 1 + row_offset, Line::from(vec![
                         bar.clone(),
                         Span::raw("   "),
                         Span::styled(chunk.to_string(), think_style),
                     ]));
                     row_offset += 1;
-                    remaining = remaining[take..].trim_start();
                 }
             }
             // V29.12: 超出 max_show 行时显示隐藏行数提示（与落档后 Trace 折叠提示对称）
@@ -1356,34 +1320,18 @@ pub fn render_messages_in_card(
                     lines.insert(stream_insert_base + stream_offset, rline);
                     stream_offset += 1;
                 } else {
-                    // 超宽行 word-wrap — 统一缩进 "   "（3空格，与所有内容对齐）
+                    // 超宽行 word-wrap — 统一调用 util::word_wrap_segments
                     let indent_str = "   ";
                     let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                     let text_style = styled.spans.first().map(|s| s.style)
                         .unwrap_or(Style::default().fg(state.theme.text));
-                    let mut remaining = full_text.as_str();
-                    while !remaining.is_empty() {
-                        let mut width = 0;
-                        let mut take = 0;
-                        let mut last_b = 0;
-                        for (i, ch) in remaining.char_indices() {
-                            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-                            if width + ch_w > content_w { break; }
-                            width += ch_w;
-                            take = i + ch.len_utf8();
-                            if ch == ' ' || ch == '-' || ch == '/'
-                                || unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) > 1 {
-                                last_b = take;
-                            }
-                        }
-                        if take < remaining.len() && last_b > 0 && last_b > take / 2 { take = last_b; }
-                        if take == 0 { take = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len()); }
+                    let segments = crate::tui::util::word_wrap_segments(&full_text, content_w);
+                    for (seg_start, seg_end) in segments {
                         lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                             bar.clone(), Span::raw(indent_str.to_string()),
-                            Span::styled(remaining[..take].to_string(), text_style),
+                            Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
                         ]));
                         stream_offset += 1;
-                        remaining = &remaining[take..];
                     }
                 }
             }

@@ -153,6 +153,15 @@ fn registry() -> &'static [Entry] {
     })
 }
 
+/// 返回所有已注册命令的名称列表（带 / 前缀）
+///
+/// Phase 3 去重：替代 event/mod.rs 中硬编码的 SLASH_COMMANDS 常量
+/// 引用关系：被 event/mod.rs::trigger_completion 调用
+/// 生命周期：纯函数，每次调用从 registry 动态生成
+pub fn all_command_names() -> Vec<&'static str> {
+    registry().iter().flat_map(|e| e.names.iter().copied()).collect()
+}
+
 /// Dispatch a slash command. Returns (consumed, result_text_for_display).
 pub fn dispatch(state: &mut AppState, text: &str) -> CmdResult {
     if !text.starts_with('/') { return CmdResult::NotFound(text.into()); }
@@ -170,19 +179,6 @@ pub fn dispatch(state: &mut AppState, text: &str) -> CmdResult {
     }
 
     CmdResult::NotFound(name)
-}
-
-/// All registered command names (for completion)
-pub fn all_command_names() -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in registry() {
-        for name in entry.names {
-            names.push(format!("/{}", name));
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
 }
 
 /// Generate help text
@@ -315,9 +311,13 @@ fn cmd_help(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 
 fn cmd_clear(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     s.messages.clear();
+    s.expert_names_cache.clear();
     s.events.clear();
     // V28: 同步清 trace_events 与 id 分配器(messages 已清,无悬挂引用风险)
     s.trace_events.clear();
+    s.trace_event_index.clear();
+    s.tool_freq_cache.borrow_mut().take();
+    s.tool_freq_dirty.set(true);
     s.next_trace_id = 0;
     s.streaming_trace_ids.clear();
     s.timeline_expanded_ids.clear();
@@ -335,28 +335,8 @@ fn cmd_clear(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 }
 
 fn cmd_new(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
-    // SC1b：内容与 event::reset_session_state 100% 重复——保留独立实现避免
-    // 跨模块循环依赖（event → slash_commands），但补 mark_dirty 与 reset_session_state 一致
-    s.messages.clear();
-    s.events.clear();
-    // V28: 同步清 trace_events 与 id 分配器(新会话从 id=0 开始,messages 同步清,无悬挂)
-    s.trace_events.clear();
-    s.next_trace_id = 0;
-    s.streaming_trace_ids.clear();
-    s.timeline_expanded_ids.clear();
-    s.timeline_row_map.borrow_mut().clear();
-    s.focused_event_id = None;
-    s.tool_records.clear();
-    s.thinking_text.clear();
-    s.turn_count = 0;
-    // V29.16: 走 SSOT set_scroll, 内部已 mark dirty
-    s.set_scroll(ScrollAction::ToBottom);
-    s.input.clear();
-    s.cursor_pos = 0;
-    s.cursor_line = 0;
-    s.cursor_col = 0;
-    if s.pending_text.is_some() { s.pending_text = None; s.input_state = crate::tui::state::InputState::Ready; }
-    s.mark_dirty();
+    // Phase 3 去重：统一调用 AppState::reset_session（SSoT）
+    s.reset_session();
     s.add_toast("已创建新会话", std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
@@ -563,7 +543,7 @@ enum PlanExtractError {
 /// 返回 None 表示无任何 Session 消息（例如 mode 切换时还未对话）— 调用方应允许无 artifact 切换。
 /// 设计意图：Clarify/Meeting 产出本质是非结构化文本（澄清摘要 / 会议结论），不像 PlanTasks 需 JSON
 /// 解析；直接把整段 Session 文本作为 artifact 携带到下阶段即可。
-fn extract_last_session_text(messages: &[crate::tui::state::Message]) -> Option<String> {
+fn extract_last_session_text(messages: &std::collections::VecDeque<crate::tui::state::Message>) -> Option<String> {
     let last_session = messages
         .iter()
         .rev()
@@ -588,7 +568,7 @@ fn extract_last_session_text(messages: &[crate::tui::state::Message]) -> Option<
 }
 
 fn extract_plan_tasks_from_messages(
-    messages: &[crate::tui::state::Message],
+    messages: &std::collections::VecDeque<crate::tui::state::Message>,
 ) -> Result<Vec<abacus_types::TaskSpec>, PlanExtractError> {
     // 从尾向前找最后一条 Session 角色消息（Planner 的回复）
     let last_session = messages

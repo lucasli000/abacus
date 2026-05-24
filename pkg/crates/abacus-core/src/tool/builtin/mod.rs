@@ -17,6 +17,7 @@
 
 pub mod filengine;
 pub mod code_exec;
+pub mod config;
 pub mod db;
 pub mod kb;
 pub mod orchestrate;
@@ -38,6 +39,8 @@ pub async fn register_all(registry: &super::ToolRegistry) {
     // 阶段一次性绑定即可。
     filengine::register_executors(registry).await;
     code_exec::CodeExecutorTool::register(registry).await;
+    config::register(registry).await;
+    // config::register_executors() called from CoreLoop::new() with runtime_overrides Arc
     db::register(registry).await;
     db::register_executors(registry).await;
     kb::register(registry).await;

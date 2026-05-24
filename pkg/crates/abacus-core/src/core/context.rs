@@ -1326,16 +1326,86 @@ impl ContextManager {
         Ok(compressed)
     }
 
+    /// Produce a structured cross-turn context block for LLM injection.
+    ///
+    /// ## Sections rendered (in order)
+    /// 1. **Session history** — last 3 hot snapshots (most recent first); if hot is empty
+    ///    falls back to warm tier (last 3).
+    /// 2. **Declared content** — retained segments (existing behavior).
+    /// 3. **Context pressure** — usage warning when window utilization > 60%.
+    ///
+    /// ##引用关系
+    /// - 读: `self.tiers.hot_snapshots` / `self.tiers.warm` — session snapshot tiers
+    /// - 读: `self.window` — context usage percentage
+    /// - 读: `self.retained_content` — declared segments
+    /// 消费方: CoreLoop system-prompt assembly (pre-turn injection)
+    ///
+    /// ## 生命周期
+    /// 无副作用——纯读、无状态变更。每次 turn 起始重新调用构建。
     pub async fn retained_context_block(&self) -> String {
-        let retained = self.retained_content.read().await;
-        if retained.is_empty() {
-            return String::new();
+        let mut block = String::new();
+
+        // ── Section 1: Session history from hot/warm snapshots ──────────────
+        {
+            let hot = self.tiers.hot_snapshots.read().await;
+            let has_hot = !hot.is_empty();
+            if has_hot {
+                block.push_str("[Retained Context]\n");
+                // Most recent 3 snapshots (reverse iteration = newest first)
+                let recent: Vec<_> = hot.iter().rev().take(3).collect();
+                for snap in &recent {
+                    // Always render turn + summary; include key_decisions if any
+                    block.push_str(&format!("- Turn {}: {}\n", snap.turn_count, snap.summary));
+                    for decision in snap.key_decisions.iter().take(2) {
+                        block.push_str(&format!("  - decision: {}\n", decision));
+                    }
+                }
+            }
+            drop(hot);
+
+            // Fallback: if hot is empty, try warm tier
+            if !has_hot {
+                let warm = self.tiers.warm.read().await;
+                if !warm.is_empty() {
+                    block.push_str("[Retained Context (warm)]\n");
+                    let recent: Vec<_> = warm.iter().rev().take(3).collect();
+                    for snap in &recent {
+                        block.push_str(&format!("- Turn {}: {}\n", snap.turn_count, snap.summary));
+                    }
+                }
+            }
         }
-        let mut parts = vec!["## Declared Content".to_string()];
-        for (seg_id, content, _meta) in retained.iter() {
-            parts.push(format!("[{seg_id}]\n{content}"));
+
+        // ── Section 2: Declared content (existing behavior) ─────────────────
+        {
+            let retained = self.retained_content.read().await;
+            if !retained.is_empty() {
+                if !block.is_empty() {
+                    block.push('\n');
+                }
+                block.push_str("## Declared Content\n\n");
+                for (seg_id, content, _meta) in retained.iter() {
+                    block.push_str(&format!("[{seg_id}]\n{content}\n\n"));
+                }
+            }
         }
-        parts.join("\n\n")
+
+        // ── Section 3: Context pressure indicator ───────────────────────────
+        {
+            let window = self.window.read().await;
+            let usage = window.usage_pct();
+            if usage > 60.0 {
+                if !block.is_empty() {
+                    block.push('\n');
+                }
+                block.push_str(&format!(
+                    "[Context pressure: {:.0}%] — prefer concise responses\n",
+                    usage
+                ));
+            }
+        }
+
+        block
     }
 
     pub async fn estimate_total_tokens(&self, messages: &[Message]) -> usize {
@@ -1448,8 +1518,8 @@ impl ContextManager {
         let force = window.should_force_discard();
         drop(window);
 
-        let keep_count = if force { 2 } else { 5 };
-        let early_keep = 1;
+        let keep_count = if force { 3 } else { 8 };
+        let early_keep = 2; // 保留开头 2 条（含初始 system/user 上下文）
 
         if messages.len() <= keep_count + early_keep + 1 {
             return Vec::new();
@@ -1459,6 +1529,73 @@ impl ContextManager {
         fn is_tool_protocol(m: &Message) -> bool {
             m.tool_calls.is_some() || m.tool_call_id.is_some()
                 || matches!(m.role, MessageRole::Tool)
+        }
+
+        /// 消息重要性评分（0.0-1.0）——高分消息在压缩时保留更多内容
+        /// 关键信息保护：决策、结论、错误、用户确认不会被简单压缩掉
+        fn importance_score(m: &Message) -> f64 {
+            let text = match &m.content {
+                Some(MessageContent::Text(t)) => t.as_str(),
+                _ => return 0.3, // 无文本内容，低分
+            };
+            let lower = text.to_lowercase();
+            let mut score = 0.3; // 基线
+
+            // 决策/结论标记 → 高保护
+            let decision_markers = ["决定", "结论", "方案", "选择", "确认",
+                "decision", "conclusion", "chosen", "confirmed", "approved",
+                "plan:", "strategy:", "architecture:"];
+            for marker in &decision_markers {
+                if lower.contains(marker) { score += 0.25; break; }
+            }
+
+            // 错误/警告 → 高保护（诊断信息不能丢）
+            let error_markers = ["error", "failed", "panic", "bug", "issue",
+                "错误", "失败", "异常", "问题"];
+            for marker in &error_markers {
+                if lower.contains(marker) { score += 0.2; break; }
+            }
+
+            // 用户角色消息 → 中等保护（用户意图）
+            if matches!(m.role, MessageRole::User) {
+                score += 0.15;
+            }
+
+            // 长消息（>500 chars）可能含重要推理 → 轻微加分
+            if text.len() > 500 { score += 0.1; }
+
+            // 含代码块 → 中等保护
+            if text.contains("```") { score += 0.15; }
+
+            if score > 1.0 { 1.0f64 } else { score }
+        }
+
+        /// 从消息中提取关键结论（保护核心信息不丢失）
+        fn extract_key_points(m: &Message) -> Option<String> {
+            let text = match &m.content {
+                Some(MessageContent::Text(t)) => t,
+                _ => return None,
+            };
+
+            let mut points = Vec::new();
+
+            // 提取 "##" 标题行（结论/决策/方案标题）
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("## ") || trimmed.starts_with("### ") {
+                    points.push(trimmed.to_string());
+                }
+                // 提取 "决定/结论/方案:" 开头的行
+                if trimmed.starts_with("决定") || trimmed.starts_with("结论")
+                    || trimmed.starts_with("方案") || trimmed.starts_with("Plan:")
+                    || trimmed.starts_with("Decision:") || trimmed.starts_with("Conclusion:")
+                {
+                    points.push(trimmed.chars().take(120).collect());
+                }
+            }
+
+            if points.is_empty() { None }
+            else { Some(points.join(" | ")) }
         }
 
         let original = std::mem::take(messages);
@@ -1539,8 +1676,18 @@ impl ContextManager {
             }
             let recover_id = format!("mb_{:016x}", h.finish());
 
+            // 提取被压缩消息中的关键结论（避免丢失重要决策）
+            let key_points: Vec<String> = buf.iter()
+                .filter_map(|m| extract_key_points(m))
+                .collect();
+            let key_section = if key_points.is_empty() {
+                String::new()
+            } else {
+                format!("\n[Preserved decisions: {}]", key_points.join("; "))
+            };
+
             let summary = format!(
-                "[Compressed history: {count} messages, ~{total_tok} tok, recover_id={recover_id}]\n{}",
+                "[Compressed: {count} msgs, ~{total_tok} tok, id={recover_id}]{key_section}\n{}",
                 role_summary.join("\n")
             );
             let compressed_tok = estimate_tokens(&summary);
@@ -1602,12 +1749,36 @@ impl ContextManager {
                 continue; // 不写入 new_messages
             }
 
+            let score = importance_score(msg);
+
             if is_tool_protocol(msg) {
-                // 保留 tool 协议消息——先 flush 累积的 non-tool 段，再原样保留 tool 消息
+                // Tool 协议消息：高重要性（错误/决策相关）→ 保留；低重要性 → 压缩为一行摘要
+                if score >= 0.5 {
+                    flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+                    new_messages.push(msg.clone());
+                } else {
+                    // 低重要性 tool 结果（如简单的文件读取成功）→ 进入 pending 压缩
+                    pending_summary.push(msg);
+                }
+            } else if score >= 0.7 {
+                // 高重要性非 tool 消息（决策/结论/错误）→ 保留原文但截断到前 300 chars
                 flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
-                new_messages.push(msg.clone());
+                let mut preserved = msg.clone();
+                if let Some(MessageContent::Text(ref text)) = preserved.content {
+                    if text.len() > 300 {
+                        // 截断但保留关键点
+                        let key_points = extract_key_points(msg);
+                        let truncated = format!(
+                            "{}...\n[Key: {}]",
+                            text.chars().take(250).collect::<String>(),
+                            key_points.unwrap_or_else(|| "truncated".into())
+                        );
+                        preserved.content = Some(MessageContent::Text(truncated));
+                    }
+                }
+                new_messages.push(preserved);
             } else {
-                // non-tool 消息进缓冲
+                // 中低重要性 → 进入 pending 批量压缩
                 pending_summary.push(msg);
             }
         }

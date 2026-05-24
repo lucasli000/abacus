@@ -9,6 +9,7 @@ pub mod model_cache;
 pub mod model_catalog;
 pub mod thinking_resolver;
 pub mod tool_view;
+pub mod tool_catalog;
 
 pub use provider::*;
 pub use prompt_cache::*;

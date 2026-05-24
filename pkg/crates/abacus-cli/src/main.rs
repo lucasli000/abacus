@@ -128,6 +128,9 @@ enum Commands {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
+    // i18n: 检测系统语言（ABACUS_LANG > LC_ALL > LANG，默认 En）
+    crate::tui::i18n::init_lang();
+
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[FATAL] Abacus panicked: {}", info);
     }));

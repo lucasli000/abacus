@@ -127,9 +127,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     } else {
         std::path::PathBuf::from(format!("/tmp/abacus-tui-{}.log", std::process::id()))
     };
-    let file_writer = std::fs::OpenOptions::new()
-        .create(true).append(true).open(&log_file_path)
-        .unwrap_or_else(|_| std::fs::File::create("/dev/null").unwrap());
+    // Phase1-1.2a: 安全降级——打开失败时使用 sink 而非 panic
+    // 引用关系：tracing_subscriber writer 消费此 Box
+    // 生命周期：进程全局（tracing global subscriber）
+    let file_writer: Box<dyn std::io::Write + Send> = match std::fs::OpenOptions::new()
+        .create(true).append(true).open(&log_file_path) {
+        Ok(f) => Box::new(f),
+        Err(_) => Box::new(std::io::sink()),
+    };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::sync::Mutex::new(file_writer))
@@ -138,10 +143,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
     // R2 修复：Panic hook — 仅恢复 terminal；session save 由正常退出路径负责
     // （panic 时 state 可能不一致，强行写文件可能比丢失更危险）
+    // Phase1-1.7: panic hook 完整终端恢复（含键盘增强/焦点/鼠标捕获）
+    // 引用关系：crossterm terminal/event 模块
+    // 生命周期：进程全局 panic hook，触发后进程即将退出
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
         let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         eprintln!("\n[PANIC] AbacusTUI crashed: {}", info);
         eprintln!("  上次正常退出的 session 保留在 ~/.abacus/projects/<cwd>/sessions/<uuid>.json");
         default_hook(info);
@@ -271,9 +285,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     spawn_event_poller(evt_tx, shutdown.clone());
 
     // P2-19: SIGTERM/SIGINT graceful shutdown
-    let mut sigterm = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::terminate()
-    ).unwrap_or_else(|_| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap());
+    // Phase1-1.2b: 消除嵌套 unwrap，注册失败时用 pending() 替代
+    // 引用关系：下方 select! 宏消费此 signal stream
+    // 生命周期：主循环存续期间保持，state.running=false 后不再 poll
+    let sigterm_result = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .or_else(|_| tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()));
+    let mut sigterm_opt = sigterm_result.ok();
 
     // 主循环
     let mut interval = tokio::time::interval(Duration::from_millis(50));
@@ -283,7 +300,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     while state.running {
         tokio::select! {
             // P2-19: Graceful shutdown on SIGTERM
-            _ = sigterm.recv() => {
+            // Phase1-1.2b: signal 注册失败时此分支永不触发（pending）
+            _ = async {
+                match sigterm_opt.as_mut() {
+                    Some(sig) => { sig.recv().await; }
+                    None => { std::future::pending::<()>().await; }
+                }
+            } => {
                 tracing::info!("received SIGTERM, shutting down gracefully");
                 state.running = false;
                 continue;
@@ -575,7 +598,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 //   ConfirmRequired stream chunk 单独处理 always_allow 短路。
                                 //   保留作为非流式 fallback：如果有 EngineResponse 仍带
                                 //   pending_confirmations 抵达，走旧 channel 通路也能放行。
-                                state.add_event(&ts, "mcip", "自动放行（已授权工具，legacy 路径）", crate::tui::state::EventLevel::Info);
+                                state.add_event(&ts, "mcip", crate::tui::i18n::t("event.auto_allow_legacy"), crate::tui::state::EventLevel::Info);
                                 state.pending_mcip_confirmations = confirmations;
                                 state.pending_confirmation_response = Some(true);
                             } else {
@@ -606,12 +629,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 }
                                 let is_destructive = is_destructive_flag;
                                 let mut options = vec![
-                                    ConfirmOption { key: 'Y', label: "允许".to_string() },
+                                    ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() },
                                 ];
                                 if !is_destructive {
-                                    options.push(ConfirmOption { key: 'A', label: "总是允许".to_string() });
+                                    options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
                                 }
-                                options.push(ConfirmOption { key: 'N', label: "拒绝".to_string() });
+                                options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
 
                                 state.confirm_dialog = Some(ConfirmDialog {
                                     title: format!("🔐 {}", first.tool_id),
@@ -631,13 +654,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     focus_lost_at: None,
                                     last_active_at: std::time::Instant::now(),
                                 });
-                                let event_msg = format!("等待授权: {}", first.tool_id);
+                                let event_msg = crate::tui::i18n::tf("event.wait_auth_tool", &[&first.tool_id]);
                                 state.pending_mcip_confirmations = confirmations;
                                 state.add_event(&ts, "mcip", &event_msg, crate::tui::state::EventLevel::Warning);
                             }
                         }
 
-                        state.add_event(&ts, "llm", "生成完成", crate::tui::state::EventLevel::Notice);
+                        state.add_event(&ts, "llm", crate::tui::i18n::t("event.gen_complete"), crate::tui::state::EventLevel::Notice);
 
                         // 有待确认工具时，保持 Executing 状态（等用户确认后再恢复）
                         if state.pending_mcip_confirmations.is_empty() {
@@ -871,8 +894,23 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // - 编辑工具（edit/write/move/mkdir）+ 非破坏性 bash：session 内放行
                             // - 破坏性操作（rm/format/drop/kill/reset/force）：每次确认
                             let tool_lower = req.tool_id.to_lowercase();
-                            let is_readonly = ["read", "search", "ls", "tree", "grep", "info", "list", "get"]
-                                .iter().any(|k| tool_lower.contains(k)) && !tool_lower.contains("write");
+                            // 知识库/记忆工具：kb_*, cross_session_*, session_resume_* 默认放行
+                            let is_kb_or_memory = tool_lower.starts_with("kb_")
+                                || tool_lower.starts_with("cross_session")
+                                || tool_lower.starts_with("session_resume")
+                                || tool_lower.contains("palace")
+                                || tool_lower.contains("memory");
+                            // Phase1-1.3: 词边界安全匹配，防止 "create" 误中 "read"
+                            // 匹配规则: 完全匹配 / 前缀 "read_xxx" / 后缀 "xxx_read" / 中间 "xxx_read_xxx"
+                            let readonly_keywords = ["read", "search", "ls", "tree", "grep", "info", "list", "get"];
+                            let has_readonly_verb = readonly_keywords.iter().any(|k| {
+                                tool_lower == *k
+                                    || tool_lower.starts_with(&format!("{}_", k))
+                                    || tool_lower.ends_with(&format!("_{}", k))
+                                    || tool_lower.contains(&format!("_{}_", k))
+                            });
+                            let is_readonly = is_kb_or_memory
+                                || (has_readonly_verb && !tool_lower.contains("write") && !tool_lower.contains("delete") && !tool_lower.contains("remove"));
                             let is_destructive_cmd = if tool_lower.contains("bash") {
                                 // 检查 bash 命令参数是否含破坏性关键词
                                 let params_str = req.params_preview.as_deref().unwrap_or("");
@@ -904,7 +942,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         // 避免与 SessionState read guard 跨 await 冲突
                                         let tx_one = {
                                             let s = eng.session.read().await;
-                                            let mut guard = s.mcip_confirm_channels.lock().unwrap();
+                                            let mut guard = s.mcip_confirm_channels.lock().unwrap_or_else(|e| e.into_inner());
                                             let removed = guard.remove(&nonce);
                                             drop(guard);
                                             removed
@@ -914,7 +952,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         }
                                     }
                                 });
-                                state.add_event(&ts, "mcip", &format!("自动放行（always_allow）: {}", req.tool_id), crate::tui::state::EventLevel::Info);
+                                state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auto_allow_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Info);
                             } else {
                                 // 弹窗
                                 let reason_destructive = req.reason.starts_with("[destructive]");
@@ -928,11 +966,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 if let Some(ref preview) = req.params_preview {
                                     details.push(format!("参数: {}", preview));
                                 }
-                                let mut options = vec![ConfirmOption { key: 'Y', label: "允许".to_string() }];
+                                let mut options = vec![ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() }];
                                 if !is_destructive_flag {
-                                    options.push(ConfirmOption { key: 'A', label: "总是允许".to_string() });
+                                    options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
                                 }
-                                options.push(ConfirmOption { key: 'N', label: "拒绝".to_string() });
+                                options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
                                 state.confirm_dialog = Some(ConfirmDialog {
                                     title: format!("🔐 {}", req.tool_id),
                                     confirm_type,
@@ -952,18 +990,31 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     last_active_at: std::time::Instant::now(),
                                 });
                                 state.pending_mcip_confirmations = vec![req.clone()];
-                                state.add_event(&ts, "mcip", &format!("等待授权: {}", req.tool_id), crate::tui::state::EventLevel::Warning);
+                                state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.wait_auth_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Warning);
                             }
                             state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::CompressStart => {
                             state.input_state = InputState::Executing;
-                            state.processing_phase = "🗜️ Compacting...".into();
+                            state.processing_phase = "🗜️ 正在压缩上下文...".into();
+                            // 在主对话流中插入系统提示，让用户明确感知压缩正在发生
+                            state.add_toast("⏳ 上下文接近容量上限，正在压缩历史消息...", Duration::from_secs(5));
                             state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
                             if messages_compressed > 0 {
                                 state.add_event(&ts, "context", &format!("压缩 {} 条消息，释放 ~{} tok", messages_compressed, tokens_saved), crate::tui::state::EventLevel::Info);
+                                // 在主对话流中通知压缩结果
+                                let note = format!(
+                                    "✅ 上下文压缩完成：{} 条历史消息 → 摘要（释放 ~{} tokens）。早期对话细节已简化，核心结论保留。",
+                                    messages_compressed, tokens_saved
+                                );
+                                state.add_toast(&note, Duration::from_secs(5));
+                                // 联动上下文展示：减去压缩释放的 tokens
+                                state.session_tokens.total_tokens = state.session_tokens.total_tokens
+                                    .saturating_sub(tokens_saved as u64);
+                                state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
+                                    .saturating_sub(tokens_saved as u64);
                             }
                             state.processing_phase.clear();
                             state.rendered_lines_dirty.set(true);
@@ -1013,8 +1064,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 }
 
                 // 渲染（每帧一次，在所有状态更新之后）
-                if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {
-                    tracing::error!(?e, "TUI 渲染错误");
+                // 性能优化：无变更时跳过整帧渲染
+                let needs_draw = state.rendered_lines_dirty.get()
+                    || !state.streaming_text.is_empty()
+                    || !state.streaming_thinking.is_empty()
+                    || !state.toasts.is_empty()
+                    || state.confirm_dialog.is_some()
+                    || state.picker.is_some()
+                    || state.input_state != InputState::Ready;
+                if needs_draw {
+                    if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {
+                        tracing::error!(?e, "TUI 渲染错误");
+                    }
                 }
                 state.cleanup_toasts();
 
@@ -1032,8 +1093,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         if is_destructive {
                             // 破坏性：超时拒绝
                             state.pending_confirmation_response = Some(false);
-                            state.add_event(&ts, "session", &format!("⏱ 超时拒绝（破坏性）: {}", action), crate::tui::state::EventLevel::Warning);
-                            state.add_toast("⏱ 超时 → 已拒绝（破坏性操作需显式确认）", Duration::from_secs(3));
+                            state.add_event(&ts, "session", &crate::tui::i18n::tf("event.timeout_reject", &[&action]), crate::tui::state::EventLevel::Warning);
+                            state.add_toast(crate::tui::i18n::t("toast.timeout_reject"), Duration::from_secs(3));
                         } else {
                             // 非破坏性：超时 → session 内允许（加入 session grants，不持久化）
                             state.pending_confirmation_response = Some(true);
@@ -1042,8 +1103,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.always_allow.insert(tool_id.clone());
                                 // 注意：不调用 save_always_allow——仅 session 内有效
                             }
-                            state.add_event(&ts, "session", &format!("⏱ 超时自动允许（session 内）: {}", action), crate::tui::state::EventLevel::Info);
-                            state.add_toast("⏱ 超时 → session 内允许（不持久化）", Duration::from_secs(3));
+                            state.add_event(&ts, "session", &crate::tui::i18n::tf("event.timeout_allow", &[&action]), crate::tui::state::EventLevel::Info);
+                            state.add_toast(crate::tui::i18n::t("toast.timeout_allow"), Duration::from_secs(3));
                         }
                     }
                 }
@@ -1066,7 +1127,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         let tool_names: Vec<String> = confirmations.iter().map(|r| r.tool_id.clone()).collect();
 
                         if allowed {
-                            state.add_event(&ts, "mcip", &format!("已授权（继续执行）: {:?}", tool_names), crate::tui::state::EventLevel::Info);
+                            state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auth_tools", &[&format!("{:?}", tool_names)]), crate::tui::state::EventLevel::Info);
                             state.add_toast("🔓 已授权，继续执行", Duration::from_secs(2));
                         } else {
                             state.add_event(&ts, "mcip", &format!("已拒绝（pipeline 将返回 deny output）: {:?}", tool_names), crate::tui::state::EventLevel::Warning);
@@ -1080,7 +1141,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         tokio::spawn(async move {
                             let senders: Vec<_> = {
                                 let s = engine_clone.session.read().await;
-                                let mut guard = s.mcip_confirm_channels.lock().unwrap();
+                                let mut guard = s.mcip_confirm_channels.lock().unwrap_or_else(|e| e.into_inner());
                                 confirmations.iter()
                                     .filter_map(|req| guard.remove(&req.nonce))
                                     .collect()
@@ -1109,6 +1170,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     state.info_panel_auto_open = false;
                     state.panel_visible = true;
                     state.panel_tab = crate::tui::state::PanelTab::Timeline;
+                }
+
+                // Phase 3 (3.8): 消费 pending_send 标志——触发自动发送
+                // 引用关系：由 pending_inputs 消费后设置，此处将 state.input 转为 pending_text 以触发发送
+                // 生命周期：单次消费，下一帧的 pending_text.take() 分支会实际发送
+                if state.pending_send {
+                    state.pending_send = false;
+                    if !state.input.is_empty() {
+                        state.pending_text = Some(state.input.clone());
+                        state.input.clear();
+                        state.cursor_pos = 0;
+                        state.cursor_line = 0;
+                        state.cursor_col = 0;
+                    }
                 }
 
                 // 处理异步补全结果
@@ -2030,9 +2105,17 @@ pub(crate) fn load_always_allow() -> std::collections::HashSet<String> {
             let mut set: std::collections::HashSet<String> = raw.into_iter()
                 .map(|s| s.replace('.', "_"))
                 .collect();
-            // 确保 DEFAULT_ALLOW 全覆盖（用户旧文件可能缺少新增工具）
+            // Phase 3 (3.7): 仅补充 set 中不存在的新增 DEFAULT 项。
+            // 如果用户显式删过某项（文件存在且不含该项），不强加回来。
+            // 适用场景：新版本新增了 DEFAULT 工具，用户从未见过该工具——此时补充。
+            // —— 无法完美区分“用户删过”与“旧版未包含”，当前策略以简化为主：
+            //   文件非空且已存在 → 仅补充 set 中完全不存在的 DEFAULT 项
+            //   TODO: 引入 removed_tools.json 记录用户显式 revoke，实现精确区分
             for d in DEFAULT_ALLOW {
-                set.insert(d.to_string());
+                // 补充 set 中不存在的 DEFAULT 项（新版本新增工具自动可用）
+                if !set.contains(*d) {
+                    set.insert(d.to_string());
+                }
             }
             let _ = save_always_allow(&set);
             set
@@ -2171,7 +2254,7 @@ pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
         thinking_depth: state.thinking_depth.clone(),
         turn_count: state.turn_count,
         session_summary: state.session_summary.clone(),
-        messages: state.messages.clone(),
+        messages: state.messages.iter().cloned().collect(),
         trace_events: state.trace_events.clone(),
         next_trace_id: state.next_trace_id,
         _always_allow_legacy: Vec::new(), // 不再写入 session
@@ -2303,9 +2386,17 @@ fn apply_session_export(state: &mut AppState, export: &serde_json::Value) {
     if let Some(s) = export.get("session_summary").and_then(|v| v.as_str()) {
         state.session_summary = s.to_string();
     }
+    // Phase 3 (3.6): 恢复 thinking_depth——保存时序列化了此字段，但原先缺少反序列化回填。
+    // 引用关系：save_session 写入 thinking_depth；本处恢复到 AppState.thinking_depth
+    // 兼容性：旧文件无此字段 → 保留 state 现值（启动默认 "medium"）
+    if let Some(td) = export.get("thinking_depth").and_then(|v| v.as_str()) {
+        if !td.is_empty() {
+            state.thinking_depth = td.to_string();
+        }
+    }
     if let Some(msgs) = export.get("messages") {
         if let Ok(msgs) = serde_json::from_value::<Vec<crate::tui::state::Message>>(msgs.clone()) {
-            state.messages = msgs;
+            state.messages = msgs.into();
         }
     }
 

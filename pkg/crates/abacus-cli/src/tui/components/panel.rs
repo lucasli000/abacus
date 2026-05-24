@@ -16,6 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use crate::tui::i18n::t;
 use crate::tui::markdown;
 use crate::tui::state::{
     AppState, ExpertStatus, Focus, MsgContent, MsgRole, PanelTab, TaskStatus,
@@ -127,104 +128,37 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     match state.mode {
         AbacusMode::Clarify => {
-            // V16: Clarify 也加单元素 Tab 栏，与 Plan/Team/Meeting 顶部结构对齐
-            // 设计意图: 三模式 panel 起手统一 [Tab + sep + 内容]，避免 Chat 内容裸起步带来的视觉断层
-            // 引用关系: 复用 build_tab_spans helper；单 label "总览" 与 Team/Meeting 的首 Tab 同义
-            // 生命周期: 每帧渲染；Chat 模式不切换 Tab，active 始终 0
-            let layout = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Length(1), // Tab 栏（静态单标签）
-                    ratatui::layout::Constraint::Length(1), // 分隔线
-                    ratatui::layout::Constraint::Min(2),    // 内容
-                ])
-                .split(inner);
-
-            // V33 场景化拆分: 「现场」(timeline + 实体/工具) + 「量化」(📊 + 知识宫殿层级)
-            // 引用关系: 与 Team/Meeting/Plan 一致, 都用 现场/量化 双 tab 范式
-            let chat_labels: Vec<String> = vec![
-                label_with_count("现场", state.trace_events.len()),
-                "量化".to_string(),
+            // 单 Tab："现场"（含时间线 + 记忆 + 简化统计）
+            let labels: Vec<String> = vec![
+                label_with_count(t("panel.scene"), state.trace_events.len()),
             ];
-            let tab_idx = match state.panel_tab {
-                PanelTab::Quant => 1,
-                _ => 0,
-            };
-            let tab_spans = build_tab_spans(&chat_labels, tab_idx, &state.theme);
-            f.render_widget(Paragraph::new(Line::from(tab_spans)), layout[0]);
-
-            let sep = "─".repeat(inner.width as usize);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(&*sep, Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)))),
-                layout[1],
-            );
-
-            // V23: 内容区统一加色条卡片
-            let content = render_card_bar(f, &state.theme, layout[2]);
-            match state.panel_tab {
-                PanelTab::Quant => render_tab_quant(f, state, content),
-                _ => render_panel_overview(f, state, content),
-            }
+            let content = render_panel_header(f, state, inner, &labels, 0);
+            render_panel_overview(f, state, content);
         }
         AbacusMode::Team => {
-            // Team: Tab 栏 + 内容
-            let layout = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Length(1), // Tab 栏
-                    ratatui::layout::Constraint::Length(1), // 分隔线
-                    ratatui::layout::Constraint::Min(2),    // 内容
-                ])
-                .split(inner);
-
-            // V33 场景化: 现场 / 任务 / 量化 三 tab + 用户自定义
-            let tab_labels: Vec<String> =
-                std::iter::once(label_with_count("现场", state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count("任务", state.tasks.len())))
-                    .chain(std::iter::once("量化".to_string()))
+            let labels: Vec<String> =
+                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
+                    .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
+                PanelTab::Custom(i) => 2 + i,
                 _ => 0,
             };
-            let tab_spans = build_tab_spans(&tab_labels, tab_idx, &state.theme);
-            f.render_widget(Paragraph::new(Line::from(tab_spans)), layout[0]);
-
-            let sep = "─".repeat(inner.width as usize);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(&*sep, Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)))),
-                layout[1],
-            );
-
-            // V23: PanelTab 内容统一加色条卡片
-            let content = render_card_bar(f, &state.theme, layout[2]);
+            let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_team_board(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
         }
         AbacusMode::Meeting => {
-            // Meeting: Tab 栏 + 内容
-            let layout = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Min(2),
-                ])
-                .split(inner);
-
-            // V33 场景化: 现场 / 议程 / 量化 三 tab + 用户自定义
-            // 议程 tab 复用 PanelTab::Tasks 索引位（meeting 主体是专家列表 + 决策记录，但路由用 Tasks 简化）
-            let tab_labels: Vec<String> =
-                std::iter::once(label_with_count("现场", state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count("议程", state.experts.len())))
-                    .chain(std::iter::once("量化".to_string()))
+            // Phase 3: 公共 header
+            let labels: Vec<String> =
+                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
+                    .chain(std::iter::once(label_with_count(t("panel.agenda"), state.experts.len())))
+                    .chain(std::iter::once(t("panel.quant").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
@@ -233,17 +167,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 PanelTab::Custom(i) => 3 + i,
                 _ => 0,
             };
-            let tab_spans = build_tab_spans(&tab_labels, tab_idx, &state.theme);
-            f.render_widget(Paragraph::new(Line::from(tab_spans)), layout[0]);
-
-            let sep = "─".repeat(inner.width as usize);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(&*sep, Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)))),
-                layout[1],
-            );
-
-            // V23: PanelTab 内容统一加色条卡片
-            let content = render_card_bar(f, &state.theme, layout[2]);
+            let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_meeting_agenda(f, state, content),
                 PanelTab::Quant => render_tab_quant(f, state, content),
@@ -252,22 +176,11 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             }
         }
         AbacusMode::Plan => {
-            // V33 Plan: Tab 栏 + 内容（与 Team/Meeting 同布局）
-            // 两个 Tab："摘要" / "任务"（Plan 输出预览，Tasks tab 复用 team_board 渲染）
-            let layout = ratatui::layout::Layout::default()
-                .direction(ratatui::layout::Direction::Vertical)
-                .constraints([
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Length(1),
-                    ratatui::layout::Constraint::Min(2),
-                ])
-                .split(inner);
-
-            // V33 场景化 Plan: 现场 / 任务 / 量化 三 tab + 用户自定义
-            let tab_labels: Vec<String> =
-                std::iter::once(label_with_count("现场", state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count("任务", state.tasks.len())))
-                    .chain(std::iter::once("量化".to_string()))
+            // Phase 3: 公共 header
+            let labels: Vec<String> =
+                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
+                    .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
+                    .chain(std::iter::once(t("panel.quant").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
@@ -276,16 +189,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 PanelTab::Custom(i) => 3 + i,
                 _ => 0,
             };
-            let tab_spans = build_tab_spans(&tab_labels, tab_idx, &state.theme);
-            f.render_widget(Paragraph::new(Line::from(tab_spans)), layout[0]);
-
-            let sep = "─".repeat(inner.width as usize);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(&*sep, Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)))),
-                layout[1],
-            );
-
-            let content = render_card_bar(f, &state.theme, layout[2]);
+            let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 // Plan 任务 tab 复用 team_board（同 TaskCard 数据结构）
                 PanelTab::Tasks => render_panel_team_board(f, state, content),
@@ -295,6 +199,41 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             }
         }
     }
+}
+
+/// Phase 3 去重：公共 Panel header 渲染（Tab 栏 + 分隔线 + 内容区分割）
+///
+/// 四模式分支共享相同的 Layout(1+1+Min(2)) + build_tab_spans + separator 逻辑。
+/// 本函数统一渲染 tab + sep，返回 content area（已经过 render_card_bar）。
+///
+/// 引用关系：被 render_panel 的 Clarify/Team/Meeting/Plan 四分支调用
+/// 生命周期：每帧渲染，纯函数
+fn render_panel_header(
+    f: &mut ratatui::Frame,
+    state: &AppState,
+    inner: Rect,
+    tab_labels: &[String],
+    tab_idx: usize,
+) -> Rect {
+    let layout = ratatui::layout::Layout::default()
+        .direction(ratatui::layout::Direction::Vertical)
+        .constraints([
+            ratatui::layout::Constraint::Length(1), // Tab 栏
+            ratatui::layout::Constraint::Length(1), // 分隔线
+            ratatui::layout::Constraint::Min(2),    // 内容
+        ])
+        .split(inner);
+
+    let tab_spans = build_tab_spans(tab_labels, tab_idx, &state.theme);
+    f.render_widget(Paragraph::new(Line::from(tab_spans)), layout[0]);
+
+    let sep = "─".repeat(inner.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(&*sep, Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)))),
+        layout[1],
+    );
+
+    render_card_bar(f, &state.theme, layout[2])
 }
 
 /// 面板总览区块(Clarify 摘要 / Plan·Team·Meeting 的"摘要"Tab)
@@ -341,7 +280,7 @@ fn render_panel_team_board(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     // ── 团队 ──
     let active_count = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Active)).count();
     lines.push(Line::from(vec![
-        Span::styled(" 🧠 团队", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.team"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}/{}", active_count, state.experts.len()),
             Style::default().fg(state.theme.muted),
@@ -376,7 +315,7 @@ fn render_panel_team_board(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     lines.push(dotted_sep.clone());
     let done_count = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
     lines.push(Line::from(vec![
-        Span::styled(" 📋 任务", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.tasks_header"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}/{}", done_count, state.tasks.len()),
             Style::default().fg(state.theme.muted),
@@ -432,7 +371,7 @@ fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: R
     // ── 参会者 ──
     let speaking_count = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Active)).count();
     lines.push(Line::from(vec![
-        Span::styled(" 🎙 参会者", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.participants"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}/{}", speaking_count, state.experts.len()),
             Style::default().fg(state.theme.muted),
@@ -463,7 +402,7 @@ fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: R
         .filter(|m| matches!(m.role, MsgRole::Session))
         .count();
     lines.push(Line::from(vec![
-        Span::styled(" 📝 决策", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.decisions"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}", total_decisions),
             Style::default().fg(state.theme.muted),
@@ -518,7 +457,7 @@ fn render_custom_tab(f: &mut ratatui::Frame, state: &AppState, area: Rect, idx: 
     let mut lines: Vec<Line> = Vec::new();
 
     if tab.content.is_empty() {
-        lines.push(Line::from(Span::styled("  (无数据)", Style::default().fg(state.theme.muted))));
+        lines.push(Line::from(Span::styled(t("panel.no_data"), Style::default().fg(state.theme.muted))));
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -645,7 +584,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     row_map.clear();
 
     lines.push(Line::from(vec![
-        Span::styled(" 📜 时间线", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.timeline"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" · {}", state.trace_events.len()), Style::default().fg(state.theme.muted)),
     ]));
 
@@ -790,7 +729,7 @@ fn render_theme_preview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // 标题行 + 分隔
     lines.push(Line::from(vec![
         Span::styled(
-            " 主题预览 ".to_string(),
+            t("panel.theme_preview").to_string(),
             state.theme.text_style(TextRole::H1),
         ),
         Span::styled(
@@ -924,7 +863,7 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     //   meta: 实体数 / 知识调用数 (两个维度的简洁聚合)
     // ════════════════════════════════════════════════════════════
     lines.push(Line::from(vec![
-        Span::styled(" 🧠 记忆", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.memory"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}/{}", expert_names.len(), state.knowledge_calls.len()),
             Style::default().fg(state.theme.muted),
@@ -973,7 +912,7 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     lines.push(dotted_sep.clone());  // 子分块间细分隔(替代空行)
     lines.push(Line::from(vec![
-        Span::styled(" 🔧 工具", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.tools"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!(" · {}", state.tool_records.len()),
             Style::default().fg(state.theme.muted),
@@ -1079,23 +1018,23 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .count();
 
     lines.push(Line::styled(
-        " 📊 统计",
+        t("panel.stats"),
         Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::from(vec![
-        Span::styled("   模式  ", Style::default().fg(state.theme.muted)),
+        Span::styled(t("stat.mode"), Style::default().fg(state.theme.muted)),
         Span::styled(state.mode.label(), Style::default().fg(state.theme.mode).add_modifier(Modifier::BOLD)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("   轮次  ", Style::default().fg(state.theme.muted)),
+        Span::styled(t("stat.turns"), Style::default().fg(state.theme.muted)),
         Span::styled(state.turn_count.to_string(), state.theme.text_style(TextRole::BodyEmphasis)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("   对话  ", Style::default().fg(state.theme.muted)),
+        Span::styled(t("stat.conv"), Style::default().fg(state.theme.muted)),
         Span::styled(format!("你 {} · AI {}", summaries, ai_count), Style::default().fg(state.theme.text)),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("   事件  ", Style::default().fg(state.theme.muted)),
+        Span::styled(t("stat.events"), Style::default().fg(state.theme.muted)),
         Span::styled(state.trace_events.len().to_string(), Style::default().fg(state.theme.text)),
     ]));
 
@@ -1112,7 +1051,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         };
 
         let mut input_spans = vec![
-            Span::styled("   输入  ", Style::default().fg(state.theme.muted)),
+            Span::styled(t("stat.input"), Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", prompt), Style::default().fg(state.theme.text)),
         ];
         if cached > 0 {
@@ -1130,7 +1069,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             (thinking as f64 / completion as f64 * 100.0).min(100.0)
         } else { 0.0 };
         let mut output_spans = vec![
-            Span::styled("   输出  ", Style::default().fg(state.theme.muted)),
+            Span::styled(t("stat.output"), Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", completion), Style::default().fg(state.theme.text)),
         ];
         if thinking > 0 {
@@ -1141,7 +1080,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         }
         lines.push(Line::from(output_spans));
         lines.push(Line::from(vec![
-            Span::styled("   合计  ", Style::default().fg(state.theme.muted)),
+            Span::styled(t("stat.total"), Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", total), state.theme.text_style(TextRole::BodyEmphasis)),
         ]));
 
@@ -1150,7 +1089,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let cost_cny = state.session_tokens.cost_cny;
         let cost_usd = state.session_tokens.cost_usd;
         lines.push(Line::from(vec![
-            Span::styled("   费用  ", Style::default().fg(state.theme.muted)),
+            Span::styled(t("stat.cost"), Style::default().fg(state.theme.muted)),
             Span::styled(crate::tui::cost::format_cny(cost_cny), Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" ≈ {}", crate::tui::cost::format_usd(cost_usd)),
@@ -1174,7 +1113,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let total_cny: f64 = model_rows.iter().map(|(_, s)| s.cost_cny).sum::<f64>().max(0.0001);
 
         lines.push(Line::from(vec![
-            Span::styled(" 🤖 模型分布", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(t("panel.model_dist"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" · {} 个模型", model_rows.len()),
                 Style::default().fg(state.theme.muted),
@@ -1224,7 +1163,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let total_cny: f64 = mode_rows.iter().map(|(_, s)| s.cost_cny).sum::<f64>().max(0.0001);
 
         lines.push(Line::from(vec![
-            Span::styled(" 🎭 模式分布", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(t("panel.mode_dist"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" · {} 个阶段", mode_rows.len()),
                 Style::default().fg(state.theme.muted),
@@ -1307,26 +1246,44 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     {
         use std::collections::HashMap;
-        let mut tool_counts: HashMap<&str, u32> = HashMap::new();
-        let mut tool_failures: HashMap<&str, u32> = HashMap::new();
-        for ev in &state.trace_events {
-            if let crate::tui::state::TraceKind::ToolCall { name, status, .. } = &ev.kind {
-                *tool_counts.entry(name.as_str()).or_insert(0) += 1;
-                if matches!(status, crate::tui::state::ToolStatus::Failed) {
-                    *tool_failures.entry(name.as_str()).or_insert(0) += 1;
+        // Phase2 性能优化: 仅 dirty 时重算工具频次，否则使用缓存
+        if state.tool_freq_dirty.get() || state.tool_freq_cache.borrow().is_none() {
+            let mut tool_counts: HashMap<&str, u32> = HashMap::new();
+            let mut tool_failures: HashMap<&str, u32> = HashMap::new();
+            for ev in &state.trace_events {
+                if let crate::tui::state::TraceKind::ToolCall { name, status, .. } = &ev.kind {
+                    *tool_counts.entry(name.as_str()).or_insert(0) += 1;
+                    if matches!(status, crate::tui::state::ToolStatus::Failed) {
+                        *tool_failures.entry(name.as_str()).or_insert(0) += 1;
+                    }
                 }
+            }
+            let cached: Vec<(String, u32, u32)> = tool_counts.iter()
+                .map(|(k, v)| (k.to_string(), *v, tool_failures.get(k).copied().unwrap_or(0)))
+                .collect();
+            *state.tool_freq_cache.borrow_mut() = Some(cached);
+            state.tool_freq_dirty.set(false);
+        }
+        let tool_data = state.tool_freq_cache.borrow().clone().unwrap_or_default();
+        // 从缓存重建 tool_counts / tool_failures 用于下方渲染逻辑
+        let mut tool_counts: HashMap<String, u32> = HashMap::new();
+        let mut tool_failures: HashMap<String, u32> = HashMap::new();
+        for (name, count, fail) in tool_data.iter() {
+            tool_counts.insert(name.clone(), *count);
+            if *fail > 0 {
+                tool_failures.insert(name.clone(), *fail);
             }
         }
         if !tool_counts.is_empty() {
             lines.push(dotted_sep.clone());
-            let mut sorted: Vec<(&str, u32)> = tool_counts.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut sorted: Vec<(String, u32)> = tool_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
             sorted.sort_by_key(|x| std::cmp::Reverse(x.1));
             let total_calls: u32 = sorted.iter().map(|x| x.1).sum();
             let top5 = sorted.iter().take(5).cloned().collect::<Vec<_>>();
             let max_count = top5.first().map(|x| x.1).unwrap_or(1).max(1);
 
             lines.push(Line::from(vec![
-                Span::styled(" 🛠 工具调用", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(t("panel.tool_calls"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!(" · {} 次 · {} 种", total_calls, sorted.len()),
                     Style::default().fg(state.theme.muted),
@@ -1340,7 +1297,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                     Span::styled("█".repeat(bar_w), Style::default().fg(state.theme.accent)),
                     Span::styled("░".repeat(16 - bar_w), Style::default().fg(state.theme.muted)),
                     Span::styled(format!(" {:>3} ", count), state.theme.text_style(TextRole::BodyEmphasis)),
-                    Span::styled(*name, Style::default().fg(state.theme.text)),
+                    Span::styled(name.clone(), Style::default().fg(state.theme.text)),
                 ];
                 if fail > 0 {
                     spans.push(Span::styled(
@@ -1369,13 +1326,13 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             //     cli 看到的"⚠ 失败率高"工具，core 大概率已自动降级（visibility threshold 截断）
             //   两层独立运转：cli 帮用户看到现象，core 自动消化决策；不需要 cli 主动调 core API
             //   未来若需在此处显示 core tier 标志，需通过 EngineHandle 异步查 effectiveness（render 同步上下文不便）
-            let mut bad_tools: Vec<(&str, u32, u32, f64)> = tool_counts.iter()
+            let mut bad_tools: Vec<(String, u32, u32, f64)> = tool_counts.iter()
                 .filter_map(|(name, count)| {
-                    let fail = tool_failures.get(*name).copied().unwrap_or(0);
+                    let fail = tool_failures.get(name).copied().unwrap_or(0);
                     if *count >= 3 && fail > 0 {
                         let rate = fail as f64 / *count as f64;
                         if rate > 0.20 {
-                            Some((*name, *count, fail, rate))
+                            Some((name.clone(), *count, fail, rate))
                         } else { None }
                     } else { None }
                 })
@@ -1394,7 +1351,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                         Span::styled("      ", Style::default()),
                         Span::styled(format!("{:>3}%", pct), Style::default().fg(state.theme.error).add_modifier(Modifier::BOLD)),
                         Span::styled(format!(" ({}/{}) ", fail, count), state.theme.text_style(TextRole::Caption)),
-                        Span::styled(*name, Style::default().fg(state.theme.text)),
+                        Span::styled(name.clone(), Style::default().fg(state.theme.text)),
                     ]));
                 }
             }
@@ -1424,7 +1381,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let avg = replies.iter().sum::<u32>() / replies.len() as u32;
             lines.push(dotted_sep.clone());
             lines.push(Line::from(vec![
-                Span::styled(" 📈 轮次趋势", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(t("panel.turn_trend"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!(" · {} 轮 · 均 {} tok", replies.len(), avg),
                     Style::default().fg(state.theme.muted),
@@ -1465,7 +1422,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         }
 
         lines.push(Line::from(vec![
-            Span::styled(" 📚 知识宫殿", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(t("panel.knowledge"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled(
                 format!(" · {} 次 · {} 实体", total_calls, state.knowledge_calls.len()),
                 Style::default().fg(state.theme.muted),

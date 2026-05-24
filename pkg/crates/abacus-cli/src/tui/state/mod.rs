@@ -13,7 +13,7 @@
 //! 或迁移到 `std::cell::Cell` / 拆分 async-safe 字段到独立 Mutex。
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -594,6 +594,10 @@ pub enum SlashCommand {
 
 pub struct AppState {
     pub theme: Theme,
+    /// 上次渲染的主题名（仅首帧或主题切换时重刷全屏背景）
+    /// 引用关系：render_global_background 读写
+    /// 生命周期：首帧 None → 渲染后 Some(name)；主题切换时 set_theme 重置为 None
+    pub last_rendered_theme: std::cell::Cell<Option<&'static str>>,
     pub mode: AbacusMode,
     /// V33: 模式间携带数据 — 上阶段产出，下阶段消费
     ///
@@ -758,7 +762,7 @@ pub struct AppState {
     /// 单次用 — 一轮对话后就退出, 用户要再次进入需重新 /plan
     pub plan_mode: bool,
 
-    pub messages: Vec<Message>,
+    pub messages: VecDeque<Message>,
     pub scroll: usize,
     /// V28.6 (PR12-5): 模式切换时保留各自的 scroll 位置, 切回不归零
     /// 引用关系: 被 `set_mode` 写入(切换前) + 读取(切换后), 不进 SessionExport
@@ -815,6 +819,15 @@ pub struct AppState {
     /// 引用关系: 被 Message::Trace.event_ids + streaming_trace_ids 引用; 被 render_tab_timeline 读取
     /// 生命周期: push_trace 追加; MAX=500 FIFO 裁剪; v2 SessionExport 显式拷入
     pub trace_events: Vec<TraceEvent>,
+    /// trace event id → index 映射（O(1) 查找替代 O(n) 线性扫描）
+    /// 引用关系：push_trace_full 写入时同步更新；FIFO drain 时批量重建
+    /// 生命周期：与 trace_events 同步，drain 后重建
+    pub trace_event_index: std::collections::HashMap<u64, usize>,
+    /// 工具频次缓存（避免每帧重算）
+    /// 引用关系：push_trace(ToolCall) 时标记 dirty；render_tab_quant 消费
+    /// 生命周期：push_trace 或 reset_session 时 invalidate
+    pub tool_freq_cache: std::cell::RefCell<Option<Vec<(String, u32, u32)>>>,
+    pub tool_freq_dirty: std::cell::Cell<bool>,
     /// V28: 单调自增 trace id 分配器,SessionExport v2 持久化(防止重启后与历史 message 引用冲突)
     pub next_trace_id: u64,
     /// V28: 流式期间临时聚集 trace ids,落档时 mem::take 转移到 Message::Trace.event_ids
@@ -847,6 +860,10 @@ pub struct AppState {
     pub thinking_text: String,
 
     pub experts: Vec<Expert>,
+    /// 去重专家名缓存
+    /// 引用关系：add_message(Expert) 时 insert
+    /// 生命周期：reset_session / cmd_new / cmd_clear 时 clear
+    pub expert_names_cache: HashSet<String>,
     pub tasks: Vec<TaskCard>,
 
     pub toasts: Vec<Toast>,
@@ -1972,6 +1989,7 @@ impl AppState {
 
         Self {
             theme,
+            last_rendered_theme: std::cell::Cell::new(None),
             mode,
             mode_artifact: None, // V33: 初始无产出
             planner_nudge_attempts: 0, // V37-1: 初始无 nudge 计数
@@ -1995,7 +2013,7 @@ impl AppState {
             session_goal: None,
             pending_turnkey_plan: None,
             plan_mode: false,
-            messages: Vec::new(),
+            messages: VecDeque::new(),
             scroll: 0,
             scroll_by_mode: std::collections::HashMap::new(),
             // V29.5: 启动时无渲染历史, clamp 退化为"不限制"; 第一帧后即被覆盖为真实值
@@ -2021,6 +2039,9 @@ impl AppState {
             commands: crate::tui::slash_commands::command_inventory(),
             events: Vec::new(),
             trace_events: Vec::new(),
+            trace_event_index: std::collections::HashMap::new(),
+            tool_freq_cache: std::cell::RefCell::new(None),
+            tool_freq_dirty: std::cell::Cell::new(true),
             next_trace_id: 0,
             streaming_trace_ids: Vec::new(),
             timeline_expanded_ids: HashSet::new(),
@@ -2031,6 +2052,7 @@ impl AppState {
             tool_records: Vec::new(),
             thinking_text: String::new(),
             experts: Vec::new(),
+            expert_names_cache: HashSet::new(),
             tasks: Vec::new(),
             toasts: Vec::new(),
             running: true,
@@ -2281,7 +2303,8 @@ impl AppState {
             ScrollAction::Absolute(n) => n.min(max),
             ScrollAction::AnchorAdjust { after_rows, before_rows } => {
                 if after_rows >= before_rows {
-                    self.scroll.saturating_add(after_rows - before_rows)
+                    // Phase 3 (3.8): clamp 到 max 防止 anchor 调整后超过最大滚动量
+                    self.scroll.saturating_add(after_rows - before_rows).min(max)
                 } else {
                     self.scroll.saturating_sub(before_rows - after_rows)
                 }
@@ -2499,6 +2522,44 @@ impl AppState {
         self.toasts.retain(|t| t.expire_at > now);
     }
 
+    /// 会话重置 — 清空所有消息/trace/scroll/输入状态
+    ///
+    /// Phase 3 去重：统一 event/mod.rs::reset_session_state + slash_commands::cmd_new
+    /// 两处 100% 重复的 session 清理逻辑为单一 SSoT
+    ///
+    /// 引用关系：被 event/mod.rs::reset_session_state、slash_commands::cmd_new 调用
+    /// 生命周期：调用后 AppState 回到"新会话"初始态（保留 engine_handle/theme/mode 等基础设施）
+    pub fn reset_session(&mut self) {
+        self.messages.clear();
+        self.events.clear();
+        self.expert_names_cache.clear();
+        // V28: 同步清 trace_events 与 id 分配器（messages 同步清，无悬挂引用风险）
+        self.trace_events.clear();
+        self.tool_freq_cache.borrow_mut().take();
+        self.tool_freq_dirty.set(true);
+        self.next_trace_id = 0;
+        self.streaming_trace_ids.clear();
+        self.timeline_expanded_ids.clear();
+        self.timeline_row_map.borrow_mut().clear();
+        self.focused_event_id = None;
+        self.tool_records.clear();
+        self.thinking_text.clear();
+        self.turn_count = 0;
+        self.set_scroll(ScrollAction::ToBottom);
+        self.input.clear();
+        self.cursor_pos = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        if self.pending_text.is_some() {
+            self.pending_text = None;
+            self.input_state = InputState::Ready;
+        }
+        // trace_event_index 同步清理（与 trace_events 对称）
+        self.trace_event_index.clear();
+        // 标记渲染缓存失效
+        self.mark_dirty();
+    }
+
     /// 标记渲染缓存失效（外部触发重绘）
     pub fn mark_dirty(&self) {
         self.rendered_lines_dirty.set(true);
@@ -2532,14 +2593,18 @@ impl AppState {
         if msg.role == MsgRole::User {
             self.turn_count += 1;
         }
+        // Phase2 性能优化: Expert 消息缓存去重名
+        if let MsgRole::Expert(ref name) = msg.role {
+            self.expert_names_cache.insert(name.clone());
+        }
         if self.messages.len() >= MAX_MESSAGES {
-            self.messages.remove(0);
+            self.messages.pop_front();
         }
         // 焦点跟随：非 User 消息（agent/system/tool）抵达 → 试图磁吸到 Panel/Timeline。
         // User 消息是用户自己刚发的，焦点不动避免与用户后续输入抢；try_magnet_focus
         // 内部有 2s 抑制窗保护连续输入场景，不会真正打断用户。
         let from_agent = !matches!(msg.role, MsgRole::User);
-        self.messages.push(msg);
+        self.messages.push_back(msg);
         if from_agent {
             self.try_magnet_focus(Focus::Panel, PanelSection::Timeline);
         }
@@ -2591,12 +2656,22 @@ impl AppState {
     ) -> u64 {
         let id = self.next_trace_id;
         self.next_trace_id = self.next_trace_id.saturating_add(1);
+        // Phase2 性能优化: ToolCall 事件 invalidate 工具频次缓存
+        if matches!(&kind, TraceKind::ToolCall { .. }) {
+            self.tool_freq_dirty.set(true);
+        }
         self.trace_events.push(TraceEvent { id, time, category, level, kind, duration_ms });
+        self.trace_event_index.insert(id, self.trace_events.len() - 1);
         if self.trace_events.len() > MAX_EVENTS {
             let drain_end = self.trace_events.len() - MAX_EVENTS / 2;
             self.trace_events.drain(0..drain_end);
             // 裁剪后 Message::Trace.event_ids 中的旧 id 变成悬挂,
             // 渲染层用 find().map_or([已过期]) 优雅降级,不 panic。
+            // 重建索引（drain 后 index 全部失效）
+            self.trace_event_index.clear();
+            for (i, ev) in self.trace_events.iter().enumerate() {
+                self.trace_event_index.insert(ev.id, i);
+            }
         }
         // 焦点跟随：trace 事件抵达 → 试图磁吸到 Panel/Timeline。
         // try_magnet_focus 内部 2s 抑制窗保护用户连续操作；模式过滤已在内部判断。
@@ -2606,6 +2681,20 @@ impl AppState {
 
     /// V28 兼容 wrapper: 17+ 调用点零改动,内部走 push_trace 统一 SSOT。
     /// 旧 `events: Vec<EventEntry>` 字段不再写入,仅供 v1 session 反序列化兜底。
+    /// 在主对话流中插入系统提示（用户直接可见的非事件通知）
+    ///
+    /// ## 用途
+    /// 上下文压缩、模型切换等影响用户体验的系统事件，需要在聊天区直接显示，
+    /// 而非仅在 event trace 中记录。
+    pub fn push_system_note(&mut self, text: &str) {
+        let now = chrono::Local::now().format("%H:%M:%S").to_string();
+        let msg = Message::new_session(
+            vec![MsgContent::Stream(text.to_string())],
+            now,
+        );
+        self.add_message(msg);
+    }
+
     pub fn add_event(
         &mut self,
         time: impl Into<String>,
@@ -2711,17 +2800,7 @@ impl AppState {
     }
 
     pub fn expert_count(&self) -> usize {
-        let mut names: Vec<&str> = self
-            .messages
-            .iter()
-            .filter_map(|m| match &m.role {
-                MsgRole::Expert(n) => Some(n.as_str()),
-                _ => None,
-            })
-            .collect();
-        names.sort();
-        names.dedup();
-        names.len()
+        self.expert_names_cache.len()
     }
 }
 

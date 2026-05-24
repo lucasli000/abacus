@@ -19,6 +19,7 @@ use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
+use crate::tui::i18n::t;
 use crate::tui::state::AppState;
 use crate::tui::theme::{SemanticIntent, Strength, TextRole};
 
@@ -288,7 +289,7 @@ pub fn render_toasts(f: &mut ratatui::Frame, state: &AppState) {
 /// 生命周期：每帧检查；返回 true 表示已渲染提示，调用方应 return
 pub fn render_min_terminal_warning(f: &mut ratatui::Frame) -> bool {
     if f.area().width < 20 || f.area().height < 5 {
-        let msg = ratatui::widgets::Paragraph::new("终端太小，请调大窗口")
+        let msg = ratatui::widgets::Paragraph::new(t("overlay.terminal_too_small"))
             .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(msg, f.area());
         return true;
@@ -447,9 +448,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     if p.items.is_empty() { return; }
 
     let title = match p.kind {
-        PickerKind::Model    => " 🤖 选择模型 (↑↓ 选模型 · ←→ 调思考 · Enter 应用 · Esc 取消) ",
-        PickerKind::Theme    => " 🎨 选择主题 (↑↓ Tab 移动, Enter 切换, Esc 取消) ",
-        PickerKind::Thinking => " 💭 思考深度 (↑↓ Tab 移动, Enter 切换, Esc 取消) ",
+        PickerKind::Model    => t("overlay.model_picker"),
+        PickerKind::Theme    => t("overlay.theme_picker"),
+        PickerKind::Thinking => t("overlay.thinking_picker"),
     };
     let frame = f.area();
 
@@ -612,7 +613,7 @@ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rec
     let modal_area = Rect::new(x, y, w, h);
 
     let settings_block = Block::default()
-        .title(" 设置 (Settings) ")
+        .title(t("label.settings"))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(state.theme.accent))
@@ -657,7 +658,7 @@ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rec
 
     // 提示
     let hint = Paragraph::new(Line::from(Span::styled(
-        "↑↓ 选择 · Enter 确认 · Esc 关闭",
+        t("overlay.settings_hint"),
         state.theme.text_style(TextRole::Caption),
     )));
     f.render_widget(hint, rows[5]);

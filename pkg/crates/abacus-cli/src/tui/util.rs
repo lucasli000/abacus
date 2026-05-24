@@ -123,3 +123,78 @@ mod tests {
         assert_eq!(truncate_to_width("中文", 1), "");
     }
 }
+
+/// 标准 base64 编码（无外部依赖）
+///
+/// 引用关系：被 clipboard.rs（OSC 52 fallback）和 event/mod.rs（遗留引用）统一调用
+/// 生命周期：纯函数、无状态、无副作用
+///
+/// Phase 3 去重：合并原 event/mod.rs::base64_encode_inner + clipboard.rs::base64_encode
+/// 两处独立实现为单一 SSoT
+pub fn base64_encode(input: &str) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// 通用 word-wrap：按 max_width 列宽拆分文本，返回 (start_byte, end_byte) 切片列表。
+/// 断点策略：空格/连字符/宽字符后断行；无合适断点时强制断。
+///
+/// 引用关系：被 components/mod.rs word-wrap 路径调用（3 处：markdown rendered line、
+///   streaming thinking visible 切片、streaming text 超宽行）
+/// 生命周期：纯函数、无状态、无副作用
+pub fn word_wrap_segments(text: &str, max_width: usize) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return vec![];
+    }
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let mut width = 0usize;
+        let mut take = 0usize;
+        let mut last_break = 0usize;
+        for (i, ch) in remaining.char_indices() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if width + cw > max_width {
+                break;
+            }
+            width += cw;
+            take = i + ch.len_utf8();
+            if ch == ' ' || ch == '-' || ch == '/'
+                || UnicodeWidthChar::width(ch).unwrap_or(0) > 1
+            {
+                last_break = take;
+            }
+        }
+        if take == 0 {
+            // 单字符超宽（不应发生），强制取 1 char
+            take = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        } else if take < remaining.len() && last_break > 0 && last_break > take / 2 {
+            take = last_break;
+        }
+        segments.push((start, start + take));
+        remaining = &remaining[take..];
+        start += take;
+    }
+    segments
+}

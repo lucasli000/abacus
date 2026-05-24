@@ -21,10 +21,8 @@
 //!   功能性退化到无；现状下用户至少能看到 toast 错误提示
 //!
 //! ## ⚠ 代码审查 @2025-01-23
-//! 严重：`base64_encode` 与 `event/mod.rs::base64_encode_inner` 完全重复。
-//! 两处独立的 base64 实现（此处 + event/mod.rs:26），本模块注释已声明
-//! "Phase 7 清理时删除 event/mod.rs 旧实现"，但 Phase 7 尚未执行。
-//! 建议：统一为 `tui::base64` 子模块，消除维护双份实现的风险。
+//! Phase 3 已完成去重：base64 实现统一到 tui::util::base64_encode，
+//! 本模块通过 `use super::util::base64_encode` 引用 SSoT 实现。
 
 use std::io::Write;
 
@@ -65,34 +63,9 @@ impl ClipboardBackend {
     }
 }
 
-/// 内部 base64 编码（保留无外部依赖路径，与原 event/mod.rs::base64_encode_inner 等价）
-///
-/// 引用关系：仅本模块 OSC 52 fallback 使用；event/mod.rs 旧 base64 函数会在 Phase 7 清理时
-/// 删除（待全部调用点切到 set_text 后）。
-fn base64_encode(input: &str) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
+/// Phase 3 去重：base64 实现已统一到 util::base64_encode
+/// 引用关系：调用 super::util::base64_encode（SSoT）
+use super::util::base64_encode;
 
 #[cfg(test)]
 mod tests {
@@ -109,7 +82,7 @@ mod tests {
 
     #[test]
     fn base64_encode_unicode() {
-        // UTF-8 byte sequence — 与 event/mod.rs::base64_encode_inner 输出对齐
+        // UTF-8 byte sequence — 与 util::base64_encode 输出对齐
         let s = "你好";
         let result = base64_encode(s);
         assert_eq!(result, "5L2g5aW9");

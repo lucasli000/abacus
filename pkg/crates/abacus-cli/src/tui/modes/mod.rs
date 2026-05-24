@@ -4,6 +4,7 @@
 
 pub mod analyzer;
 pub mod clarify;
+pub mod common;
 pub mod meeting;
 pub mod plan;
 pub mod team;

@@ -26,36 +26,14 @@ use tracing::info;
 
 use crate::tui::state::{AppState, Focus, InputState, Message, MsgContent, ScrollAction, AbacusMode, TextSelection};
 
-/// Simple base64 encoder for OSC 52 clipboard (no external dependency)
+/// Phase 3 去重：base64_encode_inner 已统一到 util::base64_encode
+/// 保留 pub 别名防止外部依赖（如有）break，下一 PR 可删此 wrapper
 ///
-/// ## ⚠ 代码审查 @2025-01-23 (严重)
-/// 与 `tui/clipboard.rs::base64_encode` 完全重复。两处独立的 base64 实现。
-/// clipboard.rs 注释已声明 "Phase 7 清理时删除旧实现"，但尚未执行。
-/// 建议：删除此处实现，统一用 `tui::clipboard` 或抽取公共 `tui::base64` 模块。
+/// 引用关系：调用 crate::tui::util::base64_encode（SSoT）
+/// 生命周期：纯函数 wrapper，无状态
+#[inline]
 pub fn base64_encode_inner(input: &str) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
-    let chunks = bytes.chunks(3);
-    for chunk in chunks {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
+    crate::tui::util::base64_encode(input)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -115,31 +93,9 @@ pub fn handle_slash_command(state: &mut AppState, text: &str) -> bool {
 // ── 斜杠命令处理函数 ──
 
 /// L3-14: 共享会话重置逻辑（避免 /new、Ctrl+N、Ctrl+W 重复）
+/// Phase 3 去重：委托 AppState::reset_session（SSoT）+ toast
 fn reset_session_state(state: &mut AppState, toast: &str) {
-    state.messages.clear();
-    state.events.clear();
-    // V28: 同步清 trace_events 与 id 分配器(messages 同步清,无悬挂引用风险)
-    state.trace_events.clear();
-    state.next_trace_id = 0;
-    state.streaming_trace_ids.clear();
-    state.timeline_expanded_ids.clear();
-    state.timeline_row_map.borrow_mut().clear();
-    state.focused_event_id = None;
-    state.tool_records.clear();
-    state.thinking_text.clear();
-    state.turn_count = 0;
-    state.set_scroll(ScrollAction::ToBottom);
-    state.input.clear();
-    state.cursor_pos = 0;
-    state.cursor_line = 0;
-    state.cursor_col = 0;
-    if state.pending_text.is_some() {
-        state.pending_text = None;
-        state.input_state = InputState::Ready;
-    }
-    // EV3 修复：messages.clear / scroll=0 / input.clear 都影响渲染输出但绕过了
-    // add_message 入口的内置 dirty——必须显式失效缓存，与 S3 (toggle_block) 同模式
-    state.mark_dirty();
+    state.reset_session();
     state.add_toast(toast, Duration::from_secs(2));
 }
 
@@ -814,22 +770,8 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
 // 补全系统 — Tab 触发，三源（命令/历史/文件）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// 所有可补全的斜杠命令（仅包含有实际 handler 的命令）
-///
-/// V29.9 调整：删除 /thinking /think /provider —— 已并入 /model 子命令路径
-/// （/model thinking <depth> · /model provider）；保留这三条会让用户误以为
-/// 是独立命令进而绕过统一入口。/model 自身的 args 解析向后兼容。
-const SLASH_COMMANDS: &[&str] = &[
-    "/help", "/clear", "/new", "/save", "/quit", "/exit",
-    "/model", "/theme",
-    "/clarify", "/chat", "/team", "/meeting",
-    "/status", "/tokens", "/copy", "/export", "/debug", "/reset", "/version",
-    "/turnkey", "/rename", "/diff", "/branch", "/fork", "/plan", "/resume", "/doctor", "/allow",
-    "/settings", "/memory", "/plugins",
-    "/context", "/compress", "/inject", "/tools", "/stats", "/safety", "/models", "/info",
-    // V0.2
-    "/history", "/search", "/feedback", "/streaming",
-];
+// Phase 3 去重：SLASH_COMMANDS 硬编码数组已删除，
+// 补全候选从 slash_commands::all_command_names() 动态获取（registry SSoT）
 
 /// 触发补全：分析当前输入，生成候选列表。
 /// 返回 true 表示有候选（进入 Completing 状态），false 表示无匹配。
@@ -852,11 +794,12 @@ pub fn trigger_completion(state: &mut AppState) -> bool {
     let partial = &input[..last_token_start]; // 补全前缀之前的固定部分
 
     let candidates: Vec<String> = if token.starts_with('/') {
-        // 斜杠命令补全
+        // 斜杠命令补全 — Phase 3: 动态从 registry 获取（SSoT）
         let lower = token.to_lowercase();
-        SLASH_COMMANDS.iter()
+        let all_names = crate::tui::slash_commands::all_command_names();
+        all_names.iter()
+            .map(|n| format!("/{}", n))
             .filter(|c| c.to_lowercase().starts_with(&lower))
-            .map(|c| c.to_string())
             .collect()
     } else if token.contains('/') || token.contains('\\') || token.starts_with('.') || token.starts_with('~') {
         // 路径补全 — 简单前缀匹配（文件列表由后端异步提供）
@@ -1733,7 +1676,7 @@ pub fn scroll_to_message(state: &mut AppState, target_idx: usize, content_width:
 /// - 依赖：state.trace_events （SSOT）、state.messages
 fn extract_selection_text(
     sel: &TextSelection,
-    messages: &[Message],
+    messages: &std::collections::VecDeque<Message>,
     trace_events: &[crate::tui::state::TraceEvent],
 ) -> String {
     use crate::tui::state::TraceKind;

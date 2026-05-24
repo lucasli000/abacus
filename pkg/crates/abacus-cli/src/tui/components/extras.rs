@@ -12,6 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
+use crate::tui::i18n::t;
 use crate::tui::state::{AppState, ExpertStatus, TaskStatus};
 use crate::tui::theme::TextRole;
 
@@ -21,7 +22,7 @@ use crate::tui::theme::TextRole;
 
 pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let block = Block::default()
-        .title(" 专家 ")
+        .title(t("label.expert"))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(state.theme.border));
@@ -63,9 +64,9 @@ pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 
         // V28.7: confidence == 0.0 → "未评估"，>0 → 百分比（orchestrator 暂无评估机制时不造伪数据）
         let conf_label = if expert.confidence > 0.0 {
-            format!("置信度: {:.0}%", expert.confidence * 100.0)
+            format!("{}: {:.0}%", t("field.confidence"), expert.confidence * 100.0)
         } else {
-            "置信度: —".to_string()
+            format!("{}: —", t("field.confidence"))
         };
         lines.push(Line::from(vec![
             Span::raw("   "),
@@ -77,11 +78,11 @@ pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 
     if lines.is_empty() {
         lines.push(Line::styled(
-            " 暂无专家接入",
+            t("empty.experts"),
             Style::default().fg(state.theme.muted),
         ));
         lines.push(Line::styled(
-            " 输入 /invite 邀请专家",
+            t("empty.invite_hint"),
             state.theme.text_style(TextRole::Caption),
         ));
     }
@@ -95,7 +96,7 @@ pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 
 pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let block = Block::default()
-        .title(" 任务看板 ")
+        .title(t("label.kanban"))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(state.theme.mode));
@@ -107,7 +108,7 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 
     if state.tasks.is_empty() {
         lines.push(Line::styled(
-            " 暂无任务",
+            t("empty.tasks"),
             Style::default().fg(state.theme.muted),
         ));
     } else {
@@ -139,7 +140,7 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
             lines.push(Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
-                    format!("负责人: {}", task.assignee),
+                    format!("{}: {}", t("field.owner"), task.assignee),
                     Style::default().fg(state.theme.muted),
                 ),
                 Span::raw("  ["),
@@ -161,7 +162,7 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
                 lines.push(Line::from(vec![
                     Span::raw("   "),
                     Span::styled(
-                        format!("依赖: {}", task.deps.join(", ")),
+                        format!("{}: {}", t("field.deps"), task.deps.join(", ")),
                         Style::default()
                             .fg(state.theme.muted)
                             .add_modifier(Modifier::DIM),
@@ -179,8 +180,12 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 // ════════════════════════════════════════════════════════════════
 // 全局背景渲染
 // ════════════════════════════════════════════════════════════════
-
 pub fn render_global_background(f: &mut ratatui::Frame, state: &AppState) {
+    // 性能优化：仅首帧或主题切换时重刷全屏背景
+    if state.last_rendered_theme.get() == Some(state.theme.name) {
+        return;
+    }
+    state.last_rendered_theme.set(Some(state.theme.name));
     // 直接设置 buffer 背景色（零分配，比 Paragraph 快 10x）
     let area = f.area();
     let bg = state.theme.bg;
@@ -263,9 +268,9 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
 
     // V13: 标题加焦点提示
     let title = if is_focused {
-        " ⌘ 命令 (↑↓ 选择 · Enter 填充 · 点击直填) "
+        t("cmd.title_focused")
     } else {
-        " ⌘ 可用命令 (↑↓ 自动聚焦 · 点击直填) "
+        t("cmd.title_unfocused")
     };
     lines.push(Line::from(vec![
         Span::styled(title.to_string(), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),

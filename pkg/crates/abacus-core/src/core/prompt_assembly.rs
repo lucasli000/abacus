@@ -256,7 +256,9 @@ impl PromptAssembly {
             - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
             - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
             - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
-            - Large tasks: break into verifiable milestones. Report progress at each milestone.".into());
+            - Large tasks: break into verifiable milestones. Report progress at each milestone.\n\
+            - Maximize single-turn throughput: call multiple tools in parallel when independent. Complete as much as possible before responding.\n\
+            - Prefer autonomous execution over asking: if the next step is unambiguous, do it. Only ask when genuinely blocked.".into());
         layers.entry(190).or_default().push(
             "## Constraints\n\
             - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\

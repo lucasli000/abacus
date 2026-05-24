@@ -134,7 +134,7 @@ pub async fn create_engine(
             abacus_types::ThinkingIntent::from_str_loose(thinking_level)
                 .unwrap_or(abacus_types::ThinkingIntent::Off)
         } else {
-            cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Off)
+            cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Medium))
         };
 
     // L1 后：thinking_intent 直接传给 CoreConfig，无需兼容外壳。
@@ -205,6 +205,7 @@ pub async fn create_engine(
         adaptive_d_tier_hide: false,
         // cross-session: 默认开启 jsonl 事件流写入
         event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
+        scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
     };
 
     let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;

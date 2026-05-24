@@ -671,6 +671,12 @@ impl DecayRouter {
             "版本", "version", "最新", "latest", "api", "价格", "price",
             "已废弃", "deprecated", "法规", "合规", "compliance",
             "变更", "changelog", "release", "更新了", "当前",
+            // 时间表达 — 年份
+            "2024", "2025", "2026",
+            // 时间表达 — 英文
+            "today", "yesterday", "this week", "this month", "recent", "now", "currently",
+            // 时间表达 — 中文
+            "今天", "昨天", "本周", "最近", "目前", "最新版",
         ];
         // 慢衰信号词
         let slow_signals = [
@@ -698,14 +704,16 @@ impl DecayRouter {
     }
 
     /// 生成注入到 system prompt 的衰减提示
+    ///
+    /// 消费方: CoreLoop PromptAssembly — 拼接到 system prompt 尾部
     pub fn prompt_hint(tier: DecayTier) -> Option<&'static str> {
         match tier {
-            DecayTier::Fast => Some(
-                "[衰减分流: 快衰] 本次查询涉及时效性知识。必须先调用 web.search 验证，禁止从权重直接回答。"
-            ),
-            DecayTier::Medium => Some(
-                "[衰减分流: 中衰] 可从权重生成初始答案，但必须用工具验证可疑点。"
-            ),
+            DecayTier::Fast => {
+                Some("[MUST search first — this query requires up-to-date information]")
+            }
+            DecayTier::Medium => {
+                Some("[Verify claims against current sources if uncertain]")
+            }
             DecayTier::Slow => None, // weight-first，无额外提示
         }
     }

@@ -122,6 +122,7 @@ async fn make_engine(api_key: String) -> EngineHandle {
         // Task #84/#87：测试场景显式关——避免 routing 误剪测试涉及的工具
         // （生产 default 已开；这里保 false 让 mock 工具无 applicable_task_kinds 也全可见）
         task_kind_routing_enabled: false,
+        scene_tool_loading_enabled: false, // 测试场景关——避免 scene prefix 误剪 mock 工具
         tool_frequency_pruning_turns: None,
         lint_overrides: None,  // Phase 3：测试场景默认无白名单
         palace_sync_interval_turns: None,

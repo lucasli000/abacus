@@ -98,6 +98,10 @@ struct TurnContext {
     /// 引用：analyze_complexity() → map_complexity_to_thinking() → execute_loop LlmRequest.thinking_intent
     /// 生命周期：setup() 写入 → execute_loop() 消费
     complexity_thinking: Option<abacus_types::ThinkingIntent>,
+    /// V30: premature stop retry counter — 防止 LLM 工具失败后过早放弃
+    /// 引用：execute_loop 中检测 "工具全失败 + 短文本输出" 时递增
+    /// 上限：3 次（避免无限续写循环）
+    premature_stop_retries: u32,
     /// Complexity-driven temperature（优先级：req_ctx.temperature > 此值 > config.default_temperature）
     /// 引用：analyze_complexity() → task_temperature() → execute_loop LlmRequest.temperature
     /// 生命周期：setup() 写入 → execute_loop() 消费
@@ -759,6 +763,7 @@ impl<'a> TurnPipeline<'a> {
             classification,
             inertia_warning: None,
             pending_confirmations: Vec::new(),
+            premature_stop_retries: 0,
             complexity_thinking,
             complexity_temperature,
             user_message_preamble, // Phase 4：setup() 阶段已构建（ICL 检索结果）
@@ -1151,6 +1156,41 @@ impl<'a> TurnPipeline<'a> {
             if tool_calls.is_empty() {
                 let text = super::extract_text(&response.message);
 
+                // V30: 检测 LLM 任务未完成即停止（premature stop）
+                // 条件：本轮有工具全部失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
+                // 机制：注入续写提示，让 LLM 继续尝试其他方法而非放弃
+                // 限制：每 session 最多触发 3 次，避免无限循环
+                if ctx.total_tool_calls > 0 && text.len() < 200 && loop_iter > 0 {
+                    let last_tools_all_failed = ctx.all_tool_outputs.iter()
+                        .rev()
+                        .take(5) // 检查最近 5 个工具结果
+                        .all(|o| !o.success);
+                    let retry_count = ctx.premature_stop_retries;
+                    if last_tools_all_failed && retry_count < 3 {
+                        ctx.premature_stop_retries += 1;
+                        tracing::warn!(
+                            retry = retry_count + 1,
+                            text_len = text.len(),
+                            "LLM stopped prematurely after tool failures, injecting continuation"
+                        );
+                        {
+                            let s = self.session.read().await;
+                            let mut msgs = s.messages.write().await;
+                            msgs.push(Message {
+                                role: MessageRole::User,
+                                content: Some(MessageContent::Text(
+                                    "The previous tool calls failed but the task is not complete. \
+                                     Try alternative approaches or different tools to accomplish the goal. \
+                                     Do not give up.".into()
+                                )),
+                                name: None, tool_calls: None, tool_call_id: None,
+                                reasoning_content: None, prefix: false,
+                            });
+                        }
+                        continue;
+                    }
+                }
+
                 // V38: 检测 max_tokens 截断 — finish_reason=="length" 表示输出被切断
                 // 自动追加续写请求（一次），让 LLM 从断点继续
                 if response.finish_reason == "length" && !text.is_empty() {
@@ -1331,6 +1371,41 @@ impl<'a> TurnPipeline<'a> {
                         self.core.mcip_gateway.check(&tool_id, &params, user_role)
                     };
 
+                    // V30: Bash command-level classification (finer than tool-level MCIP)
+                    // 即使 filengine_bash_exec 工具级别已授权，仍检查具体命令的安全等级
+                    // 依赖：classify_bash_command() from tool::builtin::filengine
+                    // 生命周期：per-invocation 分类，无持久状态
+                    let decision = if matches!(decision, McipDecision::Allowed)
+                        && tool_id.0.as_str() == "filengine_bash_exec"
+                    {
+                        let cmd_str = params.get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        match crate::tool::builtin::filengine::classify_bash_command(cmd_str) {
+                            crate::tool::builtin::filengine::BashDecision::Allow => decision,
+                            crate::tool::builtin::filengine::BashDecision::NeedsConfirm(reason)
+                            | crate::tool::builtin::filengine::BashDecision::Dangerous(reason) => {
+                                // 检查此命令是否已在本 session 被用户单次授权过
+                                // （通过 "bash:<cmd> <subcmd>" 格式匹配）
+                                let cmd_prefix: String = cmd_str.split_whitespace()
+                                    .take(2).collect::<Vec<_>>().join(" ");
+                                let bash_granted = {
+                                    let s = self.session.read().await;
+                                    let grants = s.mcip_grants.read().unwrap();
+                                    grants.contains(&format!("bash:{}", cmd_prefix))
+                                };
+                                if bash_granted {
+                                    McipDecision::Allowed
+                                } else {
+                                    McipDecision::NeedsConfirm(
+                                        format!("[bash] {}", reason))
+                                }
+                            }
+                        }
+                    } else {
+                        decision
+                    };
+
                     match decision {
                         McipDecision::Denied(reason) => Ok(ToolOutput {
                             tool_id: tool_id.clone(),
@@ -1394,13 +1469,13 @@ impl<'a> TurnPipeline<'a> {
                                 self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
                                 Ok(output)
                             } else {
+                                // 精简拒绝消息，减少 LLM 重试浪费的 token
                                 Ok(ToolOutput {
                                     tool_id: tool_id.clone(),
                                     success: false,
                                     output: serde_json::json!({
-                                        "error": "User denied authorization",
-                                        "tool": tool_id.0,
-                                        "reason": reason,
+                                        "error": "denied",
+                                        "do_not_retry": true,
                                     }),
                                     latency_ms: 0,
                                     failure_kind: Some("Authorization".into()),

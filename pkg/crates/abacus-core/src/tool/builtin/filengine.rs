@@ -676,39 +676,356 @@ async fn grep_dir(
 /// Blocks: ; | & ` $ ( ) < > ! \n \r
 const SHELL_META: &[char] = &[';', '|', '&', '`', '$', '(', ')', '<', '>', '!', '\n', '\r'];
 
-fn is_command_allowed(command: &str) -> bool {
-    // Block shell injection: no metacharacters allowed
+/// Bash command classification result.
+///
+/// ## Tiers
+/// - T0 (Allow): Pure read-only commands, no side effects
+/// - T1 (Allow): Dev tools with safe subcommand gate
+/// - T2 (NeedsConfirm): State-modifying commands, require user confirmation
+/// - T3 (NeedsConfirm/Dangerous): System-dangerous commands, require confirmation, timeout=auto-reject
+///
+/// ## Referenced by
+/// - `bash_exec()` — inner defense-in-depth guard
+/// - `crate::core::pipeline::mod.rs` — pre-execution MCIP-level intercept
+///
+/// ## Lifecycle
+/// - Created per bash_exec invocation (stateless classification)
+/// - No persistent state; classification is deterministic from command string
+#[derive(Debug, Clone, PartialEq)]
+pub enum BashDecision {
+    /// T0/T1: Execute immediately without confirmation
+    Allow,
+    /// T2: Requires user confirmation before execution (timeout → single reject)
+    NeedsConfirm(String),
+    /// T3: Dangerous command, requires confirmation with elevated warning (timeout → single reject)
+    /// Pipeline treats same as NeedsConfirm but with "dangerous" tag for UI styling
+    Dangerous(String),
+}
+
+/// Classify a bash command into security tiers.
+///
+/// ## Dependencies
+/// - Called by `bash_exec()` (inner guard) and pipeline dispatch (MCIP-level intercept)
+/// - No external dependencies; pure function
+///
+/// ## Command Tiers
+/// | Tier | Policy | Examples |
+/// |------|--------|----------|
+/// | Tier | Policy | Token Impact | Examples |
+/// |------|--------|-------------|----------|
+/// | T0 | Zero-block allow | 0 extra token | ls, cat, grep, find, stat, ps, env |
+/// | T1 | Allow + subcommand gate | 0 extra token | git status, cargo check, npm ls |
+/// | T2 | Confirm popup (timeout→reject) | ~50 tokens on reject | rm, mv, git push, npm install |
+/// | T3 | Confirm popup + danger warning | ~50 tokens on reject | sudo, dd, shutdown, mkfs |
+pub fn classify_bash_command(command: &str) -> BashDecision {
+    // Block shell injection: metacharacters → always deny
     if command.chars().any(|c| SHELL_META.contains(&c)) {
-        return false;
+        return BashDecision::Dangerous("shell metacharacters detected (injection risk)".into());
     }
 
     let parts: Vec<&str> = command.split_whitespace().collect();
     let cmd = parts.first().copied().unwrap_or("");
-    // F-BUG-1 修复：将 "git" / "cargo" 加入白名单数组，使下方 match 子命令检查
-    // 分支可达。原实现因白名单未包含这两项，所有 git/cargo 命令被前置 contains
-    // 检查直接拒绝，导致 match 子命令分支永远不可达（dead code）。
-    let allowed = ["ls", "cat", "echo", "pwd", "which", "head", "tail",
-        "wc", "sort", "uniq", "cut", "grep", "find", "diff", "stat", "du", "df",
-        "ps", "env", "whoami", "id", "date", "cal", "uptime", "free", "uname",
-        "curl", "wget", "tar", "zip", "unzip", "gzip", "gunzip",
-        "git", "cargo"];
-    // 安全: python3/node/rustc/npm/pip3/make/cmake 已从白名单移除，
-    // 防止通过 fs.write 写入恶意脚本后执行（L0-2 修复）
 
-    if !allowed.contains(&cmd) {
-        return false;
+    // ── T3: Dangerous (system-level, needs confirm with elevated warning) ──
+    const DANGEROUS_COMMANDS: &[&str] = &[
+        "sudo", "su", "doas", "dd", "mkfs", "fdisk", "parted", "diskutil",
+        "shutdown", "reboot", "halt", "poweroff", "init",
+        "iptables", "ufw", "pfctl", "chroot", "mount", "umount",
+        "systemctl", "launchctl", "service",
+        "format", "fsck",
+    ];
+    if DANGEROUS_COMMANDS.contains(&cmd) {
+        return BashDecision::Dangerous(
+            format!("⚠ '{}' is a system-dangerous command", cmd));
     }
 
+    // ── T0: Always Allow (read-only, no side effects) ──
+    const ALLOW_READONLY: &[&str] = &[
+        "ls", "cat", "echo", "pwd", "which", "head", "tail",
+        "wc", "sort", "uniq", "cut", "grep", "find", "diff", "stat",
+        "du", "df", "ps", "env", "whoami", "id", "date", "cal",
+        "uptime", "free", "uname", "file", "basename", "dirname",
+        "realpath", "readlink", "type", "command", "tr", "seq",
+        "true", "false", "test", "printf", "md5sum", "sha256sum",
+        "xxd", "od", "hexdump", "strings", "less", "more",
+    ];
+    if ALLOW_READONLY.contains(&cmd) {
+        return BashDecision::Allow;
+    }
+
+    // ── T1/T2: Dev tools with subcommand classification ──
     match cmd {
-        "git" => {
-            !command.contains("-c ") && !command.contains("--upload-pack")
-                && !command.contains("--exec=")
+        "git" => classify_git(&parts, command),
+        "cargo" => classify_cargo(&parts),
+        "npm" | "npx" | "yarn" | "pnpm" => classify_npm(&parts, cmd),
+        "python3" | "python" => classify_python(&parts),
+        "node" => classify_node(&parts),
+        "rustc" => classify_rustc(&parts),
+        "make" | "cmake" => classify_make(&parts),
+        "docker" => classify_docker(&parts),
+        "curl" => classify_curl(&parts, command),
+        "wget" => classify_wget(&parts),
+        // T2: State-modifying commands (always need confirm)
+        "rm" | "rmdir" => BashDecision::NeedsConfirm(
+            format!("'{}' deletes files/directories", cmd)),
+        "mv" => BashDecision::NeedsConfirm("'mv' moves/renames files".into()),
+        "cp" => BashDecision::NeedsConfirm("'cp' copies files (may overwrite)".into()),
+        "mkdir" => BashDecision::Allow, // mkdir is low-risk (creates dirs)
+        "touch" => BashDecision::Allow, // touch is low-risk (creates empty files)
+        "chmod" | "chown" => BashDecision::NeedsConfirm(
+            format!("'{}' changes file permissions/ownership", cmd)),
+        "kill" | "killall" | "pkill" => BashDecision::NeedsConfirm(
+            format!("'{}' terminates processes", cmd)),
+        "pip" | "pip3" => classify_pip(&parts),
+        "brew" => classify_brew(&parts),
+        "tar" => classify_tar(&parts),
+        "zip" | "unzip" | "gzip" | "gunzip" => BashDecision::Allow,
+        "sed" => {
+            // sed -i is destructive; without -i is read-only
+            if parts.iter().any(|p| p.starts_with("-i") || *p == "--in-place") {
+                BashDecision::NeedsConfirm("'sed -i' modifies files in-place".into())
+            } else {
+                BashDecision::Allow
+            }
         }
-        "cargo" => {
-            matches!(parts.get(1), Some(&"build" | &"check" | &"test" | &"clippy" | &"fmt" | &"doc"))
-        }
-        _ => true,
+        "awk" => BashDecision::Allow, // awk without redirection is read-only (metachar blocks >)
+        "tee" => BashDecision::NeedsConfirm("'tee' writes to files".into()),
+        _ => BashDecision::NeedsConfirm(format!("command '{}' not in allowed list", cmd)),
     }
+}
+
+/// Git subcommand classification.
+/// T1 (Allow): read-only git ops. T2 (NeedsConfirm): write ops.
+fn classify_git(parts: &[&str], command: &str) -> BashDecision {
+    // Block known injection vectors regardless of subcommand
+    if command.contains("-c ") || command.contains("--upload-pack")
+        || command.contains("--exec=") {
+        return BashDecision::Dangerous("git injection vector detected (-c/--upload-pack/--exec=)".into());
+    }
+
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    const GIT_READONLY: &[&str] = &[
+        "status", "log", "diff", "show", "branch", "tag", "remote",
+        "fetch", "describe", "rev-parse", "ls-files", "ls-tree",
+        "blame", "shortlog", "reflog", "stash", "config",
+        "rev-list", "cat-file", "name-rev", "symbolic-ref",
+        "for-each-ref", "count-objects", "fsck", "verify-pack",
+    ];
+    // git stash list/show = readonly; git stash drop/pop/apply = write
+    if subcmd == "stash" {
+        let stash_op = parts.get(2).copied().unwrap_or("list");
+        return match stash_op {
+            "list" | "show" => BashDecision::Allow,
+            _ => BashDecision::NeedsConfirm(
+                format!("'git stash {}' modifies stash state", stash_op)),
+        };
+    }
+    // git branch -d/-D = write; git branch (list) = readonly
+    if subcmd == "branch" {
+        if parts.iter().any(|p| *p == "-d" || *p == "-D" || *p == "--delete") {
+            return BashDecision::NeedsConfirm("'git branch -d' deletes branches".into());
+        }
+        return BashDecision::Allow;
+    }
+    // git config --get = read; git config (set) = write
+    if subcmd == "config" {
+        if parts.iter().any(|p| *p == "--get" || *p == "--get-all" || *p == "--list" || *p == "-l") {
+            return BashDecision::Allow;
+        }
+        return BashDecision::NeedsConfirm("'git config' modifies git configuration".into());
+    }
+    // git tag -l = read; git tag (create/delete) = write
+    if subcmd == "tag" {
+        if parts.iter().any(|p| *p == "-l" || *p == "--list") || parts.len() == 2 {
+            return BashDecision::Allow;
+        }
+        return BashDecision::NeedsConfirm("'git tag' creates/deletes tags".into());
+    }
+
+    if GIT_READONLY.contains(&subcmd) {
+        BashDecision::Allow
+    } else {
+        // push, commit, add, reset, rebase, merge, checkout, cherry-pick, pull, clone, init...
+        BashDecision::NeedsConfirm(format!("'git {}' modifies repository state", subcmd))
+    }
+}
+
+/// Cargo subcommand classification.
+/// T1: build/check/test/clippy/fmt/doc/tree/metadata. T2: install/publish/add/remove/run.
+fn classify_cargo(parts: &[&str]) -> BashDecision {
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    const CARGO_SAFE: &[&str] = &[
+        "build", "check", "test", "clippy", "fmt", "doc",
+        "tree", "metadata", "verify-project", "locate-project",
+        "pkgid", "search", "info",
+    ];
+    if subcmd == "--version" || subcmd == "-V" {
+        return BashDecision::Allow;
+    }
+    if CARGO_SAFE.contains(&subcmd) {
+        BashDecision::Allow
+    } else {
+        // install, publish, add, remove, update, run, bench, clean, ...
+        BashDecision::NeedsConfirm(format!("'cargo {}' may modify project state", subcmd))
+    }
+}
+
+/// npm/yarn/pnpm subcommand classification.
+fn classify_npm(parts: &[&str], pkg_mgr: &str) -> BashDecision {
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    const NPM_READONLY: &[&str] = &[
+        "ls", "list", "info", "view", "audit", "outdated",
+        "why", "explain", "pack", "search", "--version", "-v",
+    ];
+    if NPM_READONLY.contains(&subcmd) {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm(
+            format!("'{} {}' may modify node_modules or project", pkg_mgr, subcmd))
+    }
+}
+
+/// Python classification. --version is safe; -c could be dangerous.
+fn classify_python(parts: &[&str]) -> BashDecision {
+    if parts.get(1).copied() == Some("--version") || parts.get(1).copied() == Some("-V") {
+        return BashDecision::Allow;
+    }
+    // python3 -m pip list/show/freeze = readonly
+    if parts.get(1).copied() == Some("-m") && parts.get(2).copied() == Some("pip") {
+        let pip_cmd = parts.get(3).copied().unwrap_or("");
+        if matches!(pip_cmd, "list" | "show" | "freeze" | "check" | "search") {
+            return BashDecision::Allow;
+        }
+        return BashDecision::NeedsConfirm(
+            format!("'python -m pip {}' modifies packages", pip_cmd));
+    }
+    BashDecision::NeedsConfirm("python execution may have side effects".into())
+}
+
+/// Node classification.
+fn classify_node(parts: &[&str]) -> BashDecision {
+    let flag = parts.get(1).copied().unwrap_or("");
+    if matches!(flag, "--version" | "-v" | "-e" | "-p" | "--eval" | "--print") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm("'node' script execution may have side effects".into())
+    }
+}
+
+/// rustc classification.
+fn classify_rustc(parts: &[&str]) -> BashDecision {
+    let flag = parts.get(1).copied().unwrap_or("");
+    if matches!(flag, "--version" | "-V" | "--print" | "--explain") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm("'rustc' compilation may produce artifacts".into())
+    }
+}
+
+/// make/cmake classification.
+fn classify_make(parts: &[&str]) -> BashDecision {
+    if parts.iter().any(|p| *p == "-n" || *p == "--dry-run" || *p == "--just-print") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm("'make' builds and may modify filesystem".into())
+    }
+}
+
+/// Docker classification. Read-only inspection vs. container lifecycle.
+fn classify_docker(parts: &[&str]) -> BashDecision {
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    const DOCKER_READONLY: &[&str] = &[
+        "ps", "images", "inspect", "logs", "stats", "top",
+        "port", "version", "info", "network", "volume",
+    ];
+    if subcmd == "--version" || subcmd == "-v" {
+        return BashDecision::Allow;
+    }
+    if DOCKER_READONLY.contains(&subcmd) {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm(format!("'docker {}' modifies container state", subcmd))
+    }
+}
+
+/// curl classification. GET = safe; POST/PUT/DELETE/PATCH = needs confirm.
+fn classify_curl(parts: &[&str], command: &str) -> BashDecision {
+    // Check for write methods
+    let has_write_method = parts.iter().any(|p| {
+        *p == "-X" || *p == "--request"
+    }) && command.to_uppercase().contains("POST")
+        || command.to_uppercase().contains("PUT")
+        || command.to_uppercase().contains("DELETE")
+        || command.to_uppercase().contains("PATCH");
+    // Check for data flags (implies POST)
+    let has_data = parts.iter().any(|p| {
+        p.starts_with("-d") || p.starts_with("--data") || *p == "-F" || *p == "--form"
+    });
+    if has_write_method || has_data {
+        BashDecision::NeedsConfirm("curl with POST/PUT/DELETE sends data to remote".into())
+    } else {
+        BashDecision::Allow
+    }
+}
+
+/// wget classification. Downloading files = needs confirm (writes to disk).
+fn classify_wget(parts: &[&str]) -> BashDecision {
+    // wget --spider = just check, no download
+    if parts.iter().any(|p| *p == "--spider") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm("'wget' downloads and writes files to disk".into())
+    }
+}
+
+/// pip/pip3 classification.
+fn classify_pip(parts: &[&str]) -> BashDecision {
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    if matches!(subcmd, "list" | "show" | "freeze" | "check" | "search" | "--version" | "-V") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm(format!("'pip {}' modifies installed packages", subcmd))
+    }
+}
+
+/// brew classification.
+fn classify_brew(parts: &[&str]) -> BashDecision {
+    let subcmd = parts.get(1).copied().unwrap_or("");
+    if matches!(subcmd, "list" | "info" | "search" | "doctor" | "config" | "deps" | "--version") {
+        BashDecision::Allow
+    } else {
+        BashDecision::NeedsConfirm(format!("'brew {}' modifies system packages", subcmd))
+    }
+}
+
+/// tar classification. -t (list) = safe; -x (extract) = needs confirm.
+fn classify_tar(parts: &[&str]) -> BashDecision {
+    let flags: String = parts.iter()
+        .filter(|p| p.starts_with('-'))
+        .flat_map(|p| p.chars())
+        .collect();
+    if flags.contains('t') {
+        // listing contents
+        BashDecision::Allow
+    } else if flags.contains('x') {
+        BashDecision::NeedsConfirm("'tar -x' extracts files (may overwrite)".into())
+    } else if flags.contains('c') {
+        // creating archive = allow (writes new file but doesn't destroy existing)
+        BashDecision::Allow
+    } else {
+        BashDecision::Allow
+    }
+}
+
+/// Inner defense-in-depth guard (called within bash_exec after pipeline-level classification).
+/// Pipeline is the primary gate (classify_bash_command → NeedsConfirm → UI confirm).
+/// Once confirmed, execution reaches bash_exec — inner guard only blocks injection vectors.
+///
+/// ## Referenced by
+/// - `bash_exec()` only (belt-and-suspenders; pipeline classify_bash_command is primary gate)
+fn is_command_allowed(command: &str) -> bool {
+    // Shell metachar injection is the only hard block (no confirmation can override)
+    !command.chars().any(|c| SHELL_META.contains(&c))
 }
 
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
@@ -1284,34 +1601,48 @@ mod tests {
 
     #[test]
     fn bash_whitelist_enforced() {
-        // 白名单内（基础工具）
-        assert!(is_command_allowed("ls -la"));
-        assert!(is_command_allowed("cat /tmp/x.txt"));
-        assert!(is_command_allowed("echo hello"));
+        use super::BashDecision;
 
-        // 白名单外（python3/node 已在 L0-2 移除）
-        assert!(!is_command_allowed("python3 evil.py"));
-        assert!(!is_command_allowed("node evil.js"));
-        assert!(!is_command_allowed("bash"));
-        assert!(!is_command_allowed("rm -rf /"));
+        // T0: read-only commands → Allow
+        assert_eq!(classify_bash_command("ls -la"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("cat /tmp/x.txt"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("echo hello"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("grep pattern file"), BashDecision::Allow);
 
-        // F-BUG-1 已修复：git/cargo 现在能命中 match 子命令检查分支
-        assert!(is_command_allowed("git status"));
-        assert!(is_command_allowed("git log --oneline"));
-        assert!(is_command_allowed("cargo build"));
-        assert!(is_command_allowed("cargo test"));
-        assert!(is_command_allowed("cargo check"));
-        assert!(is_command_allowed("cargo clippy"));
+        // T1: git/cargo safe subcommands → Allow
+        assert_eq!(classify_bash_command("git status"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("git log --oneline"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("cargo build"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("cargo test"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("cargo check"), BashDecision::Allow);
+        assert_eq!(classify_bash_command("npm ls"), BashDecision::Allow);
 
-        // git 黑名单 flag（match 内部的子拒绝条件）
-        assert!(!is_command_allowed("git -c core.evil=1 status"));
-        assert!(!is_command_allowed("git clone --upload-pack=evil host:repo"));
-        assert!(!is_command_allowed("git pull --exec=rm"));
+        // T2: state-modifying → NeedsConfirm
+        assert!(matches!(classify_bash_command("rm -rf /tmp/x"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("git push origin main"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("cargo install evil"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("cargo run"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("npm install lodash"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("python3 evil.py"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("mv a b"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("kill -9 1234"), BashDecision::NeedsConfirm(_)));
 
-        // cargo 子命令白名单（仅 build/check/test/clippy/fmt/doc）
-        assert!(!is_command_allowed("cargo run"));
-        assert!(!is_command_allowed("cargo install evil"));
-        assert!(!is_command_allowed("cargo")); // 无子命令
+        // T3: dangerous → Dangerous (still needs confirm, not flat deny)
+        assert!(matches!(classify_bash_command("sudo rm -rf /"), BashDecision::Dangerous(_)));
+        assert!(matches!(classify_bash_command("dd if=/dev/zero of=/dev/sda"), BashDecision::Dangerous(_)));
+        assert!(matches!(classify_bash_command("shutdown -h now"), BashDecision::Dangerous(_)));
+
+        // Git injection vectors → Dangerous
+        assert!(matches!(classify_bash_command("git -c core.evil=1 status"), BashDecision::Dangerous(_)));
+        assert!(matches!(classify_bash_command("git clone --upload-pack=evil repo"), BashDecision::Dangerous(_)));
+
+        // Unknown commands → NeedsConfirm (not denied)
+        assert!(matches!(classify_bash_command("bash"), BashDecision::NeedsConfirm(_)));
+        assert!(matches!(classify_bash_command("unknown_tool"), BashDecision::NeedsConfirm(_)));
+
+        // Shell metacharacters → Dangerous
+        assert!(matches!(classify_bash_command("ls; rm -rf /"), BashDecision::Dangerous(_)));
+        assert!(matches!(classify_bash_command("echo $(whoami)"), BashDecision::Dangerous(_)));
     }
 
     // ─── Phase 2 undo 注入：FilengineToolExecutor + undo_logger ──────────

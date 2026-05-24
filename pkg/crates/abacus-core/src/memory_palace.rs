@@ -528,7 +528,10 @@ pub trait MemoryEmbedder: Send + Sync {
 }
 
 /// 余弦相似度计算
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
+///
+/// 引用关系：被 MemoryEmbedder::similarity / KnowledgeStore::semantic_search 使用
+/// 生命周期：纯函数，无状态
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }
@@ -1063,6 +1066,23 @@ impl SqlitePalaceStore {
             CREATE INDEX IF NOT EXISTS idx_mrel_from ON memory_relations(from_id);
             CREATE INDEX IF NOT EXISTS idx_mrel_to ON memory_relations(to_id);"
         ).map_err(|e| format!("schema: {e}"))?;
+
+        // Migration: add embedding BLOB column to knowledge_entries (idempotent)
+        // SQLite lacks IF NOT EXISTS for ADD COLUMN; check pragma table_info first.
+        let has_embedding: bool = conn.prepare("PRAGMA table_info(knowledge_entries)")
+            .and_then(|mut stmt| {
+                let found = stmt.query_map([], |row| row.get::<_, String>(1))?
+                    .filter_map(|r| r.ok())
+                    .any(|col| col == "embedding");
+                Ok(found)
+            })
+            .unwrap_or(false);
+        if !has_embedding {
+            conn.execute_batch(
+                "ALTER TABLE knowledge_entries ADD COLUMN embedding BLOB;"
+            ).map_err(|e| format!("migrate embedding column: {e}"))?;
+        }
+
         Ok(())
     }
 
@@ -1246,6 +1266,90 @@ impl SqlitePalaceStore {
             .unwrap_or(0);
         Ok((k as usize, b as usize, r as usize))
     }
+
+    // ─── Embedding 持久化 ────────────────────────────────────────────────
+
+    /// Store embedding vector for a knowledge entry.
+    ///
+    /// Serialization: each f32 → 4 bytes little-endian, concatenated into a BLOB.
+    ///
+    /// 引用关系：被 DualPalaceMemory 语义索引流程调用
+    /// 生命周期：随对应 knowledge_entry 行的生命周期（DELETE CASCADE 不适用，
+    /// 但 entry 删除时 embedding 列随行删除）
+    pub async fn persist_embedding(&self, entry_id: &str, embedding: &[f32]) -> Result<(), String> {
+        let blob = f32_slice_to_blob(embedding);
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE knowledge_entries SET embedding = ?1 WHERE id = ?2",
+            rusqlite::params![blob, entry_id],
+        ).map_err(|e| format!("persist_embedding: {e}"))?;
+        Ok(())
+    }
+
+    /// Load embedding for a knowledge entry.
+    ///
+    /// Returns None if the entry has no stored embedding.
+    pub async fn load_embedding(&self, entry_id: &str) -> Result<Option<Vec<f32>>, String> {
+        let conn = self.conn.lock().await;
+        let blob: Option<Vec<u8>> = conn.query_row(
+            "SELECT embedding FROM knowledge_entries WHERE id = ?1",
+            rusqlite::params![entry_id],
+            |row| row.get(0),
+        ).map_err(|e| format!("load_embedding: {e}"))?;
+        match blob {
+            Some(bytes) => Ok(Some(blob_to_f32_vec(&bytes))),
+            None => Ok(None),
+        }
+    }
+
+    /// Load all embeddings (for batch similarity search).
+    ///
+    /// Returns (entry_id, embedding) pairs for entries that have a non-NULL embedding.
+    pub async fn load_all_embeddings(&self) -> Result<Vec<(String, Vec<f32>)>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, embedding FROM knowledge_entries WHERE embedding IS NOT NULL"
+        ).map_err(|e| format!("load_all_embeddings prepare: {e}"))?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        }).map_err(|e| format!("load_all_embeddings query: {e}"))?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (id, blob) = row.map_err(|e| format!("load_all_embeddings row: {e}"))?;
+            results.push((id, blob_to_f32_vec(&blob)));
+        }
+        Ok(results)
+    }
+}
+
+// ─── Embedding BLOB 序列化辅助 ─────────────────────────────────────────────
+
+/// f32 slice → little-endian byte vec (4 bytes per element)
+///
+/// 引用关系：persist_embedding / KnowledgeStore 的 embedding 写入
+/// 生命周期：纯函数，无状态
+pub(crate) fn f32_slice_to_blob(data: &[f32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data.len() * 4);
+    for &val in data {
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+    buf
+}
+
+/// Little-endian byte vec → f32 vec
+///
+/// 引用关系：load_embedding / load_all_embeddings / KnowledgeStore 的 embedding 读取
+/// 生命周期：纯函数，无状态
+pub(crate) fn blob_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| {
+            let arr: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            f32::from_le_bytes(arr)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -94,16 +94,17 @@ pub(super) fn try_render_bash_exec<'a>(
 pub(super) fn group_consecutive_tool_runs(
     event_ids: &[u64],
     trace_events: &[TraceEvent],
+    trace_event_index: &std::collections::HashMap<u64, usize>,
 ) -> Vec<Vec<u64>> {
     let mut runs: Vec<Vec<u64>> = Vec::new();
     for id in event_ids {
-        let tool_name = trace_events.iter().find(|e| e.id == *id).and_then(|ev| {
+        let tool_name = trace_event_index.get(id).and_then(|&i| trace_events.get(i)).and_then(|ev| {
             if let TraceKind::ToolCall { ref name, .. } = ev.kind { Some(name.as_str()) } else { None }
         });
         // 尝试追加到前一 run (必须都是 ToolCall 且同名)
         let append = if let (Some(prev_run), Some(cur_name)) = (runs.last(), tool_name) {
             // 前一 run 的首 id 对应的 tool name
-            let prev_name = trace_events.iter().find(|e| e.id == prev_run[0]).and_then(|ev| {
+            let prev_name = trace_event_index.get(&prev_run[0]).and_then(|&i| trace_events.get(i)).and_then(|ev| {
                 if let TraceKind::ToolCall { ref name, .. } = ev.kind { Some(name.as_str()) } else { None }
             });
             prev_name == Some(cur_name)
@@ -246,6 +247,7 @@ pub(super) fn render_single_trace_event<'a>(
 pub(super) fn render_merged_tool_run<'a>(
     run: &[u64],
     trace_events: &[TraceEvent],
+    trace_event_index: &std::collections::HashMap<u64, usize>,
     bar: &Span<'a>,
     theme: &Theme,
     code_blocks_expanded: bool,
@@ -254,7 +256,7 @@ pub(super) fn render_merged_tool_run<'a>(
 ) {
     // 收集本组 events（部分可能已被 FIFO 裁剪）
     let events: Vec<&TraceEvent> = run.iter()
-        .filter_map(|id| trace_events.iter().find(|e| e.id == *id))
+        .filter_map(|id| trace_event_index.get(id).and_then(|&i| trace_events.get(i)))
         .collect();
     if events.is_empty() {
         // 全部过期: 显示占位提示
