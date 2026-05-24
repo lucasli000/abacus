@@ -118,7 +118,7 @@ impl MeetingEngineAdapter {
                 };
                 req_ctx.thinking_intent = sp_clone.specialty.engagement.parse_thinking_intent();
                 // 单参与者超时: 90 秒防止会议死锁；同时接外部 cancel
-                let participant_timeout = std::time::Duration::from_secs(90);
+                let participant_timeout = std::time::Duration::from_secs(600);
                 let engine_result = run_specialist(
                     core, &prompt, session_state, req_ctx, participant_timeout, cancel.clone(),
                 ).await
@@ -171,7 +171,7 @@ impl MeetingEngineAdapter {
                     abacus_core::core::RequestContext::default()
                 };
                 req_ctx.thinking_intent = sp_clone.specialty.engagement.parse_thinking_intent();
-                let participant_timeout = std::time::Duration::from_secs(90);
+                let participant_timeout = std::time::Duration::from_secs(600);
                 let engine_result = run_specialist(
                     core, &prompt, session_state, req_ctx, participant_timeout, cancel.clone(),
                 ).await

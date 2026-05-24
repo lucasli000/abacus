@@ -71,9 +71,9 @@ pub struct SubAgentBoundary {
 impl Default for SubAgentBoundary {
     fn default() -> Self {
         Self {
-            max_steps: 20,
-            max_tokens: 8192,
-            max_duration: Duration::from_secs(120),
+            max_steps: 500,
+            max_tokens: 200_000,
+            max_duration: Duration::from_secs(900),
             allowed_tools: Vec::new(),
             forbidden_tools: Vec::new(),
             context_scope: ContextScope::Inherited { keys: vec!["goal".into()] },

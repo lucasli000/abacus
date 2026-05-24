@@ -117,11 +117,11 @@ impl EngagementLimit {
 impl Default for EngagementLimit {
     fn default() -> Self {
         Self {
-            max_speeches_per_round: 3,
-            max_thinking_tokens: 4096,
-            max_tool_calls_per_think: 5,
+            max_speeches_per_round: 50,
+            max_thinking_tokens: 100_000,
+            max_tool_calls_per_think: 100,
             min_confidence: 0.3,
-            response_timeout_secs: 120,
+            response_timeout_secs: 900,
             thinking: None,
         }
     }

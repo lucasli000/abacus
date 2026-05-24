@@ -65,7 +65,7 @@ impl ContextPool {
     pub fn add_turn(&mut self, entry: TimelineEntry) -> u32 {
         self.timeline.push(entry);
         self.turn_counter += 1;
-        if self.timeline.len() > 25 {
+        if self.timeline.len() > 200 {
             self.compress();
         }
         self.turn_counter
@@ -147,13 +147,13 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_at_26_entries() {
+    fn test_compress_at_201_entries() {
         let mut pool = ContextPool::new();
-        for i in 1..=26 {
+        for i in 1..=201 {
             pool.add_turn(make_entry(i, "sp-coder"));
         }
-        assert!(pool.all().len() < 26);
-        assert!(pool.all().len() >= 14);
+        assert!(pool.all().len() < 201);
+        assert!(pool.all().len() >= 101);
     }
 
     #[test]

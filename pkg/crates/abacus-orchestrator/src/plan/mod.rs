@@ -375,16 +375,16 @@ impl PlanExecutor {
                 return Ok(plan.status.clone());
             }
 
-            // 执行就绪步骤（每步最多 120 秒超时）
+            // 执行就绪步骤（每步最多 900 秒超时）
             for step_id in &ready {
                 plan.mark_step(step_id, StepStatus::Running, None);
 
                 let step = plan.steps.iter().find(|s| s.id == *step_id).unwrap().clone();
-                let step_timeout = std::time::Duration::from_secs(120);
+                let step_timeout = std::time::Duration::from_secs(900);
                 let result = match tokio::time::timeout(step_timeout, self.execute_step(&step)).await {
                     Ok(r) => r,
                     Err(_) => Ok(StepResult::Failed {
-                        error: format!("step '{}' timed out after 120s", step.id),
+                        error: format!("step '{}' timed out after 900s", step.id),
                         retryable: true,
                     }),
                 };

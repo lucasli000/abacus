@@ -1169,20 +1169,38 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // Gap A 修复：把 state.thinking_depth 转为 per-turn RequestContext.thinking_intent
                             // 引用关系：ThinkingIntent::from_str_loose 接受 off/low/medium/high/max/adaptive/整数
                             // 生命周期：仅此 spawn 内本轮有效；下轮重新取 state.thinking_depth
-                            // V38: 注入模式上下文到 system prompt override
-                            // 让 LLM 知道当前模式 + 可用的 mode_switch 工具 + DAG 转移选项
-                            let mode_context = {
+                            // V38: 注入能力上下文——模式 + 工具 + Skill + 命令
+                            // 让 LLM 完整了解可用能力，自主决定调用哪个
+                            let capability_context = {
                                 let transitions: Vec<&str> = current_mode.transitions().iter()
                                     .map(|m| m.label()).collect();
+
+                                // 收集可用 skill 名称（从 skill_engine 当前注册）
+                                let skill_names: Vec<String> = if let Some(ref handle) = state.engine_handle {
+                                    let engine = handle.core.skill_engine_ref().read().await;
+                                    engine.list_skills().iter().take(20).map(|s| s.id.0.clone()).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                let skills_str = if skill_names.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("\nAvailable Skills: {}", skill_names.join(", "))
+                                };
+
                                 format!(
-                                    "\n\n[Mode Context] Current: {} ({}). Available transitions: {:?}. \
-                                     Call mode_switch tool to transition when task requires different collaboration style.",
-                                    current_mode.display_zh(), current_mode.label(), transitions
+                                    "\n\n[Capabilities]\n\
+                                     Mode: {} ({}) | Transitions: {:?} (call mode_switch tool)\n\
+                                     Key Commands: /plan, /meeting, /team (mode switch), /compress (context), /streaming (toggle){}\n\
+                                     Tool Discovery: call tool_compass with intent description if unsure which tool fits.\n\
+                                     You have full access to file system tools, shell execution, web search, and knowledge retrieval.\n\
+                                     Choose the most efficient tool for each step — prefer direct action over asking.",
+                                    current_mode.display_zh(), current_mode.label(), transitions, skills_str
                                 )
                             };
                             let chat_req_ctx = abacus_core::core::RequestContext {
                                 thinking_intent: abacus_types::ThinkingIntent::from_str_loose(&state.thinking_depth),
-                                system_prompt_override: Some(mode_context),
+                                system_prompt_override: Some(capability_context),
                                 ..Default::default()
                             };
 
