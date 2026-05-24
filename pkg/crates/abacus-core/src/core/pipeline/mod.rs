@@ -757,12 +757,25 @@ impl<'a> TurnPipeline<'a> {
 
     /// Returns `Some(TurnResult)` if the turn gated (early return),
     /// `None` if normal completion.
-    /// Remove the last assistant message if it contains tool_calls
-    /// but the following messages don't have matching tool responses.
-    /// This prevents API errors when a previous turn was interrupted.
+    /// Sanitize tool protocol invariants in message history.
+    ///
+    /// Handles two cases to prevent API errors:
+    /// 1. **Dangling tool_calls**: assistant message has tool_calls but not all
+    ///    matching tool responses exist after it → remove the assistant message.
+    /// 2. **Orphaned tool responses**: tool message whose tool_call_id doesn't match
+    ///    any preceding assistant's tool_calls → remove the orphan.
+    ///
+    /// Case 2 occurs when context compression removes the assistant (with tool_calls)
+    /// but preserves the tool response, or when a proactive tool injection lacks
+    /// a synthetic assistant turn.
+    ///
+    /// ## 引用关系
+    /// - 调用点：execute_loop 每次构建 LlmRequest.messages 前
+    /// - 消费方：所有 OpenAI-compatible providers (DeepSeek, OpenAI, etc.)
     fn sanitize_dangling_tool_calls(msgs: &mut Vec<Message>) {
         if msgs.is_empty() { return; }
-        // Find the last assistant message with tool_calls
+
+        // ── Case 1: dangling assistant tool_calls without matching responses ──
         let last_assistant_with_tools = msgs.iter().rposition(|m| {
             m.role == MessageRole::Assistant && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
         });
@@ -771,13 +784,11 @@ impl<'a> TurnPipeline<'a> {
             let expected_ids: std::collections::HashSet<&str> = tool_calls.iter()
                 .map(|tc| tc.id.as_str())
                 .collect();
-            // Check if all tool_call_ids have matching tool responses after this message
             let found_ids: std::collections::HashSet<&str> = msgs[idx + 1..].iter()
                 .filter(|m| m.role == MessageRole::Tool)
                 .filter_map(|m| m.tool_call_id.as_deref())
                 .collect();
             if !expected_ids.is_subset(&found_ids) {
-                // Dangling tool_calls — remove the assistant message to prevent API error
                 tracing::warn!(
                     idx,
                     missing = ?(expected_ids.difference(&found_ids).collect::<Vec<_>>()),
@@ -785,6 +796,32 @@ impl<'a> TurnPipeline<'a> {
                 );
                 msgs.remove(idx);
             }
+        }
+
+        // ── Case 2: orphaned tool responses without preceding assistant tool_calls ──
+        // Collect all tool_call IDs declared by assistant messages (owned to avoid borrow conflict).
+        let declared_ids: std::collections::HashSet<String> = msgs.iter()
+            .filter(|m| m.role == MessageRole::Assistant)
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|tc| tc.id.clone())
+            .collect();
+
+        let before_len = msgs.len();
+        msgs.retain(|m| {
+            if m.role != MessageRole::Tool { return true; }
+            match m.tool_call_id.as_deref() {
+                Some(id) => declared_ids.contains(id),
+                // tool message without tool_call_id is malformed — remove
+                None => false,
+            }
+        });
+        let removed = before_len - msgs.len();
+        if removed > 0 {
+            tracing::warn!(
+                removed,
+                "removed orphaned tool response messages (no matching assistant tool_calls)"
+            );
         }
     }
 
@@ -1988,8 +2025,9 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_removes_dangling_assistant_when_responses_missing() {
-        // assistant 发了 t1+t2，但只有 t1 的 response → 整个 assistant 消息被移除
+    fn sanitize_removes_dangling_assistant_and_orphan_response() {
+        // assistant 发了 t1+t2，但只有 t1 的 response → assistant 被移除
+        // → t1 response 现在也是孤儿（其 tool_call_id 不再匹配任何 assistant）→ 也被移除
         let mut msgs = vec![
             user_msg("query"),
             assistant_with_tool_calls(&["t1", "t2"]),
@@ -1997,14 +2035,14 @@ mod tests {
             // t2 response 缺失
         ];
         TurnPipeline::<'static>::sanitize_dangling_tool_calls(&mut msgs);
-        assert_eq!(msgs.len(), 2, "dangling assistant removed");
+        assert_eq!(msgs.len(), 1, "dangling assistant + orphan tool response both removed");
         assert!(matches!(msgs[0].role, MessageRole::User));
-        assert!(matches!(msgs[1].role, MessageRole::Tool)); // 孤儿 tool response 保留（由 provider 层处理）
     }
 
     #[test]
-    fn sanitize_only_removes_last_assistant_with_dangling_calls() {
-        // 历史中有早期完整对、后期 dangling：仅处理"最后一条 assistant with tool_calls"
+    fn sanitize_only_removes_last_dangling_and_its_orphans() {
+        // 历史中有早期完整对、后期 dangling：
+        // 移除 dangling assistant (b1+b2) → b1 response 变孤儿也被移除
         let mut msgs = vec![
             user_msg("first query"),
             assistant_with_tool_calls(&["a1"]),
@@ -2015,15 +2053,24 @@ mod tests {
             // b2 缺失 → 此 assistant 应被移除
         ];
         TurnPipeline::<'static>::sanitize_dangling_tool_calls(&mut msgs);
-        // 原 6 条，移除最后一条 dangling assistant → 5 条
-        assert_eq!(msgs.len(), 5);
-        // 早期 a1 对仍在
+        // 早期 a1 对完整保留；b1+b2 的 assistant + b1 orphan 被移除
+        assert_eq!(msgs.len(), 4);
         assert!(matches!(msgs[0].role, MessageRole::User));
         assert!(matches!(msgs[1].role, MessageRole::Assistant));
         assert!(matches!(msgs[2].role, MessageRole::Tool));
-        // 晚期 user / b1 response 保留，但 b1+b2 的 assistant 已移除
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some("a1"));
         assert!(matches!(msgs[3].role, MessageRole::User));
-        assert!(matches!(msgs[4].role, MessageRole::Tool)); // b1 response，原 assistant 位置已 remove
-        assert_eq!(msgs[4].tool_call_id.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn sanitize_removes_pure_orphan_tool_response() {
+        // tool response 前面完全没有 assistant tool_calls（proactive injection 场景）
+        let mut msgs = vec![
+            user_msg("hello"),
+            tool_response("call_injected_123"),
+        ];
+        TurnPipeline::<'static>::sanitize_dangling_tool_calls(&mut msgs);
+        assert_eq!(msgs.len(), 1, "orphan tool response removed");
+        assert!(matches!(msgs[0].role, MessageRole::User));
     }
 }
