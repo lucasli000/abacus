@@ -590,7 +590,8 @@ pub fn handle_issue(issue: &LintIssue) {
 ///
 /// 设计意图：让 Warn 默认不 panic（用户友好），CI 可显式 opt-in
 ///
-/// 引用关系：仅由 handle_issue 的 Warn 分支调用
+/// 引用关系：仅由 handle_issue 的 Warn 分支调用（#[cfg(debug_assertions)] 块内）
+#[cfg(debug_assertions)]
 fn lint_strict_enabled() -> bool {
     if cfg!(test) { return false; } // 测试场景永不启用
     std::env::var("ABACUS_LINT_STRICT").as_deref() == Ok("1")
