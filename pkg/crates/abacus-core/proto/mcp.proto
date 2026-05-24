@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package abacus.mcp;
+
+service McpService {
+  rpc Discover(DiscoverRequest) returns (DiscoverResponse);
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc StreamEvents(StreamRequest) returns (stream McpEvent);
+}
+
+message DiscoverRequest {
+  string server_id = 1;
+}
+
+message ToolSchema {
+  string name = 1;
+  string description = 2;
+  string parameters_json = 3;
+}
+
+message DiscoverResponse {
+  repeated ToolSchema tools = 1;
+}
+
+message ExecuteRequest {
+  string tool_name = 1;
+  string params_json = 2;
+  string session_id = 3;
+  string hmac_signature = 4;
+}
+
+message ExecuteResponse {
+  bool success = 1;
+  string output_json = 2;
+  uint64 latency_ms = 3;
+  string error = 4;
+}
+
+message StreamRequest {
+  string session_id = 1;
+  repeated string event_types = 2;
+}
+
+message McpEvent {
+  string event_type = 1;
+  string data_json = 2;
+  uint64 timestamp_ms = 3;
+}

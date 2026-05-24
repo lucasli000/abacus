@@ -1,0 +1,149 @@
+# Changelog
+
+## v1.0.0 (2026-05-24) — 首个稳定版发布
+
+### Architecture
+
+- **协议同构感知层（J1+J2）** — `tool::cluster::ClusterRegistry` 把工具间横向关系显式化；
+  `build_tool_definitions_for` 自动给每个工具 description 末尾追加 cluster + siblings + differentiator；
+  新增 `tool_compass` 自省工具让 LLM 在不确定时主动咨询「该用哪个工具」
+- **adaptive_d_tier_hide 默认开（K1~K5）** — 5 层兜底防误杀：
+  K1 `ToolOutcome::EnvFailure` 不入 success_rate 分母（修网络/auth 失败拖累评分）；
+  K2 扩展工具（MCP/Plugin/Skill）30 次冷启动期；
+  K3 hide 层 floor + 极端兜底（每 provider 至少保留 N、整 cluster 至少保留 1、整体回退）；
+  K4 `palace_demoted` 每 50 turn 试探放行（修单调降级死锁）；
+  K5 default=true + audit 透明化
+- **机制接入完整闭环（L1~L6）** — pipeline `record_outcome` 真识别失败类型；
+  `sync_from_palace_at(turn)` 让 K4 试探放行机制启动；
+  audit_report 输出 `env_failure_dominated` 提示运维；
+  history.jsonl 加 `search_history` 读取 API；
+  tool_compass 推荐时过滤 hide 状态
+- **跨 session 持久化（A~I 9 段）** — 进程注册表 + jsonl event log + GlobalHistoryHook +
+  rotation + replay + SessionResumeReport；4 个端到端集成测试锁全链路
+- **DualPalaceMemory** — BehaviorPalace + KnowledgePalace + ContextTiers FIFO 三层记忆机制
+
+### Code Quality
+
+- **0 warning / 0 error** 全仓编译
+- **695 lib tests + 4 cross-session e2e** 全部通过
+
+### Security
+
+- 所有源码本地路径 / 个人项目名 / 第三方品牌引用清洗完成
+- `subtle::ConstantTimeEq` 用于 HMAC / auth token / admin token 比较
+- 审计 / 决策 / 会话 / 限流 key / Context 声明栈全部上限管理
+
+---
+
+## v0.2.0 (2026-05) — 后端深度审查 + 技术债清扫
+
+### Architecture
+
+- **取消语义贯通**：`tokio_util::CancellationToken` 三层透传（server → pipeline → provider），`tokio::select!` 与 in-flight reqwest 竞速取消，timeout 后不再泄漏未完成请求
+- **Meeting L4 接通**：5 个 HTTP handler 落地（create / list / detail / ask / delete），`MeetingStore` 镜像 `TeamManager` 形态，与 L3 实现解耦
+- **Pipeline 模块拆分**：1511 行单文件 → `pipeline/{mod.rs, post.rs}` 跨文件 inherent impl，post.rs 承载 Phase 5/6（post_process + detect_inertia ≈ 315 行）
+- **Provider 共享 HTTP 客户端**：`shared_http_client()` 静态 `OnceLock<reqwest::Client>`（pool_idle_timeout=90s, pool_max_idle_per_host=32），三个 provider 复用单一连接池
+- **首次启动模型自动发现**：`CoreLoop::discover_and_cache()` 后台 task；CLI 新增 `abacus models discover`；`/api/v1/models` 实时拉取（5s 超时） + cache + static 三级 fallback；ConfigManager 自动补全 `[available_models]`
+- **BoundedFifo 抽象**：`abacus-types::collections::BoundedFifo<T>` 统一 5 处有界 FIFO 场景（`RateLimiter.clients` / `ServerSessionManager.snapshots` / `SecretsManager.audit_log` / `McipGateway.decision_log` / `ContextManager.{pending, retained_content}`），替代 Vec.remove(0) O(n) 滚动
+
+### Performance / Resource Safety
+
+- **C1 RateLimiter GC**：clients HashMap 加 `last_seen` + 4096 阈值触发 5×window 闲置项清理，防 token 旋转期 OOM
+- **C2 RateLimiter 哈希常时比较**：`subtle::ConstantTimeEq` 替代字面 ==，规避基于响应时间的 key 探测
+- **C5 auth_middleware 抗短路**：去除早期 return 短路，所有 token 比对走完整 ct_eq 路径
+- **C6 SecretString::generate 不再 panic**：CSPRNG 失败返回 `Result<Self, getrandom::Error>`，调用方决定 fail-fast 或 fallback
+- **H3 FallbackProvider 抖动**：`SystemTime::subsec_millis` → CSPRNG 真随机，并发同周期请求避免 thundering herd
+- **H4 FallbackProvider 借用优化**：`execute_with_retry` 改为 `&LlmRequest`，省掉成功路径外层 deep clone（messages/tools 全 Vec 复制）
+- **H6 Provider 注册前置检查**：OpenAI provider 同时缺 base_url 和 key 时不注册，缺 key 时 warn log
+- **H9 error_response 状态码保留**：`Response::builder` + `*resp.status_mut()` 双层兜底，避免 `.status_code()` 返回 200 误导监控
+- **M7 CORS 生产硬化**：`ABACUS_ENV=production` 且无 `CORS_ORIGINS` → deny-all（之前默默允许所有源）
+- **P1 LazyLock 编译期 Regex**：context.rs 9 个 Regex 改为 `LazyLock`，进程级单次编译
+- **P3-D Prometheus seqlock**：`record_request` 用 epoch 协议（奇数=写入中，偶数=稳态），render 期间检测并发写入计入 `dirty_scrape_total`，暴露 `metrics_write_epoch` 给 Grafana 一致性告警
+
+### Bug Fixes
+
+- **TUI 主题对比度**：Nord muted/bg 1.69 → 2.8（提亮 nord3 至 Snow Storm 0 变体），通过 WCAG 2.5+ 次要文本断言
+- **`Theme: !Clone`**：补 `#[derive(Clone)]` 让 contrast 测试可批量验证
+- **TUI Markdown highlight_code 调用签名**：补 `&self.theme` 参数；`render_table` 用 `std::mem::take` 拆借用
+- **`normalized_buf` unused assignment**：去除冗余 String::new() 兜底，编译期确认 else 分支不读取该变量
+- **TUI panel_visible 默认 true**：测试断言对齐实际 UX 设计
+
+### Code Quality
+
+- **0 warning / 0 error 全仓**：清理 7 处遗留警告（unused imports / unused mut / value never read）
+- **433 tests 全部通过**（vs v0.1.0 的 350，新增 BoundedFifo / model_cache / pipeline post 等 83 项）
+- 三层 cancel API 加入 trait 默认方法 (`complete_cancellable`, `discover_models`)，向后兼容现有 provider 实现
+
+### Security
+
+- 已扩展 v0.1.0 防护到所有遗漏：HMAC 比较、auth token 比较、admin token 比较全部走 `subtle::ConstantTimeEq`
+- 审计 log / 决策 log / 会话快照 / 限流 key / Context 声明栈全部上限管理
+
+### Known Limitations
+
+- M1 pipeline 拆分仅完成 Phase 5/6 → post.rs；setup/execute/finalize 三阶段保留在 mod.rs 中。剩余拆分纯粹是组织优化，无功能/性能影响，遵循「最低风险增量」原则推迟到下一次大重构（避免 1500 行同改批量引入 lifetime/import 风险）
+
+---
+
+## v0.1.0 (2026-05)
+
+### Architecture
+
+- Provider fallback 链：Anthropic → OpenAI → DeepSeek 自动降级
+- Meeting 并发多专家：Semaphore 限流 + tokio::spawn 并行执行
+- Meeting 主持人机制：首个 expert 自动 host，分发任务 + 汇总结论
+- 命令注册表：`slash_commands.rs` 替换 110 行 giant match，/help 自动生成
+- 反馈分层：Toast（瞬态）/ Panel（持久）/ StatusBar（实时）
+
+### Code Quality
+
+- **0 warning / 0 error** 全仓编译
+- **350 tests** 全部通过
+- 消除死代码：`run_tui_demo`、`disclaimer` 模块、重复 `MeetingManager` struct
+- 消除 `unwrap()` panic 点：`auth_middleware` / `rate_limit_mw` → `error_response()` 安全 fallback
+- CI 纳入 `abacus-server` 全量编译
+- token 计量改用引擎返回的 `session_tokens.total_tokens`
+- analyzer 假阳性修复：中文单字 "分析"/"实现" 不再误触发
+
+### Security
+
+- RateLimiter key 改为 SHA256 哈希（原存完整 Bearer token）
+- 工具参数解析失败日志不再输出原始内容
+- `audit_log` / `decision_log` 加 Vec 上限防 OOM
+- ConfigManager 对 `api_key`/`server_token` 输出 `[REDACTED]`
+
+### UX
+
+- **Tab 补全可达**：Input 焦点时 Tab 不再切面板
+- **引擎 init 失败直接报错**：不再静默降级 demo 模式
+- **模式不自动切换**：单词触发的 analyzer 改为 toast 建议
+- **消息折行 + OSC 52 复制**：非 TUI 模式支持
+- **Toast 可读**：1s → 2s 最低时长
+- **渲染缓存**：消息不变时零开销复用 `cached_lines`
+- 消息渲染增强：gutter 缩进、代码块识别、角色 emoji、转场箭头
+- 处理进度：`🤔 Thinking... [1/4] 12.3s` step 步数 + 阶段描述
+- 模型品牌色：DeepSeek 冷灰蓝 / OpenAI 冷灰绿 / Anthropic 暖灰橙 等
+
+### Product Completeness
+
+- Shell completions（`abacus completions <bash|zsh|fish>`）
+- Rustyline 行编辑 + 历史持久化（`~/.abacus/history.txt`）
+- `config list-keys` 14 个配置项 + 中文通俗说明
+- `skill install/remove`、`mcp add/remove` 命令
+- 会话持久化：退出自动保存 `~/.abacus/sessions/latest.json`
+- 会话自动恢复：重启 TUI 自动加载上次消息
+- 设置面板可达：Ctrl+O + /settings 双入口
+- Docker entrypoint 修正：`abacus-server` 二进制正确打包
+
+### Bug Fixes
+
+- **docker-compose**：端口 3000/8080 不一致 → 统一 8080
+- **Dockerfile**：缺少 `abacus-server` 二进制 copy
+- **session_id 复用**：chat_handler 读请求中的 session_id
+- **SSE keep-alive**：30s 间隔防代理超时
+- **错误格式统一**：chat_handler 返回 `ErrorResponse` 而非 `ChatResponse`
+- **logging.rs 死代码**：main.rs 改为调用 `logging::init()`
+- **skill/MCP 命令 enum**：恢复 Enable/Disable/Disconnect 丢失变体
+- **`tui_main` binary 路径**：`src/tui/main.rs` → `src/bin/tui_main.rs`
+- **`block` 渲染 move 后 borrow**：交换 `.inner()` 和 `render_widget` 顺序
+- **new_with_gate_config 缺 max_sessions**：参数传入

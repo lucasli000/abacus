@@ -1,0 +1,61 @@
+[package]
+name = "abacus-core"
+version = "1.0.0"
+edition = "2021"
+description = "Abacus Agent Kernel — L1+L2 unified core layer"
+
+[dependencies]
+abacus-types = { path = "../abacus-types" }
+
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+glob = "0.3"
+walkdir = "2"
+rhai = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+rustls = { workspace = true }
+toml = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+getrandom = "0.3"
+futures-util = "0.3"
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+wasmtime = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+zeroize = { workspace = true }
+lru = { workspace = true }
+dirs = "6.0.0"
+
+# ─── Phase Stability-1：稳定性补强 ───
+parking_lot = { workspace = true }
+governor = { workspace = true }
+backon = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+async-trait = { workspace = true }
+tempfile = "3"
+insta = { version = "1", features = ["yaml", "json"] }
+# Path 1：HTTP mock server for testing provider runtime（complete/stream_complete/error 路径）。
+# wiremock 是 tokio-native，支持 streaming / 状态码模拟 / Header 断言；与 #[tokio::test] 直接组合。
+wiremock = "0.6"
+# Property-based testing —— 给 canonical_hash / importance_score 等纯函数补强不变量验证
+proptest = "1"
+
+[lints]
+workspace = true

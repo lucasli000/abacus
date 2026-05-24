@@ -1,0 +1,116 @@
+# Abacus Configuration Template
+# 复制为 ~/.abacus/config.yaml 后填入实际值
+# 环境变量可覆盖同名配置：ABACUS_<KEY>（将 . 替换为 _ 并大写）
+
+# ════════════════════════════════════════════════════════
+# LLM Provider — 至少配一个
+# ════════════════════════════════════════════════════════
+
+# DeepSeek（国内首选，一个 key 覆盖全系列模型）
+# ======
+# 支持模型：deepseek-v4-flash / deepseek-v4-pro / deepseek-reasoner 等
+# 切换方式：TUI 输入 /model flash 或 /model pro
+#llm.api_key = "sk-xxxxxxxxxxxxxxxx"
+#llm.base_url = "https://api.deepseek.com"
+
+# OpenAI 兼容接口（同 key 可混用 gpt-4o / gpt-4-turbo / gpt-3.5 等）
+# ======
+# 切换方式：/model gpt-4o 或 /model gpt-4-turbo
+#llm.openai_api_key = "sk-xxxxxxxxxxxxxxxx"
+#llm.openai_base_url = "https://api.openai.com/v1"
+
+# Anthropic Claude（同 key 支持 sonnet / opus / haiku）
+# ======
+# 切换方式：/model claude-sonnet-4 或 /model claude-opus-4
+#llm.anthropic_api_key = "sk-ant-xxxxxxxxxxxxxxxx"
+#llm.anthropic_base_url = "https://api.anthropic.com"
+
+# ════════════════════════════════════════════════════════
+# Core — 模型与行为
+# ════════════════════════════════════════════════════════
+
+core.default_model = "deepseek-v4-flash"    # 对话使用的模型
+core.system_prompt = ""                       # 自定义 AI 角色设定语
+core.temperature = 0.6                        # 回复的随机程度 0=严谨 1=创意
+core.max_tokens = 8192                        # 单次回复最长长度
+
+# ─── Thinking 配置 [PRIMARY] ─────────────────────────────────
+# 单字段统一表达思考意图，自动适配 4 家厂商：
+#   off       — 不思考（默认）
+#   adaptive  — 模型自决（Anthropic Opus 4.7 / Mythos 唯一支持；Gemini 自动 -1）
+#   minimal   — 极简（仅 OpenAI GPT-5）
+#   low/medium/high — 通用档位
+#   max       — 最深推理（Anthropic Opus 4.6+ / DeepSeek Anthropic 格式）
+#   xhigh     — 极高（Anthropic Opus 4.7 编码场景）
+#   <整数>    — 显式 token 预算（推荐 Gemini，Anthropic extended_thinking 兼容）
+#
+# ## Provider-specific 实际行为（vs 用户输入的 effort 字符串）：
+#
+# - **DeepSeek V3.1+/V4 (V4 Pro/Flash, V3.2)**：服务端默认 thinking=enabled，
+#   client 已显式发 `{type:"disabled"}` 让 off 行为可靠（D3 修复，否则 server 默认开 → 协议错配 400）。
+#   reasoning_effort 服务端 alias 规则：low/medium → high，xhigh → max；
+#   client 侧已镜像该规则（D2 clamp），监控/日志看到的 effort 与真实档位一致。
+# - **DeepSeek-Reasoner / R1**：thinking 永远 on，client 不发 thinking 字段。
+# - **Anthropic Opus 4.7+ / Mythos**：仅支持 adaptive 模式 + output_config.effort；
+#   旧 budget_tokens 已弃用（API 直接 400）。
+# - **Anthropic Sonnet 4.6 / Opus 4.6**：dual mode（adaptive + extended_thinking）；
+#   adaptive 路径为优先选择。
+# - **Anthropic 4.5 及更早**：仅 extended_thinking + budget_tokens；adaptive 自动降级。
+# - **OpenAI GPT-5 系列**：reasoning_effort=minimal/low/medium/high；其他 provider 无 minimal。
+# - **OpenAI o3 / o1**：无 minimal；low/medium/high。
+# - **Gemini 2.5**：thinkingBudget 整数；off→0，adaptive→-1，effort→default_budget_tokens。
+core.thinking = "off"
+core.thinking_display = "summarized"          # Anthropic adaptive 显示模式: summarized / omitted
+
+# ─── Thinking 配置 [DEPRECATED] —— 旧 key，Phase 5 移除 ───────
+# 启动时若使用此处会触发一次性 deprecation warning，请尽快迁移到 core.thinking
+# core.thinking_enabled = false               # 是否先思考再回答
+# core.thinking_effort = "medium"             # 思考深度 off/low/medium/high
+
+core.context_window = 1000000                 # 记忆对话的总量上限
+core.max_turns = 20                           # 单次任务最多来回对话轮数
+core.max_tool_calls = 10                     # 单次回复最多执行工具次数
+core.silent_router_enabled = true             # 静默路由模式
+
+# ════════════════════════════════════════════════════════
+# Meeting 模式 — 多专家会议
+# ════════════════════════════════════════════════════════
+
+# 以上配置通过 meeting YAML 文件指定（非 toml key）
+# 示例见 examples/meeting-code-review.yaml
+# 加载方式：abacus meeting --config examples/meeting-code-review.yaml
+
+# YAML 中的可配置项：
+#   meeting:
+#     max_participants: 8          # 最大参会专家数
+#     max_concurrent_llm: 4        # 并行 LLM 调用数（Semaphore 限流）
+#     idle_timeout_secs: 300       # 空闲超时
+#     max_duration_minutes: 60     # 会议最大时长
+#     timeline_view_size: 5        # 时间线展示条数
+#   specialists:
+#     - id: coder                  # 专家 ID
+#       domain: coding             # 领域
+#       name: Code Expert          # 显示名
+#       role: Member               # AgentRole（Member/Advisor/PM）
+#       model: deepseek-v4-flash   # 该专家使用的模型（可各自不同）
+#       guide_strategy: "..."      # 指导策略
+#       anti_pattern: "..."        # 反模式
+#       capabilities: [...]        # 能力标签
+#       tags: [...]                # 匹配标签
+
+# ════════════════════════════════════════════════════════
+# Team 模式 — 多角色协作执行
+# ════════════════════════════════════════════════════════
+
+# Team 通过 Builder API 构建，运行时配置：
+#   - max_retries: 2              # 任务失败重试次数
+#   - AgentRole: Leader/Member/PM/Advisor
+#   - TaskSpec: 任务 ID + 描述 + 依赖 + 优先级 + 工具白名单
+
+# ════════════════════════════════════════════════════════
+# Server — HTTP API 服务
+# ════════════════════════════════════════════════════════
+
+#server.max_sessions = 1000                   # 最大并发会话数
+#server.rate_limit_per_sec = 60              # 每秒最大请求数
+#server.request_timeout_secs = 300           # 单次请求超时

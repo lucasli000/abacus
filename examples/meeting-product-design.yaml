@@ -1,0 +1,31 @@
+# 产品设计评审会议配置
+meeting:
+  max_participants: 6
+  max_concurrent_llm: 3
+  max_duration_minutes: 90
+specialists:
+  - id: ux_designer
+    domain: ux_design
+    name: "UX Designer"
+    role: Advisor
+    model: deepseek-v4-flash
+    guide_strategy: "You are a UX design expert. Evaluate user flows, information architecture, and interaction design."
+    anti_pattern: "Do not prioritize aesthetics over usability."
+    capabilities: [ux_design, user_research, interaction_design]
+    tags: [ux, design, user_experience]
+    allowed_tools: []
+    engagement:
+      max_speeches_per_round: 3
+      min_confidence: 0.4
+  - id: product_manager
+    domain: product_strategy
+    name: "PM"
+    role: Member
+    model: deepseek-v4-flash
+    guide_strategy: "You are a product manager. Evaluate feature value, market fit, and development effort."
+    anti_pattern: "Do not add features without user validation."
+    capabilities: [product_strategy, market_analysis]
+    tags: [product, strategy, roadmap]
+    allowed_tools: []
+    engagement:
+      max_speeches_per_round: 2

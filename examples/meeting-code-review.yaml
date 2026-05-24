@@ -1,0 +1,33 @@
+# 代码审查会议配置
+meeting:
+  max_participants: 6
+  max_concurrent_llm: 4
+  max_duration_minutes: 120
+specialists:
+  - id: coder
+    domain: code_implementation
+    name: "Coder"
+    role: Member
+    model: deepseek-v4-flash
+    guide_strategy: "You are a code implementation expert. Focus on writing correct, efficient, and maintainable code."
+    anti_pattern: "Do not modify production files. Do not skip error handling."
+    capabilities: [code_implementation, refactoring, debugging]
+    tags: [code, programming, implementation]
+    allowed_tools: [filengine.fs.*]
+    engagement:
+      max_speeches_per_round: 3
+      max_thinking_tokens: 4096
+      min_confidence: 0.3
+  - id: reviewer
+    domain: code_review
+    name: "Reviewer"
+    role: Advisor
+    model: deepseek-v4-flash
+    guide_strategy: "You are a code review expert. Find bugs, security issues, and design problems."
+    anti_pattern: "Do not give criticism without solutions."
+    capabilities: [code_review, security_audit]
+    tags: [review, code_quality, security]
+    allowed_tools: [filengine.fs.read]
+    engagement:
+      max_speeches_per_round: 2
+      min_confidence: 0.5

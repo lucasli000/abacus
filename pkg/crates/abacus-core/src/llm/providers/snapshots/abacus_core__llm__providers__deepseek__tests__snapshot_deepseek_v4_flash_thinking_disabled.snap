@@ -1,0 +1,13 @@
+---
+source: crates/abacus-core/src/llm/providers/deepseek.rs
+assertion_line: 1224
+expression: snapshot_deepseek_fields(&body)
+---
+{
+  "model": "deepseek-v4-flash",
+  "reasoning_effort": null,
+  "stream": false,
+  "thinking": {
+    "type": "disabled"
+  }
+}

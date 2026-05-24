@@ -1,0 +1,15 @@
+---
+source: crates/abacus-core/src/llm/providers/gemini.rs
+assertion_line: 446
+expression: snapshot_gemini_fields(&body)
+---
+{
+  "generationConfig": {
+    "maxOutputTokens": 8192,
+    "temperature": 0.7,
+    "thinkingConfig": {
+      "includeThoughts": true,
+      "thinkingBudget": -1
+    }
+  }
+}

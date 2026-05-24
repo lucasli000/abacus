@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  abacus-server:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - ABACUS_API_KEY=${ABACUS_API_KEY}
+      - ABACUS_SERVER_TOKEN=${ABACUS_SERVER_TOKEN:-dev-token}
+      - ABACUS_SERVER_ADDR=0.0.0.0:8080
+      - ABACUS_CORS_ORIGINS=http://localhost:3000
+      - RUST_LOG=abacus_engine=info,abacus_server=info
+    volumes:
+      - abacus-data:/app/data
+      - abacus-logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  abacus-data:
+  abacus-logs:

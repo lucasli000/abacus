@@ -1,0 +1,10 @@
+---
+source: crates/abacus-core/src/llm/providers/openai_compatible.rs
+assertion_line: 937
+expression: snapshot_openai_fields(&body)
+---
+{
+  "model": "gpt-5",
+  "reasoning_effort": null,
+  "stream": false
+}

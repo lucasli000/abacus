@@ -1,0 +1,13 @@
+---
+source: crates/abacus-core/src/llm/providers/deepseek.rs
+assertion_line: 1147
+expression: snapshot_deepseek_fields(&body)
+---
+{
+  "model": "deepseek-v4-pro",
+  "reasoning_effort": "high",
+  "stream": false,
+  "thinking": {
+    "type": "enabled"
+  }
+}

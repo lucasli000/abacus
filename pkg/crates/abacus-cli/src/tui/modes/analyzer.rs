@@ -1,0 +1,97 @@
+//! 任务分析 — 根据输入自动推荐交互模式
+
+use crate::tui::state::AbacusMode;
+
+/// 根据用户输入文本推荐最适合的交互模式。
+/// 返回 None 表示保持当前模式（不建议切换）。
+pub fn suggest_mode(input: &str) -> Option<AbacusMode> {
+    let trimmed = input.trim();
+    let char_count = trimmed.chars().count();
+
+    // 短输入（<20个字符）或纯问候 → 不建议切换
+    if char_count < 20 || is_greeting(trimmed) {
+        return None;
+    }
+
+    let lower = trimmed.to_lowercase();
+
+    // Meeting 模式：需多视角评审 / 对比分析
+    let meeting_keywords = [
+        "code review", "设计评审", "方案选择", "架构评审",
+        "pros and cons", "利弊分析", "对比分析", "多方评估",
+    ];
+    if meeting_keywords.iter().any(|k| lower.contains(k)) {
+        return Some(AbacusMode::Meeting);
+    }
+
+    // Team 模式：明确多步骤/多角色任务
+    let team_keywords = [
+        "full stack", "全栈", "多模块", "pipeline", "workflow",
+        "端到端", "从零开始构建", "完整系统", "微服务",
+    ];
+    if team_keywords.iter().any(|k| lower.contains(k)) {
+        return Some(AbacusMode::Team);
+    }
+
+    // 超长代码块 → 可能多步操作
+    if char_count > 300 && trimmed.contains("```") {
+        return Some(AbacusMode::Team);
+    }
+
+    None
+}
+
+fn is_greeting(s: &str) -> bool {
+    let lower = s.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "hi" | "hello" | "hey" | "你好" | "嗨" | "您好" | "早上好" | "下午好" | "晚上好"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_greeting_no_switch() {
+        assert_eq!(suggest_mode("你好"), None);
+        assert_eq!(suggest_mode("hi"), None);
+        assert_eq!(suggest_mode("hello"), None);
+    }
+
+    #[test]
+    fn test_short_input_no_switch() {
+        assert_eq!(suggest_mode("帮我写个函数"), None);
+        assert_eq!(suggest_mode("分析一下这个问题"), None);
+    }
+
+    #[test]
+    fn test_code_review_triggers_meeting() {
+        assert_eq!(suggest_mode("帮我做 code review 检查这段代码的安全性"), Some(AbacusMode::Meeting));
+    }
+
+    #[test]
+    fn test_design_review_triggers_meeting() {
+        assert_eq!(suggest_mode("我想做一次架构评审评估，讨论整体系统设计方案的安全性"), Some(AbacusMode::Meeting));
+    }
+
+    #[test]
+    fn test_fullstack_triggers_team() {
+        assert_eq!(suggest_mode("帮我用 full stack 实现一个博客系统"), Some(AbacusMode::Team));
+    }
+
+    #[test]
+    fn test_long_code_block_triggers_team() {
+        let long = std::iter::repeat_n("fn hello() { println!(\"world\"); }\n", 100).collect::<String>();
+        let input = format!("```\n{}```\n请优化", long);
+        assert_eq!(suggest_mode(&input), Some(AbacusMode::Team));
+    }
+
+    #[test]
+    fn test_common_question_no_switch() {
+        assert_eq!(suggest_mode("Rust 里 String 和 &str 有什么区别"), None);
+        assert_eq!(suggest_mode("如何用 actix-web 做 JWT 认证"), None);
+        assert_eq!(suggest_mode("帮我改下这个函数让它支持异步"), None);
+    }
+}

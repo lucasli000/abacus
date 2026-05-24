@@ -1,0 +1,10 @@
+---
+source: crates/abacus-core/src/llm/providers/openai_compatible.rs
+assertion_line: 949
+expression: snapshot_openai_fields(&body)
+---
+{
+  "model": "o3",
+  "reasoning_effort": "high",
+  "stream": false
+}

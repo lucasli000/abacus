@@ -1,0 +1,15 @@
+---
+source: crates/abacus-core/src/llm/providers/anthropic.rs
+assertion_line: 1364
+expression: snapshot_relevant_fields(&body)
+---
+{
+  "max_tokens": 8192,
+  "model": "claude-sonnet-4-6",
+  "output_config": {
+    "effort": "high"
+  },
+  "thinking": {
+    "type": "adaptive"
+  }
+}

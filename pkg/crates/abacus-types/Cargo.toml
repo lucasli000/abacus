@@ -1,0 +1,12 @@
+[package]
+name = "abacus-types"
+version = "1.0.0"
+edition = "2021"
+description = "Abacus Agent Kernel — L0 type definitions"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+[lints]
+workspace = true

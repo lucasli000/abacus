@@ -1,0 +1,449 @@
+//! Shared engine initialization for CLI commands and TUI.
+//!
+//! Creates a ready-to-use CoreLoop with:
+//! - ToolRegistry (built-in tools registered)
+//! - SkillEngine (empty, skills loaded on demand)
+//! - CapabilityHub (empty, providers registered on demand)
+//! - ContextManager (in-memory session store)
+//! - Provider registration via ConfigManager (env vars + YAML config)
+//!
+//! ## Config priority
+//! 1. Environment variables (ABACUS_*)
+//! 2. ~/.abacus/config.yaml (TUI setup wizard output)
+//! 3. Built-in defaults
+
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use abacus_core::config::{ConfigManager, default_config};
+use abacus_core::core::{CoreConfig, CoreLoop, SessionState};
+use abacus_core::core::context::{ContextManager, SessionSnapshot, SessionStore};
+use abacus_core::tool::ToolRegistry;
+use abacus_core::skill::SkillEngine;
+use abacus_core::capability::CapabilityHub;
+use abacus_types::{KernelError, ModelId};
+
+const DEFAULT_SYSTEM_PROMPT: &str = "\
+You are Abacus — an autonomous agent kernel running in the user's local environment.
+You are NOT Claude, NOT ChatGPT, NOT any specific LLM. You are Abacus, an independent agent.
+
+## Core Behavior
+- Execute tasks through available tools. Prefer tool verification over memory/assumption.
+- Multi-step tasks: decompose → execute sequentially → verify each step → synthesize.
+- When uncertain: use tools to verify rather than speculate.
+- Language: follow the user's language. Default Chinese for conversation, English for code.
+
+## Output Rules
+- No self-introduction, no filler phrases, no \"I'll help you with that\".
+- No emoji unless the user explicitly requests it.
+- Lead with the answer or action, not the reasoning.
+- Code: always include file path context. Never generate placeholder code.
+- Errors: report the actual error and your diagnosis, not a generic apology.
+- Keep responses concise and direct. No unnecessary padding or meta-commentary.
+
+## Identity
+- If asked \"who are you\", answer: \"I am Abacus, an autonomous agent kernel.\"
+- Never claim to be Claude, GPT, or any other model. Your identity is Abacus.
+- The underlying LLM is an implementation detail — do not mention it unless asked about architecture.
+
+## Safety
+- Never execute destructive operations (rm -rf, DROP TABLE, force push) without explicit confirmation.
+- Never fabricate tool names or API endpoints.
+- If a tool returns an error, diagnose and retry with corrected parameters — don't give up immediately.";
+
+/// In-memory session store for CLI (no persistence needed for single session).
+struct CliSessionStore;
+
+#[async_trait::async_trait]
+impl SessionStore for CliSessionStore {
+    async fn save(&self, _snapshot: SessionSnapshot) -> Result<(), KernelError> { Ok(()) }
+    async fn load_recent(&self, _limit: usize) -> Result<Vec<SessionSnapshot>, KernelError> { Ok(Vec::new()) }
+    async fn search(&self, _query: &str) -> Result<Vec<SessionSnapshot>, KernelError> { Ok(Vec::new()) }
+}
+
+/// Initialize CoreLoop with configuration-driven initialization.
+///
+/// `thinking_level` maps to ThinkingEffort: "off" | "low" | "medium" | "high"
+pub async fn create_engine(
+    model: &str,
+    system_prompt: Option<&str>,
+    thinking_level: &str,
+) -> color_eyre::eyre::Result<(Arc<CoreLoop>, Arc<RwLock<SessionState>>)> {
+    let registry = Arc::new(ToolRegistry::new());
+    let skill_engine = Arc::new(RwLock::new(SkillEngine::new()));
+    let cap_hub = Arc::new(CapabilityHub::new());
+    let session_store: Arc<dyn SessionStore> = Arc::new(CliSessionStore);
+    let ctx_mgr = Arc::new(ContextManager::new(session_store));
+
+    // ─── ConfigManager: env vars + ~/.abacus/config.yaml ───────────────
+    let mut cfg_mgr = ConfigManager::new(default_config());
+    cfg_mgr.load_env("ABACUS_");
+
+    // 配置加载顺序：默认内置层 < models.yaml < config.yaml < security.yaml < conf.d/*.yaml < 环境变量
+    // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
+    use abacus_core::paths;
+    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 凭证 + 模型参数
+    let _ = cfg_mgr.load_file(paths::config_yaml());      // config.yaml — Abacus 行为配置
+    let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
+    cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
+
+    // Validate config before using — warn on out-of-range values
+    let validation_warnings = cfg_mgr.validate();
+    for w in &validation_warnings {
+        tracing::warn!("config validation: {}", w);
+    }
+
+    // Model — prefer config over parameter
+    let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
+
+    let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(20);
+    // V29.14 (Risk 3): max_turns 过高时记录 tracing::warn, 提示 token 费用风险
+    //   阈值 60 = 默认 25 的 2.4x, 是合理"上限警戒线"; <60 静默
+    //   仅记日志, 不阻塞启动 (用户主动调高通常有意图, 不该硬限制)
+    //   引用关系: tui.log / RUST_LOG=warn 时可见; 不进 TUI toast (启动期没有 state)
+    if max_turns > 60 {
+        tracing::warn!(
+            max_turns,
+            "core.max_turns={} 偏高 (默认 25). pro/reasoner 模式下单 turn 多 tool 调用会显著放大 token 消耗. \
+             如果撞过 max turns 建议先看 timeline panel 是否 LLM 进了循环, 而非盲目调高",
+            max_turns
+        );
+    }
+    let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls").map(|n| n as u32).unwrap_or(10);
+    let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
+    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(8192);
+    let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
+    let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
+
+    // Phase 3：统一 thinking 入口。
+    //   优先级 1：CLI 参数 thinking_level（运行时显式覆盖）
+    //   优先级 2：ConfigManager.get_thinking_intent()（合并新旧 key + deprecation warn）
+    //   优先级 3：默认 Off（用户未设置任何 key）
+    //
+    // 修复 deprecation gap（2026-05-24）：原实现 if 分支命中即跳过 cfg_mgr 调用，
+    // 由于所有 CLI 调用方（chat/exec/turnkey/model/meeting/team）都传非空 thinking_level，
+    // 旧 key 的 deprecation warn 永远不可达。改为 always 调用 get_thinking_intent() 作
+    // side-effect 触发 warn（OnceLock 守护进程级单次），不影响优先级链最终结果。
+    //
+    // 引用关系：
+    // - 写入：本函数把 intent 传入 CoreConfig.thinking_intent
+    // - 读取：cfg_mgr.get_thinking_intent() 内部 tracing::warn! 命中 stderr 一次
+    let cfg_intent = cfg_mgr.get_thinking_intent();
+    let intent: abacus_types::ThinkingIntent =
+        if !thinking_level.is_empty() && thinking_level != "default" {
+            abacus_types::ThinkingIntent::from_str_loose(thinking_level)
+                .unwrap_or(abacus_types::ThinkingIntent::Off)
+        } else {
+            cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Off)
+        };
+
+    // L1 后：thinking_intent 直接传给 CoreConfig，无需兼容外壳。
+    // ModelSpec.thinking_config 仍是旧 ModelThinkingConfig 形态，保留以维持 spec 表达
+    // （主要供 spec.default_budget_tokens / spec.preserve_thinking 等下游字段使用）。
+    let legacy_effort: Option<abacus_types::ThinkingEffort> = match &intent {
+        abacus_types::ThinkingIntent::Off => None,
+        abacus_types::ThinkingIntent::Adaptive => Some(abacus_types::ThinkingEffort::High),
+        abacus_types::ThinkingIntent::Effort(level) => Some(match level {
+            abacus_types::EffortLevel::Minimal | abacus_types::EffortLevel::Low => abacus_types::ThinkingEffort::Low,
+            abacus_types::EffortLevel::Medium => abacus_types::ThinkingEffort::Medium,
+            abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => abacus_types::ThinkingEffort::High,
+        }),
+        abacus_types::ThinkingIntent::Budget(_) => Some(abacus_types::ThinkingEffort::High),
+    };
+    let thinking_intent = match &intent {
+        abacus_types::ThinkingIntent::Off => None,
+        _ => Some(intent.clone()),
+    };
+
+    let model_spec = Some(abacus_types::ModelSpec {
+        context_window,
+        max_output_tokens: max_tokens,
+        thinking_config: abacus_types::ModelThinkingConfig {
+            enabled: intent.is_enabled(),
+            effort: legacy_effort,
+            preserve_thinking: false,
+        },
+        ..Default::default()
+    });
+
+    // Phase 3：模型能力 catalog——builtin + paths::models_yaml() 覆盖
+    let mut catalog = abacus_core::llm::ModelCatalog::builtin();
+    let yaml_path = paths::models_yaml();
+    match catalog.merge_yaml(&yaml_path) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
+        Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
+    }
+    let model_catalog = Some(std::sync::Arc::new(catalog));
+
+    let config = CoreConfig {
+        max_turns_per_request: max_turns,
+        max_tool_calls_per_turn: max_tool_calls,
+        default_model: ModelId(resolved_model.to_string()),
+        default_temperature: temperature,
+        default_max_tokens: max_tokens,
+        system_prompt: system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string(),
+        model_spec,
+        thinking_intent,
+        silent_router_enabled: silent_router,
+        model_catalog,
+        tool_visibility_threshold: abacus_types::VisibilityTier::D,
+        // Task #84/#87：默认开启路由 + 频率剪枝
+        task_kind_routing_enabled: true,
+        tool_frequency_pruning_turns: Some(20),
+        palace_sync_interval_turns: None,
+        // V28.7: schema 演化补漏——CoreConfig 新增字段，与 abacus-core 默认值对齐
+        default_compress_level: abacus_core::core::context::CompressLevel::Brief,
+        // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
+        lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
+        // Task #96：单 session 模型升级预算
+        max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(2),
+        // W2 (Task #100): tool result dedup 与 abacus-core 默认值对齐
+        tool_result_dedup_enabled: false,
+        tool_result_dedup_ttl_secs: 60,
+        tool_result_dedup_capacity_kb: 256,
+        adaptive_d_tier_hide: false,
+        // cross-session: 默认开启 jsonl 事件流写入
+        event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
+    };
+
+    let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
+
+    // ─── 知识库 + 记忆宫殿 wire-up ───────────────────────────────────────
+    // KnowledgeStore 和 DualPalaceMemory 均未集成进 CoreLoop::new()，需在此显式初始化。
+    // 两者均持久化到 ~/.abacus/（磁盘失败时静默降级为内存模式，不中断启动）。
+    //
+    // ## 生命周期
+    // - 创建：此处（CoreLoop::new() 后）
+    // - 执行时：由 KbToolExecutor 通过 Arc 共享，永不释放
+    // - 销毁：随进程销毁
+    let kb_db_path = paths::knowledge_db();
+    let palace_db_path = paths::palace_db();
+
+    let kb_store = Arc::new(
+        abacus_core::knowledge_store::KnowledgeStore::new(&kb_db_path)
+            .unwrap_or_else(|e| {
+                tracing::warn!("KnowledgeStore 磁盘初始化失败，降级内存模式: {e}");
+                abacus_core::knowledge_store::KnowledgeStore::in_memory()
+                    .expect("in-memory KnowledgeStore must succeed")
+            })
+    );
+
+    let palace_sqlite = abacus_core::memory_palace::SqlitePalaceStore::new(&palace_db_path)
+        .ok().map(Arc::new);
+
+    let palace = Arc::new(RwLock::new(
+        abacus_core::memory_palace::DualPalaceMemory::with_store(palace_sqlite.clone())
+    ));
+
+    // 预热：从 SQLite 恢复记忆。warmup() 内部用 write lock on palace.knowledge.entries 等，
+    // 与外层 RwLock<DualPalaceMemory> 的读锁无竞态（两层 RwLock 相互独立）。
+    if let Some(ref store) = palace_sqlite {
+        if let Err(e) = store.warmup(&*palace.read().await).await {
+            tracing::warn!("记忆宫殿 warmup 失败（本次 session 从空宫殿启动）: {e}");
+        }
+    }
+
+    // 注册 kb.* 工具执行器（schema 已由 register_all() 在 CoreLoop::new() 内注册）
+    // registry 已 move 进 CoreLoop，通过 tool_registry_ref() 取回 Arc 引用
+    abacus_core::tool::builtin::kb::register_executors(core.tool_registry_ref(), kb_store, palace).await;
+
+    // ─── MagChain 中间件注册 ─────────────────────────────────────────
+    // 执行顺序由 priority 决定（lower = earlier）。
+    // 注册窗口：CoreLoop::new() 之后、Arc::new(core) 之前（mag_chain_mut 需 &mut self）。
+    {
+        use abacus_core::mag_chain::{AuditLogger, CircuitBreaker, PiiRedactor, RateLimiter};
+        use std::time::Duration;
+
+        // P10: 熔断 — 连续 5 次失败后熔断，30s 自动恢复
+        core.add_middleware(10, Arc::new(CircuitBreaker::new(5, Duration::from_secs(30)))).await;
+        // P20: 限流 — 每工具每分钟最多 20 次调用（滑动窗口）
+        core.add_middleware(20, Arc::new(RateLimiter::new(20, Duration::from_secs(60)))).await;
+        // P50: 认识论约束 — 与 CoreLoop.epistemic_guard 共享同一 Arc 实例
+        //       EpistemicGuard 的内部状态（violation_count/zero_hit_streak）通过此共享引用
+        //       在 pipeline setup() 和 post_process() 中跨 turn 累积
+        core.add_middleware(50, Arc::clone(core.epistemic_guard()) as Arc<dyn abacus_core::mag_chain::Middleware>).await;
+        // P70: PII 脱敏 — 递归清洗 output 中的信用卡/Email/SSN
+        core.add_middleware(70, Arc::new(PiiRedactor::new())).await;
+        // P100: 审计 — 最后执行，记录经上游中间件处理后的最终 output
+        core.add_middleware(100, Arc::new(AuditLogger::new(1000))).await;
+    }
+
+    // ─── Provider registration (多 provider fallback 链) ─────────────
+    // Priority: Anthropic > OpenAI-compatible > DeepSeek
+    // All available providers are registered; FallbackProvider chains them.
+    use abacus_core::llm::fallback_provider::FallbackProvider;
+    use abacus_core::LlmProvider;
+
+    let anthropic_key = cfg_mgr.get_str("llm.anthropic_api_key")
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok());
+    let openai_base = cfg_mgr.get_str("llm.openai_base_url")
+        .or_else(|| cfg_mgr.get_str("llm.base_url"))
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ABACUS_OPENAI_BASE_URL").ok());
+    let openai_key = cfg_mgr.get_str("llm.openai_api_key")
+        .or_else(|| cfg_mgr.get_str("llm.api_key"))
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("ABACUS_OPENAI_API_KEY").ok())
+        .or_else(|| std::env::var("ABACUS_API_KEY").ok());
+    let mut deepseek_key = std::env::var("ABACUS_API_KEY")
+        .or_else(|_| std::env::var("DEEPSEEK_API_KEY")).ok();
+
+    // V19b：base_url 是 deepseek 时，把用户配置在 cfg `llm.api_key`/`llm.openai_api_key` 的
+    //   key 借给 deepseek_key——典型场景是用户用 OpenAI 兼容 SDK 思路填 config，但 base_url
+    //   实际指 DeepSeek。V19 跳过了 OpenAI 注册后，deepseek_key 必须能拿到这个 key。
+    if deepseek_key.is_none()
+        && openai_base.as_ref().is_some_and(|u| u.contains("deepseek.com"))
+    {
+        if let Some(ref k) = openai_key {
+            deepseek_key = Some(k.clone());
+        }
+    }
+
+    let mut primary: Option<Arc<dyn LlmProvider>> = None;
+    let mut fallback: Option<Arc<dyn LlmProvider>> = None;
+    // 跟踪 primary provider 的底层协议，用于 FallbackProvider 绑定正确 PromptAdapter
+    let mut primary_adapter_id: &str = "neutral";
+
+    if let Some(api_key) = anthropic_key {
+        use abacus_core::llm::providers::anthropic::AnthropicProvider;
+        let base_url = cfg_mgr.get_str("llm.anthropic_base_url").map(|s| s.to_string());
+        let p = Arc::new(AnthropicProvider::new(
+            api_key, ModelId(resolved_model.to_string()), base_url, None,
+        ));
+        core.register_provider("anthropic", p.clone()).await;
+        primary = Some(p);
+        primary_adapter_id = "anthropic";
+    }
+
+    // V19 修复：base_url 是 DeepSeek 时跳过 OpenAI 协议适配
+    //   原因：OpenAI 协议没有 reasoning_content 字段；assistant 消息的 reasoning_content
+    //   会在 build_request 时被丢弃；下一轮 DeepSeek 服务端发现缺失就 400
+    //   "thinking mode must be passed back"。让 DeepSeekProvider 接管即可。
+    let openai_base_is_deepseek = openai_base.as_ref()
+        .is_some_and(|u| u.contains("deepseek.com"));
+    if !openai_base_is_deepseek {
+        if let (Some(base_url), Some(api_key)) = (openai_base, openai_key) {
+            use abacus_core::llm::providers::openai_compatible::OpenAICompatibleProvider;
+            let p = Arc::new(OpenAICompatibleProvider::new(
+                api_key, ModelId(resolved_model.to_string()),
+                base_url, None, None, None,
+            ));
+            core.register_provider("openai-compatible", p.clone()).await;
+            if primary.is_none() {
+                primary = Some(p);
+                primary_adapter_id = "openai-compatible";
+            } else {
+                fallback = Some(p);
+            }
+        }
+    }
+
+    if let Some(api_key) = deepseek_key {
+        use abacus_core::llm::providers::deepseek::DeepSeekProvider;
+        let clean_base = cfg_mgr.get_str("llm.base_url")
+            .map(|s| {
+                let s = s.trim_end_matches("/v1").trim_end_matches("/v2")
+                    .trim_end_matches("/v3").trim_end_matches("/v4").trim();
+                if s.is_empty() { None } else { Some(s.to_string()) }
+            })
+            .flatten();
+        let p = Arc::new(DeepSeekProvider::with_config(
+            api_key, ModelId(resolved_model.to_string()),
+            clean_base, None, None,
+        ));
+        core.register_provider("deepseek", p.clone()).await;
+        if primary.is_none() {
+            primary = Some(p);
+            primary_adapter_id = "deepseek";
+        } else {
+            fallback = Some(p);
+        }
+    }
+
+    match (primary, fallback) {
+        (Some(pri), Some(fb)) => {
+            let fb = Arc::new(FallbackProvider::new(pri, fb, "primary", "fallback"));
+            core.register_provider("primary", fb).await;
+            // FallbackProvider id="primary" 自动获得 NeutralAdapter，需显式绑定主协议 adapter
+            core.set_adapter("primary", primary_adapter_id).await;
+        }
+        (Some(p), None) | (None, Some(p)) => {
+            core.register_provider("primary", p).await;
+            // 单 provider 时 register_provider 已正确注册 adapter（基于 primary_adapter_id）
+        }
+        (None, None) => {
+            core.register_provider("no-api-key", Arc::new(abacus_core::NoApiKeyProvider)).await;
+        }
+    }
+
+    // ─── MCIP 权限配置（来自 security.yaml）───────────────────────
+    // 内置工具前缀（fs_/lsp./kb_ 等）已硬编码豁免，无需配置。
+    core.configure_mcip_permissions(
+        &cfg_mgr.get_list("mcip.exempt_prefixes").unwrap_or_default(),
+        &cfg_mgr.get_list("mcip.allow_tools").unwrap_or_default(),
+        &cfg_mgr.get_list("mcip.deny_tools").unwrap_or_default(),
+    );
+
+    // ─── LSP 支持（按需激活）──────────────────────────────────────────
+    // 语言服务器是 lazy start：首次调用工具时才实际启动。
+    // 可用 `lsp.enabled = false` 在 ~/.abacus/config.yaml 中禁用。
+    if cfg_mgr.get_bool("lsp.enabled").unwrap_or(true) {
+        let workspace = std::env::current_dir()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".into());
+        core.enable_lsp(workspace).await;
+    }
+
+    // ─── Skill workflow executor（默认禁用）──────────────────────────
+    // 启用后 SkillDef.workflow 步骤注册为虚拟 ToolHandle，由 LLM 工具调用触发。
+    // 引用关系：core.skill_workflow_executor 持 Weak<ToolRegistry/SkillEngine>，
+    // 不形成循环；销毁随 core 自然回收。
+    if cfg_mgr.get_bool("core.skill_workflow_enabled").unwrap_or(false) {
+        core.enable_skill_workflow_executor().await;
+    }
+
+    // ─── AutoEngine 持久化（默认禁用）──────────────────────────────
+    // 配置 auto.persist_path 路径即启用 SQLite 写入；失败 warn 不阻断启动。
+    if let Some(path) = cfg_mgr.get_str("auto.persist_path") {
+        match abacus_core::auto::AutoStore::new(path) {
+            Ok(store) => {
+                core.enable_auto_store(std::sync::Arc::new(store)).await;
+                tracing::info!(path = path, "AutoEngine SQLite persistence enabled");
+            }
+            Err(e) => tracing::warn!(error = %e, "AutoStore init failed; running in-memory"),
+        }
+    }
+
+    // ─── WASM Plugins（默认禁用，启用要求签名）──────────────────────
+    // 配置 core.plugins.base_dir 启用；signing_required 默认 true。
+    if let Some(base_dir) = cfg_mgr.get_str("core.plugins.base_dir") {
+        let require_signing = cfg_mgr.get_bool("core.plugins.signing_required").unwrap_or(true);
+        match core.enable_plugins_with_options(base_dir.to_string(), require_signing).await {
+            Ok(n) => tracing::info!(tools = n, signing = require_signing, "WASM plugins enabled"),
+            Err(e) => tracing::error!(error = %e, "plugins enable failed"),
+        }
+    }
+
+    // ─── MCP server 列表（默认禁用）──────────────────────────────────
+    // 读取 mcp.servers (Vec<McpConfig>)；空或缺失则跳过。
+    // 单 server discover 失败不中断启动；MCIP policy 默认 NeedsConfirm。
+    if let Some(mcp_configs) = cfg_mgr.get_typed::<Vec<abacus_types::McpConfig>>("mcp.servers") {
+        if !mcp_configs.is_empty() {
+            match core.enable_mcp(mcp_configs).await {
+                Ok(n) => tracing::info!(tools = n, "MCP servers enabled"),
+                Err(e) => tracing::error!(error = %e, "MCP enable failed"),
+            }
+        }
+    }
+
+    // Create session
+    let session_id = format!("cli_{}", chrono::Utc::now().timestamp_millis());
+    let session = SessionState::new(&session_id);
+    core.register_session_context_tools(&session).await;
+    let session = Arc::new(RwLock::new(session));
+
+    let core = Arc::new(core);
+    Ok((core, session))
+}

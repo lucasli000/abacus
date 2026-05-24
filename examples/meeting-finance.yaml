@@ -1,0 +1,32 @@
+# 投资策略会议配置
+meeting:
+  max_participants: 8
+  max_concurrent_llm: 4
+  max_duration_minutes: 60
+specialists:
+  - id: analyst
+    domain: financial_analysis
+    name: "Analyst"
+    role: Advisor
+    model: deepseek-v4-flash
+    guide_strategy: "You are a financial analyst. Analyze market trends, financial statements, and economic indicators. Provide data-driven investment recommendations."
+    anti_pattern: "Do not make price predictions without data support. Do not ignore risk factors."
+    capabilities: [financial_analysis, market_research, valuation]
+    tags: [finance, analysis, market]
+    allowed_tools: []
+    engagement:
+      max_speeches_per_round: 3
+      min_confidence: 0.4
+  - id: trader
+    domain: trading_strategy
+    name: "Trader"
+    role: Member
+    model: deepseek-v4-flash
+    guide_strategy: "You are a trading strategy expert. Design entry/exit strategies, position sizing, and risk management plans."
+    anti_pattern: "Do not recommend all-in positions. Do not ignore position sizing."
+    capabilities: [trading_strategy, risk_management]
+    tags: [trading, strategy, risk]
+    allowed_tools: []
+    engagement:
+      max_speeches_per_round: 4
+      max_thinking_tokens: 8192

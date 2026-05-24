@@ -1,0 +1,20 @@
+[package]
+name = "abacus-orchestrator"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+abacus-types = { path = "../abacus-types" }
+abacus-core = { path = "../abacus-core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

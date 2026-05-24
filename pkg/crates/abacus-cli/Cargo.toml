@@ -1,0 +1,58 @@
+[package]
+name = "abacus-cli"
+version = "1.0.0"
+edition = "2021"
+authors = ["Abacus Team"]
+description = "CLI interface for Abacus LLM Agent kernel"
+repository = "https://github.com/lucasli000/abacus"
+homepage = "https://github.com/lucasli000/abacus"
+license = "MIT"
+keywords = ["llm", "agent", "cli", "abacus"]
+categories = ["command-line-interface", "artificial-intelligence"]
+
+[[bin]]
+name = "abacus"
+path = "src/main.rs"
+
+
+[dependencies]
+abacus-core = { path = "../abacus-core", version = "1.0.0" }
+abacus-types = { path = "../abacus-types", version = "1.0.0" }
+abacus-orchestrator = { path = "../abacus-orchestrator", version = "1.0.0" }
+
+clap = { version = "4.5", features = ["derive", "cargo"] }
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+color-eyre = "0.6"
+owo-colors = "3.5"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+rustyline = { version = "13.0", features = ["with-file-history"] }
+ratatui = "0.28"
+crossterm = "0.28"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { workspace = true }
+async-trait = "0.1"
+serde_yaml = "0.9"
+unicode-width = "0.1"
+pulldown-cmark = "0.10"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+once_cell = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+clap_complete = "4.6.5"
+shlex = "1.3"
+glob = "0.3"
+# V30 复制修复：平台原生剪贴板（macOS NSPasteboard / Linux X11/Wayland / Windows clipboard）
+# 引用关系：tui/clipboard.rs::set_text 优先走 arboard，失败时 fallback OSC 52
+# 生命周期：process 内全局可调用；Arc 包装不必要 (arboard 自身句柄保护)
+clipboard = { package = "arboard", version = "3", default-features = false }
+# V29.11: LCS line-diff 用于 fs_edit trace 渲染 — 标记 unchanged/insert/delete 上下文
+similar = "2.7"
+
+[lints]
+workspace = true

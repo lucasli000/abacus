@@ -1,0 +1,84 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/abacus-types",
+    "crates/abacus-core",
+    "crates/abacus-orchestrator",
+    "crates/abacus-cli",
+    "crates/abacus-server",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Abacus — LLM Agent kernel with CLI, TUI, and HTTP interfaces"
+repository = "https://github.com/lucasli000/abacus"
+readme = "README.md"
+homepage = "https://github.com/lucasli000/abacus"
+rust-version = "1.75"
+
+# Path 2a：workspace-wide clippy 策略。
+# 这里"allow"的 lints 都是经过审查的设计决策，不是欠债——具体理由见每条注释。
+# 实际代码 bug 类的 lints 都已逐处修复，未豁免。
+[workspace.lints.clippy]
+# Pipeline 初始化、prompt 装配等核心 API 已沉淀超过 7 参数；
+# 重构成 builder 会让调用点反而冗长，且引入 builder 误用风险。
+too_many_arguments = "allow"
+# 部分跨模块抽象（injector / prompt_assembly / mod.rs:640）类型签名复杂，
+# 提取 type alias 会打散 self-documenting 形态。
+type_complexity = "allow"
+# `from_str` 在多处作为关联函数提供 lossy parsing 入口，与 FromStr trait
+# 的语义（必须 Err 类型）有差异。保留为关联函数。
+should_implement_trait = "allow"
+# V33-续：rustdoc list 格式 lint 在中文 doc + 续行对齐场景下有大量假阳性
+# （32+ 处分散在 10 个文件，逐处修反而破坏现有可读对齐）。
+# 这两条只影响 rustdoc 渲染细节，不影响代码功能；属于设计决定。
+doc_overindented_list_items = "allow"
+doc_lazy_continuation = "allow"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+regex = "1"
+rhai = { version = "1", features = ["serde", "sync"] }
+tonic = { version = "0.12", features = ["transport", "prost", "codegen"] }
+prost = "0.13"
+rustls = "0.23"
+hmac = "0.12"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+serde_yaml = "0.9"
+toml = "0.8"
+wasmtime = "24"
+zeroize = { version = "1", features = ["derive"] }
+lru = "0.12"
+indexmap = "2"
+
+# ─── 稳定性补强 (Phase Stability-1) ───────────────────────────────────────
+# parking_lot：消除 std::sync poison panic，read/write 不返 Result。
+#   未来批量替换 std::sync::{Mutex, RwLock}（影响 104 处，分批迁移）
+parking_lot = "0.12"
+# governor：lock-free GCRA 限流（O(1) 决策）替换 mag_chain::RateLimiter 朴素 Vec<Instant> 滑窗（O(n) 扫描）
+governor = "0.7"
+# backon：exponential backoff + jitter，给 LLM provider / MCP 重连加重试装饰器
+backon = "1.2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+debug = 0
+panic = "abort"
+
+[profile.release.package."*"]
+debug = 0
