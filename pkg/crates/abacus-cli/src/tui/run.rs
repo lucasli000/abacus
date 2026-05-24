@@ -1034,22 +1034,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
-                // 打字机流式输出：每帧前进 ~20 字符 (20 chars × 20 FPS ≈ 400 chars/s ≈ 100 tok/s)
-                if state.stream_cursor > 0 || matches!(state.input_state, InputState::Outputting) {
-                    // 计算最后一条消息的总文本长度
-                    let last_text_len: usize = state.messages.last()
-                        .map(|m| m.parts.iter()
-                            .filter_map(|p| match p { crate::tui::state::MsgContent::Stream(s) => Some(s.len()), _ => None })
-                            .sum())
-                        .unwrap_or(0);
-                    if state.stream_cursor < last_text_len {
-                        state.stream_cursor += 20;
-                        state.rendered_lines_dirty.set(true);
-                        if state.stream_cursor >= last_text_len {
-                            state.stream_cursor = 0; // 完成，恢复正常渲染
-                            state.rendered_lines_dirty.set(true);
-                        }
-                    }
+                // V37: 去掉打字机节流——与 Claude Code 一致，API token 到达即渲染
+                // stream_cursor 机制保留但不再主动驱动（仅由 streaming chunk 自然触发 dirty）
+                // 如需恢复打字机效果，还原此处为 stream_cursor += N 逻辑
+                if state.stream_cursor > 0 {
+                    state.stream_cursor = 0;
+                    state.rendered_lines_dirty.set(true);
                 }
 
                 // info panel 自动打开（/help /status 等触发）
