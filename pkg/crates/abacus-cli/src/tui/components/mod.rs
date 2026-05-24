@@ -1767,7 +1767,8 @@ pub fn render_messages_in_card(
             }
         }
 
-        // ── Phase 2: Tools（仅 show_streaming_trace=true 时展示完整内容）──
+        // ── Phase 2: Tools（仅 show_streaming_trace=true 时展示）──
+        // V38: 文件编辑工具展示 inline diff（红绿色），其他工具展示截断预览
         if state.show_streaming_trace && !state.streaming_tools.is_empty() {
             use crate::tui::state::StreamingToolStatus;
             for (name, status, duration_ms, trace_id) in state.streaming_tools.iter().rev().take(10) {
@@ -1777,32 +1778,89 @@ pub fn render_messages_in_card(
                     StreamingToolStatus::Failed => ("✗", state.theme.error),
                 };
                 let dur = duration_ms.map(|ms| format!(" {}ms", ms)).unwrap_or_default();
+                // 工具标题行
                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
                     Span::raw("   "),
                     Span::styled(format!("⚙ {}{} {}", name, dur, icon), Style::default().fg(color)),
                 ]));
                 stream_offset += 1;
-                // 参数和输出
+
                 if let Some(ev) = state.trace_events.iter().find(|e| e.id == *trace_id) {
                     if let crate::tui::state::TraceKind::ToolCall { args, output, .. } = &ev.kind {
-                        if !args.is_empty() {
-                            let args_preview: String = args.chars().take(content_w).collect();
-                            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                bar.clone(),
-                                Span::raw("   "),
-                                Span::styled(args_preview, state.theme.text_style(TextRole::Caption)),
-                            ]));
-                            stream_offset += 1;
+                        let name_lower = name.to_lowercase();
+
+                        // ── 文件编辑工具：inline diff ──
+                        if (name_lower.contains("edit") || name_lower.contains("write")) && !args.is_empty() {
+                            if let Some(diff_lines) = try_render_edit_diff(name, args, &state.theme, 12) {
+                                for dl in diff_lines {
+                                    lines.insert(stream_insert_base + stream_offset, dl);
+                                    stream_offset += 1;
+                                }
+                            } else if !args.is_empty() {
+                                // diff 解析失败时 fallback 到单行预览
+                                let preview: String = args.chars().take(content_w).collect();
+                                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                    bar.clone(), Span::raw("   "),
+                                    Span::styled(preview, state.theme.text_style(TextRole::Caption)),
+                                ]));
+                                stream_offset += 1;
+                            }
                         }
-                        if let Some(out) = output {
-                            let out_preview: String = out.chars().take(content_w).collect();
-                            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                bar.clone(),
-                                Span::raw("   "),
-                                Span::styled(out_preview, Style::default().fg(state.theme.success)),
-                            ]));
-                            stream_offset += 1;
+                        // ── 文件读取工具：输出前 8 行 + 行号 ──
+                        else if name_lower.contains("read") {
+                            if let Some(out) = output {
+                                let file_lines: Vec<&str> = out.lines().take(8).collect();
+                                let total_lines = out.lines().count();
+                                let num_width = format!("{}", file_lines.len()).len();
+                                for (i, fl) in file_lines.iter().enumerate() {
+                                    let line_num = format!("{:>width$} ", i + 1, width = num_width);
+                                    let content_text: String = fl.chars().take(content_w.saturating_sub(num_width + 1)).collect();
+                                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                        bar.clone(),
+                                        Span::raw("   "),
+                                        Span::styled(line_num, Style::default().fg(state.theme.muted)),
+                                        Span::styled(content_text, Style::default().fg(state.theme.text)),
+                                    ]));
+                                    stream_offset += 1;
+                                }
+                                if total_lines > 8 {
+                                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                        bar.clone(), Span::raw("   "),
+                                        Span::styled(format!("↳ +{} 行", total_lines - 8), state.theme.text_style(TextRole::Caption)),
+                                    ]));
+                                    stream_offset += 1;
+                                }
+                            }
+                        }
+                        // ── Bash/其他工具：输出前 5 行截断 ──
+                        else {
+                            if let Some(out) = output {
+                                let out_lines: Vec<&str> = out.lines().take(5).collect();
+                                let total_lines = out.lines().count();
+                                for ol in &out_lines {
+                                    let truncated: String = ol.chars().take(content_w).collect();
+                                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                        bar.clone(), Span::raw("   "),
+                                        Span::styled(truncated, Style::default().fg(state.theme.muted)),
+                                    ]));
+                                    stream_offset += 1;
+                                }
+                                if total_lines > 5 {
+                                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                        bar.clone(), Span::raw("   "),
+                                        Span::styled(format!("↳ +{} 行输出", total_lines - 5), state.theme.text_style(TextRole::Caption)),
+                                    ]));
+                                    stream_offset += 1;
+                                }
+                            } else if !args.is_empty() {
+                                let preview: String = args.chars().take(content_w).collect();
+                                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                    bar.clone(), Span::raw("   "),
+                                    Span::styled(preview, state.theme.text_style(TextRole::Caption)),
+                                ]));
+                                stream_offset += 1;
+                            }
                         }
                     }
                 }
