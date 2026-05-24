@@ -1724,92 +1724,99 @@ pub fn render_messages_in_card(
             lines.push(Line::from(vec![bar.clone(), Span::raw("   ")]));
         }
 
-        // V37: Thinking + Tools 流式展示（Claude Code 风格）
-        // - 默认隐藏（show_streaming_trace=false）：不占任何行
-        // - Ctrl+O 开启后：thinking 展示最新 20 行，tools 完整展示名称+参数+输出
-        if state.show_streaming_trace && (!state.streaming_thinking.is_empty() || !state.streaming_tools.is_empty()) {
-            let insert_pos = lines.len().saturating_sub(1);
-            let content_w = inner.width.saturating_sub(7) as usize;
+        // V38: Streaming trace + text 顺序渲染（修复同时弹出问题）
+        // 渲染顺序严格遵循生成时序：① thinking → ② tools → ③ 分隔线 → ④ response text
+        // 使用统一的累积 insert_offset 确保顺序正确，不再各自独立计算 insert_pos
+        let stream_insert_base = lines.len().saturating_sub(1);
+        let mut stream_offset: usize = 0;
+        let content_w = inner.width.saturating_sub(5) as usize;
+
+        // ── Phase 1: Thinking（仅 show_streaming_trace=true 时展示）──
+        if state.show_streaming_trace && !state.streaming_thinking.is_empty() {
             let think_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
+            let think_all_lines: Vec<&str> = state.streaming_thinking.lines().collect();
+            let total = think_all_lines.len();
+            let max_show = 20;
+            let start = total.saturating_sub(max_show);
+            let visible = &think_all_lines[start..];
 
-            // ── Thinking: 展示最新 20 行 ──
-            if !state.streaming_thinking.is_empty() {
-                let think_all_lines: Vec<&str> = state.streaming_thinking.lines().collect();
-                let total = think_all_lines.len();
-                let max_show = 20;
-                let start = total.saturating_sub(max_show);
-                let visible = &think_all_lines[start..];
+            // Header
+            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                bar.clone(),
+                Span::raw("   "),
+                Span::styled(format!("💭 Thinking · {}行", total), state.theme.text_style(TextRole::Caption)),
+            ]));
+            stream_offset += 1;
 
-                lines.insert(insert_pos, Line::from(vec![
+            for tline in visible {
+                let truncated: String = tline.chars().take(content_w).collect();
+                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
                     Span::raw("   "),
-                    Span::styled(
-                        format!("💭 Thinking · {}行", total),
-                        state.theme.text_style(TextRole::Caption),
-                    ),
+                    Span::styled(if truncated.is_empty() { " ".to_string() } else { truncated }, think_style),
                 ]));
-                let mut row_offset = 1;
-                for tline in visible {
-                    let truncated: String = tline.chars().take(content_w).collect();
-                    lines.insert(insert_pos + row_offset, Line::from(vec![
-                        bar.clone(),
-                        Span::raw("   "),
-                        Span::styled(
-                            if truncated.is_empty() { " ".to_string() } else { truncated },
-                            think_style,
-                        ),
-                    ]));
-                    row_offset += 1;
-                }
-                if total > max_show {
-                    lines.insert(insert_pos + row_offset, Line::from(vec![
-                        bar.clone(),
-                        Span::raw("   "),
-                        Span::styled(format!("↳ +{} 行", total - max_show), state.theme.text_style(TextRole::Caption)),
-                    ]));
-                }
+                stream_offset += 1;
             }
+            if total > max_show {
+                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                    bar.clone(),
+                    Span::raw("   "),
+                    Span::styled(format!("↳ +{} 行", total - max_show), state.theme.text_style(TextRole::Caption)),
+                ]));
+                stream_offset += 1;
+            }
+        }
 
-            // ── Tools: 完整展示每个工具的名称、参数、输出 ──
-            if !state.streaming_tools.is_empty() {
-                use crate::tui::state::StreamingToolStatus;
-                let insert_pos = lines.len().saturating_sub(1);
-                for (name, status, duration_ms, trace_id) in state.streaming_tools.iter().rev().take(10) {
-                    let (icon, color) = match status {
-                        StreamingToolStatus::Running => ("⟳", state.theme.gold),
-                        StreamingToolStatus::Success => ("✓", state.theme.success),
-                        StreamingToolStatus::Failed => ("✗", state.theme.error),
-                    };
-                    let dur = duration_ms.map(|ms| format!(" {}ms", ms)).unwrap_or_default();
-                    // 工具标题行
-                    lines.insert(insert_pos, Line::from(vec![
-                        bar.clone(),
-                        Span::raw("   "),
-                        Span::styled(format!("⚙ {}{} {}", name, dur, icon), Style::default().fg(color)),
-                    ]));
-                    // 参数和输出（从 trace_events 中查找）
-                    if let Some(ev) = state.trace_events.iter().find(|e| e.id == *trace_id) {
-                        if let crate::tui::state::TraceKind::ToolCall { args, output, .. } = &ev.kind {
-                            if !args.is_empty() {
-                                let args_preview: String = args.chars().take(content_w).collect();
-                                lines.insert(insert_pos + 1, Line::from(vec![
-                                    bar.clone(),
-                                    Span::raw("     "),
-                                    Span::styled(args_preview, state.theme.text_style(TextRole::Caption)),
-                                ]));
-                            }
-                            if let Some(out) = output {
-                                let out_preview: String = out.chars().take(content_w).collect();
-                                lines.insert(insert_pos + 2, Line::from(vec![
-                                    bar.clone(),
-                                    Span::raw("     "),
-                                    Span::styled(out_preview, Style::default().fg(state.theme.success)),
-                                ]));
-                            }
+        // ── Phase 2: Tools（仅 show_streaming_trace=true 时展示完整内容）──
+        if state.show_streaming_trace && !state.streaming_tools.is_empty() {
+            use crate::tui::state::StreamingToolStatus;
+            for (name, status, duration_ms, trace_id) in state.streaming_tools.iter().rev().take(10) {
+                let (icon, color) = match status {
+                    StreamingToolStatus::Running => ("⟳", state.theme.gold),
+                    StreamingToolStatus::Success => ("✓", state.theme.success),
+                    StreamingToolStatus::Failed => ("✗", state.theme.error),
+                };
+                let dur = duration_ms.map(|ms| format!(" {}ms", ms)).unwrap_or_default();
+                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                    bar.clone(),
+                    Span::raw("   "),
+                    Span::styled(format!("⚙ {}{} {}", name, dur, icon), Style::default().fg(color)),
+                ]));
+                stream_offset += 1;
+                // 参数和输出
+                if let Some(ev) = state.trace_events.iter().find(|e| e.id == *trace_id) {
+                    if let crate::tui::state::TraceKind::ToolCall { args, output, .. } = &ev.kind {
+                        if !args.is_empty() {
+                            let args_preview: String = args.chars().take(content_w).collect();
+                            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                bar.clone(),
+                                Span::raw("   "),
+                                Span::styled(args_preview, state.theme.text_style(TextRole::Caption)),
+                            ]));
+                            stream_offset += 1;
+                        }
+                        if let Some(out) = output {
+                            let out_preview: String = out.chars().take(content_w).collect();
+                            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                                bar.clone(),
+                                Span::raw("   "),
+                                Span::styled(out_preview, Style::default().fg(state.theme.success)),
+                            ]));
+                            stream_offset += 1;
                         }
                     }
                 }
             }
+        }
+
+        // ── Phase 3: 分隔线（trace 有内容且 text 也有内容时插入）──
+        if stream_offset > 0 && !state.streaming_text.is_empty() {
+            lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                bar.clone(),
+                Span::raw("   "),
+                Span::styled("╌╌╌╌╌╌╌╌", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+            ]));
+            stream_offset += 1;
         }
 
         // [V36 折叠] 以下 thinking/tools 详细渲染仅在 show_stream_details=true 时启用
@@ -1985,31 +1992,28 @@ pub fn render_messages_in_card(
         // 100KB 流式文本解析 < 1ms（每帧 50ms 预算的 2%），完全可承受。
         // 增量缓存（streaming_parsed_lines/len）字段保留为 reset_streaming 兼容，
         // 但本路径不再使用——下一次重构可清理。
+        // ── Phase 4: Response text（统一使用 stream_offset 保持顺序）──
         if !state.streaming_text.is_empty() {
-            // V14 修复：原 -2 把内容插到 Abacus header 之前，导致 thinking/tools 视觉上挂在 user 下
-            //          改为 -1：插在闪烁光标(末尾)之前、🤖 Abacus header(倒2)之后
-            let insert_pos = lines.len().saturating_sub(1);
-            let content_w = inner.width.saturating_sub(5) as usize;
-
-            // 整段重解析（pulldown-cmark 全局上下文敏感，无法跨调用持久化 state）
-            // V27: 同 build_message_lines, 把 content_w 传入 markdown 让表格按预算缩列
+            // 统一缩进：所有内容（文本/代码/表格）使用 bar + "   "（3空格）
+            // 代码块继续行额外 1 空格对齐（视觉上与 fence 标记缩进一致）
             let styled_lines = markdown::render_markdown_bounded(&state.streaming_text, &state.theme, false, content_w);
-            let mut rendered: Vec<Line> = Vec::with_capacity(styled_lines.len());
             for styled in &styled_lines {
                 let rline = markdown::styled_line_to_ratatui(styled, &bar, &state.theme);
-                // V27: 表格行豁免 word-wrap (box-drawing 字符不可拆)
+                // 表格行豁免 word-wrap (box-drawing 字符不可拆)
                 if styled.line_type == LineType::Table {
-                    rendered.push(rline);
+                    lines.insert(stream_insert_base + stream_offset, rline);
+                    stream_offset += 1;
                     continue;
                 }
                 let line_w: usize = rline.spans.iter()
                     .map(|s| crate::tui::util::display_width(s.content.as_ref()))
                     .sum();
                 if line_w <= content_w + 4 {
-                    rendered.push(rline);
+                    lines.insert(stream_insert_base + stream_offset, rline);
+                    stream_offset += 1;
                 } else {
-                    // 超宽行 word-wrap（沿用既有逻辑）
-                    let indent_str = match styled.line_type { LineType::Code => "    ", _ => "   " };
+                    // 超宽行 word-wrap — 统一缩进 "   "（3空格，与所有内容对齐）
+                    let indent_str = "   ";
                     let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                     let text_style = styled.spans.first().map(|s| s.style)
                         .unwrap_or(Style::default().fg(state.theme.text));
@@ -2030,17 +2034,14 @@ pub fn render_messages_in_card(
                         }
                         if take < remaining.len() && last_b > 0 && last_b > take / 2 { take = last_b; }
                         if take == 0 { take = remaining.chars().next().map(|c| c.len_utf8()).unwrap_or(remaining.len()); }
-                        rendered.push(Line::from(vec![
+                        lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                             bar.clone(), Span::raw(indent_str.to_string()),
                             Span::styled(remaining[..take].to_string(), text_style),
                         ]));
+                        stream_offset += 1;
                         remaining = &remaining[take..];
                     }
                 }
-            }
-
-            for (i, line) in rendered.into_iter().enumerate() {
-                lines.insert(insert_pos + i, line);
             }
         }
     }
