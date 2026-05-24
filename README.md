@@ -1,5 +1,10 @@
 # Abacus
 
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/lucasli000/abacus/releases/tag/v1.0.0)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![CI](https://github.com/lucasli000/abacus/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasli000/abacus/actions/workflows/ci.yml)
+
 LLM Agent Kernel — 模块化 Agent 运行时，支持 Chat / Team / Meeting 三种交互模式。
 
 ## Quick Start
