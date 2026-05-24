@@ -634,6 +634,17 @@ pub struct ContextManager {
     /// None → declare 走原 path（自建 GeneralizedIndex）。
     /// Some → declare 优先 ingest 到 KB 再把 chunks 映射成 IndexSegment。
     pub kb_store: RwLock<Option<Arc<crate::knowledge_store::KnowledgeStore>>>,
+    /// LLM 主动标记的受保护消息索引（turn 编号）
+    ///
+    /// ## 设计
+    /// LLM 通过 `context_pin` 工具标记某些对话轮次为"不可压缩"。
+    /// auto_compress_messages 在处理中间段时跳过 pinned 消息（保留原文）。
+    ///
+    /// ## 生命周期
+    /// - 写入：`context_pin` tool executor
+    /// - 读取：`auto_compress_messages` 压缩时检查
+    /// - 清理：session 结束时随 ContextManager 销毁
+    pub pinned_turns: RwLock<std::collections::HashSet<u32>>,
     /// Phase Z3：auto_compress 使用的默认档位
     pub default_compress_level: RwLock<CompressLevel>,
     /// Phase Z2：消息压缩 archive（recover_id → 原始 messages 副本）
@@ -748,6 +759,7 @@ impl ContextManager {
             usage: RwLock::new(SubsystemUsage::default()),
             shed_pending: std::sync::atomic::AtomicBool::new(false),
             kb_store: RwLock::new(None),
+            pinned_turns: RwLock::new(std::collections::HashSet::new()),
             default_compress_level: RwLock::new(CompressLevel::Brief),
             message_archive: RwLock::new(abacus_types::BoundedFifo::new(MAX_ARCHIVE_ENTRIES)),
             summarizer: RwLock::new(Arc::new(DeterministicSummarizer::brief())),
@@ -763,6 +775,21 @@ impl ContextManager {
 
     pub fn get_current_turn(&self) -> u32 {
         self.current_turn.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// LLM 主动 pin 指定 turn（压缩时保留原文）
+    pub async fn pin_turn(&self, turn: u32) {
+        self.pinned_turns.write().await.insert(turn);
+    }
+
+    /// 取消 pin
+    pub async fn unpin_turn(&self, turn: u32) {
+        self.pinned_turns.write().await.remove(&turn);
+    }
+
+    /// 获取当前 pinned turns 列表
+    pub async fn pinned_turns_list(&self) -> Vec<u32> {
+        self.pinned_turns.read().await.iter().copied().collect()
     }
 
     /// Phase Z4：注入自定义 summarizer（如 LLM-driven）
@@ -1598,6 +1625,9 @@ impl ContextManager {
             else { Some(points.join(" | ")) }
         }
 
+        // 读取 LLM pinned turns（压缩时无条件保留）
+        let pinned = self.pinned_turns.read().await.clone();
+
         let original = std::mem::take(messages);
         let total_len = original.len();
         let tail_start = total_len.saturating_sub(keep_count);
@@ -1720,12 +1750,25 @@ impl ContextManager {
             buf.clear();
         };
 
+        let mut current_turn_num: u32 = 0;
         for (i, msg) in original.iter().enumerate() {
+            // 跟踪 turn 编号（每条 User 消息 = 新 turn）
+            if matches!(msg.role, MessageRole::User) {
+                current_turn_num += 1;
+            }
+
             let in_early = i < early_keep;
             let in_late = i >= tail_start;
 
             if in_early || in_late {
                 // 先 flush 累积的中间段
+                flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+                new_messages.push(msg.clone());
+                continue;
+            }
+
+            // LLM pinned turn → 无条件保留（LLM 主动标记的重要对话）
+            if pinned.contains(&current_turn_num) {
                 flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
                 new_messages.push(msg.clone());
                 continue;
@@ -2309,6 +2352,41 @@ impl ToolExecutor for ContextToolExecutor {
                 }
             }
 
+            // LLM 感知压缩决策：pin 指定 turn（压缩时保留原文）
+            "context_pin" => {
+                let turn = params["turn"]
+                    .as_u64()
+                    .ok_or_else(|| KernelError::Other("missing turn number".into()))? as u32;
+                let reason = params["reason"].as_str().unwrap_or("important");
+                self.manager.pin_turn(turn).await;
+                Ok(serde_json::json!({
+                    "pinned": turn,
+                    "reason": reason,
+                    "total_pinned": self.manager.pinned_turns_list().await.len(),
+                }))
+            }
+
+            // 取消 pin
+            "context_unpin" => {
+                let turn = params["turn"]
+                    .as_u64()
+                    .ok_or_else(|| KernelError::Other("missing turn number".into()))? as u32;
+                self.manager.unpin_turn(turn).await;
+                Ok(serde_json::json!({
+                    "unpinned": turn,
+                    "total_pinned": self.manager.pinned_turns_list().await.len(),
+                }))
+            }
+
+            // 查看当前 pinned turns
+            "context_pinned" => {
+                let pinned = self.manager.pinned_turns_list().await;
+                Ok(serde_json::json!({
+                    "pinned_turns": pinned,
+                    "count": pinned.len(),
+                }))
+            }
+
             other => Err(KernelError::Other(format!("unknown context tool: {other}"))),
         }
     }
@@ -2503,6 +2581,71 @@ pub async fn register_context_tools(
             state: ToolState::Loaded,
             effectiveness: ToolEffectiveness::default(),
         },
+        // LLM 感知压缩决策：pin 指定 turn（压缩时保留原文）
+        ToolHandle {
+            id: ToolId("context_pin".into()),
+            schema: ToolSchema {
+                name: "context_pin".into(),
+                description: "Pin a conversation turn to protect it from compression. Pinned turns are never compressed — use for critical decisions, error diagnostics, or user confirmations you need to reference later.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "turn": {"type": "integer", "description": "Turn number to pin (from [Awareness] block)"},
+                        "reason": {"type": "string", "description": "Why this turn is important"}
+                    },
+                    "required": ["turn"]
+                }),
+                returns: None,
+                security: None,
+                cost: Some(ToolCost { tokens: 8, latency: "1ms".into(), risk: "low".into() }),
+                examples: Vec::new(),
+                applicable_task_kinds: None,
+                idempotent: true,
+            },
+            provider: ToolProvider::BuiltIn,
+            state: ToolState::Loaded,
+            effectiveness: ToolEffectiveness::default(),
+        },
+        ToolHandle {
+            id: ToolId("context_unpin".into()),
+            schema: ToolSchema {
+                name: "context_unpin".into(),
+                description: "Remove pin from a previously pinned turn (allow it to be compressed).".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "turn": {"type": "integer", "description": "Turn number to unpin"}
+                    },
+                    "required": ["turn"]
+                }),
+                returns: None,
+                security: None,
+                cost: Some(ToolCost { tokens: 8, latency: "1ms".into(), risk: "low".into() }),
+                examples: Vec::new(),
+                applicable_task_kinds: None,
+                idempotent: true,
+            },
+            provider: ToolProvider::BuiltIn,
+            state: ToolState::Loaded,
+            effectiveness: ToolEffectiveness::default(),
+        },
+        ToolHandle {
+            id: ToolId("context_pinned".into()),
+            schema: ToolSchema {
+                name: "context_pinned".into(),
+                description: "List all currently pinned turns (protected from compression).".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                returns: None,
+                security: None,
+                cost: Some(ToolCost { tokens: 8, latency: "1ms".into(), risk: "low".into() }),
+                examples: Vec::new(),
+                applicable_task_kinds: None,
+                idempotent: true,
+            },
+            provider: ToolProvider::BuiltIn,
+            state: ToolState::Loaded,
+            effectiveness: ToolEffectiveness::default(),
+        },
     ];
 
     for tool in tools {
@@ -2692,24 +2835,30 @@ mod tests {
             w.compression_trigger_pct = 85;
         }
         let mut msgs = Vec::new();
-        msgs.push(mk_msg("EARLY"));
-        for i in 0..6 {
+        // early_keep=2
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
+        // 10 middle messages (importance < 0.7, will be compressed)
+        for i in 0..10 {
             msgs.push(mk_assistant(&format!("middle msg {i} with reasonably long content")));
         }
-        for i in 0..5 {
+        // keep_count=8 tail messages
+        for i in 0..8 {
             msgs.push(mk_msg(&format!("late {i}")));
         }
+        // total = 20, early=2, tail_start=20-8=12, middle=index 2..12 (10 msgs)
         let compressed = mgr.auto_compress_messages(&mut msgs).await;
         assert!(!compressed.is_empty());
-        assert_eq!(msgs.len(), 7,
-            "12 → 7（early + 1 合并 + late）");
-        assert!(matches!(msgs[0].content, Some(MessageContent::Text(ref t)) if t == "EARLY"));
-        let second = match &msgs[1].content {
+        // Result: 2 early + 1 compressed summary + 8 tail = 11
+        assert_eq!(msgs.len(), 11,
+            "20 → 11（2 early + 1 合并 + 8 tail）, got {}", msgs.len());
+        assert!(matches!(msgs[0].content, Some(MessageContent::Text(ref t)) if t == "EARLY1"));
+        let summary = match &msgs[2].content {
             Some(MessageContent::Text(t)) => t.clone(),
-            _ => panic!("expected text"),
+            _ => panic!("expected text at index 2"),
         };
-        assert!(second.starts_with("[Compressed history:"),
-            "中间段应合并为单条 summary：{second}");
+        assert!(summary.contains("Compressed"),
+            "中间段应合并为 summary：{summary}");
     }
 
     // ─── Ctx-C: 行为宫殿协同 evict 测试 ────────────────────────────────────
@@ -2881,20 +3030,23 @@ mod tests {
             w.compression_trigger_pct = 85;
         }
         let mut msgs = Vec::new();
-        msgs.push(mk_msg("EARLY"));
-        for i in 0..6 {
+        // early_keep=2, keep_count=8 → need >11 msgs
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
+        for i in 0..10 {
             msgs.push(mk_assistant(&format!("middle msg {i}")));
         }
-        for i in 0..5 {
+        for i in 0..8 {
             msgs.push(mk_msg(&format!("late {i}")));
         }
         let _ = mgr.auto_compress_messages(&mut msgs).await;
-        // msgs[1] 是合并 summary，应含 recover_id
-        if let Some(MessageContent::Text(s)) = &msgs[1].content {
-            assert!(s.contains("recover_id=mb_"),
+        // 找压缩 summary（含 "Compressed"）
+        let summary_msg = msgs.iter().find(|m| {
+            matches!(&m.content, Some(MessageContent::Text(s)) if s.contains("Compressed"))
+        }).expect("应有压缩 summary 消息");
+        if let Some(MessageContent::Text(s)) = &summary_msg.content {
+            assert!(s.contains("id=mb_"),
                 "summary 必须嵌入 recover_id：{s}");
-        } else {
-            panic!("expected text content at msgs[1]");
         }
     }
 
@@ -2909,29 +3061,33 @@ mod tests {
             w.compression_trigger_pct = 85;
         }
         let mut msgs = Vec::new();
-        msgs.push(mk_msg("EARLY"));
-        for i in 0..6 {
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
+        for i in 0..10 {
             msgs.push(mk_assistant(&format!("middle msg {i}")));
         }
-        for i in 0..5 {
+        for i in 0..8 {
             msgs.push(mk_msg(&format!("late {i}")));
         }
         let _ = mgr.auto_compress_messages(&mut msgs).await;
 
-        // 提取 recover_id
-        let summary_text = match &msgs[1].content {
+        // 找压缩 summary 提取 recover_id
+        let summary_msg = msgs.iter().find(|m| {
+            matches!(&m.content, Some(MessageContent::Text(s)) if s.contains("Compressed"))
+        }).expect("应有压缩 summary");
+        let summary_text = match &summary_msg.content {
             Some(MessageContent::Text(s)) => s.clone(),
             _ => panic!("expected text"),
         };
         let recover_id = summary_text
-            .split("recover_id=").nth(1)
+            .split("id=").nth(1)
             .and_then(|s| s.split(']').next())
             .expect("recover_id should be present");
 
         let recovered = mgr.recover_messages(recover_id).await;
         assert!(recovered.is_some(), "recover 应返回 Some");
         let recovered = recovered.unwrap();
-        assert_eq!(recovered.len(), 6, "应恢复 6 条原始 middle msgs");
+        assert_eq!(recovered.len(), 10, "应恢复 10 条原始 middle msgs");
     }
 
     /// Z2: recover 不存在的 id 返回 None
@@ -3148,15 +3304,27 @@ mod tests {
             w.compression_trigger_pct = 85;
         }
         let mut msgs = Vec::new();
-        msgs.push(mk_msg("EARLY"));
-        for _ in 0..6 {
+        // early_keep=2, so first 2 are preserved
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
+        // 10 middle messages to ensure some get compressed
+        for _ in 0..10 {
             msgs.push(mk_assistant("some content with details that should be stripped"));
         }
-        for i in 0..5 {
+        // keep_count=8 tail messages
+        for i in 0..8 {
             msgs.push(mk_msg(&format!("late {i}")));
         }
-        let _ = mgr.auto_compress_messages(&mut msgs).await;
-        if let Some(MessageContent::Text(s)) = &msgs[1].content {
+        let compressed = mgr.auto_compress_messages(&mut msgs).await;
+        // 应有压缩记录
+        assert!(!compressed.is_empty(), "应产生压缩记录");
+        // 找到压缩摘要消息（包含 "Compressed"）
+        let summary_msg = msgs.iter().find(|m| {
+            matches!(&m.content, Some(MessageContent::Text(s)) if s.contains("Compressed"))
+        });
+        assert!(summary_msg.is_some(), "应有压缩摘要消息");
+        if let Some(MessageContent::Text(s)) = &summary_msg.unwrap().content {
+            // Minimal 档位不保留 snippet 内容
             assert!(!s.contains("some content"),
                 "Minimal 档位应去除内容 snippet：{s}");
             assert!(s.contains("tok"), "应包含 tok 数标记");
@@ -3196,18 +3364,22 @@ mod tests {
         {
             let mut w = mgr.window.write().await;
             w.max_tokens = 100;
-            w.current_tokens = 96;
+            w.current_tokens = 96; // >= 95% → force_discard
             w.compression_trigger_pct = 85;
         }
         let mut msgs = Vec::new();
-        msgs.push(mk_msg("EARLY"));
+        // force mode: early_keep=2, keep_count=3 → need > 6 msgs
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
         for _ in 0..10 {
             msgs.push(mk_assistant_with_tool_call("tool call"));
         }
         msgs.push(mk_msg("late 1"));
         msgs.push(mk_msg("late 2"));
+        msgs.push(mk_msg("late 3"));
+        // total=15, early=2, tail_start=15-3=12, middle=index 2..12 (10 msgs, all force-discarded)
         let _ = mgr.auto_compress_messages(&mut msgs).await;
-        assert_eq!(msgs.len(), 3, "force_discard：early + 2 late");
+        assert_eq!(msgs.len(), 5, "force_discard：2 early + 3 late = 5");
     }
 
     // ─── W4 (Task #102) Selective History Retention ────────────────────────

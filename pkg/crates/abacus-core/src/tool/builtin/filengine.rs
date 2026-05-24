@@ -674,7 +674,10 @@ async fn grep_dir(
 
 /// Shell metacharacters that could enable injection.
 /// Blocks: ; | & ` $ ( ) < > ! \n \r
-const SHELL_META: &[char] = &[';', '|', '&', '`', '$', '(', ')', '<', '>', '!', '\n', '\r'];
+/// Shell metacharacters that enable injection. `!` removed: it's used in legit
+/// commands like `echo "hello!"` and `git commit -m "fix!"`, and history expansion
+/// is disabled in non-interactive sh -c context anyway.
+const SHELL_META: &[char] = &[';', '|', '&', '`', '$', '(', ')', '<', '>', '\n', '\r'];
 
 /// Bash command classification result.
 ///

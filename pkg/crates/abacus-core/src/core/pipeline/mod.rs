@@ -1454,6 +1454,17 @@ impl<'a> TurnPipeline<'a> {
                             // 等待用户决策（drop sender = false / 显式 send true|false）
                             let approved = rx_one.await.unwrap_or(false);
                             if approved {
+                                // V30: bash 命令级 session grant——同类命令本 session 不再弹窗
+                                // 格式 "bash:{cmd} {subcmd}"，如 "bash:git push"
+                                if tool_id.0.as_str() == "filengine_bash_exec" {
+                                    if let Some(cmd_str) = params.get("command").and_then(|v| v.as_str()) {
+                                        let prefix: String = cmd_str.split_whitespace()
+                                            .take(2).collect::<Vec<_>>().join(" ");
+                                        let grant_key = format!("bash:{}", prefix);
+                                        let s = self.session.read().await;
+                                        s.mcip_grants.write().unwrap().insert(grant_key);
+                                    }
+                                }
                                 // 走真 execute 路径（mag_chain.before → registry.execute → wrap → after）
                                 self.core.mag_chain.read().await.before(&tool_id, &params).await?;
                                 let exec_ctx = {

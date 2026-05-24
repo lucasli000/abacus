@@ -128,12 +128,16 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     match state.mode {
         AbacusMode::Clarify => {
-            // 单 Tab："现场"（含时间线 + 记忆 + 简化统计）
+            // 默认单 Tab "现场"（含时间线+记忆+简化统计）；/quant 可切到完整量化
             let labels: Vec<String> = vec![
                 label_with_count(t("panel.scene"), state.trace_events.len()),
             ];
-            let content = render_panel_header(f, state, inner, &labels, 0);
-            render_panel_overview(f, state, content);
+            let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 0 } else { 0 };
+            let content = render_panel_header(f, state, inner, &labels, tab_idx);
+            match state.panel_tab {
+                PanelTab::Quant => render_tab_quant(f, state, content),
+                _ => render_panel_overview(f, state, content),
+            }
         }
         AbacusMode::Team => {
             let labels: Vec<String> =
@@ -154,46 +158,37 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             }
         }
         AbacusMode::Meeting => {
-            // Phase 3: 公共 header
             let labels: Vec<String> =
                 std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
                     .chain(std::iter::once(label_with_count(t("panel.agenda"), state.experts.len())))
-                    .chain(std::iter::once(t("panel.quant").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
+                PanelTab::Custom(i) => 2 + i,
                 _ => 0,
             };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_meeting_agenda(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
         }
         AbacusMode::Plan => {
-            // Phase 3: 公共 header
             let labels: Vec<String> =
                 std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
                     .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
-                    .chain(std::iter::once(t("panel.quant").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
+                PanelTab::Custom(i) => 2 + i,
                 _ => 0,
             };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
-                // Plan 任务 tab 复用 team_board（同 TaskCard 数据结构）
                 PanelTab::Tasks => render_panel_team_board(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
@@ -242,21 +237,20 @@ fn render_panel_header(
 /// 引用关系: 被三模式的 PanelTab::Overview 分支调用
 /// 生命周期: 每帧渲染; 不持有状态
 fn render_panel_overview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    // V24: timeline 占 60% (原 40%), 给"事件流"主导地位
-    //      memory 用 Min(15) 兜底, 容纳记忆+工具+统计 三子分块(~15 行)
-    //      小屏(area.height<25)下 ratatui 按权重缩比, Min(15) 软约束保底
+    // 布局：时间线(55%) + 分隔 + 记忆(30%) + 分隔 + 简化统计(15%)
     let sections = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
-            ratatui::layout::Constraint::Percentage(60),  // V24: 40 → 60 (timeline 主导)
-            ratatui::layout::Constraint::Length(1),       // 细分隔 ╌╌╌
-            ratatui::layout::Constraint::Min(15),         // V24: 3 → 15 (memory 三子分块紧凑靠底)
+            ratatui::layout::Constraint::Percentage(55),  // 时间线
+            ratatui::layout::Constraint::Length(1),       // 细分隔
+            ratatui::layout::Constraint::Min(10),         // 记忆
+            ratatui::layout::Constraint::Length(1),       // 细分隔
+            ratatui::layout::Constraint::Length(5),       // 简化统计
         ])
         .split(area);
 
     render_tab_timeline(f, state, sections[0]);
 
-    // 细分隔: 与 L1 标题对齐(col=1 起), 8 个 ╌ 看起来精致而不喧闹
     let dotted_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
     f.render_widget(
         Paragraph::new(Line::styled(" ╌╌╌╌╌╌╌╌", dotted_style)),
@@ -264,6 +258,91 @@ fn render_panel_overview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     );
 
     render_tab_memory(f, state, sections[2]);
+
+    f.render_widget(
+        Paragraph::new(Line::styled(" ╌╌╌╌╌╌╌╌", dotted_style)),
+        sections[3],
+    );
+
+    // 简化统计（原量化 Tab 的核心数据，压缩为 4 行）
+    render_compact_stats(f, state, sections[4]);
+}
+
+/// 简化统计：轮次 · tokens · 费用（时间线下方紧凑展示）
+///
+/// 排版规范：
+/// - 左侧 1 字符缩进（与时间线/记忆对齐）
+/// - 数值用 format_ctx() 格式化（7.2K / 32K）
+/// - 费用仅在 >0 时显示
+fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use super::format_ctx;
+    let muted = state.theme.text_style(TextRole::Caption);
+    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+    let mut lines: Vec<Line> = Vec::new();
+
+    let prompt = state.session_tokens.prompt_tokens;
+    let completion = state.session_tokens.completion_tokens;
+    let cached = state.session_tokens.cached_tokens;
+    let total = state.session_tokens.total_tokens;
+    let cost = state.session_tokens.cost_usd;
+
+    let user_count = state.messages.iter()
+        .filter(|m| matches!(m.role, crate::tui::state::MsgRole::User))
+        .count();
+    let ai_count = state.messages.iter()
+        .filter(|m| matches!(m.role, crate::tui::state::MsgRole::Session | crate::tui::state::MsgRole::Expert(_)))
+        .count();
+
+    // 标题
+    lines.push(Line::from(vec![
+        Span::styled(t("panel.stats"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+    ]));
+
+    // 轮次 · 对话（窄面板缩写）
+    let narrow = area.width < 24;
+    if narrow {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  t{} · u{} a{}", state.turn_count, user_count, ai_count), muted),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("   turns ", muted),
+            Span::styled(format!("{}", state.turn_count), Style::default().fg(state.theme.text)),
+            Span::styled("  ·  you ", muted),
+            Span::styled(format!("{}", user_count), Style::default().fg(state.theme.text)),
+            Span::styled("  ai ", muted),
+            Span::styled(format!("{}", ai_count), Style::default().fg(state.theme.text)),
+        ]));
+    }
+
+    // tokens + cache + cost（窄面板时用缩写防溢出）
+    if total > 0 {
+        let cache_pct = if prompt > 0 { cached * 100 / prompt } else { 0 };
+        let narrow = area.width < 24;
+        let (in_label, out_label, cache_label, cost_label) = if narrow {
+            ("  in ", " · out ", "  ♻", " · $")
+        } else {
+            ("   input ", "  ·  output ", "   cache ", "  ·  cost ")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(in_label, muted),
+            Span::styled(format_ctx(prompt as usize), Style::default().fg(state.theme.text)),
+            Span::styled(out_label, muted),
+            Span::styled(format_ctx(completion as usize), Style::default().fg(state.theme.text)),
+        ]));
+
+        let mut cache_cost_spans = vec![
+            Span::styled(cache_label, muted),
+            Span::styled(format!("{}%", cache_pct), Style::default().fg(state.theme.success)),
+        ];
+        if cost > 0.001 {
+            cache_cost_spans.push(Span::styled(cost_label, muted));
+            cache_cost_spans.push(Span::styled(format!("${:.4}", cost), Style::default().fg(state.theme.gold)));
+        }
+        lines.push(Line::from(cache_cost_spans));
+    }
+
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Team 模式专属：任务看板（专家状态 + Task Kanban）

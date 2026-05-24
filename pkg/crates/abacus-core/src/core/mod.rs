@@ -2042,7 +2042,7 @@ impl CoreLoop {
             // DAG 约束：Clarify → Meeting/Plan → Team → Clarify
             // LLM 应在推理过程中判断当前任务需要哪种协作形态并主动切换
             ("mode_switch",
-                "Switch the interaction mode. Modes form a DAG: Clarify→Meeting/Plan→Team→Clarify. Use this when you determine the task requires a different collaboration style: 'meeting' for multi-perspective review/debate, 'plan' for task decomposition/roadmap, 'team' for multi-agent parallel execution, 'clarify' to reset and gather requirements. The switch changes system behavior, tool availability, and output format.",
+                "Switch interaction mode: clarify/meeting/plan/team. Changes system behavior and tool availability.",
                 json!({
                     "type": "object",
                     "properties": {
