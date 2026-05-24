@@ -665,9 +665,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // V0.2: 消费 streaming chunks — 实时更新 partial message（渲染前处理）
                 // V29.5: 把硬编码 100 提为命名 const, 注释说明语义
                 //   含义: 每帧最多消化的 chunk 数, 防止 LLM 突发推送堆积导致单帧延迟
-                //   选值: 100 ≈ 16ms 渲染预算下足够大但不会让单帧超时(每 chunk parse < 100µs)
-                //   未来配置化: 改成 AppState.frame_chunk_budget, 由 /streaming N 命令调
-                const FRAME_CHUNK_BUDGET: u32 = 100;
+                //   选值: 20——每 chunk 都触发 rendered_lines_dirty → 全量 markdown 重解析,
+                //   100 chunks/frame 时单帧渲染开销过高导致卡顿; 降到 20 让突发 delta 分摊
+                //   到多帧,视觉上无感(20 FPS × 20 chunks = 仍可消化 400 chunks/s, 远超 LLM 产出速率)
+                const FRAME_CHUNK_BUDGET: u32 = 20;
                 let mut chunk_budget = FRAME_CHUNK_BUDGET;
                 while chunk_budget > 0 {
                     let chunk = match stream_rx.try_recv() {
@@ -1033,7 +1034,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
-                // 打字机流式输出：每帧前进 ~35 字符，到达末尾自动停止
+                // 打字机流式输出：每帧前进 ~20 字符 (20 chars × 20 FPS ≈ 400 chars/s ≈ 100 tok/s)
                 if state.stream_cursor > 0 || matches!(state.input_state, InputState::Outputting) {
                     // 计算最后一条消息的总文本长度
                     let last_text_len: usize = state.messages.last()
@@ -1042,7 +1043,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             .sum())
                         .unwrap_or(0);
                     if state.stream_cursor < last_text_len {
-                        state.stream_cursor += 35;
+                        state.stream_cursor += 20;
                         state.rendered_lines_dirty.set(true);
                         if state.stream_cursor >= last_text_len {
                             state.stream_cursor = 0; // 完成，恢复正常渲染

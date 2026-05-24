@@ -1724,8 +1724,35 @@ pub fn render_messages_in_card(
             lines.push(Line::from(vec![bar.clone(), Span::raw("   ")]));
         }
 
-        // Thinking（实时展示最新 ~20 行思考内容）
-        if !state.streaming_thinking.is_empty() {
+        // Thinking + Tools 折叠为单行摘要（V36: 减少视觉噪音，用户只关注最终输出）
+        // 完整 thinking/tools 内容落档后在 Trace panel 可展开查看
+        if !state.streaming_thinking.is_empty() || !state.streaming_tools.is_empty() {
+            let insert_pos = lines.len().saturating_sub(1);
+            let mut summary_parts: Vec<String> = Vec::new();
+            if !state.streaming_thinking.is_empty() {
+                let think_lines = state.streaming_thinking.lines().count();
+                summary_parts.push(format!("💭 Thinking ({} 行)", think_lines));
+            }
+            if !state.streaming_tools.is_empty() {
+                use crate::tui::state::StreamingToolStatus;
+                let running = state.streaming_tools.iter().filter(|t| matches!(t.1, StreamingToolStatus::Running)).count();
+                let done = state.streaming_tools.len() - running;
+                if running > 0 {
+                    summary_parts.push(format!("⚙ {} tools ({}⟳)", state.streaming_tools.len(), running));
+                } else {
+                    summary_parts.push(format!("⚙ {} tools ✓", done));
+                }
+            }
+            lines.insert(insert_pos, Line::from(vec![
+                bar.clone(),
+                Span::raw("   "),
+                Span::styled(summary_parts.join(" · "), state.theme.text_style(TextRole::Caption)),
+            ]));
+        }
+
+        // [V36 折叠] 以下 thinking/tools 详细渲染仅在 show_stream_details=true 时启用
+        // 当前默认折叠（上方单行摘要已足够），保留代码供 /show-details 命令复活
+        if false && !state.streaming_thinking.is_empty() {
             let think_all_lines: Vec<&str> = state.streaming_thinking.lines().collect();
             let total = think_all_lines.len();
             let max_show = 20;
@@ -1821,10 +1848,8 @@ pub fn render_messages_in_card(
         }
 
         // Tools（最多显示 10 个）—— V11：区分成功/失败/进行中三态 + 显示耗时
-        // 成功: ✓ 绿色 + 耗时
-        // 失败: ✗ 红色 + 耗时（用 semantic Danger）
-        // 进行中: ⟳ gold + "..."
-        if !state.streaming_tools.is_empty() {
+        // [V36 折叠] 详细 tools 列表渲染仅在 show_stream_details=true 时启用
+        if false && !state.streaming_tools.is_empty() {
             use crate::tui::state::StreamingToolStatus;
             // V14 修复：原 -2 把内容插到 Abacus header 之前，导致 thinking/tools 视觉上挂在 user 下
             //          改为 -1：插在闪烁光标(末尾)之前、🤖 Abacus header(倒2)之后

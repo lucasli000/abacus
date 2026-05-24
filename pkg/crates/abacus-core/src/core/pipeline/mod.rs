@@ -835,6 +835,41 @@ impl<'a> TurnPipeline<'a> {
                 "removed orphaned tool response messages (no matching assistant tool_calls)"
             );
         }
+
+        // ── Case 3: merge consecutive same-role messages ──
+        // OpenAI-compatible APIs require alternating user/assistant roles.
+        // Consecutive user messages can arise from:
+        //   - auto_compress inserting role=user summaries adjacent to real user messages
+        //   - model escalation path pushing continuation prompts
+        // Fix: merge consecutive user (or assistant) messages by joining content with \n\n.
+        if msgs.len() >= 2 {
+            let mut merged: Vec<Message> = Vec::with_capacity(msgs.len());
+            for msg in msgs.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if last.role == msg.role
+                        && last.role != MessageRole::Tool
+                        && last.tool_calls.is_none()
+                        && msg.tool_calls.is_none()
+                    {
+                        // Merge content
+                        let existing = last.content.take().map(|c| match c {
+                            MessageContent::Text(t) => t,
+                            MessageContent::MultiPart(_) => String::new(),
+                        }).unwrap_or_default();
+                        let incoming = msg.content.map(|c| match c {
+                            MessageContent::Text(t) => t,
+                            MessageContent::MultiPart(_) => String::new(),
+                        }).unwrap_or_default();
+                        last.content = Some(MessageContent::Text(
+                            format!("{}\n\n{}", existing, incoming)
+                        ));
+                        continue;
+                    }
+                }
+                merged.push(msg);
+            }
+            *msgs = merged;
+        }
     }
 
     async fn execute_loop(&self, ctx: &mut TurnContext) -> Result<Option<TurnResult>, KernelError> {
@@ -2014,11 +2049,14 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_keeps_history_with_no_tool_calls() {
+    fn sanitize_merges_consecutive_user_messages() {
         let mut msgs = vec![user_msg("hello"), user_msg("world")];
-        let before = msgs.len();
         TurnPipeline::<'static>::sanitize_dangling_tool_calls(&mut msgs);
-        assert_eq!(msgs.len(), before, "no tool_calls → no change");
+        assert_eq!(msgs.len(), 1, "consecutive user messages merged");
+        match &msgs[0].content {
+            Some(MessageContent::Text(t)) => assert!(t.contains("hello") && t.contains("world")),
+            _ => panic!("merged content should be Text"),
+        }
     }
 
     #[test]
