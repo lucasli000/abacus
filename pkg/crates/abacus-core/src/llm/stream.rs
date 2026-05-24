@@ -63,6 +63,10 @@ pub enum StreamChunk {
     /// UI 收到后弹授权对话框；用户决策通过 SessionState.mcip_confirm_channels[nonce] 直发回去
     /// nonce 是从 channel 找回 sender 的 key
     ConfirmRequired(crate::mcip::McipConfirmRequest),
+    /// 上下文压缩开始（TUI 切换到 Compacting 工作态）
+    CompressStart,
+    /// 上下文压缩完成（携带压缩统计）
+    CompressEnd { messages_compressed: usize, tokens_saved: usize },
     /// Turn 完成（携带最终统计）
     Complete(TurnStats),
     /// 错误（stream 中断）

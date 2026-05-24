@@ -437,11 +437,23 @@ impl<'a> TurnPipeline<'a> {
         // Phase Ctx-A: pressure shed pending 检查——若上一轮 pressure_monitor 报警，
         // 这里立即触发 auto_compress 让 prefix 字节回到稳定区间
         if self.core.context_manager.take_shed_pending() {
+            if let Some(ref stx) = self.stream_tx {
+                let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+            }
             let s = self.session.read().await;
             let mut msgs = s.messages.write().await;
             let compressed = self.core.context_manager.auto_compress_messages(&mut msgs).await;
             if !compressed.is_empty() {
                 tracing::info!("pressure shed: compressed {} messages", compressed.len());
+            }
+            if let Some(ref stx) = self.stream_tx {
+                let tokens_saved: usize = compressed.iter()
+                    .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                    .sum();
+                let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                    messages_compressed: compressed.len(),
+                    tokens_saved,
+                });
             }
         }
 

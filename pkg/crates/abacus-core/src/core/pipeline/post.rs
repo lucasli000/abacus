@@ -28,13 +28,30 @@ impl<'a> TurnPipeline<'a> {
             // 由 persist_and_build_result 兜底处理。
         }
 
-        // Context compression
+        // Context compression — emit 工作态事件让 TUI 展示 "Compacting" 状态
+        if let Some(ref stx) = self.stream_tx {
+            let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+        }
         {
             let s = self.session.read().await;
             let mut msgs = s.messages.write().await;
             let compressed = self.core.context_manager.auto_compress_messages(&mut msgs).await;
             if !compressed.is_empty() {
+                let tokens_saved: usize = compressed.iter()
+                    .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                    .sum();
                 tracing::info!("compressed {} messages in turn {}", compressed.len(), ctx.turn_number);
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                        messages_compressed: compressed.len(),
+                        tokens_saved,
+                    });
+                }
+            } else if let Some(ref stx) = self.stream_tx {
+                let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                    messages_compressed: 0,
+                    tokens_saved: 0,
+                });
             }
         }
 

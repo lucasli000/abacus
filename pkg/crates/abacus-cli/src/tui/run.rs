@@ -893,6 +893,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                             state.rendered_lines_dirty.set(true);
                         }
+                        StreamChunk::CompressStart => {
+                            state.input_state = InputState::Executing;
+                            state.processing_phase = "🗜️ Compacting...".into();
+                            state.rendered_lines_dirty.set(true);
+                        }
+                        StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
+                            if messages_compressed > 0 {
+                                state.add_event(&ts, "context", &format!("压缩 {} 条消息，释放 ~{} tok", messages_compressed, tokens_saved), crate::tui::state::EventLevel::Info);
+                            }
+                            state.processing_phase.clear();
+                            state.rendered_lines_dirty.set(true);
+                        }
                         StreamChunk::Complete(_) => {
                             // ST1：清理流式累积避免双显示
                             state.reset_streaming();
