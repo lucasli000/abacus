@@ -842,24 +842,36 @@ impl<'a> TurnPipeline<'a> {
         //   - auto_compress inserting role=user summaries adjacent to real user messages
         //   - model escalation path pushing continuation prompts
         // Fix: merge consecutive user (or assistant) messages by joining content with \n\n.
+        // ── Case 3: merge consecutive same-role messages ──
+        // OpenAI-compatible APIs require alternating user/assistant roles.
+        // Consecutive user messages can arise from auto_compress (role=user summaries)
+        // or model escalation (continuation prompts). Also skip System role (must be first).
         if msgs.len() >= 2 {
             let mut merged: Vec<Message> = Vec::with_capacity(msgs.len());
             for msg in msgs.drain(..) {
                 if let Some(last) = merged.last_mut() {
                     if last.role == msg.role
                         && last.role != MessageRole::Tool
+                        && last.role != MessageRole::System
                         && last.tool_calls.is_none()
                         && msg.tool_calls.is_none()
                     {
-                        // Merge content
-                        let existing = last.content.take().map(|c| match c {
-                            MessageContent::Text(t) => t,
-                            MessageContent::MultiPart(_) => String::new(),
-                        }).unwrap_or_default();
-                        let incoming = msg.content.map(|c| match c {
-                            MessageContent::Text(t) => t,
-                            MessageContent::MultiPart(_) => String::new(),
-                        }).unwrap_or_default();
+                        // Extract text content, preserving MultiPart by serializing to text
+                        let extract_text = |c: MessageContent| -> String {
+                            match c {
+                                MessageContent::Text(t) => t,
+                                MessageContent::MultiPart(parts) => {
+                                    // Preserve multipart by extracting text parts
+                                    parts.iter().filter_map(|p| {
+                                        if let crate::llm::ContentPart::Text { text } = p {
+                                            Some(text.as_str())
+                                        } else { None }
+                                    }).collect::<Vec<_>>().join("\n")
+                                }
+                            }
+                        };
+                        let existing = last.content.take().map(extract_text).unwrap_or_default();
+                        let incoming = msg.content.map(extract_text).unwrap_or_default();
                         last.content = Some(MessageContent::Text(
                             format!("{}\n\n{}", existing, incoming)
                         ));
