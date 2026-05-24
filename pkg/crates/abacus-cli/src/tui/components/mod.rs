@@ -1724,30 +1724,74 @@ pub fn render_messages_in_card(
             lines.push(Line::from(vec![bar.clone(), Span::raw("   ")]));
         }
 
-        // Thinking + Tools 折叠为单行摘要（V36: 减少视觉噪音，用户只关注最终输出）
-        // 完整 thinking/tools 内容落档后在 Trace panel 可展开查看
+        // Thinking + Tools 流式展示（V37: 3 行实时滚动显示最新内容）
+        // 设计：thinking 最新内容 + 当前工具状态，限制在 3 行内，像终端 tail -3 滚动
         if !state.streaming_thinking.is_empty() || !state.streaming_tools.is_empty() {
             let insert_pos = lines.len().saturating_sub(1);
-            let mut summary_parts: Vec<String> = Vec::new();
-            if !state.streaming_thinking.is_empty() {
-                let think_lines = state.streaming_thinking.lines().count();
-                summary_parts.push(format!("💭 Thinking ({} 行)", think_lines));
-            }
+            let content_w = inner.width.saturating_sub(7) as usize;
+            let trace_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
+
+            // 构建 3 行内容：优先展示当前工具状态（1行），剩余给 thinking 最新内容
+            let mut trace_lines: Vec<Line<'static>> = Vec::with_capacity(3);
+
+            // Line 1: 工具状态摘要（如有）
             if !state.streaming_tools.is_empty() {
                 use crate::tui::state::StreamingToolStatus;
-                let running = state.streaming_tools.iter().filter(|t| matches!(t.1, StreamingToolStatus::Running)).count();
-                let done = state.streaming_tools.len() - running;
-                if running > 0 {
-                    summary_parts.push(format!("⚙ {} tools ({}⟳)", state.streaming_tools.len(), running));
-                } else {
-                    summary_parts.push(format!("⚙ {} tools ✓", done));
+                // 取最后一个工具的状态
+                if let Some((name, status, duration_ms, _)) = state.streaming_tools.last() {
+                    let (icon, color) = match status {
+                        StreamingToolStatus::Running => ("⟳", state.theme.gold),
+                        StreamingToolStatus::Success => ("✓", state.theme.success),
+                        StreamingToolStatus::Failed => ("✗", state.theme.error),
+                    };
+                    let dur = duration_ms.map(|ms| format!(" {}ms", ms)).unwrap_or_default();
+                    let tool_text = format!("⚙ {}{} {} [{}/{}]", name, dur, icon,
+                        state.streaming_tools.iter().filter(|t| !matches!(t.1, StreamingToolStatus::Running)).count(),
+                        state.streaming_tools.len());
+                    let truncated: String = tool_text.chars().take(content_w).collect();
+                    trace_lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::raw("   "),
+                        Span::styled(truncated, Style::default().fg(color)),
+                    ]));
                 }
             }
-            lines.insert(insert_pos, Line::from(vec![
-                bar.clone(),
-                Span::raw("   "),
-                Span::styled(summary_parts.join(" · "), state.theme.text_style(TextRole::Caption)),
-            ]));
+
+            // Lines 2-3 (or 1-3 if no tools): thinking 最新内容
+            let think_slots = 3 - trace_lines.len();
+            if !state.streaming_thinking.is_empty() && think_slots > 0 {
+                let all_lines: Vec<&str> = state.streaming_thinking.lines().collect();
+                let total = all_lines.len();
+                let start = total.saturating_sub(think_slots);
+                for tline in &all_lines[start..] {
+                    let truncated: String = tline.chars().take(content_w).collect();
+                    trace_lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::raw("   "),
+                        Span::styled(
+                            if truncated.is_empty() { "…".to_string() } else { truncated },
+                            trace_style,
+                        ),
+                    ]));
+                }
+            }
+
+            // 如果 thinking 为空但有工具且没填满 3 行，补一行统计
+            if state.streaming_thinking.is_empty() && trace_lines.len() < 3 && !state.streaming_tools.is_empty() {
+                let total_tools = state.streaming_tools.len();
+                let think_line_count = state.streaming_thinking.lines().count();
+                let stats = format!("💭 {} 行 · ⚙ {} tools", think_line_count, total_tools);
+                trace_lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::raw("   "),
+                    Span::styled(stats, state.theme.text_style(TextRole::Caption)),
+                ]));
+            }
+
+            // 插入 trace 行
+            for (i, line) in trace_lines.into_iter().enumerate() {
+                lines.insert(insert_pos + i, line);
+            }
         }
 
         // [V36 折叠] 以下 thinking/tools 详细渲染仅在 show_stream_details=true 时启用
