@@ -1850,7 +1850,7 @@ pub fn submit_message(state: &mut AppState) {
         }
     }
 
-    // V28.7: 模式自适应——Chat → Team/Meeting（自动切换 + 显著 toast）
+    // V28.7: 模式自适应——Clarify → Team/Meeting（自动切换 + 显著 toast；Plan 由 /done 显式触发，不走自动）
     //
     // 引用关系：
     //   - 输入：text（用户当条消息）

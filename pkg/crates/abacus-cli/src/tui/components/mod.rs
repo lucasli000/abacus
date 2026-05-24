@@ -2054,7 +2054,7 @@ pub fn render_streaming_cursor(lines: &mut Vec<Line<'_>>, state: &AppState) {
 ///   - 色条作为视觉锚点贯通整个内容高度 (panel "卡片型" 风格)
 ///   - 内容渲染代码不需要关心色条 — 关注点分离
 ///   - 三模式所有 PanelTab 内容区(overview/team_board/meeting_agenda/custom)统一调用
-/// 引用关系: 被 render_panel 的 Chat/Team/Meeting 三分支调用
+/// 引用关系: 被 render_panel 的 Clarify/Plan/Team/Meeting 四分支调用
 /// 生命周期: 每帧渲染; 不持有状态
 fn render_card_bar(f: &mut ratatui::Frame, theme: &crate::tui::theme::Theme, area: Rect) -> Rect {
     let split_h = ratatui::layout::Layout::default()
@@ -2170,7 +2170,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     match state.mode {
         AbacusMode::Clarify => {
-            // V16: Chat 也加单元素 Tab 栏，与 Team/Meeting 顶部结构对齐
+            // V16: Clarify 也加单元素 Tab 栏，与 Plan/Team/Meeting 顶部结构对齐
             // 设计意图: 三模式 panel 起手统一 [Tab + sep + 内容]，避免 Chat 内容裸起步带来的视觉断层
             // 引用关系: 复用 build_tab_spans helper；单 label "总览" 与 Team/Meeting 的首 Tab 同义
             // 生命周期: 每帧渲染；Chat 模式不切换 Tab，active 始终 0
@@ -2340,7 +2340,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 }
 
-/// 面板总览区块(Chat 摘要 / Team·Meeting 的"摘要"Tab)
+/// 面板总览区块(Clarify 摘要 / Plan·Team·Meeting 的"摘要"Tab)
 /// V23: 色条逻辑已迁出到 render_card_bar (render_panel 统一调用),
 ///      此函数只负责内容区垂直布局: timeline / 细分隔 / memory
 /// 引用关系: 被三模式的 PanelTab::Overview 分支调用

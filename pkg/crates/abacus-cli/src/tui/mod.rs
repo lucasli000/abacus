@@ -4,7 +4,7 @@
 //!
 //! 入口: `cargo run --bin tui_main`
 //!
-//! 支持 Chat / Team / Meeting 三种模式切换。
+//! 支持 Clarify / Plan / Team / Meeting 四种模式切换。
 //! 快捷键参考: Ctrl+C 退出, Esc 暂停, Tab 切换焦点, Ctrl+B 看板, Ctrl+Enter 发送。
 
 pub mod api;

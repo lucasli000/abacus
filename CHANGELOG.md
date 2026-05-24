@@ -2,6 +2,9 @@
 
 ## v1.0.0 (2026-05-24) — 首个稳定版发布
 
+### TUI 交互模式（V33 4 阶 DAG）
+- **Clarify**（默认入口）→ **Plan** → **Team** → **Meeting** 四模式按需流转
+
 ### Architecture
 
 - **协议同构感知层（J1+J2）** — `tool::cluster::ClusterRegistry` 把工具间横向关系显式化；

@@ -5,7 +5,7 @@
 //! 布局: 顶栏(100%宽) + 对话区 + 输入区(7/5/4行) + 可选右侧面板(28%宽, Ctrl+B)
 //!
 //! ## ⚠ 代码审查 @2025-01-23 (中等)
-//! Chat/Team/Meeting 三种 render() 函数有大量重复代码（约 25 行完全相同的布局逻辑：
+//! Clarify/Plan/Team/Meeting 四种 render() 函数有大量重复代码（约 25 行完全相同的布局逻辑：
 //! render_min_terminal_warning → chat_input_height → 四段 Layout → render_top_bar →
 //! 窄屏/宽屏分支 → render_input_bar_focused → render_status_bar → render_overlays）。
 //! 三种模式仅在 Panel 内容上不同 (render_panel_overview / render_panel_team_board /

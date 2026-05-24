@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/lucasli000/abacus/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasli000/abacus/actions/workflows/ci.yml)
 
-LLM Agent Kernel — 模块化 Agent 运行时，支持 Chat / Team / Meeting 三种交互模式。
+LLM Agent Kernel — 模块化 Agent 运行时，TUI 内置 Clarify → Plan → Team → Meeting 四阶交互模式 DAG。
 
 ## Quick Start
 
@@ -26,12 +26,20 @@ eval "$(cargo run --bin abacus -- completions bash)"
 
 ## Features
 
+### TUI 交互模式（4 阶 DAG）
+
+| 模式 | 功能 |
+|------|------|
+| **Clarify** | 默认入口——澄清需求，agent 通过提问消除歧义 |
+| **Plan** | 规划任务——Planner agent 将需求拆解为 TaskSpec[] |
+| **Team** | 执行任务——多 agent 并行执行，消费上阶段产出 |
+| **Meeting** | 专家会诊——多专家并行发言，综合得出讨论结论 |
+
+### 系统能力
+
 | 模块 | 功能 |
 |------|------|
-| **Chat** | 单 Agent 对话，实时思考 + 工具调用渲染 |
-| **Team** | 多角色协同执行，任务自动分配+顺序仿真 |
-| **Meeting** | 专家会议模式，并发推理+主持人分发汇总 |
-| **CLI** | Rustyline 行编辑、Shell 补全、消息复制 |
+| **CLI** | Rustyline 行编辑、Shell 补全、消息复制、`abacus chat/team/meeting` 子命令 |
 | **HTTP Server** | REST API + SSE 流式推送，Bearer token 认证 |
 | **Config** | 首次配置向导、config.yaml、环境变量覆盖 |
 

@@ -264,7 +264,7 @@ pub fn keyboard_cheatsheet() -> String {
             ("Ctrl+O",       "设置面板（API Key / Model / Thinking / Theme）"),
         ]),
         ("模式", &[
-            ("Ctrl+1/2/3",   "切换 Chat / Team / Meeting"),
+            ("Ctrl+1/2/3",   "切换 Clarify / Team / Meeting（Plan 由 /done 从 Clarify 流转触发）"),
         ]),
         ("会话", &[
             ("Ctrl+N",       "新建会话（清空当前 + 保留引擎）"),
