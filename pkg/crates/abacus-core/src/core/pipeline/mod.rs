@@ -1151,6 +1151,25 @@ impl<'a> TurnPipeline<'a> {
             if tool_calls.is_empty() {
                 let text = super::extract_text(&response.message);
 
+                // V38: 检测 max_tokens 截断 — finish_reason=="length" 表示输出被切断
+                // 自动追加续写请求（一次），让 LLM 从断点继续
+                if response.finish_reason == "length" && !text.is_empty() {
+                    tracing::warn!(text_len = text.len(), "response truncated by max_tokens, requesting continuation");
+                    // 把截断的响应存为 assistant message（已在上方 push 了）
+                    // 追加一条 user 续写提示
+                    {
+                        let s = self.session.read().await;
+                        let mut msgs = s.messages.write().await;
+                        msgs.push(Message {
+                            role: MessageRole::User,
+                            content: Some(MessageContent::Text("Continue from where you left off. Do not repeat what you already said.".into())),
+                            name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, prefix: false,
+                        });
+                    }
+                    // 继续循环（下一次迭代会发新请求）
+                    continue;
+                }
+
                 // Model Self-Escalation (flash → pro)
                 if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
                     return Ok(Some(result));
