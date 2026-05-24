@@ -33,7 +33,7 @@
 //!
 //! ## 边界
 //! - 最多 8 个 Specialist 同时参与 (configurable)
-//! - timeline > 25 轮触发压缩
+//! - timeline > 200 轮触发压缩
 //! - Specialist 通过 @mention 或语义匹配路由
 
 pub mod core;

@@ -3532,6 +3532,30 @@ Output JSON:
                     "guidance": "见到 violations>0 时主动调工具验证；cold_start=true 时降低断言密度优先 [训练快照] 标记；有 cross_session knowledge 时可主动 cross_session_query 检索历史。",
                 })
             }
+            // V38: session_request_permission — 检查工具是否已授权
+            // 如果已在 always_allow / mcip_grants 中，直接告知 LLM 已授权，无需等待
+            "session_request_permission" => {
+                let requested_tool = params.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
+                let grants = s.mcip_grants.read().unwrap();
+                let already_granted = grants.contains(requested_tool);
+                drop(grants);
+                drop(map);
+                drop(s);
+                if already_granted || requested_tool.is_empty() {
+                    serde_json::json!({
+                        "status": "already_authorized",
+                        "tool_id": requested_tool,
+                        "hint": "This tool is already in your permanent allow list. You can call it directly without requesting permission."
+                    })
+                } else {
+                    // 未授权——返回说明让 LLM 直接调用工具（MCIP 会自动弹窗）
+                    serde_json::json!({
+                        "status": "not_needed",
+                        "tool_id": requested_tool,
+                        "hint": "You don't need to request permission explicitly. Just call the tool directly — if authorization is needed, the system will automatically prompt the user."
+                    })
+                }
+            }
             // V38: LLM 主动模式切换
             "mode_switch" => {
                 drop(map);

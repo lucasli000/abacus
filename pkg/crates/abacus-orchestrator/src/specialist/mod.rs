@@ -395,8 +395,8 @@ impl SpecialistInstance {
 ///     tags: ["代码", "编程"]
 ///     allowed_tools: ["filengine_fs_*"]
 ///     engagement:
-///       max_speeches_per_round: 3
-///       max_thinking_tokens: 4096
+///       max_speeches_per_round: 50
+///       max_thinking_tokens: 100000
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialistRegistration {

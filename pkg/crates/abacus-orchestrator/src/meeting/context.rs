@@ -17,11 +17,18 @@
 //! - 路由后 `snapshot_private()` 被调用保存推理前快照
 //!
 //! ## 边界
-//! - timeline 超过 25 条时触发压缩，合并最早一半
+//! - timeline token 总量超过 context_budget 的 60% 时触发压缩
 //! - 私有上下文在 FollowUp 完成后被 `drop_private()` 清理
 
 use crate::specialist::SpecialistId;
 use std::collections::BTreeMap;
+
+/// 默认 context budget (tokens)。
+/// 可通过 `ContextPool::with_budget()` 覆盖。
+const DEFAULT_CONTEXT_BUDGET: usize = 200_000;
+
+/// 压缩触发比例：timeline token 占 budget 的此比例时触发压缩
+const COMPRESS_RATIO: f64 = 0.60;
 
 /// 共享时间线条目
 #[derive(Debug, Clone)]
@@ -49,6 +56,10 @@ pub struct ContextPool {
     timeline: Vec<TimelineEntry>,
     private: BTreeMap<SpecialistId, PrivateContext>,
     turn_counter: u32,
+    /// timeline 累计 token 估算
+    timeline_tokens: usize,
+    /// context window 预算 (tokens)
+    context_budget: usize,
 }
 
 impl Default for ContextPool {
@@ -59,13 +70,29 @@ impl Default for ContextPool {
 
 impl ContextPool {
     pub fn new() -> Self {
-        Self { timeline: vec![], private: BTreeMap::new(), turn_counter: 0 }
+        Self {
+            timeline: vec![],
+            private: BTreeMap::new(),
+            turn_counter: 0,
+            timeline_tokens: 0,
+            context_budget: DEFAULT_CONTEXT_BUDGET,
+        }
+    }
+
+    /// 创建指定 context budget 的 ContextPool
+    pub fn with_budget(budget: usize) -> Self {
+        Self {
+            context_budget: budget,
+            ..Self::new()
+        }
     }
 
     pub fn add_turn(&mut self, entry: TimelineEntry) -> u32 {
+        self.timeline_tokens += estimate_entry_tokens(&entry);
         self.timeline.push(entry);
         self.turn_counter += 1;
-        if self.timeline.len() > 200 {
+        let threshold = (self.context_budget as f64 * COMPRESS_RATIO) as usize;
+        if self.timeline_tokens > threshold {
             self.compress();
         }
         self.turn_counter
@@ -84,11 +111,11 @@ impl ContextPool {
         self.turn_counter
     }
 
-    /// 压缩时间线: 合并最早一半为一条摘要
+    /// 压缩时间线: 合并最早一半为一条摘要，重算 token 计数
     ///
     /// ## 边界
     /// - 压缩后保留约一半条目（含一条摘要）
-    /// - v0.1 压缩丢弃被合并轮次的实际内容
+    /// - token 计数从保留部分重算（精确）
     fn compress(&mut self) {
         let mid = self.timeline.len() / 2;
         let summary = TimelineEntry {
@@ -99,6 +126,18 @@ impl ContextPool {
         };
         self.timeline.drain(..mid);
         self.timeline.insert(0, summary);
+        // 重算 token（压缩后精确值）
+        self.timeline_tokens = self.timeline.iter().map(estimate_entry_tokens).sum();
+    }
+
+    /// 当前 timeline token 使用量
+    pub fn timeline_token_usage(&self) -> usize {
+        self.timeline_tokens
+    }
+
+    /// context budget
+    pub fn context_budget(&self) -> usize {
+        self.context_budget
     }
 
     pub fn snapshot_private(&mut self, sp_id: SpecialistId, messages: Vec<String>) {
@@ -112,6 +151,33 @@ impl ContextPool {
     pub fn drop_private(&mut self, sp_id: &SpecialistId) {
         self.private.remove(sp_id);
     }
+}
+
+/// 估算单条 TimelineEntry 的 token 开销（CJK-aware）
+fn estimate_entry_tokens(entry: &TimelineEntry) -> usize {
+    // speaker id + turn 元数据 ~ 10 tokens
+    let meta = 10;
+    let text = &entry.conclusion;
+    if text.is_empty() {
+        return meta + 1;
+    }
+    let mut cjk_chars = 0usize;
+    let mut ascii_bytes = 0usize;
+    for ch in text.chars() {
+        if matches!(ch,
+            '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' |
+            '\u{F900}'..='\u{FAFF}' | '\u{3000}'..='\u{303F}' |
+            '\u{FF00}'..='\u{FFEF}' | '\u{AC00}'..='\u{D7AF}' |
+            '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}'
+        ) {
+            cjk_chars += 1;
+        } else {
+            ascii_bytes += ch.len_utf8();
+        }
+    }
+    let cjk_tokens = (cjk_chars as f64 * 1.2) as usize;
+    let ascii_tokens = (ascii_bytes as f64 * 0.25) as usize;
+    meta + cjk_tokens + ascii_tokens + 1
 }
 
 #[cfg(test)]
@@ -147,13 +213,28 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_at_201_entries() {
-        let mut pool = ContextPool::new();
-        for i in 1..=201 {
+    fn test_compress_triggered_by_token_budget() {
+        // 使用小 budget 快速触发压缩
+        let mut pool = ContextPool::with_budget(500);
+        // 每条 entry 约 14 tokens ("结论N" ~ 4 CJK + meta)
+        // 500 * 0.6 = 300 token threshold → ~21 条触发
+        for i in 1..=30 {
             pool.add_turn(make_entry(i, "sp-coder"));
         }
-        assert!(pool.all().len() < 201);
-        assert!(pool.all().len() >= 101);
+        // 压缩应该已触发，条目数 < 30
+        assert!(pool.all().len() < 30);
+        // token 使用量应低于 budget
+        assert!(pool.timeline_token_usage() < 500);
+    }
+
+    #[test]
+    fn test_no_compress_under_budget() {
+        // 大 budget，10 条不会触发
+        let mut pool = ContextPool::with_budget(100_000);
+        for i in 1..=10 {
+            pool.add_turn(make_entry(i, "sp-coder"));
+        }
+        assert_eq!(pool.all().len(), 10);
     }
 
     #[test]

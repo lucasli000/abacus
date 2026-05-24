@@ -269,8 +269,8 @@ impl PlanExecutor {
             StepKind::SubAgentDelegate { task_description, boundary_preset } => {
                 use crate::subagent::{SubAgentBoundary, SubAgentContext};
                 let boundary = match boundary_preset.as_str() {
-                    "tight" => SubAgentBoundary { max_steps: 5, max_tokens: 4096, ..Default::default() },
-                    "wide" => SubAgentBoundary { max_steps: 50, max_tokens: 16384, ..Default::default() },
+                    "tight" => SubAgentBoundary { max_steps: 50, max_tokens: 32_000, ..Default::default() },
+                    "wide" => SubAgentBoundary { max_steps: 1000, max_tokens: 500_000, ..Default::default() },
                     _ => SubAgentBoundary::default(),
                 };
                 let ctx = SubAgentContext {
