@@ -581,20 +581,20 @@ pub(crate) fn adaptive_timeout_secs(
     turn_count: u32,
     ceiling_secs: u64,
 ) -> u64 {
-    const FLOOR_SECS: u64 = 120;
+    const FLOOR_SECS: u64 = 300;
 
     // 模型基础时间：flash 模型推理更快
-    let base: u64 = if model_id.contains("flash") { 150 } else { 360 };
+    let base: u64 = if model_id.contains("flash") { 600 } else { 900 };
 
-    // Thinking 奖励：extended reasoning 可能需要 3-5 分钟额外时间
-    let thinking_bonus: u64 = if thinking_enabled { 180 } else { 0 };
+    // Thinking 奖励：extended reasoning 可能需要更长额外时间
+    let thinking_bonus: u64 = if thinking_enabled { 600 } else { 0 };
 
-    // Token 生成时间：按平均 40 tokens/s 估算上限
-    // max_tokens=8192 → +204s；max_tokens=32768 → +819s（会被 ceiling 截断）
-    let token_time: u64 = (max_tokens as u64) / 40;
+    // Token 生成时间：按保守 15 tokens/s 估算上限
+    // max_tokens=8192 → +546s；max_tokens=32000 → +2133s（会被 ceiling 截断）
+    let token_time: u64 = (max_tokens as u64) / 15;
 
-    // Session 深度：每 5 轮 +30s，上限 120s（超长会话上下文很大）
-    let session_depth: u64 = ((turn_count as u64 / 5) * 30).min(120);
+    // Session 深度：每 5 轮 +30s，上限 600s（超长会话上下文很大）
+    let session_depth: u64 = ((turn_count as u64 / 5) * 30).min(600);
 
     let computed = base + thinking_bonus + token_time + session_depth;
     // 防止 ceiling_secs < FLOOR_SECS 时 u64::clamp panic（clamp 要求 min ≤ max）
@@ -627,12 +627,12 @@ impl AbacusServer {
         let default_model = cfg_mgr.get_str("core.default_model")
             .unwrap_or("deepseek-v4-flash");
         let max_turns = cfg_mgr.get_number("core.max_turns")
-            .map(|n| n as u32).unwrap_or(10);
+            .map(|n| n as u32).unwrap_or(50);
         let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls")
-            .map(|n| n as u32).unwrap_or(8);
+            .map(|n| n as u32).unwrap_or(100);
         let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
         let max_tokens = cfg_mgr.get_number("core.max_tokens")
-            .map(|n| n as u32).unwrap_or(8192);
+            .map(|n| n as u32).unwrap_or(32000);
         let context_window = cfg_mgr.get_number("core.context_window")
             .map(|n| n as usize).unwrap_or(128_000);
         let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
@@ -775,8 +775,8 @@ impl AbacusServer {
 
             // P10: 熔断 — 连续 5 次失败后熔断，30s 自动恢复
             core_loop.add_middleware(10, Arc::new(CircuitBreaker::new(5, Duration::from_secs(30)))).await;
-            // P20: 限流 — 每工具每分钟最多 20 次调用
-            core_loop.add_middleware(20, Arc::new(RateLimiter::new(20, Duration::from_secs(60)))).await;
+            // P20: 限流 — 每工具每分钟最多 200 次调用
+            core_loop.add_middleware(20, Arc::new(RateLimiter::new(200, Duration::from_secs(60)))).await;
             // P50: 认识论约束 — 与 CoreLoop.epistemic_guard 共享同一 Arc 实例（热插拔版）
             core_loop.add_middleware(50, Arc::clone(core_loop.epistemic_guard()) as Arc<dyn abacus_core::mag_chain::Middleware>).await;
             // P70: PII 脱敏 — 递归清洗 output 中的信用卡/Email/SSN

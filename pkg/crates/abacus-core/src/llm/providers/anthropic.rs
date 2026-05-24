@@ -751,7 +751,7 @@ impl LlmProvider for AnthropicProvider {
         );
 
         let mut retries: u64 = 0;
-        let max_retries = 2;
+        let max_retries = 5;
 
         let resp = loop {
             let mut req_builder = self

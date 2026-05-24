@@ -866,8 +866,36 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk, ConfirmOption};
                             use abacus_core::mcip::McipConfirmKind;
 
-                            // V28：always_allow 短路——用户之前已总是允许此工具，立即放行
-                            if state.always_allow.contains(&req.tool_id) {
+                            // V38: 分级权限策略——根据工具类型决定是否自动放行
+                            // - 只读工具（read/search/ls/tree/grep/info）：永久放行
+                            // - 编辑工具（edit/write/move/mkdir）+ 非破坏性 bash：session 内放行
+                            // - 破坏性操作（rm/format/drop/kill/reset/force）：每次确认
+                            let tool_lower = req.tool_id.to_lowercase();
+                            let is_readonly = ["read", "search", "ls", "tree", "grep", "info", "list", "get"]
+                                .iter().any(|k| tool_lower.contains(k)) && !tool_lower.contains("write");
+                            let is_destructive_cmd = if tool_lower.contains("bash") {
+                                // 检查 bash 命令参数是否含破坏性关键词
+                                let params_str = req.params_preview.as_deref().unwrap_or("");
+                                let params_lower = params_str.to_lowercase();
+                                ["rm ", "rm\t", "rmdir", "format", "mkfs", "dd ", "kill -9",
+                                 "drop ", "truncate", "reset --hard", "push --force", "clean -f",
+                                 "> /dev/", "shred", "wipefs"]
+                                    .iter().any(|k| params_lower.contains(k))
+                            } else {
+                                ["delete", "remove", "drop", "destroy", "purge"]
+                                    .iter().any(|k| tool_lower.contains(k))
+                            };
+
+                            let auto_allow = if is_readonly {
+                                true // 只读：永久放行
+                            } else if is_destructive_cmd {
+                                false // 破坏性：绝不自动放行
+                            } else {
+                                // 编辑类：检查 always_allow（首次弹窗后 session 内放行）
+                                state.always_allow.contains(&req.tool_id)
+                            };
+
+                            if auto_allow {
                                 let nonce = req.nonce.clone();
                                 let engine = state.engine_handle.clone();
                                 tokio::spawn(async move {
@@ -991,34 +1019,31 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 state.cleanup_toasts();
 
                 // ── 确认弹窗超时检查（每帧） ──
-                // V27/V29 用户偏好：差异化超时 + 用户介入冻结
-                //   High 风险（破坏性）：8s 无操作 → auto-reject (V29: P2 5s→8s 给 D 阅读留缓冲)
-                //   Medium/Low（非破坏性）：10s 无操作 → auto-ALWAYS-allow（push 进 always_allow，
-                //     后续同工具自动放行，不再弹窗骚扰）
-                //   V29 (P1+P4): D 按下 / 终端失焦 时 timer 暂停, is_expired 内部已处理
+                // V38: 分级超时策略
+                //   破坏性（High risk）：超时 → 拒绝
+                //   非破坏性（Medium/Low）：超时 → session 内允许（不写入永久 always_allow）
                 if let Some(ref dialog) = state.confirm_dialog {
                     if dialog.is_expired() {
-                        // V29 (P0): tool_id 用于 always_allow 短路, action 仅用于显示
                         let tool_id = dialog.tool_id.clone();
                         let action = dialog.action.clone();
-                        let auto_allow = dialog.timeout_action();
                         let is_destructive = dialog.risk == crate::tui::state::ConfirmRisk::High;
                         state.confirm_dialog = None;
-                        state.pending_confirmation_response = Some(auto_allow);
                         let ts = chrono::Local::now().format("%H:%M").to_string();
-                        if auto_allow {
-                            // V27：非破坏性超时 → 加入 always_allow（视同用户选了"总是允许"）
-                            // V29 (P0): 用 tool_id 而非 action — 与 run loop 短路检查一致
-                            if !is_destructive && !state.always_allow.contains(&tool_id) {
-                                state.always_allow.insert(tool_id.clone());
-                                // V29.11: 系统级持久化
-                                let _ = save_always_allow(&state.always_allow);
-                            }
-                            state.add_event(&ts, "session", &format!("⏱ 超时自动总是允许: {}", action), crate::tui::state::EventLevel::Info);
-                            state.add_toast("⏱ 超时 → 自动允许（同类不再询问）", Duration::from_secs(3));
+                        if is_destructive {
+                            // 破坏性：超时拒绝
+                            state.pending_confirmation_response = Some(false);
+                            state.add_event(&ts, "session", &format!("⏱ 超时拒绝（破坏性）: {}", action), crate::tui::state::EventLevel::Warning);
+                            state.add_toast("⏱ 超时 → 已拒绝（破坏性操作需显式确认）", Duration::from_secs(3));
                         } else {
-                            state.add_event(&ts, "session", &format!("⏱ 超时自动拒绝: {}", action), crate::tui::state::EventLevel::Warning);
-                            state.add_toast("⏱ 超时 → 已自动拒绝（破坏性操作）", Duration::from_secs(3));
+                            // 非破坏性：超时 → session 内允许（加入 session grants，不持久化）
+                            state.pending_confirmation_response = Some(true);
+                            // 加入 session 级 grants（不写 always_allow.json，session 结束后失效）
+                            if !state.always_allow.contains(&tool_id) {
+                                state.always_allow.insert(tool_id.clone());
+                                // 注意：不调用 save_always_allow——仅 session 内有效
+                            }
+                            state.add_event(&ts, "session", &format!("⏱ 超时自动允许（session 内）: {}", action), crate::tui::state::EventLevel::Info);
+                            state.add_toast("⏱ 超时 → session 内允许（不持久化）", Duration::from_secs(3));
                         }
                     }
                 }

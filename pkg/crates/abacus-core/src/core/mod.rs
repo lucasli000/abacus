@@ -470,8 +470,8 @@ impl Default for CoreConfig {
     fn default() -> Self {
         Self {
             // V29.13: 5 → 25, 同步 config.rs default_config()
-            max_turns_per_request: 200,
-            max_tool_calls_per_turn: 8,
+            max_turns_per_request: 1000,
+            max_tool_calls_per_turn: 100,
             default_model: ModelId("deepseek-v4-flash".into()),
             default_temperature: 0.6,
             default_max_tokens: 32000,
@@ -492,13 +492,13 @@ impl Default for CoreConfig {
             // 引用关系：CoreLoop::new 用此值替换 registry 默认 LintRuleSet
             lint_overrides: None,
             // Task #96：单 session 默认最多 2 次模型升级，防 cache 振荡
-            max_escalations: 2,
+            max_escalations: 10,
             palace_sync_interval_turns: None,   // Phase γ-Palace-C：默认关
             default_compress_level: crate::core::context::CompressLevel::Brief, // Z3：默认 Brief 兼容旧行为
             // W2 (Task #100)：默认关——遵循 default-off 原则；运维显式开启
             tool_result_dedup_enabled: false,
             tool_result_dedup_ttl_secs: 60,
-            tool_result_dedup_capacity_kb: 256,
+            tool_result_dedup_capacity_kb: 2048,
             // Wrapping-E + 段 K5：默认开——段 K1~K4 多层兜底已根除评分错杀风险
             //   K1: env_failure 不拉评分；K2: 扩展工具 30 次冷启动期；
             //   K4: palace_demoted 每 50 turn 试探放行；K3: provider/cluster floor + 全量回退兜底

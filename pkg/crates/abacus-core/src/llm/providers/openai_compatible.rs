@@ -496,7 +496,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
 
         let mut retries: u64 = 0;
-        let max_retries = 2;
+        let max_retries = 5;
 
         let resp = loop {
             let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());

@@ -582,7 +582,7 @@ mod tests {
                 allowed_ports: vec![443],
             }],
             confirm_required: false,
-            max_execution_ms: 5000,
+            max_execution_ms: 60000,
             min_role: UserRole::User,
         };
         let gateway = McipGateway::new();
@@ -602,7 +602,7 @@ mod tests {
                 read_only: true,
             }],
             confirm_required: false,
-            max_execution_ms: 5000,
+            max_execution_ms: 60000,
             min_role: UserRole::User,
         };
         let gateway = McipGateway::new();
@@ -647,7 +647,7 @@ mod tests {
             tool_id_pattern: "admin/**".into(),
             allowed_capabilities: vec![],
             confirm_required: false,
-            max_execution_ms: 5000,
+            max_execution_ms: 60000,
             min_role: UserRole::Admin,
         });
         let denied = gateway2.check(&ToolId("admin/delete".into()), &Value::Null, UserRole::Developer);

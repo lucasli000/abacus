@@ -45,7 +45,7 @@ impl Step {
             id: id.into(),
             kind,
             depends_on: Vec::new(),
-            timeout_secs: 30,
+            timeout_secs: 300,
         }
     }
 

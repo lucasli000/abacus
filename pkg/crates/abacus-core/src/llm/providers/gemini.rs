@@ -366,7 +366,7 @@ impl LlmProvider for GeminiProvider {
         );
 
         let mut retries: u64 = 0;
-        let max_retries = 2;
+        let max_retries = 5;
         let url = self.endpoint_url("generateContent");
 
         let resp = loop {

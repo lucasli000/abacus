@@ -96,7 +96,7 @@ pub async fn create_engine(
     // Model — prefer config over parameter
     let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
 
-    let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(20);
+    let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(200);
     // V29.14 (Risk 3): max_turns 过高时记录 tracing::warn, 提示 token 费用风险
     //   阈值 60 = 默认 25 的 2.4x, 是合理"上限警戒线"; <60 静默
     //   仅记日志, 不阻塞启动 (用户主动调高通常有意图, 不该硬限制)
@@ -109,9 +109,9 @@ pub async fn create_engine(
             max_turns
         );
     }
-    let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls").map(|n| n as u32).unwrap_or(10);
+    let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls").map(|n| n as u32).unwrap_or(100);
     let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
-    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(8192);
+    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(32000);
     let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
     let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
 
@@ -197,11 +197,11 @@ pub async fn create_engine(
         // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
         lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
         // Task #96：单 session 模型升级预算
-        max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(2),
+        max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
         // W2 (Task #100): tool result dedup 与 abacus-core 默认值对齐
         tool_result_dedup_enabled: false,
         tool_result_dedup_ttl_secs: 60,
-        tool_result_dedup_capacity_kb: 256,
+        tool_result_dedup_capacity_kb: 2048,
         adaptive_d_tier_hide: false,
         // cross-session: 默认开启 jsonl 事件流写入
         event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
@@ -255,10 +255,10 @@ pub async fn create_engine(
         use abacus_core::mag_chain::{AuditLogger, CircuitBreaker, PiiRedactor, RateLimiter};
         use std::time::Duration;
 
-        // P10: 熔断 — 连续 5 次失败后熔断，30s 自动恢复
-        core.add_middleware(10, Arc::new(CircuitBreaker::new(5, Duration::from_secs(30)))).await;
-        // P20: 限流 — 每工具每分钟最多 20 次调用（滑动窗口）
-        core.add_middleware(20, Arc::new(RateLimiter::new(20, Duration::from_secs(60)))).await;
+        // P10: 熔断 — 连续 10 次失败后熔断，30s 自动恢复
+        core.add_middleware(10, Arc::new(CircuitBreaker::new(10, Duration::from_secs(30)))).await;
+        // P20: 限流 — 每工具每分钟最多 200 次调用（滑动窗口）
+        core.add_middleware(20, Arc::new(RateLimiter::new(200, Duration::from_secs(60)))).await;
         // P50: 认识论约束 — 与 CoreLoop.epistemic_guard 共享同一 Arc 实例
         //       EpistemicGuard 的内部状态（violation_count/zero_hit_streak）通过此共享引用
         //       在 pipeline setup() 和 post_process() 中跨 turn 累积

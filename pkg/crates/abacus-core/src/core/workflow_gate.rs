@@ -445,8 +445,8 @@ impl Default for PhaseConfig {
         Self {
             fast_path_threshold: 0.3,
             full_threshold: 0.6,
-            max_rollbacks: 3,
-            max_total_duration_secs: 300,
+            max_rollbacks: 10,
+            max_total_duration_secs: 3600,
         }
     }
 }

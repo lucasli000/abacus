@@ -61,7 +61,7 @@ impl CodeExecutor {
         let engine = Self::build_sandboxed_engine();
         Self {
             engine,
-            timeout_ms: 1000,
+            timeout_ms: 30000,
         }
     }
 

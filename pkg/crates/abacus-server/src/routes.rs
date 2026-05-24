@@ -229,9 +229,9 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     use std::time::Duration;
     use abacus_core::llm::ModelCache;
 
-    // 实时拉取（5s timeout）
+    // 实时拉取（30s timeout）
     let live = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         state.core_loop.discover_all_models(),
     ).await;
 
@@ -637,8 +637,19 @@ async fn chat_stream_handler(
                     yield Ok(Event::default().event("confirm_required").data(data));
                 }
                 // V29.11: ToolArgs/ToolOutput 是 TUI 专用 chunk（diff/trace 渲染）
-                // SSE 客户端不消费——静默丢弃避免 non-exhaustive 编译失败
+                // SSE 客户端不消费——静默丢弃
                 StreamChunk::ToolArgs { .. } | StreamChunk::ToolOutput { .. } => {}
+                // Iteration/Compress 是 CoreLoop 内部生命周期信号，SSE 转为轻量状态事件
+                StreamChunk::IterationStart { iteration } => {
+                    yield Ok(Event::default().event("iteration_start").data(iteration.to_string()));
+                }
+                StreamChunk::CompressStart => {
+                    yield Ok(Event::default().event("compress_start").data(""));
+                }
+                StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
+                    let data = serde_json::json!({"messages_compressed": messages_compressed, "tokens_saved": tokens_saved}).to_string();
+                    yield Ok(Event::default().event("compress_end").data(data));
+                }
             }
         }
 

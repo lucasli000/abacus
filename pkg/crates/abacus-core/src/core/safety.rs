@@ -41,9 +41,9 @@ impl SafetyGuard {
     pub fn new() -> Self {
         Self {
             max_input_length: 100_000,
-            max_total_tool_calls: 40,
-            max_recursion_depth: 5,
-            max_session_duration: Duration::from_secs(3600), // 1 小时
+            max_total_tool_calls: 500,
+            max_recursion_depth: 20,
+            max_session_duration: Duration::from_secs(28800), // 8 小时
             // ToolId 命名空间：dispatch 链路传入的是 ToolId.0（带 filengine. 前缀），
             // is_sensitive_operation 当前用 contains 子串匹配做兼容兜底，但前缀化的
             // 名单消除子串匹配脆弱性（避免未来 mcp/server-fs.write 等命名误判敏感）。
@@ -209,16 +209,16 @@ mod tests {
     #[test]
     fn test_tool_call_count_check() {
         let guard = SafetyGuard::new();
-        assert!(guard.check_tool_call_count(39).is_ok());
-        assert!(guard.check_tool_call_count(40).is_ok());
-        assert!(guard.check_tool_call_count(41).is_err());
+        assert!(guard.check_tool_call_count(499).is_ok());
+        assert!(guard.check_tool_call_count(500).is_ok());
+        assert!(guard.check_tool_call_count(501).is_err());
     }
 
     #[test]
     fn test_recursion_depth_check() {
         let guard = SafetyGuard::new();
-        assert!(guard.check_recursion_depth(4).is_ok());
-        assert!(guard.check_recursion_depth(5).is_err());
+        assert!(guard.check_recursion_depth(19).is_ok());
+        assert!(guard.check_recursion_depth(20).is_err());
     }
 
     #[test]
@@ -240,7 +240,7 @@ mod tests {
     fn test_check_all_fail() {
         let guard = SafetyGuard::new();
         let start = Instant::now();
-        let result = guard.check_all(&"x".repeat(100_001), 41, 6, start);
+        let result = guard.check_all(&"x".repeat(100_001), 501, 21, start);
         assert!(result.is_err());
         let violations = result.unwrap_err();
         assert_eq!(violations.len(), 3); // input + tool + recursion
