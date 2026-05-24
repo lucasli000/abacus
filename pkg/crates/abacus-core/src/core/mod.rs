@@ -474,7 +474,7 @@ impl Default for CoreConfig {
             max_tool_calls_per_turn: 8,
             default_model: ModelId("deepseek-v4-flash".into()),
             default_temperature: 0.6,
-            default_max_tokens: 8192,
+            default_max_tokens: 32000,
             system_prompt: String::new(),
             model_spec: None,
             thinking_intent: None,

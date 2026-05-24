@@ -292,11 +292,11 @@ impl AnthropicProvider {
 
         let model_id: ModelId = model.into();
         let (budget, max_tokens) = if model_id.0.contains("sonnet") || model_id.0.contains("haiku") {
-            (4096, 8192)
+            (16384, 32000)
         } else if model_id.0.contains("opus") {
-            (8192, 16384)
+            (32768, 32000)
         } else {
-            (4096, 8192)
+            (16384, 32000)
         };
 
         Self {

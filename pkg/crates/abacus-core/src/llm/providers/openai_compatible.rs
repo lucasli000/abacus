@@ -266,7 +266,7 @@ impl OpenAICompatibleProvider {
             model: model.into(),
             auth_header: auth_header.unwrap_or_else(|| "Authorization".into()),
             auth_prefix: auth_prefix.unwrap_or_else(|| "Bearer ".into()),
-            default_max_tokens: 4096,
+            default_max_tokens: 32000,
         }
     }
 
