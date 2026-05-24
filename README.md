@@ -9,20 +9,14 @@ LLM Agent Kernel — 模块化 Agent 运行时，TUI 内置 Clarify → Plan →
 
 ## Quick Start
 
+已装好 abacus（见 [Installation](#installation)）后：
+
 ```bash
-# 1. 设置 API key
-export ABACUS_API_KEY=sk-xxx
-# 或
-export DEEPSEEK_API_KEY=sk-xxx
-
-# 2. 进入交互式 TUI
-cargo run --bin abacus
-# 或直接 chat
-cargo run --bin abacus -- chat --model deepseek-v4-flash
-
-# 3. 生成 Shell 补全
-eval "$(cargo run --bin abacus -- completions bash)"
+export ABACUS_API_KEY=sk-xxx        # 或 DEEPSEEK_API_KEY=sk-xxx
+abacus                              # 进入 TUI（默认 Clarify 模式）
 ```
+
+零起点首次安装请直接看下方 Installation 节。
 
 ## Features
 
@@ -55,22 +49,67 @@ abacus-cli        — CLI + TUI (ratatui + crossterm)
 
 ## Installation
 
+### 1. 前置依赖
+
+Rust 1.75+。未装：
+
 ```bash
-# Build from source
-cd pkg && cargo build --release
-
-# Run TUI
-./target/release/abacus
-
-# Run HTTP server
-./target/release/abacus-server
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### Docker
+### 2. 从源码编译
 
 ```bash
+git clone https://github.com/lucasli000/abacus.git
+cd abacus/pkg
+cargo build --release
+# 产物：./target/release/{abacus, abacus-server}
+```
+
+### 3. 入 PATH（可选）
+
+```bash
+cargo install --path crates/abacus-cli      # abacus（CLI + TUI）
+cargo install --path crates/abacus-server   # abacus-server（HTTP）
+# 或直接复制：cp ./target/release/abacus ~/.local/bin/
+```
+
+### 4. 配置 API Key
+
+```bash
+export ABACUS_API_KEY=sk-xxx                # 或
+export DEEPSEEK_API_KEY=sk-xxx
+```
+
+### 5. 验证安装
+
+```bash
+abacus --version                            # 1.0.0
+abacus chat -m "ping"                       # 端到端冒烟
+```
+
+### Shell 补全（可选）
+
+```bash
+eval "$(abacus completions bash)"           # bash
+abacus completions zsh > ~/.zsh/completions/_abacus
+abacus completions fish > ~/.config/fish/completions/abacus.fish
+```
+
+### Docker（HTTP server 场景）
+
+```bash
+git clone https://github.com/lucasli000/abacus.git
+cd abacus
 docker compose up -d
-curl http://localhost:8080/api/v1/health
+curl http://localhost:8080/api/v1/health    # 验证
+```
+
+### 卸载
+
+```bash
+cargo uninstall abacus-cli abacus-server
+rm -rf ~/.abacus/                           # 清理配置 + sessions + sqlite
 ```
 
 ## Configuration
