@@ -762,6 +762,25 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         // V29.11: 工具输出内容 — 回填 trace event 的 output 字段
                         StreamChunk::ToolOutput { name, output_json } => {
+                            // V38: 拦截 mode_switch 工具输出，执行模式切换
+                            if name == "mode_switch" {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
+                                    if val.get("action").and_then(|v| v.as_str()) == Some("switch_mode") {
+                                        if let Some(target_str) = val.get("target").and_then(|v| v.as_str()) {
+                                            if let Some(target) = abacus_types::AbacusMode::from_label(target_str) {
+                                                let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                                                let display = val.get("display_name").and_then(|v| v.as_str()).unwrap_or(target_str);
+                                                state.set_mode(target);
+                                                state.add_toast(
+                                                    format!("🤖 LLM 切换到 {} 模式: {}", display, reason),
+                                                    std::time::Duration::from_secs(5),
+                                                );
+                                                state.add_event(&ts, "session", &format!("LLM 切换 → {}", display), crate::tui::state::EventLevel::Notice);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(tool) = state.streaming_tools.iter().rev()
                                 .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
                             {

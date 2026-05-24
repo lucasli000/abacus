@@ -2004,6 +2004,20 @@ impl CoreLoop {
                     },
                     "required": ["intent"]
                 })),
+            // V38: LLM 主动模式切换工具
+            // 引用：TUI run.rs 消费此工具输出后调用 state.set_mode(target)
+            // DAG 约束：Clarify → Meeting/Plan → Team → Clarify
+            // LLM 应在推理过程中判断当前任务需要哪种协作形态并主动切换
+            ("mode_switch",
+                "Switch the interaction mode. Modes form a DAG: Clarify→Meeting/Plan→Team→Clarify. Use this when you determine the task requires a different collaboration style: 'meeting' for multi-perspective review/debate, 'plan' for task decomposition/roadmap, 'team' for multi-agent parallel execution, 'clarify' to reset and gather requirements. The switch changes system behavior, tool availability, and output format.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "enum": ["clarify", "meeting", "plan", "team"], "description": "Target mode to switch to"},
+                        "reason": {"type": "string", "description": "Brief reason for the switch (shown to user)"}
+                    },
+                    "required": ["target"]
+                })),
         ];
         for (name, desc, params) in &entries {
             registry.register(ToolHandle {
@@ -3517,6 +3531,37 @@ Output JSON:
                     "cross_session": cross_session_stats,
                     "guidance": "见到 violations>0 时主动调工具验证；cold_start=true 时降低断言密度优先 [训练快照] 标记；有 cross_session knowledge 时可主动 cross_session_query 检索历史。",
                 })
+            }
+            // V38: LLM 主动模式切换
+            "mode_switch" => {
+                drop(map);
+                drop(s);
+                let target_str = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
+                let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("LLM initiated");
+                match abacus_types::AbacusMode::from_label(target_str) {
+                    Some(target) => {
+                        // 返回切换指令——TUI 层消费此 output 执行实际切换
+                        // core 层不直接修改 AppState（跨 crate 边界）
+                        serde_json::json!({
+                            "action": "switch_mode",
+                            "target": target_str,
+                            "reason": reason,
+                            "display_name": target.display_zh(),
+                        })
+                    }
+                    None => {
+                        return Ok(ToolOutput {
+                            tool_id: tool_id.clone(), success: false,
+                            output: serde_json::json!({
+                                "error": format!("invalid target mode: '{}'", target_str),
+                                "valid_targets": ["clarify", "meeting", "plan", "team"],
+                            }),
+                            latency_ms: 0,
+                            failure_kind: Some("ValidationError".into()),
+                            try_instead: Vec::new(),
+                        });
+                    }
+                }
             }
             _ => serde_json::json!({"error": format!("unknown: {}", name)}),
         };
