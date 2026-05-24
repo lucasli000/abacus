@@ -956,6 +956,12 @@ impl<'a> TurnPipeline<'a> {
         const MAX_TOTAL_TOOL_CALLS: u32 = 200;
 
         for loop_iter in 0..self.core.config.max_turns_per_request {
+            // V38: 迭代边界信号——TUI 收到后清空 streaming_thinking，避免跨迭代累积
+            if let Some(ref stx) = self.stream_tx {
+                let _ = stx.send(crate::llm::stream::StreamChunk::IterationStart {
+                    iteration: loop_iter as u32,
+                });
+            }
             // V35-1: messages 改为 mut，便于按需追加 prefix=true 的 assistant message
             let mut messages = {
                 let s = self.session.read().await;

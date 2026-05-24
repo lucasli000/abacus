@@ -45,6 +45,9 @@ pub enum StreamEvent {
 /// TUI 不需要关心 tool arg delta。
 #[derive(Debug, Clone)]
 pub enum StreamChunk {
+    /// 新一轮 LLM 调用开始（execute_loop 迭代边界）
+    /// TUI 收到后清空 streaming_thinking，准备接收新一轮内容
+    IterationStart { iteration: u32 },
     /// 思考过程增量文本
     Thinking(String),
     /// 正文增量文本

@@ -679,6 +679,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     use abacus_core::llm::stream::StreamChunk;
                     let ts = chrono::Local::now().format("%H:%M").to_string();
                     match chunk {
+                        StreamChunk::IterationStart { iteration } => {
+                            // V38: 迭代边界——清空累积的 thinking，准备新一轮内容
+                            // 保留 streaming_text（回复内容跨迭代累积是正确的）
+                            // 保留 streaming_tools（工具历史保留供参考）
+                            state.streaming_thinking.clear();
+                            state.streaming_thinking_started = false;
+                            state.streaming_text_started = false;
+                            if iteration > 0 {
+                                state.input_state = InputState::Thinking;
+                                state.processing_phase = format!("· iteration {}", iteration + 1);
+                            }
+                            state.rendered_lines_dirty.set(true);
+                        }
                         StreamChunk::TextDelta(t) => {
                             if !t.is_empty() && !state.streaming_text_started {
                                 state.streaming_text_started = true;
