@@ -1023,10 +1023,11 @@ impl<'a> TurnPipeline<'a> {
                 user_message_preamble: ctx.user_message_preamble.clone(),
             };
 
-            // V0.2: 选择 streaming 或 blocking 路径
-            // 策略: 只有"无 tools 定义"的请求才走 streaming（因为 tool_calls 需要完整 JSON）
-            // 有 tools 时降级为 blocking complete()，避免 tool calls 丢失
-            let use_streaming = self.stream_tx.is_some() && ctx.tool_defs.is_empty();
+            // V38: 始终走 streaming path（有 stream_tx 时）
+            // stream_complete 返回完整 LlmResponse（含 tool_calls），同时实时 forward
+            // thinking/text chunks 到 TUI。不再因为有 tools 就降级到 blocking（那会导致
+            // thinking 和消息输出"等完才弹出"，违背实时流式体验）。
+            let use_streaming = self.stream_tx.is_some();
 
             // 执行 LLM 请求（streaming 或 blocking），400 错误时尝试自动修复并重试一次
             let provider_result: Result<crate::llm::LlmResponse, KernelError> = if use_streaming {
