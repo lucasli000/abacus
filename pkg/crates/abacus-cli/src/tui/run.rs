@@ -680,12 +680,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     let ts = chrono::Local::now().format("%H:%M").to_string();
                     match chunk {
                         StreamChunk::TextDelta(t) => {
-                            // V29.5: 用专用 bool 字段判首次, 不再依赖 streaming_text.is_empty()
-                            //   原行为: 空字符串 delta 心跳后, 仍以 is_empty 判首次, 第二次真正
-                            //   非空 delta 不会触发"开始输出"事件 (实际无害但语义错位)
-                            //   修复: 收到非空 delta 才置 started; 重复非空 delta 不再误触发
                             if !t.is_empty() && !state.streaming_text_started {
                                 state.streaming_text_started = true;
+                                // V38: 切换状态指示到 Outputting
+                                state.input_state = InputState::Outputting;
+                                state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始输出", crate::tui::state::EventLevel::Info);
                             }
                             // K6：传入实际行内容数组，flash_state 内部计算 hash（避免“底部偏移”漂移）
@@ -700,15 +699,15 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // V29.5: 同 TextDelta, 用 streaming_thinking_started 判首次
                             if !t.is_empty() && !state.streaming_thinking_started {
                                 state.streaming_thinking_started = true;
+                                state.input_state = InputState::Thinking;
+                                state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
                             }
                             state.streaming_thinking.push_str(&t);
-                            state.rendered_lines_dirty.set(true); // 每个 chunk 都触发重绘
+                            state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::ToolStart { name } => {
                             // V28 (T3): 创建 ToolCall trace 拿 trace_id, 缓存到 streaming_tools
-                            // 末位 + streaming_trace_ids; ToolEnd 按 id 直接反查更新, 替代旧
-                            // "按 name 顺序匹配"路径(并行 tool call 不再错位)。
                             let trace_id = state.push_trace_full(
                                 ts.clone(),
                                 "tool".into(),
@@ -723,11 +722,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             );
                             state.streaming_trace_ids.push(trace_id);
                             state.streaming_tools.push((
-                                name,
+                                name.clone(),
                                 crate::tui::state::StreamingToolStatus::Running,
                                 None,
                                 trace_id,
                             ));
+                            // V38: 状态栏实时反映当前工具名（Working · tool_name）
+                            state.input_state = InputState::Executing;
+                            state.processing_phase = format!("· {}", name);
                             state.rendered_lines_dirty.set(true);
                         }
                         // V29.11: 工具输入参数 — 回填 trace event 的 args 字段

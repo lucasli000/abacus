@@ -1477,9 +1477,9 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let phase = &state.processing_phase;
     let phase_sep = if phase.is_empty() { "" } else { " " };
     let (status_text, status_color) = match state.input_state {
-        crate::tui::state::InputState::Thinking => (format!("{}{}{}{}", spinner(), phase_sep, phase, elapsed), state.theme.accent),
-        crate::tui::state::InputState::Executing => (format!("⚙{}{}{}", phase_sep, phase, elapsed), state.theme.gold),
-        crate::tui::state::InputState::Outputting => (format!("{} Generating{}", spinner(), elapsed), state.theme.success),
+        crate::tui::state::InputState::Thinking => (format!("{} Thinking{}{}{}", spinner(), phase_sep, phase, elapsed), state.theme.accent),
+        crate::tui::state::InputState::Executing => (format!("{} Working{}{}{}", spinner(), phase_sep, phase, elapsed), state.theme.gold),
+        crate::tui::state::InputState::Outputting => (format!("{} Outputting{}", spinner(), elapsed), state.theme.success),
         crate::tui::state::InputState::Paused => ("⏸ Paused".into(), state.theme.semantic_fg(SemanticIntent::Warning)),
         _ if state.engine_handle.is_some() => ("● Ready".into(), state.theme.success),
         _ => ("● Ready".into(), state.theme.muted),

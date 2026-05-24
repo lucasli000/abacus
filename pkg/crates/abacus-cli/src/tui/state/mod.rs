@@ -2072,7 +2072,7 @@ impl AppState {
             is_streaming: false,
             streaming_text: String::new(),
             streaming_thinking: String::new(),
-            show_streaming_trace: false, // V37: 默认隐藏 thinking/tools（Ctrl+O 切换）
+            show_streaming_trace: true, // V38: 默认显示 thinking/tools 内容流 + 状态指示并存
             // V29.5: 首次 chunk 触发标志（替代 is_empty 判定, 防空 delta 心跳误判）
             streaming_text_started: false,
             streaming_thinking_started: false,
