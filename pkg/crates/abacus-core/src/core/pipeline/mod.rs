@@ -1431,11 +1431,15 @@ impl<'a> TurnPipeline<'a> {
                                 let s = self.session.read().await;
                                 s.mcip_confirm_channels.lock().unwrap().insert(nonce.clone(), tx_one);
                             }
+                            // V30: bash 命令预览——让用户在弹窗中看到具体命令
+                            let preview = serde_json::to_string(&params)
+                                .ok()
+                                .map(|s| s.chars().take(120).collect::<String>());
                             let confirm_req = crate::mcip::McipConfirmRequest {
                                 tool_id: tool_id.0.clone(),
                                 reason: reason.clone(),
                                 kind: crate::mcip::McipConfirmKind::McipPolicy,
-                                params_preview: None,
+                                params_preview: preview,
                                 nonce: nonce.clone(),
                             };
                             ctx.pending_confirmations.push(confirm_req.clone());
@@ -1451,8 +1455,26 @@ impl<'a> TurnPipeline<'a> {
                                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
                                     .as_millis() as u64,
                             }).await;
-                            // 等待用户决策（drop sender = false / 显式 send true|false）
-                            let approved = rx_one.await.unwrap_or(false);
+                            // 等待用户决策，带超时保护（15s）防止 TUI 无响应时 pipeline 永久挂起
+                            // 超时 → 非破坏性自动允许，破坏性自动拒绝（与 TUI 侧 timeout 行为一致）
+                            let approved = match tokio::time::timeout(
+                                std::time::Duration::from_secs(15),
+                                rx_one,
+                            ).await {
+                                Ok(Ok(v)) => v,          // 正常收到用户决策
+                                Ok(Err(_)) => false,     // sender dropped（TUI 异常退出）→ 拒绝
+                                Err(_) => {
+                                    // 超时：非破坏性允许，破坏性拒绝
+                                    let is_dangerous = reason.contains("[bash]")
+                                        && reason.contains("⚠");
+                                    tracing::warn!(
+                                        tool = %tool_id.0,
+                                        dangerous = is_dangerous,
+                                        "confirm timeout (15s) — pipeline-side fallback"
+                                    );
+                                    !is_dangerous
+                                }
+                            };
                             if approved {
                                 // V30: bash 命令级 session grant——同类命令本 session 不再弹窗
                                 // 格式 "bash:{cmd} {subcmd}"，如 "bash:git push"

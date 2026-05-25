@@ -772,7 +772,7 @@ pub fn classify_bash_command(command: &str) -> BashDecision {
         "rm" | "rmdir" => BashDecision::NeedsConfirm(
             format!("'{}' deletes files/directories", cmd)),
         "mv" => BashDecision::NeedsConfirm("'mv' moves/renames files".into()),
-        "cp" => BashDecision::NeedsConfirm("'cp' copies files (may overwrite)".into()),
+        "cp" => BashDecision::Allow, // cp 不删除原件，低风险
         "mkdir" => BashDecision::Allow, // mkdir is low-risk (creates dirs)
         "touch" => BashDecision::Allow, // touch is low-risk (creates empty files)
         "chmod" | "chown" => BashDecision::NeedsConfirm(
@@ -793,6 +793,25 @@ pub fn classify_bash_command(command: &str) -> BashDecision {
         }
         "awk" => BashDecision::Allow, // awk without redirection is read-only (metachar blocks >)
         "tee" => BashDecision::NeedsConfirm("'tee' writes to files".into()),
+        // macOS/Linux: 打开文件/URL（无副作用，只是启动外部 app）
+        "open" | "xdg-open" => BashDecision::Allow,
+        // 编辑器/IDE 打开（无副作用）
+        "code" | "vim" | "nvim" | "nano" | "subl" | "cursor" => BashDecision::Allow,
+        // Rust 工具链管理（只读查询）
+        "rustup" => {
+            let subcmd = parts.get(1).copied().unwrap_or("");
+            if matches!(subcmd, "show" | "which" | "doc" | "man" | "check"
+                | "target" | "toolchain" | "component" | "override" | "--version") {
+                BashDecision::Allow
+            } else {
+                BashDecision::NeedsConfirm(format!("'rustup {}' may modify toolchain", subcmd))
+            }
+        }
+        // 剪贴板（允许——常用于复制结果）
+        "pbcopy" | "pbpaste" | "xclip" | "xsel" | "wl-copy" | "wl-paste" => BashDecision::Allow,
+        // man/help 查阅
+        "man" | "info" | "tldr" => BashDecision::Allow,
+        // 其他未知命令 → 需确认
         _ => BashDecision::NeedsConfirm(format!("command '{}' not in allowed list", cmd)),
     }
 }
@@ -846,11 +865,19 @@ fn classify_git(parts: &[&str], command: &str) -> BashDecision {
     }
 
     if GIT_READONLY.contains(&subcmd) {
-        BashDecision::Allow
-    } else {
-        // push, commit, add, reset, rebase, merge, checkout, cherry-pick, pull, clone, init...
-        BashDecision::NeedsConfirm(format!("'git {}' modifies repository state", subcmd))
+        return BashDecision::Allow;
     }
+    // 日常开发写操作（低风险，可回退）→ 允许
+    const GIT_DEV_WRITE: &[&str] = &[
+        "add", "commit", "pull", "clone", "init", "checkout", "switch",
+        "merge", "cherry-pick", "stash",
+    ];
+    if GIT_DEV_WRITE.contains(&subcmd) {
+        return BashDecision::Allow;
+    }
+    // 高风险写操作（不可回退/影响远端）→ 需确认
+    // push, reset, rebase, push --force, clean, gc
+    BashDecision::NeedsConfirm(format!("'git {}' modifies repository state", subcmd))
 }
 
 /// Cargo subcommand classification.
@@ -861,6 +888,9 @@ fn classify_cargo(parts: &[&str]) -> BashDecision {
         "build", "check", "test", "clippy", "fmt", "doc",
         "tree", "metadata", "verify-project", "locate-project",
         "pkgid", "search", "info",
+        // 开发常用：运行/基准/清理/更新是日常操作
+        "run", "bench", "clean", "update", "generate-lockfile",
+        "vendor", "fetch",
     ];
     if subcmd == "--version" || subcmd == "-V" {
         return BashDecision::Allow;
@@ -874,45 +904,78 @@ fn classify_cargo(parts: &[&str]) -> BashDecision {
 }
 
 /// npm/yarn/pnpm subcommand classification.
+/// T1: 只读 + 开发常用（test/run/start/build 不改 node_modules）
+/// T2: install/uninstall/publish（修改依赖或发布）
 fn classify_npm(parts: &[&str], pkg_mgr: &str) -> BashDecision {
     let subcmd = parts.get(1).copied().unwrap_or("");
-    const NPM_READONLY: &[&str] = &[
+    const NPM_ALLOW: &[&str] = &[
         "ls", "list", "info", "view", "audit", "outdated",
         "why", "explain", "pack", "search", "--version", "-v",
+        // 开发常用：运行脚本/测试/构建不修改 node_modules
+        "test", "t", "run", "run-script", "start", "build",
+        "dev", "serve", "lint", "format", "typecheck",
     ];
-    if NPM_READONLY.contains(&subcmd) {
+    if NPM_ALLOW.contains(&subcmd) {
         BashDecision::Allow
     } else {
+        // install, uninstall, publish, init, link, etc.
         BashDecision::NeedsConfirm(
             format!("'{} {}' may modify node_modules or project", pkg_mgr, subcmd))
     }
 }
 
-/// Python classification. --version is safe; -c could be dangerous.
+/// Python classification.
+/// T1: --version, -c (inline eval), -m pytest/unittest, script.py (开发常用)
+/// T2: -m pip install (修改包)
 fn classify_python(parts: &[&str]) -> BashDecision {
-    if parts.get(1).copied() == Some("--version") || parts.get(1).copied() == Some("-V") {
+    let flag = parts.get(1).copied().unwrap_or("");
+    // --version
+    if matches!(flag, "--version" | "-V") {
         return BashDecision::Allow;
     }
-    // python3 -m pip list/show/freeze = readonly
-    if parts.get(1).copied() == Some("-m") && parts.get(2).copied() == Some("pip") {
-        let pip_cmd = parts.get(3).copied().unwrap_or("");
-        if matches!(pip_cmd, "list" | "show" | "freeze" | "check" | "search") {
+    // python3 -c "expr" — inline eval, 允许（无文件副作用）
+    if matches!(flag, "-c") {
+        return BashDecision::Allow;
+    }
+    // python3 -m module
+    if flag == "-m" {
+        let module = parts.get(2).copied().unwrap_or("");
+        // 测试框架：允许
+        if matches!(module, "pytest" | "unittest" | "doctest" | "mypy" | "black" | "ruff"
+            | "isort" | "flake8" | "pylint" | "json.tool" | "http.server") {
             return BashDecision::Allow;
         }
+        // pip 子命令分流
+        if module == "pip" {
+            let pip_cmd = parts.get(3).copied().unwrap_or("");
+            if matches!(pip_cmd, "list" | "show" | "freeze" | "check" | "search") {
+                return BashDecision::Allow;
+            }
+            return BashDecision::NeedsConfirm(
+                format!("'python -m pip {}' modifies packages", pip_cmd));
+        }
         return BashDecision::NeedsConfirm(
-            format!("'python -m pip {}' modifies packages", pip_cmd));
+            format!("'python -m {}' may have side effects", module));
+    }
+    // python3 script.py — 允许（LLM 写完脚本需要验证运行）
+    if flag.ends_with(".py") {
+        return BashDecision::Allow;
     }
     BashDecision::NeedsConfirm("python execution may have side effects".into())
 }
 
 /// Node classification.
+/// T1: --version, -e (eval), -p (print), script.js (开发常用)
 fn classify_node(parts: &[&str]) -> BashDecision {
     let flag = parts.get(1).copied().unwrap_or("");
     if matches!(flag, "--version" | "-v" | "-e" | "-p" | "--eval" | "--print") {
-        BashDecision::Allow
-    } else {
-        BashDecision::NeedsConfirm("'node' script execution may have side effects".into())
+        return BashDecision::Allow;
     }
+    // node script.js — 允许（LLM 验证脚本执行）
+    if flag.ends_with(".js") || flag.ends_with(".mjs") || flag.ends_with(".ts") {
+        return BashDecision::Allow;
+    }
+    BashDecision::NeedsConfirm("'node' script execution may have side effects".into())
 }
 
 /// rustc classification.
@@ -971,13 +1034,14 @@ fn classify_curl(parts: &[&str], command: &str) -> BashDecision {
     }
 }
 
-/// wget classification. Downloading files = needs confirm (writes to disk).
+/// wget classification. 下载文件低风险（不覆盖已有，除非 -O）
 fn classify_wget(parts: &[&str]) -> BashDecision {
-    // wget --spider = just check, no download
-    if parts.iter().any(|p| *p == "--spider") {
-        BashDecision::Allow
+    // -O 指定输出文件可能覆盖 → 需确认
+    if parts.iter().any(|p| p.starts_with("-O") || *p == "--output-document") {
+        BashDecision::NeedsConfirm("'wget -O' may overwrite existing file".into())
     } else {
-        BashDecision::NeedsConfirm("'wget' downloads and writes files to disk".into())
+        // 默认下载到当前目录新文件，低风险
+        BashDecision::Allow
     }
 }
 
@@ -1624,9 +1688,15 @@ mod tests {
         assert!(matches!(classify_bash_command("rm -rf /tmp/x"), BashDecision::NeedsConfirm(_)));
         assert!(matches!(classify_bash_command("git push origin main"), BashDecision::NeedsConfirm(_)));
         assert!(matches!(classify_bash_command("cargo install evil"), BashDecision::NeedsConfirm(_)));
-        assert!(matches!(classify_bash_command("cargo run"), BashDecision::NeedsConfirm(_)));
+        // cargo run 现在允许（开发常用）
+        assert_eq!(classify_bash_command("cargo run"), BashDecision::Allow);
+        // cargo install 仍需确认
+        assert!(matches!(classify_bash_command("cargo install evil"), BashDecision::NeedsConfirm(_)));
         assert!(matches!(classify_bash_command("npm install lodash"), BashDecision::NeedsConfirm(_)));
-        assert!(matches!(classify_bash_command("python3 evil.py"), BashDecision::NeedsConfirm(_)));
+        // python3 script.py 现在允许（LLM 写脚本后需验证执行）
+        assert_eq!(classify_bash_command("python3 evil.py"), BashDecision::Allow);
+        // python3 无参数仍需确认
+        assert!(matches!(classify_bash_command("python3"), BashDecision::NeedsConfirm(_)));
         assert!(matches!(classify_bash_command("mv a b"), BashDecision::NeedsConfirm(_)));
         assert!(matches!(classify_bash_command("kill -9 1234"), BashDecision::NeedsConfirm(_)));
 
