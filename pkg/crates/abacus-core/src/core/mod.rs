@@ -3194,7 +3194,7 @@ impl CoreLoop {
             // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
             // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
             // byte-stable（不含变量），被 prefix cache 覆盖
-            // ~120 tokens，精简版——避免 LLM 简单操作也空转 6 步
+            // ~150 tokens，精简版——避免 LLM 简单操作也空转
             s.push_str(concat!(
                 "\n\n[Entropy Guard]\n",
                 "Creating files/folders or multi-step tasks → think first:\n",
@@ -3202,7 +3202,14 @@ impl CoreLoop {
                 "• Follow existing naming/structure. Check siblings.\n",
                 "• One task = one coherent change. No speculative files.\n",
                 "• Unsure about placement? Ask, don't guess.\n",
-                "Exempt: single-file edits, appending to existing, running commands.",
+                "Exempt: single-file edits, appending to existing, running commands.\n",
+                "\n[Explicit Declaration]\n",
+                "NEVER go silent. If you encounter ANY of these, you MUST state it explicitly in your response:\n",
+                "• Blocked — tool denied, permission missing, file not found, command failed\n",
+                "• Stuck — tried multiple approaches, none worked, need different strategy\n",
+                "• Need input — ambiguous requirement, multiple valid options, missing context\n",
+                "• Partial — task partially done, remaining steps require user action\n",
+                "Format: start with [Blocked], [Stuck], [Need Input], or [Partial], then explain in 1-2 sentences.",
             ));
             s
         };
