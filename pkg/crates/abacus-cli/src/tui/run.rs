@@ -1031,19 +1031,28 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::Complete(_) => {
                             // ST1：清理流式累积避免双显示
                             state.reset_streaming();
+                            // V30: Complete 到达即释放输入（不等 EngineResponse）
+                            // 防止 post_process 耗时（auto_compress LLM 调用）导致前端静默卡死
+                            // EngineResponse 到达后会再次检查并处理最终状态
+                            if state.pending_mcip_confirmations.is_empty() {
+                                state.input_state = InputState::Ready;
+                                state.op_started_at = None;
+                                state.accumulated_elapsed = Duration::ZERO;
+                            }
                             state.rendered_lines_dirty.set(true);
-                            // TT4：drain 同轮残留 chunks（API 异常或 provider 多发时可能存在），
-                            // 否则循环 try_recv 拿到下一个 TextDelta 又会累积到刚清空的字段。
-                            // 新流式启动前安全：用户按 Enter 到首 chunk 抵达至少跨 tick
+                            // TT4：drain 同轮残留 chunks
                             while stream_rx.try_recv().is_ok() {}
                             break;
                         }
                         StreamChunk::Error(e) => {
                             state.reset_streaming();
+                            // V30: Error 到达即释放输入（与 Complete 一致）
+                            state.input_state = InputState::Ready;
+                            state.op_started_at = None;
+                            state.accumulated_elapsed = Duration::ZERO;
                             state.rendered_lines_dirty.set(true);
                             state.add_event(&ts, "llm", &format!("错误: {}", e), crate::tui::state::EventLevel::Warning);
                             state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
-                            // TT4：错误后丢弃残留并 break，与 Complete 一致
                             while stream_rx.try_recv().is_ok() {}
                             break;
                         }
