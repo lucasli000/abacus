@@ -111,7 +111,9 @@ pub async fn create_engine(
     }
     let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls").map(|n| n as u32).unwrap_or(100);
     let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
-    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(32000);
+    // V40: 默认 64000 — 对齐 Claude Code/OpenCode 的单轮输出上限
+    // DeepSeek v4-flash thinking 模式支持最高 64K+ output
+    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(64000);
     let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
     let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
 
@@ -202,7 +204,7 @@ pub async fn create_engine(
         tool_result_dedup_enabled: false,
         tool_result_dedup_ttl_secs: 60,
         tool_result_dedup_capacity_kb: 2048,
-        adaptive_d_tier_hide: false,
+        adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),
         // cross-session: 默认开启 jsonl 事件流写入
         event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
         scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),

@@ -602,7 +602,22 @@ async fn chat_stream_handler(
         });
 
         // 实时转发 streaming chunks 为 SSE events
-        while let Some(chunk) = stream_rx.recv().await {
+        // V40: idle timeout 从 600s 提升到 1800s（30min）
+        // 原因：长时间工具执行（cargo build、大文件搜索等）期间 pipeline 不发 chunk，
+        // 600s 可能不够。30min 与 request_timeout_ceiling 对齐。
+        // KeepAlive(30s) 保证网络层不断连；idle timeout 只防 pipeline 彻底挂死。
+        let idle_timeout = std::time::Duration::from_secs(1800);
+        loop {
+            let chunk = match tokio::time::timeout(idle_timeout, stream_rx.recv()).await {
+                Ok(Some(c)) => c,
+                Ok(None) => break, // channel closed
+                Err(_) => {
+                    // idle 超时：pipeline 可能挂死
+                    tracing::warn!("SSE stream idle timeout (1800s), closing connection");
+                    yield Ok(Event::default().event("error").data("stream idle timeout"));
+                    break;
+                }
+            };
             use abacus_core::llm::stream::StreamChunk;
             match chunk {
                 StreamChunk::TextDelta(t) => {
@@ -614,8 +629,8 @@ async fn chat_stream_handler(
                 StreamChunk::ToolStart { name } => {
                     yield Ok(Event::default().event("tool_start").data(name));
                 }
-                StreamChunk::ToolEnd { name, success, duration_ms } => {
-                    let data = serde_json::json!({"name":name,"success":success,"duration_ms":duration_ms}).to_string();
+                StreamChunk::ToolEnd { name, success, duration_ms, failure_kind } => {
+                    let data = serde_json::json!({"name":name,"success":success,"duration_ms":duration_ms,"failure_kind":failure_kind}).to_string();
                     yield Ok(Event::default().event("tool_end").data(data));
                 }
                 StreamChunk::Complete(stats) => {
@@ -636,9 +651,24 @@ async fn chat_stream_handler(
                     }).to_string();
                     yield Ok(Event::default().event("confirm_required").data(data));
                 }
-                // V29.11: ToolArgs/ToolOutput 是 TUI 专用 chunk（diff/trace 渲染）
-                // SSE 客户端不消费——静默丢弃
-                StreamChunk::ToolArgs { .. } | StreamChunk::ToolOutput { .. } => {}
+                // V40: ToolArgs/ToolOutput 转发为 SSE 事件（Web 前端 timeline 需要）
+                StreamChunk::ToolArgs { name, args_json } => {
+                    let data = serde_json::json!({"name": name, "args": args_json}).to_string();
+                    yield Ok(Event::default().event("tool_args").data(data));
+                }
+                StreamChunk::ToolOutput { name, output_json } => {
+                    // 输出可能很大（文件内容等），截取前 ~2000 字节防止 SSE frame 过大
+                    // P0 修复：UTF-8 安全切片，找到不超过 2000 bytes 的 char boundary
+                    let truncated = if output_json.len() > 2000 {
+                        let mut end = 2000;
+                        while !output_json.is_char_boundary(end) { end -= 1; }
+                        format!("{}...[truncated]", &output_json[..end])
+                    } else {
+                        output_json
+                    };
+                    let data = serde_json::json!({"name": name, "output": truncated}).to_string();
+                    yield Ok(Event::default().event("tool_output").data(data));
+                }
                 // Iteration/Compress 是 CoreLoop 内部生命周期信号，SSE 转为轻量状态事件
                 StreamChunk::IterationStart { iteration } => {
                     yield Ok(Event::default().event("iteration_start").data(iteration.to_string()));
@@ -665,6 +695,17 @@ async fn chat_stream_handler(
                     }).collect();
                     let data = serde_json::json!({"phase": phase, "agents": agents}).to_string();
                     yield Ok(Event::default().event("team_progress").data(data));
+                }
+                StreamChunk::ToolHealth(entries) => {
+                    let data: Vec<serde_json::Value> = entries.iter().map(|e| {
+                        serde_json::json!({
+                            "tool_id": e.tool_id,
+                            "tier": e.tier,
+                            "blocked_by_env": e.blocked_by_env,
+                            "score": e.score,
+                        })
+                    }).collect();
+                    yield Ok(Event::default().event("tool_health").data(serde_json::json!(data).to_string()));
                 }
             }
         }

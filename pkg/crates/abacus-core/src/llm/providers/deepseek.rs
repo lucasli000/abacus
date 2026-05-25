@@ -274,7 +274,7 @@ impl DeepSeekProvider {
             model: model_id,
             pricing,
             reasoning_effort,
-            default_max_tokens: 32000,
+            default_max_tokens: 64000,
         }
     }
 

@@ -34,7 +34,7 @@ anyhow = "1.0"
 rustyline = { version = "13.0", features = ["with-file-history"] }
 ratatui = "0.28"
 crossterm = "0.28"
-dirs = "5"
+dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { workspace = true }
 async-trait = "0.1"

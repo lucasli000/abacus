@@ -194,8 +194,7 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
             state.input_state = InputState::Ready;
             state.op_started_at = None;
             state.accumulated_elapsed = Duration::ZERO;
-            // TT18: 走 SSoT helper（之前 inline 清理 3 字段漏了 streaming_parsed_lines/len，
-            // 是 reset_streaming 文档明示的第 5 个真相源站点）
+            // TT18: 走 SSoT helper（reset_streaming 是唯一 streaming 状态清理入口）
             state.reset_streaming();
             state.rendered_lines_dirty.set(true);
             state.add_toast("已取消当前请求", Duration::from_secs(2));

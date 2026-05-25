@@ -524,7 +524,7 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("core.max_tool_calls".into(), ConfigValue::Number(8.0));
     defaults.insert("core.default_model".into(), ConfigValue::String("deepseek-v4-flash".into()));
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
-    defaults.insert("core.max_tokens".into(), ConfigValue::Number(8192.0));
+    defaults.insert("core.max_tokens".into(), ConfigValue::Number(64000.0));
     defaults.insert("core.thinking_enabled".into(), ConfigValue::Bool(false));   // [DEPRECATED] Phase 5 移除
     defaults.insert("core.thinking_effort".into(), ConfigValue::String("medium".into())); // [DEPRECATED] Phase 5 移除
     // Phase 3 新 key（PRIMARY）：单字段表达 thinking 意图

@@ -65,7 +65,10 @@ pub enum StreamChunk {
     /// TUI 用于 trace 展开时显示工具返回
     ToolOutput { name: String, output_json: String },
     /// 工具执行完成
-    ToolEnd { name: String, success: bool, duration_ms: u64 },
+    ///
+    /// failure_kind: 失败时的分类标签（Timeout/Panic/Cooldown/NoExecutor/BusinessError 等）
+    /// TUI 用于差异化渲染失败原因（可重试 vs 永久失败 vs 环境问题）
+    ToolEnd { name: String, success: bool, duration_ms: u64, failure_kind: Option<String> },
     /// V28：实时授权请求——pipeline dispatch 暂停等待用户授权时发出
     /// UI 收到后弹授权对话框；用户决策通过 SessionState.mcip_confirm_channels[nonce] 直发回去
     /// nonce 是从 channel 找回 sender 的 key
@@ -93,8 +96,34 @@ pub enum StreamChunk {
         phase: String,              // "planning" / "executing" / "reviewing" / "completed"
         tasks: Vec<TeamTaskInfo>,
     },
+    /// 工具健康快照 — 每 turn 结束前发送一次（仅含本轮调用过的工具）
+    ///
+    /// ## 引用关系
+    /// - 生产者: pipeline execute_loop 完成后、Complete 之前发送
+    /// - 消费者: TUI run loop → 写入 state.tool_health_map
+    ///
+    /// ## 设计
+    /// 轻量：只传本轮工具的 tier + blocked_by_env，不传全量 200+ 工具
+    /// TUI 用于：工具名称旁标注 tier badge、blocked 工具灰色警示
+    ToolHealth(Vec<ToolHealthEntry>),
     /// 错误（stream 中断）
     Error(String),
+}
+
+/// 单个工具的健康状态（StreamChunk::ToolHealth 的载荷）
+///
+/// 引用关系：
+/// - 生产者：pipeline 从 EffectivenessTracker 提取
+/// - 消费者：TUI state.tool_health_map
+#[derive(Debug, Clone)]
+pub struct ToolHealthEntry {
+    pub tool_id: String,
+    /// Visibility tier: "S"/"A"/"B"/"C"/"D"
+    pub tier: String,
+    /// 环境阻塞标志（如 API key 缺失、网络不可达）
+    pub blocked_by_env: bool,
+    /// 综合评分 0.0-1.0
+    pub score: f64,
 }
 
 /// Team 模式任务进度信息（StreamChunk::TeamProgress 的载荷）

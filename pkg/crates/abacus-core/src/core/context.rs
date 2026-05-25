@@ -499,7 +499,8 @@ impl RetainMeta {
     /// 阈值用于 `evict_by_importance` 的排序裁剪。
     pub fn importance_score(&self, current_turn: u32) -> f64 {
         // 饱和的 ref_count 贡献：1 - 0.7^n，n=0→0, n=1→0.3, n=3→0.66, n=5→0.83, n=10→0.97
-        let ref_factor = 1.0 - 0.7_f64.powi(self.ref_count as i32);
+        // clamp to 100 避免 u32 → i32 溢出（100 时结果已 ≈ 1.0）
+        let ref_factor = 1.0 - 0.7_f64.powi(self.ref_count.min(100) as i32);
 
         let last = self.last_used_turn.max(self.created_turn);
         let recency_dist = (current_turn.saturating_sub(last)) as f64;
@@ -561,14 +562,17 @@ async fn compute_and_fill_msg_tokens(
     let computed: usize = messages
         .iter()
         .map(|m| {
-            let content_len = match &m.content {
-                Some(crate::llm::MessageContent::Text(t)) => t.len(),
+            let text_tokens = match &m.content {
+                Some(crate::llm::MessageContent::Text(t)) => estimate_tokens(t),
                 Some(crate::llm::MessageContent::MultiPart(parts)) => {
-                    parts.iter().map(content_part_len).sum()
+                    // 对 MultiPart 回退到字节估算（各 part 类型混合，无法统一取 &str）
+                    let bytes: usize = parts.iter().map(content_part_len).sum();
+                    (bytes as f64 * 0.35) as usize + parts.len()
                 }
-                None => 0,
+                None => 1,
             };
-            4 + (content_len / 3).max(1)
+            // +4 for message overhead (role, separators)
+            4 + text_tokens
         })
         .sum();
     *mgr.msg_cache.write().await = Some(MessageTokenCache {

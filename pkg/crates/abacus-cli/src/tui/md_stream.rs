@@ -30,6 +30,10 @@ pub struct StreamingMd {
     committed_lines: Vec<StyledLine>,
     /// 已渲染的 committed block 数量（用于增量：只渲染新 commit 的 blocks）
     rendered_committed_count: usize,
+    /// P5 优化：pending block 内容 hash 缓存
+    /// 如果 pending 内容未变，跳过 pulldown-cmark 重解析，复用上一帧结果
+    pending_hash: u64,
+    pending_cache: Vec<StyledLine>,
 }
 
 impl StreamingMd {
@@ -38,6 +42,8 @@ impl StreamingMd {
             stream: MdStream::new(mdstream::Options::default()),
             committed_lines: Vec::new(),
             rendered_committed_count: 0,
+            pending_hash: 0,
+            pending_cache: Vec::new(),
         }
     }
 
@@ -76,10 +82,10 @@ impl StreamingMd {
         &self.committed_lines
     }
 
-    /// 获取 pending 部分（未闭合块）的渲染结果（每帧重算，但仅处理尾部文本）
-    pub fn pending_styled(&mut self, theme: &Theme, is_user: bool, max_width: usize) -> Vec<StyledLine> {
+    /// 获取 pending 部分（未闭合块）的渲染结果
+    /// P5 优化：内容未变时复用上一帧缓存，跳过 pulldown-cmark 重解析
+    pub fn pending_styled(&mut self, theme: &Theme, is_user: bool, max_width: usize) -> &[StyledLine] {
         let blocks = self.stream.snapshot_blocks();
-        // pending = 最后一个 Pending status 的 block
         let pending_block = blocks.iter()
             .find(|b| b.status == mdstream::BlockStatus::Pending);
 
@@ -87,12 +93,23 @@ impl StreamingMd {
             Some(block) => {
                 let text = block.display_or_raw();
                 if text.is_empty() {
-                    vec![]
-                } else {
-                    markdown::render_markdown_bounded(text, theme, is_user, max_width)
+                    self.pending_cache.clear();
+                    self.pending_hash = 0;
+                    return &self.pending_cache;
                 }
+                // 简单 hash：长度 + 尾部 8 字节（增量场景下足够区分）
+                let h = quick_hash(text);
+                if h != self.pending_hash {
+                    self.pending_cache = markdown::render_markdown_bounded(text, theme, is_user, max_width);
+                    self.pending_hash = h;
+                }
+                &self.pending_cache
             }
-            None => vec![],
+            None => {
+                self.pending_cache.clear();
+                self.pending_hash = 0;
+                &self.pending_cache
+            }
         }
     }
 
@@ -120,18 +137,22 @@ impl StreamingMd {
             self.rendered_committed_count = current_count;
         }
 
-        // 构建结果：committed 引用 + pending 新渲染
+        // 构建结果：committed 缓存 + pending（使用 hash 缓存）
         let mut result = Vec::with_capacity(self.committed_lines.len() + 8);
         result.extend_from_slice(&self.committed_lines);
 
-        // pending 部分
+        // P5: pending 部分使用 hash 缓存
         let pending_block = blocks.iter()
             .find(|b| b.status == mdstream::BlockStatus::Pending);
         if let Some(block) = pending_block {
             let text = block.display_or_raw();
             if !text.is_empty() {
-                let mut pending = markdown::render_markdown_bounded(text, theme, is_user, max_width);
-                result.append(&mut pending);
+                let h = quick_hash(text);
+                if h != self.pending_hash {
+                    self.pending_cache = markdown::render_markdown_bounded(text, theme, is_user, max_width);
+                    self.pending_hash = h;
+                }
+                result.extend_from_slice(&self.pending_cache);
             }
         }
         result
@@ -142,10 +163,29 @@ impl StreamingMd {
         self.stream.reset();
         self.committed_lines.clear();
         self.rendered_committed_count = 0;
+        self.pending_hash = 0;
+        self.pending_cache.clear();
     }
 
     /// 原始文本（用于落档 / fallback）
     pub fn raw_text(&self) -> &str {
         self.stream.buffer()
     }
+}
+
+/// 轻量 hash：len + 尾部内容组合
+/// 流式场景下 pending block 每次追加几个字符，len 变化即可判定
+/// 边界条件：换行重排不改 len 但改内容 → 加尾部采样
+#[inline]
+fn quick_hash(text: &str) -> u64 {
+    let len = text.len() as u64;
+    let tail = if text.len() >= 8 {
+        let bytes = &text.as_bytes()[text.len() - 8..];
+        u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]))
+    } else {
+        let mut buf = [0u8; 8];
+        buf[..text.len()].copy_from_slice(text.as_bytes());
+        u64::from_le_bytes(buf)
+    };
+    len.wrapping_mul(0x517cc1b727220a95) ^ tail
 }

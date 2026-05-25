@@ -129,6 +129,40 @@ pub enum StreamingToolStatus {
     Failed,
 }
 
+/// V40: 统一时序流条目 — 替代分区渲染模型
+///
+/// 所有 streaming 事件按到达顺序 push 到 `streaming_timeline: Vec<TimelineEntry>`。
+/// 渲染时顺序遍历，每种类型用对应样式直接构建 `Line<'static>`。
+///
+/// 引用关系：
+/// - 写入：run.rs chunk drain loop（ToolStart/ToolArgs/ToolEnd/Thinking/TextDelta/Iteration）
+/// - 读取：components/mod.rs streaming appendix 遍历渲染
+/// 生命周期：streaming 开始时首次 push → streaming 结束时 reset_streaming 清空
+#[derive(Clone, Debug)]
+pub enum TimelineEntry {
+    /// LLM 思考摘要（仅保存首行 preview，全文在 streaming_thinking）
+    Thinking { summary: String },
+    /// 工具生命周期（ToolStart 创建，ToolArgs/ToolEnd 原地更新）
+    Tool {
+        name: String,
+        /// 从 args 提取的关键上下文（路径/命令/URL/查询）
+        context: String,
+        status: StreamingToolStatus,
+        duration_ms: Option<u64>,
+        /// 失败分类（Timeout/Panic/Cooldown 等）
+        failure_kind: Option<String>,
+        /// 对应 trace_events 中的 id（用于获取 diff/output）
+        trace_id: u64,
+    },
+    /// 工具输出摘要（bash stdout 首行/read 行数/search 匹配数）
+    ToolOutput { summary: String },
+    /// 正文文本区段（指向 streaming_text 的 byte range）
+    /// mdstream 渲染 streaming_text[start..end]
+    Text { start: usize, end: usize },
+    /// 迭代边界（多轮工具调用之间的分隔）
+    Iteration { number: u32 },
+}
+
 /// 块类型
 #[derive(Clone, Serialize, Deserialize)]
 pub enum BlockKind {
@@ -854,6 +888,16 @@ pub struct AppState {
     /// 生命周期: 会话级;切换/关会话时清;再次点击其他 event 覆盖
     pub focused_event_id: Option<u64>,
     pub tool_records: Vec<ToolRecord>,
+    /// 工具健康快照 — 每 turn 从 EffectivenessTracker 获取
+    ///
+    /// ## 引用关系
+    /// - 生产者：run.rs 收到 StreamChunk::ToolHealth 时写入
+    /// - 消费者：panel components 渲染工具 tier 标识
+    ///
+    /// ## 生命周期
+    /// - 创建：每 turn 覆盖更新（不累积，只保留最近已调用工具的状态）
+    /// - 销毁：reset_session 时 clear
+    pub tool_health: std::collections::HashMap<String, abacus_core::llm::stream::ToolHealthEntry>,
     pub thinking_text: String,
 
     pub experts: Vec<Expert>,
@@ -922,6 +966,10 @@ pub struct AppState {
     pub processing_total_steps: u32,
     /// 消息渲染缓存（dirty 标记避免每帧重建全部行）
     pub(crate) rendered_lines_dirty: std::cell::Cell<bool>,
+    /// P1 优化：帧级 dirty 标记 — 任何事件/交互导致状态变化时设 true
+    /// 引用关系：event handler / run.rs 响应处理 设置 → run.rs 条件渲染判定消费
+    /// 生命周期：每帧 draw 前检查，draw 后 reset
+    pub(crate) frame_dirty: std::cell::Cell<bool>,
     /// V40: streaming-only dirty — 仅 streaming 尾部内容变化，base 消息未改变
     /// 引用关系：run.rs chunk drain 设置 → components/mod.rs 分区渲染路径消费
     /// 生命周期：每帧渲染后 reset
@@ -976,14 +1024,12 @@ pub struct AppState {
     ///          components::render 读 name/status/dur 显示流式列表
     /// 生命周期:streaming 开始空 → 工具流期间增改 → streaming 结束/异常清空
     pub streaming_tools: Vec<(String, StreamingToolStatus, Option<u64>, u64)>,
-    /// 流式渲染缓存：已解析的行（对应 streaming_text 的前 N 个字符）
-    /// 增量策略：每帧只解析 streaming_text[cached_len..] 的新增部分
-    ///
-    /// 生命周期：streaming 开始时清空 → 每帧增量追加 → streaming 结束时清空
-    /// 使用 RefCell：渲染函数持有 &self 但需要写入缓存
-    pub(crate) streaming_parsed_lines: std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
-    /// streaming_text 中已被解析的字节数（增量解析游标）
-    pub(crate) streaming_parsed_len: std::cell::Cell<usize>,
+    /// V40: 统一时序流 — 所有 streaming 事件按到达顺序排列
+    /// 引用关系：run.rs push → components/mod.rs 遍历渲染
+    /// 生命周期：首次 chunk 到达时 push → reset_streaming 清空
+    pub streaming_timeline: Vec<TimelineEntry>,
+    // V40: streaming_parsed_lines / streaming_parsed_len 已移除
+    // 旧的增量解析缓存被 timeline + mdstream committed/pending 模型完全替代
     /// 流式 Markdown 增量渲染状态（mdstream committed/pending 模型）
     /// 引用关系：run.rs TextDelta → append；components 渲染 → committed_styled/pending_styled
     /// 生命周期：首次 TextDelta 时 lazy 创建，reset_streaming 时 drop
@@ -1928,6 +1974,17 @@ pub struct SessionTokenStats {
     #[serde(default)]
     pub per_model: std::collections::HashMap<String, ModelTokenStats>,
 
+    /// 累计压缩次数 — 每次 CompressEnd 事件 +1
+    ///
+    /// 引用关系：run.rs CompressEnd handler 累加；panel compact_stats 展示
+    #[serde(default)]
+    pub compress_count: u32,
+    /// 累计压缩回收的 tokens — 每次 CompressEnd 累加 tokens_saved
+    ///
+    /// 引用关系：run.rs CompressEnd handler 累加；panel compact_stats 展示
+    #[serde(default)]
+    pub compress_tokens_saved: u64,
+
     /// V39-4: 按 AbacusMode 拆分的 per-mode 累计统计
     ///
     /// ## 引用关系
@@ -2063,6 +2120,7 @@ impl AppState {
             message_trace_row_map: RefCell::new(Vec::new()),
             focused_event_id: None,
             tool_records: Vec::new(),
+            tool_health: std::collections::HashMap::new(),
             thinking_text: String::new(),
             experts: Vec::new(),
             expert_names_cache: HashSet::new(),
@@ -2097,6 +2155,7 @@ impl AppState {
             processing_step: 0,
             processing_total_steps: 0,
             rendered_lines_dirty: std::cell::Cell::new(true),
+            frame_dirty: std::cell::Cell::new(true),
             streaming_content_dirty: std::cell::Cell::new(false),
             cached_base_lines: std::cell::RefCell::new(Vec::new()),
             cached_base_msg_count: std::cell::Cell::new(0),
@@ -2116,8 +2175,7 @@ impl AppState {
             streaming_text_started: false,
             streaming_thinking_started: false,
             streaming_tools: Vec::new(),
-            streaming_parsed_lines: std::cell::RefCell::new(Vec::new()),
-            streaming_parsed_len: std::cell::Cell::new(0),
+            streaming_timeline: Vec::new(),
             streaming_md: std::cell::RefCell::new(None),
             flash_state: crate::tui::effects::FlashState::new(),
             anim_tick: std::cell::Cell::new(0),
@@ -2561,6 +2619,7 @@ impl AppState {
         self.timeline_row_map.borrow_mut().clear();
         self.focused_event_id = None;
         self.tool_records.clear();
+        self.tool_health.clear();
         self.thinking_text.clear();
         self.turn_count = 0;
         self.set_scroll(ScrollAction::ToBottom);
@@ -2599,11 +2658,10 @@ impl AppState {
         self.streaming_text_started = false;
         self.streaming_thinking_started = false;
         self.streaming_tools.clear();
+        self.streaming_timeline.clear();
         // V28: 防御性兜底 — 正常落档路径已 mem::take 走 streaming_trace_ids,
         // 这里 clear 只在异常退出/异常 reset 时生效,避免悬挂引用。
         self.streaming_trace_ids.clear();
-        self.streaming_parsed_lines.borrow_mut().clear();
-        self.streaming_parsed_len.set(0);
         // 流式 Markdown 增量引擎：drop 释放 mdstream 状态
         *self.streaming_md.borrow_mut() = None;
         // V40: 失效分区渲染缓存（streaming 结束后 messages 即将变化）
@@ -3270,8 +3328,11 @@ mod tests {
         state.streaming_text = "partial output".into();
         state.streaming_thinking = "partial reasoning".into();
         state.streaming_tools.push(("read_file".into(), StreamingToolStatus::Running, None, 0));
-        state.streaming_parsed_lines.borrow_mut().push(ratatui::text::Line::raw("cached line"));
-        state.streaming_parsed_len.set(8);
+        state.streaming_timeline.push(TimelineEntry::Tool {
+            name: "read_file".into(), context: String::new(),
+            status: StreamingToolStatus::Running, duration_ms: None,
+            failure_kind: None, trace_id: 0,
+        });
 
         state.reset_streaming();
 
@@ -3279,8 +3340,7 @@ mod tests {
         assert!(state.streaming_text.is_empty(), "streaming_text 应被清空");
         assert!(state.streaming_thinking.is_empty(), "streaming_thinking 应被清空");
         assert!(state.streaming_tools.is_empty(), "streaming_tools 应被清空");
-        assert!(state.streaming_parsed_lines.borrow().is_empty(), "增量解析缓存应被清空");
-        assert_eq!(state.streaming_parsed_len.get(), 0, "解析游标应归零");
+        assert!(state.streaming_timeline.is_empty(), "streaming_timeline 应被清空");
     }
 
     /// ST1 回归：reset_streaming 是幂等操作——多次调用无副作用

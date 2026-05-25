@@ -537,7 +537,7 @@ impl KnowledgeStore {
             let conn = self.conn.lock().await;
             let mut stmt = match conn.prepare(
                 "SELECT id, file, chunk_idx, content, heading_path, embedding
-                 FROM chunks WHERE embedding IS NOT NULL"
+                 FROM chunks WHERE embedding IS NOT NULL LIMIT 10000"
             ) {
                 Ok(s) => s,
                 Err(_) => return self.query(query, top_k, None).await.unwrap_or_default(),
@@ -554,11 +554,18 @@ impl KnowledgeStore {
                 Ok(r) => r,
                 Err(_) => return self.query(query, top_k, None).await.unwrap_or_default(),
             };
-            rows.filter_map(|r| r.ok())
+            let results: Vec<_> = rows.filter_map(|r| r.ok())
                 .map(|(id, file, idx, content, hp, blob)| {
                     (id, file, idx, content, hp, memory_palace::blob_to_f32_vec(&blob))
                 })
-                .collect()
+                .collect();
+            if results.len() >= 10000 {
+                tracing::warn!(
+                    "knowledge_store: embedding count reached LIMIT 10000, \
+                     vector search results may be incomplete. Consider pruning stale entries."
+                );
+            }
+            results
         };
 
         // If no embeddings stored, fallback

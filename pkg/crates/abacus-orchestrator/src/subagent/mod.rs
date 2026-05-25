@@ -551,9 +551,13 @@ impl SubAgentDispatcher {
         before - agents.len()
     }
 
-    /// 移除指定 agent
+    /// 移除指定 agent（同时取消 watchdog 防止资源泄漏）
     pub async fn remove(&self, id: &str) -> bool {
-        self.agents.write().await.remove(id).is_some()
+        let removed = self.agents.write().await.remove(id);
+        if let Some(agent) = &removed {
+            agent.watchdog_cancel.cancel();
+        }
+        removed.is_some()
     }
 }
 

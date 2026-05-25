@@ -486,7 +486,12 @@ impl TeamSession {
     }
 
     /// Execute all ready tasks, dispatching by role.
-    /// Tasks are executed role-by-role; within each role, tasks run sequentially.
+    /// Currently sequential across roles; within each role, tasks run sequentially.
+    ///
+    /// ## 并发模型
+    /// - 同 role 串行：避免单 session 中消息交叉
+    /// - 跨 role：当前串行（&self 生命周期约束，未来可引入 futures crate 实现 join_all）
+    /// - 单 task 失败不中断其他 task
     pub async fn execute_ready_tasks(
         &self,
         core: &abacus_core::core::CoreLoop,
@@ -494,17 +499,15 @@ impl TeamSession {
         let by_role = self.ready_tasks_by_role().await;
         let mut all_results = Vec::new();
 
-        // Execute each role's tasks sequentially
         for (role, tasks) in by_role {
             for task in &tasks {
                 match self.execute_task_with_core(core, task, &role).await {
                     Ok(r) => all_results.push((task.id.clone(), r)),
                     Err(e) => {
-                        self.update_task_status(&task.id, TaskStatus::Failed {
+                        let _ = self.update_task_status(&task.id, TaskStatus::Failed {
                             error: e.to_string(),
                             retries: 0,
-                        }).await?;
-                        // Continue with other tasks instead of failing entirely
+                        }).await;
                         tracing::warn!("Task {} failed: {}", task.id, e);
                     }
                 }

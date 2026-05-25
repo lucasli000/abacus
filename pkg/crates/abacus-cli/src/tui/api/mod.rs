@@ -246,6 +246,17 @@ pub async fn send_chat_message_streaming(
     match result {
         Ok(r) => {
             let thinking = extract_thinking(&handle.session).await;
+            // ToolHealth snapshot: 从 EffectivenessTracker 获取真实历史评分
+            // 引用关系：CoreLoop.effectiveness → tool_health_snapshot() → TUI state
+            if !r.tool_outputs.is_empty() {
+                let tool_ids: Vec<abacus_types::ToolId> = r.tool_outputs.iter()
+                    .map(|to| to.tool_id.clone())
+                    .collect();
+                let health = handle.core.tool_health_snapshot(&tool_ids).await;
+                if !health.is_empty() {
+                    let _ = stream_tx.send(StreamChunk::ToolHealth(health));
+                }
+            }
             let _ = stream_tx.send(StreamChunk::Complete(r.stats.clone()));
             ApiResult::Ok(EngineResponse::from_turn_result(r, thinking))
         }
@@ -1038,7 +1049,9 @@ pub async fn send_team_message(
                         };
                         let preview = if let TTS::Completed { result } = &t.status {
                             let s = result.to_string();
-                            if s.len() > 100 { Some(format!("{}...", &s[..97])) } else { Some(s) }
+                            if s.chars().count() > 100 {
+                                Some(format!("{}...", s.chars().take(97).collect::<String>()))
+                            } else { Some(s) }
                         } else {
                             None
                         };
@@ -1080,14 +1093,46 @@ pub async fn send_team_message(
             team.emit(TeamEvent::TeamCompleted { summary });
         }
 
-        // Build response text from all results
-        let mut combined_text = String::new();
-        for (task_id, output) in &results {
-            combined_text.push_str(&format!("### Task: {}\n{}\n\n", task_id, output));
-        }
-        if combined_text.is_empty() {
-            combined_text = "所有任务已在之前完成。发送新指令可添加后续任务。".to_string();
-        }
+        // Phase 4: Leader 汇总 — 综合所有 agent 结果给用户最终回答
+        // 连续流程：需求→分解→执行→汇总，无需用户介入
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            "\n═══ 汇总 ══════════════════════════════\n".into(),
+        ));
+
+        let combined_text = if results.is_empty() {
+            "所有任务已在之前完成。发送新指令可添加后续任务。".to_string()
+        } else {
+            // 构建汇总 prompt：让 Leader 综合各 agent 结果
+            let mut agent_outputs = String::new();
+            for (task_id, output) in &results {
+                agent_outputs.push_str(&format!("## Agent result for task '{}':\n{}\n\n", task_id, output));
+            }
+            let summary_prompt = format!(
+                "You are the team Leader. Your agents have completed their tasks.\n\
+                 Original user request: {}\n\n\
+                 Agent results:\n{}\n\
+                 Now synthesize all agent outputs into a cohesive final answer for the user. \
+                 Be concise, highlight key findings, and present actionable conclusions.",
+                message, agent_outputs
+            );
+
+            // Leader 汇总也走流式——用户实时看到最终回答流入
+            let summary_session = abacus_core::core::SessionState::new("_summary");
+            let summary_session = tokio::sync::RwLock::new(summary_session);
+            match handle.core.process_turn_streaming(
+                &summary_prompt, &summary_session, stream_tx.clone()
+            ).await {
+                Ok(result) => result.response,
+                Err(e) => {
+                    // 汇总失败时 fallback 到原始拼接
+                    tracing::warn!("Leader summary failed: {}, falling back to raw concat", e);
+                    results.iter()
+                        .map(|(id, out)| format!("### {}\n{}", id, out))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+            }
+        };
 
         ApiResult::Ok(EngineResponse {
             text: combined_text,
@@ -1340,6 +1385,448 @@ pub async fn send_meeting_message(
     }
 }
 
+/// Meeting 模式流式连续流程 — 多专家顺序发言 + Host 综合结论
+///
+/// ## 连续流程（用户一条消息触发完整会诊）
+/// Phase 1: 初始化会议 + 确定参与专家
+/// Phase 2: 各专家顺序流式推理（streaming TextDelta 实时可见）
+/// Phase 3: Host 综合所有意见，流式输出最终结论
+///
+/// ## 引用关系
+/// - 消费者: run.rs Meeting 分支 spawn
+/// - stream_tx: 与 run.rs 主 channel 同源 clone
+/// - MeetingPromptAssembler: abacus-orchestrator::meeting::assembler（组装 per-specialist prompt）
+/// - core.process_turn_streaming: 流式推理入口
+///
+/// ## 生命周期
+/// - meeting_handle: ensure 时创建，reset_meeting 时销毁
+/// - stream_tx clone: 本函数结束时 drop
+pub async fn send_meeting_message_streaming(
+    handle: &EngineHandle,
+    message: &str,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
+) -> ApiResult<EngineResponse> {
+    let _permit = match handle.inflight_guard.try_acquire() {
+        Ok(p) => p,
+        Err(_) => return ApiResult::Err("请求过于频繁".to_string()),
+    };
+
+    let work = async {
+        // Phase 1: 确保 Meeting 存在并 Running
+        if let Err(e) = handle.ensure_meeting_handle(message).await {
+            return ApiResult::Err(format!("Meeting 初始化失败: {}", e));
+        }
+
+        let mut mtg_guard = handle.meeting_handle.write().await;
+        let mtg = match mtg_guard.as_mut() {
+            Some(m) => m,
+            None => return ApiResult::Err("Meeting handle 未初始化".into()),
+        };
+
+        {
+            let status = mtg.session().status.clone();
+            if !matches!(status, abacus_orchestrator::meeting::core::MeetingStatus::Running) {
+                if let Err(e) = mtg.start() {
+                    return ApiResult::Err(format!("Meeting 启动失败 (status={:?}): {}", status, e));
+                }
+            }
+        }
+
+        // Phase 2: 各专家顺序流式推理
+        let participants: Vec<(String, String, String)> = mtg.session().participants.values()
+            .map(|sp| (sp.id.0.clone(), sp.name.clone(), sp.specialty.domain.clone()))
+            .collect();
+
+        if participants.is_empty() {
+            return ApiResult::Err("Meeting 无参与专家".into());
+        }
+
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            format!("会诊开始 — {} 位专家参与\n\n", participants.len()),
+        ));
+
+        let mut expert_outputs: Vec<(String, String, String)> = Vec::new();
+
+        for (sp_id, sp_name, sp_domain) in &participants {
+            use abacus_orchestrator::meeting::assembler::MeetingPromptAssembler;
+            use abacus_orchestrator::meeting::router::RoutingMode;
+
+            let sp_instance = match mtg.session().participants.get(sp_id) {
+                Some(sp) => sp.clone(),
+                None => continue,
+            };
+
+            let prompt = MeetingPromptAssembler::assemble_specialist_prompt(
+                &mtg.session().topic,
+                &mtg.session().participants,
+                &mtg.session().context_pool,
+                &sp_instance,
+                &RoutingMode::Fresh,
+            );
+            let full_prompt = format!("{}\n\n用户提问: {}", prompt, message);
+
+            let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                format!("\n── {} ({}) ─────────────────────────\n", sp_name, sp_domain),
+            ));
+
+            // 流式推理（per-specialist 独立 session）
+            let sp_session = abacus_core::core::SessionState::new(&format!("_meeting_{}", sp_id));
+            let sp_session = tokio::sync::RwLock::new(sp_session);
+
+            let req_ctx = if let Some(ref model) = sp_instance.preferred_model {
+                abacus_core::core::RequestContext::with_model(model)
+            } else {
+                abacus_core::core::RequestContext::default()
+            };
+
+            match handle.core.process_turn_streaming_cancellable_with_context(
+                &full_prompt,
+                &sp_session,
+                stream_tx.clone(),
+                req_ctx,
+                tokio_util::sync::CancellationToken::new(),
+            ).await {
+                Ok(result) => {
+                    let opinion = abacus_orchestrator::specialist::SpecialistOpinion {
+                        specialist_id: abacus_orchestrator::specialist::SpecialistId(sp_id.clone()),
+                        turn: mtg.session().context_pool.turn_count() + 1,
+                        conclusion: result.response.clone(),
+                        confidence: 0.8,
+                        reasoning_summary: String::new(),
+                        tool_evidence: vec![],
+                        suggestions: vec![],
+                        requires_attention: vec![],
+                        auto_approve: true,
+                        host_review_required: false,
+                    };
+                    let _ = mtg.session_mut().process_opinion(opinion);
+                    expert_outputs.push((sp_id.clone(), sp_name.clone(), result.response));
+
+                    let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                        format!("\n── {} 完成 ──────────────────────────\n", sp_name),
+                    ));
+                }
+                Err(e) => {
+                    let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                        format!("\n── {} 失败: {} ──────────────────\n", sp_name, e),
+                    ));
+                    tracing::warn!(specialist = %sp_id, error = %e, "specialist streaming failed");
+                }
+            }
+        }
+
+        // Phase 3: Host 综合结论（流式）
+        if expert_outputs.is_empty() {
+            return ApiResult::Err("所有专家推理失败".into());
+        }
+
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            "\n═══ 综合结论 ══════════════════════════════\n".into(),
+        ));
+
+        let mut opinions_summary = String::new();
+        for (_, name, output) in &expert_outputs {
+            opinions_summary.push_str(&format!("## {} 的观点:\n{}\n\n", name, output));
+        }
+
+        let synthesis_prompt = format!(
+            "你是会议主持人。以下是各领域专家对用户问题的分析。\n\
+             请综合所有专家意见，给出结构化的最终结论。\n\
+             突出共识、标注分歧、给出可执行建议。\n\n\
+             用户原始问题: {}\n\n\
+             各专家观点:\n{}",
+            message, opinions_summary
+        );
+
+        let host_session = abacus_core::core::SessionState::new("_meeting_host");
+        let host_session = tokio::sync::RwLock::new(host_session);
+
+        let final_text = match handle.core.process_turn_streaming(
+            &synthesis_prompt, &host_session, stream_tx.clone()
+        ).await {
+            Ok(result) => result.response,
+            Err(e) => {
+                tracing::warn!("Host synthesis failed: {}, using raw concat", e);
+                opinions_summary
+            }
+        };
+
+        use crate::tui::state::{Expert, ExpertStatus};
+        let experts: Vec<Expert> = mtg.session().participants.values().map(|inst| {
+            let has_output = expert_outputs.iter().any(|(id, _, _)| id == &inst.id.0);
+            Expert {
+                name: inst.name.clone(),
+                domain: inst.specialty.domain.clone(),
+                status: if has_output { ExpertStatus::Done } else { ExpertStatus::Idle },
+                confidence: 0.0,
+            }
+        }).collect();
+
+        ApiResult::Ok(EngineResponse {
+            text: final_text,
+            thinking: None,
+            tool_records: vec![],
+            stats: None,
+            progressive_state: None,
+            inertia_warning: None,
+            pending_confirmations: vec![],
+            meeting_experts: Some(experts),
+            auto_fallback_chat: None,
+            turnkey_plan: None,
+        })
+    };
+
+    let timeout = tokio::time::sleep(Duration::from_secs(600));
+    tokio::pin!(timeout);
+
+    let result = tokio::select! {
+        r = work => r,
+        _ = &mut timeout => {
+            ApiResult::Err("Meeting 会诊超时 (600s)".to_string())
+        }
+    };
+
+    match result {
+        ApiResult::Ok(resp) => ApiResult::Ok(resp),
+        ApiResult::Err(meeting_err) => {
+            let is_first_start_failure = meeting_err.starts_with("Meeting 初始化失败")
+                || meeting_err.starts_with("Meeting handle 未初始化")
+                || meeting_err.starts_with("Meeting 启动失败");
+            if is_first_start_failure {
+                tracing::warn!(error = %meeting_err, "Meeting 首次启动失败, 兜底到 Chat (streaming)");
+                handle.reset_meeting().await;
+                match send_chat_message_streaming(
+                    handle, message, stream_tx,
+                    abacus_core::core::RequestContext::default()
+                ).await {
+                    ApiResult::Ok(mut resp) => {
+                        resp.auto_fallback_chat = Some(format!("Meeting 启动失败: {}", meeting_err));
+                        ApiResult::Ok(resp)
+                    }
+                    ApiResult::Err(chat_err) => ApiResult::Err(format!(
+                        "Meeting 失败({}); Chat 兜底也失败({})", meeting_err, chat_err
+                    )),
+                    other => other,
+                }
+            } else {
+                ApiResult::Err(meeting_err)
+            }
+        }
+        other => other,
+    }
+}
+
+/// Plan 模式流式连续流程 — 规划 + 自动执行 + 汇总
+///
+/// ## 连续流程（用户一条消息触发完整规划→执行→结果）
+/// Phase 1: Planner 分析需求、生成任务列表（流式，用户实时可见分析过程）
+/// Phase 2: 解析任务列表后自动进入执行（复用 Team 模式执行能力）
+/// Phase 3: Leader 综合执行结果，流式输出最终回答
+///
+/// ## 引用关系
+/// - 消费者: run.rs Plan 分支 spawn
+/// - stream_tx: 与 run.rs 主 channel 同源 clone
+/// - send_planner_message_streaming: Phase 1 规划（复用）
+/// - TeamSession: Phase 2 执行（复用 Team 基础设施）
+/// - parse_task_list: 解析 LLM 输出为 TaskSpec
+///
+/// ## 生命周期
+/// - team_session: 本函数内创建，函数结束后由 Arc 引用计数管理
+/// - stream_tx clone: 本函数结束时 drop
+pub async fn send_plan_and_execute_streaming(
+    handle: &EngineHandle,
+    message: &str,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
+    req_ctx: abacus_core::core::RequestContext,
+) -> ApiResult<EngineResponse> {
+    let _permit = match handle.inflight_guard.try_acquire() {
+        Ok(p) => p,
+        Err(_) => return ApiResult::Err("请求过于频繁".to_string()),
+    };
+
+    let work = async {
+        // Phase 1: Planner 分析 + 生成任务列表（流式）
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            "规划阶段 — 分析需求并拆解任务...\n\n".into(),
+        ));
+
+        // 复用 Planner 流式调用
+        let mut plan_req = req_ctx.clone();
+        plan_req.tool_filter = Some(planner_tool_whitelist());
+        plan_req.prefix_assistant_content = Some(PLANNER_PREFIX_CONTENT.to_string());
+        plan_req.system_prompt_override = Some(PLANNER_SYSTEM_PROMPT.to_string());
+
+        let plan_result = send_chat_message_streaming(
+            handle, message, stream_tx.clone(), plan_req
+        ).await;
+
+        let plan_text = match plan_result {
+            ApiResult::Ok(resp) => resp.text,
+            ApiResult::Err(e) => return ApiResult::Err(format!("规划失败: {}", e)),
+            _ => return ApiResult::Err("规划中断".into()),
+        };
+
+        // 从 Planner 输出解析任务列表
+        let tasks = parse_task_list(&plan_text, message);
+        if tasks.is_empty() {
+            // 规划无结构化任务输出，直接返回规划结果
+            return ApiResult::Ok(EngineResponse {
+                text: plan_text,
+                thinking: None,
+                tool_records: vec![],
+                stats: None,
+                progressive_state: None,
+                inertia_warning: None,
+                pending_confirmations: vec![],
+                meeting_experts: None,
+                auto_fallback_chat: None,
+                turnkey_plan: None,
+            });
+        }
+
+        // Phase 2: 自动执行（复用 Team 执行逻辑）
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            format!("\n执行阶段 — {} 个任务开始执行\n\n", tasks.len()),
+        ));
+
+        // 确保 Team session 存在并添加任务
+        let team = handle.ensure_team_session(message).await;
+        // 重置已有任务（如果是新的 plan 执行）
+        let initial_status = team.status().await;
+        let team = if matches!(initial_status, TeamStatus::Completed { .. } | TeamStatus::Failed { .. }) {
+            handle.reset_team().await;
+            handle.ensure_team_session(message).await
+        } else {
+            team
+        };
+
+        if let Err(e) = team.transition_to(TeamStatus::Planning).await {
+            tracing::warn!("Plan→Team status transition failed: {}", e);
+        }
+
+        for task in &tasks {
+            team.add_task(task.clone()).await;
+        }
+
+        // 展示任务分配
+        {
+            let mut assign_text = String::from("已规划任务：\n");
+            for (i, task) in tasks.iter().enumerate() {
+                assign_text.push_str(&format!(" → task_{}: {}\n", i + 1, task.description));
+            }
+            assign_text.push('\n');
+            let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(assign_text));
+        }
+
+        // 执行
+        let _ = team.transition_to(TeamStatus::Executing {
+            active_tasks: 0, completed_tasks: 0,
+        }).await;
+
+        let ready_by_role = team.ready_tasks_by_role().await;
+        let mut results: Vec<(String, String)> = Vec::new();
+
+        for (role, role_tasks) in &ready_by_role {
+            for (idx, task) in role_tasks.iter().enumerate() {
+                let agent_label = format!("task_{}", idx + 1);
+                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                    format!("⚙ {} 开始执行...\n", agent_label),
+                ));
+
+                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                    format!("\n── {} ({:?}) ─────────────────────────\n", agent_label, role),
+                ));
+
+                match team.execute_task_with_core_streaming(
+                    &handle.core, task, role, stream_tx.clone()
+                ).await {
+                    Ok(r) => {
+                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                            format!("\n── {} 完成 ──────────────────────────\n", agent_label),
+                        ));
+                        results.push((task.id.clone(), r));
+                    }
+                    Err(e) => {
+                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                            format!("\n── {} 失败: {} ──────────────────\n", agent_label, e),
+                        ));
+                        tracing::warn!("Plan task {} failed: {}", task.id, e);
+                    }
+                }
+            }
+        }
+
+        // 状态转换
+        if team.all_tasks_done().await {
+            let (total, completed, failed) = team.stats().await;
+            let summary = format!("{}/{} 完成, {} 失败", completed, total, failed);
+            let _ = team.transition_to(TeamStatus::Reviewing).await;
+            let _ = team.transition_to(TeamStatus::Completed { summary }).await;
+        }
+
+        // Phase 3: Leader 综合结果
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            "\n═══ 汇总 ══════════════════════════════\n".into(),
+        ));
+
+        let final_text = if results.is_empty() {
+            "所有任务执行失败，请检查上方错误信息。".to_string()
+        } else {
+            let mut agent_outputs = String::new();
+            for (task_id, output) in &results {
+                agent_outputs.push_str(&format!("## Task '{}':\n{}\n\n", task_id, output));
+            }
+            let summary_prompt = format!(
+                "You are the team Leader. Tasks have been planned and executed.\n\
+                 Original user request: {}\n\n\
+                 Task results:\n{}\n\
+                 Synthesize all results into a cohesive final answer. Be concise and actionable.",
+                message, agent_outputs
+            );
+
+            let summary_session = abacus_core::core::SessionState::new("_plan_summary");
+            let summary_session = tokio::sync::RwLock::new(summary_session);
+            match handle.core.process_turn_streaming(
+                &summary_prompt, &summary_session, stream_tx.clone()
+            ).await {
+                Ok(result) => result.response,
+                Err(e) => {
+                    tracing::warn!("Plan summary failed: {}", e);
+                    results.iter()
+                        .map(|(id, out)| format!("### {}\n{}", id, out))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                }
+            }
+        };
+
+        ApiResult::Ok(EngineResponse {
+            text: final_text,
+            thinking: None,
+            tool_records: vec![],
+            stats: None,
+            progressive_state: None,
+            inertia_warning: None,
+            pending_confirmations: vec![],
+            meeting_experts: None,
+            auto_fallback_chat: None,
+            turnkey_plan: None,
+        })
+    };
+
+    let timeout = tokio::time::sleep(Duration::from_secs(900)); // Plan+Execute 更长超时
+    tokio::pin!(timeout);
+
+    let result = tokio::select! {
+        r = work => r,
+        _ = &mut timeout => {
+            ApiResult::Err("Plan+Execute 超时 (900s)".to_string())
+        }
+    };
+
+    result
+}
+
 /// 从 LLM 输出解析任务列表（简单行号格式）
 fn parse_task_list(llm_output: &str, _goal: &str) -> Vec<abacus_orchestrator::team::TaskSpec> {
     let mut tasks = Vec::new();
@@ -1511,6 +1998,23 @@ pub struct EngineResponse {
     /// 生命周期: 随 EngineResponse 创建; state 持有直到下一次 plan / execute / clear
     /// 设计: 可选 — 仅 Turnkey 路径填充, 不污染普通 chat 路径
     pub turnkey_plan: Option<abacus_types::sandbox::TaskSpec>,
+}
+
+impl Default for EngineResponse {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            thinking: None,
+            tool_records: vec![],
+            stats: None,
+            progressive_state: None,
+            inertia_warning: None,
+            pending_confirmations: vec![],
+            meeting_experts: None,
+            auto_fallback_chat: None,
+            turnkey_plan: None,
+        }
+    }
 }
 
 impl EngineResponse {

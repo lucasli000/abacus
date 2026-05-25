@@ -80,7 +80,7 @@ impl ConfigToolExecutor {
     /// config_get 实现：返回所有支持的配置键及其当前有效值
     fn get(&self, params: Value) -> abacus_types::Result<Value> {
         let specific_key = params.get("key").and_then(|v| v.as_str());
-        let overrides = self.overrides.read().unwrap();
+        let overrides = self.overrides.read().unwrap_or_else(|p| p.into_inner());
 
         let mut result = serde_json::Map::new();
 
@@ -135,7 +135,7 @@ impl ConfigToolExecutor {
         self.validate_value(key, value)?;
 
         // 写入 overrides
-        self.overrides.write().unwrap().insert(key.to_string(), value.to_string());
+        self.overrides.write().unwrap_or_else(|p| p.into_inner()).insert(key.to_string(), value.to_string());
 
         Ok(json!({
             "status": "ok",
@@ -257,27 +257,27 @@ fn parse_bool(s: &str) -> Option<bool> {
 /// - 消费方：CoreLoop pipeline 各消费点（execute_loop, build_tool_definitions_for 等）
 /// - 依赖：CoreLoop.runtime_overrides（同一 Arc）
 pub fn read_override_u32(overrides: &RuntimeOverrides, key: &str) -> Option<u32> {
-    overrides.read().unwrap().get(key).and_then(|v| v.parse().ok())
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get(key).and_then(|v| v.parse().ok())
 }
 
 pub fn read_override_u64(overrides: &RuntimeOverrides, key: &str) -> Option<u64> {
-    overrides.read().unwrap().get(key).and_then(|v| v.parse().ok())
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get(key).and_then(|v| v.parse().ok())
 }
 
 pub fn read_override_f64(overrides: &RuntimeOverrides, key: &str) -> Option<f64> {
-    overrides.read().unwrap().get(key).and_then(|v| v.parse().ok())
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get(key).and_then(|v| v.parse().ok())
 }
 
 pub fn read_override_bool(overrides: &RuntimeOverrides, key: &str) -> Option<bool> {
-    overrides.read().unwrap().get(key).and_then(|v| parse_bool(v))
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get(key).and_then(|v| parse_bool(v))
 }
 
 pub fn read_override_thinking(overrides: &RuntimeOverrides) -> Option<ThinkingIntent> {
-    overrides.read().unwrap().get("thinking").and_then(|v| ThinkingIntent::from_str_loose(v))
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get("thinking").and_then(|v| ThinkingIntent::from_str_loose(v))
 }
 
 pub fn read_override_compress_level(overrides: &RuntimeOverrides) -> Option<CompressLevel> {
-    overrides.read().unwrap().get("compress_level").map(|v| CompressLevel::from_str(v))
+    overrides.read().unwrap_or_else(|p| p.into_inner()).get("compress_level").map(|v| CompressLevel::from_str(v))
 }
 
 // ─── Schema ────────────────────────────────────────────────────────────────

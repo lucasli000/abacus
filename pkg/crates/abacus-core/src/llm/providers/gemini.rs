@@ -190,7 +190,7 @@ impl GeminiProvider {
             api_key: SecretString::new(api_key),
             model,
             base_url: base_url.unwrap_or_else(|| Self::DEFAULT_BASE_URL.to_string()),
-            default_max_tokens: 8192,
+            default_max_tokens: 64000,
         }
     }
 

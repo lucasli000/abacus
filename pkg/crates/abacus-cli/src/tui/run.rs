@@ -25,7 +25,7 @@ use ratatui::layout::Alignment;
 use tokio::sync::mpsc;
 use tracing;
 
-use crate::tui::api::{EngineHandle, send_chat_message, send_team_message, send_meeting_message, list_cwd_files, ai_complete, ApiResult, EngineResponse};
+use crate::tui::api::{EngineHandle, send_chat_message, send_team_message, send_meeting_message_streaming, send_plan_and_execute_streaming, list_cwd_files, ai_complete, ApiResult, EngineResponse};
 use crate::tui::event::{handle_chat_scroll_key, handle_global_key, handle_input_key, handle_mouse};
 use crate::tui::modes;
 use crate::tui::setup;
@@ -332,6 +332,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {
                     while let Ok(response) = res_rx.try_recv() {
+                        state.frame_dirty.set(true);
                         let ts = chrono::Local::now().format("%H:%M").to_string();
 
                         // V28 (T4): 落档前先 mem::take streaming_trace_ids
@@ -626,6 +627,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     || reason_destructive;
                                 let (confirm_type, risk) = if is_destructive_flag {
                                     (ConfirmType::ShellExec, ConfirmRisk::High)
+                                } else if first.tool_id.contains("bash") || first.tool_id.contains("shell") {
+                                    let cmd_risk = first.params_preview.as_deref()
+                                        .map(|p| crate::tui::state::assess_command_risk(p))
+                                        .unwrap_or(ConfirmRisk::Medium);
+                                    (ConfirmType::ShellExec, cmd_risk)
                                 } else {
                                     (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
                                 };
@@ -720,6 +726,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if iteration > 0 {
                                 state.input_state = InputState::Thinking;
                                 state.processing_phase = format!("· iteration {}", iteration + 1);
+                                // V40: timeline 迭代分隔
+                                state.streaming_timeline.push(
+                                    crate::tui::state::TimelineEntry::Iteration { number: iteration + 1 }
+                                );
                             }
                             had_streaming_update = true;
                         }
@@ -736,7 +746,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if !added.is_empty() {
                                 state.flash_state.mark_new_lines(&added);
                             }
+                            // V40: timeline Text entry — 记录 byte range
+                            let text_start = state.streaming_text.len();
                             state.streaming_text.push_str(&t);
+                            let text_end = state.streaming_text.len();
+                            // 合并连续 Text entries（避免每个 delta 一个 entry）
+                            if let Some(crate::tui::state::TimelineEntry::Text { end, .. }) =
+                                state.streaming_timeline.last_mut()
+                            {
+                                *end = text_end;
+                            } else {
+                                state.streaming_timeline.push(
+                                    crate::tui::state::TimelineEntry::Text { start: text_start, end: text_end }
+                                );
+                            }
                             // 增量送入 streaming md 引擎（mdstream committed/pending 分割）
                             {
                                 let mut smd_ref = state.streaming_md.borrow_mut();
@@ -756,6 +779,33 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.input_state = InputState::Thinking;
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
+                                // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
+                                let first_line = t.lines().next().unwrap_or("").to_string();
+                                let summary = if first_line.chars().count() > 40 {
+                                    format!("{}…", first_line.chars().take(37).collect::<String>())
+                                } else {
+                                    first_line
+                                };
+                                state.streaming_timeline.push(
+                                    crate::tui::state::TimelineEntry::Thinking { summary }
+                                );
+                            } else if !t.is_empty() {
+                                // 后续 thinking chunk: 更新摘要为最新一行（实时感）
+                                if let Some(crate::tui::state::TimelineEntry::Thinking { summary }) =
+                                    state.streaming_timeline.iter_mut().rev()
+                                        .find(|e| matches!(e, crate::tui::state::TimelineEntry::Thinking { .. }))
+                                {
+                                    // 取 thinking 全文的最后非空行作为 live preview
+                                    let full = &state.streaming_thinking;
+                                    let combined = format!("{}{}", full, t);
+                                    if let Some(last_line) = combined.lines().rev().find(|l| !l.trim().is_empty()) {
+                                        *summary = if last_line.chars().count() > 50 {
+                                            format!("{}…", last_line.chars().take(47).collect::<String>())
+                                        } else {
+                                            last_line.to_string()
+                                        };
+                                    }
+                                }
                             }
                             state.streaming_thinking.push_str(&t);
                             had_streaming_update = true;
@@ -784,18 +834,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // V38: 状态栏实时反映当前工具名（Working · tool_name）
                             state.input_state = InputState::Executing;
                             state.processing_phase = format!("· {}", name);
-                            // V40: 主消息区内联工具指示器 — 用户在主消息区直接看到工具活动
-                            // 格式：灰色行 "▸ tool_name" — 类似 Claude Code 的工具名显示
-                            state.streaming_text.push_str(&format!("\n▸ `{}`", name));
-                            {
-                                let mut smd_ref = state.streaming_md.borrow_mut();
-                                if smd_ref.is_none() {
-                                    *smd_ref = Some(crate::tui::md_stream::StreamingMd::new());
+                            // V40: timeline Tool entry（ToolArgs/ToolEnd 会原地更新）
+                            state.streaming_timeline.push(
+                                crate::tui::state::TimelineEntry::Tool {
+                                    name: name.clone(),
+                                    context: String::new(), // ToolArgs 到达后填充
+                                    status: crate::tui::state::StreamingToolStatus::Running,
+                                    duration_ms: None,
+                                    failure_kind: None,
+                                    trace_id,
                                 }
-                                if let Some(ref mut smd) = *smd_ref {
-                                    smd.append(&format!("\n▸ `{}`", name));
-                                }
-                            }
+                            );
                             had_streaming_update = true;
                         }
                         // V29.11: 工具输入参数 — 回填 trace event 的 args 字段
@@ -808,10 +857,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let tid = tool.3;
                                 if let Some(ev) = state.trace_events.iter_mut().find(|e| e.id == tid) {
                                     if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
-                                        *args = args_json;
+                                        *args = args_json.clone();
                                     }
                                 }
                             }
+                            // V40: 更新 timeline Tool entry 的 context（从 args 提取摘要）
+                            if let Some(crate::tui::state::TimelineEntry::Tool { context, .. }) =
+                                state.streaming_timeline.iter_mut().rev()
+                                    .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { name: n, status: s, .. }
+                                        if *n == name && *s == crate::tui::state::StreamingToolStatus::Running))
+                            {
+                                *context = crate::tui::components::block_detail::extract_tool_param_summary(&args_json);
+                            }
+                            had_streaming_update = true;
                         }
                         // V29.11: 工具输出内容 — 回填 trace event 的 output 字段
                         StreamChunk::ToolOutput { name, output_json } => {
@@ -834,6 +892,39 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     }
                                 }
                             }
+                            // V40: timeline ToolOutput — bash/read 工具推送输出摘要
+                            // 先提取摘要（借用 output_json），再 move 给 trace（避免 clone）
+                            let tool_lower = name.to_lowercase();
+                            let is_bash = tool_lower.contains("bash") || tool_lower.contains("exec");
+                            let is_read = tool_lower.contains("read");
+                            if (is_bash || is_read) && !output_json.is_empty() {
+                                let summary = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
+                                    let text = val.as_str()
+                                        .or_else(|| val.get("stdout").and_then(|v| v.as_str()))
+                                        .or_else(|| val.get("output").and_then(|v| v.as_str()))
+                                        .unwrap_or("");
+                                    let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                                    if first_line.chars().count() > 60 {
+                                        format!("{}…", first_line.chars().take(57).collect::<String>())
+                                    } else {
+                                        first_line.to_string()
+                                    }
+                                } else {
+                                    // 非 JSON 输出：取首行
+                                    let first_line = output_json.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                                    if first_line.chars().count() > 60 {
+                                        format!("{}…", first_line.chars().take(57).collect::<String>())
+                                    } else {
+                                        first_line.to_string()
+                                    }
+                                };
+                                if !summary.is_empty() {
+                                    state.streaming_timeline.push(
+                                        crate::tui::state::TimelineEntry::ToolOutput { summary }
+                                    );
+                                }
+                            }
+                            // 回填 trace event output（move，不 clone）
                             if let Some(tool) = state.streaming_tools.iter().rev()
                                 .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
                             {
@@ -844,8 +935,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     }
                                 }
                             }
+                            had_streaming_update = true;
                         }
-                        StreamChunk::ToolEnd { name, success, duration_ms } => {
+                        StreamChunk::ToolEnd { name, success, duration_ms, failure_kind } => {
                             // V28 (T3): 反查 streaming_tools 拿 trace_id, 直接定位 trace_events
                             // 中对应条目更新 status + duration_ms(替代 add_event 重复事件)。
                             let new_status = if success {
@@ -910,18 +1002,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     }
                                 }
                             }
-                            // V40: 主消息区工具完成指示 — 在 ToolStart 行尾追加结果
-                            let result_indicator = if success {
-                                format!(" ✓ {}ms", duration_ms)
+                            // V40: 更新 timeline Tool entry（status + duration + failure_kind）
+                            let tl_status = if success {
+                                crate::tui::state::StreamingToolStatus::Success
                             } else {
-                                format!(" ✗ failed {}ms", duration_ms)
+                                crate::tui::state::StreamingToolStatus::Failed
                             };
-                            state.streaming_text.push_str(&result_indicator);
+                            if let Some(crate::tui::state::TimelineEntry::Tool {
+                                status: ref mut st, duration_ms: ref mut dur, failure_kind: ref mut fk, ..
+                            }) = state.streaming_timeline.iter_mut().rev()
+                                .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { name: ref n, status: ref s, .. }
+                                    if *n == name && *s == crate::tui::state::StreamingToolStatus::Running))
                             {
-                                let mut smd_ref = state.streaming_md.borrow_mut();
-                                if let Some(ref mut smd) = *smd_ref {
-                                    smd.append(&result_indicator);
-                                }
+                                *st = tl_status;
+                                *dur = Some(duration_ms);
+                                *fk = failure_kind;
                             }
                             had_streaming_update = true;
                         }
@@ -997,11 +1092,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 });
                                 state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auto_allow_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Info);
                             } else {
-                                // 弹窗
+                                // 弹窗 — 使用 assess_command_risk 做细粒度分级
                                 let reason_destructive = req.reason.starts_with("[destructive]");
                                 let is_destructive_flag = matches!(req.kind, McipConfirmKind::DestructiveOp) || reason_destructive;
                                 let (confirm_type, risk) = if is_destructive_flag {
                                     (ConfirmType::ShellExec, ConfirmRisk::High)
+                                } else if req.tool_id.contains("bash") || req.tool_id.contains("shell") {
+                                    // bash 工具：从 params_preview 提取命令做精确风险评估
+                                    let cmd_risk = req.params_preview.as_deref()
+                                        .map(|p| crate::tui::state::assess_command_risk(p))
+                                        .unwrap_or(ConfirmRisk::Medium);
+                                    (ConfirmType::ShellExec, cmd_risk)
                                 } else {
                                     (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
                                 };
@@ -1047,20 +1148,30 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
                             if messages_compressed > 0 {
                                 state.add_event(&ts, "context", &format!("压缩 {} 条消息，释放 ~{} tok", messages_compressed, tokens_saved), crate::tui::state::EventLevel::Info);
-                                // 在主对话流中通知压缩结果
+                                // 在主对话流中插入系统提示卡片，让用户明确感知压缩边界
                                 let note = format!(
-                                    "✅ 上下文压缩完成：{} 条历史消息 → 摘要（释放 ~{} tokens）。早期对话细节已简化，核心结论保留。",
+                                    "--- 上下文压缩 ---\n{} 条历史消息已压缩为摘要（释放 ~{} tokens）\n核心结论和关键决策已保留，后续输出继续。",
                                     messages_compressed, tokens_saved
                                 );
-                                state.add_toast(&note, Duration::from_secs(5));
+                                state.push_system_note(&note);
                                 // 联动上下文展示：减去压缩释放的 tokens
                                 state.session_tokens.total_tokens = state.session_tokens.total_tokens
                                     .saturating_sub(tokens_saved as u64);
                                 state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
                                     .saturating_sub(tokens_saved as u64);
+                                // 累计压缩统计
+                                state.session_tokens.compress_count += 1;
+                                state.session_tokens.compress_tokens_saved += tokens_saved as u64;
                             }
                             state.processing_phase.clear();
                             state.rendered_lines_dirty.set(true);
+                        }
+                        StreamChunk::ToolHealth(entries) => {
+                            // 工具健康快照：写入 state 供 panel 渲染
+                            // 引用关系：api/mod.rs 在 Complete 前发送 → 此处消费
+                            for entry in entries {
+                                state.tool_health.insert(entry.tool_id.clone(), entry);
+                            }
                         }
                         StreamChunk::Complete(_) => {
                             // ST1：清理流式累积避免双显示
@@ -1147,12 +1258,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
-                // 渲染（每帧一次，在所有状态更新之后）
-                // 每帧都渲染：输入栏光标闪烁需要持续刷新，且 ratatui 双缓冲 diff
-                // 机制保证无变化区域不会产生终端 I/O，开销极小。
-                // 之前的 skip 优化导致输入删到空时残影 bug。
-                let needs_draw = true;
+                // P1 优化：条件渲染
+                // - streaming 期间：每帧渲染（内容持续变化 + 光标动画）
+                // - 非 streaming：仅在有状态变化时渲染（事件/响应/resize/toast）
+                // ratatui 双缓冲 diff 保证即使每帧调也只写变化区域到终端
+                let needs_draw = state.is_streaming
+                    || state.rendered_lines_dirty.get()
+                    || state.resize_debounce_frames > 0
+                    || !state.toasts.is_empty()
+                    || state.confirm_dialog.is_some()
+                    || state.frame_dirty.get();
                 if needs_draw {
+                    state.frame_dirty.set(false);
                     if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {
                         tracing::error!(?e, "TUI 渲染错误");
                     }
@@ -1280,6 +1397,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             }
 
             Some(event) = evt_rx.recv() => {
+                // P1 优化：用户事件触发渲染
+                state.frame_dirty.set(true);
                 // V29.1 (P1 续): 任何用户活动(键/鼠/焦点恢复)都重置 ConfirmDialog 的 idle 计时器
                 //   设计意图: timer 衡量"用户多久没操作"而非"弹窗存在多久"
                 //   不在 interaction_paused 状态下时, 把 last_active_at 推到 now
@@ -1405,14 +1524,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                     turnkey_plan: None,
                                                 });
                                             }
-                                            _ => {}
+                                            _ => { let _ = tx.send(EngineResponse::default()); }
                                         }
                                     });
                                 }
-                                // ═══ Meeting 模式: 专家会诊路由 ═══
+                                // ═══ Meeting 模式: 多专家会诊 + Host 综合（流式连续流程） ═══
                                 AbacusMode::Meeting => {
+                                    let stx = stream_tx.clone();
+                                    state.reset_streaming();
+                                    state.is_streaming = true;
                                     tokio::spawn(async move {
-                                        match send_meeting_message(&engine, &text).await {
+                                        match send_meeting_message_streaming(&engine, &text, stx).await {
                                             ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                             ApiResult::Err(e) => {
                                                 let _ = tx.send(EngineResponse {
@@ -1428,7 +1550,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                     turnkey_plan: None,
                                                 });
                                             }
-                                            _ => {}
+                                            _ => { let _ = tx.send(EngineResponse::default()); }
                                         }
                                     });
                                 }
@@ -1457,7 +1579,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         turnkey_plan: None,
                                                     });
                                                 }
-                                                _ => {}
+                                                _ => { let _ = tx.send(EngineResponse::default()); }
                                             }
                                         });
                                     } else {
@@ -1478,7 +1600,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         turnkey_plan: None,
                                                     });
                                                 }
-                                                _ => {}
+                                                _ => { let _ = tx.send(EngineResponse::default()); }
                                             }
                                         });
                                     }
@@ -1488,55 +1610,31 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 //   - 注入 Planner system prompt
                                 //   - 限制只读 tool whitelist (read/glob/grep/kb_query)
                                 //   - 用户进入 Team 模式时才执行写操作
+                                // ═══ Plan 模式: 规划 + 自动执行 + 汇总（流式连续流程） ═══
                                 AbacusMode::Plan => {
-                                    if state.streaming_enabled {
-                                        let stx = stream_tx.clone();
-                                        state.reset_streaming();
-                                        state.is_streaming = true;
-                                        tokio::spawn(async move {
-                                            use crate::tui::api::send_planner_message_streaming;
-                                            match send_planner_message_streaming(&engine, &text, stx, chat_req_ctx).await {
-                                                ApiResult::Ok(resp) => { let _ = tx.send(resp); }
-                                                ApiResult::Err(e) => {
-                                                    let _ = tx.send(EngineResponse {
-                                                        text: format!("⚠️ [Plan] {}", e),
-                                                        thinking: None,
-                                                        tool_records: vec![],
-                                                        stats: None,
-                                                        progressive_state: None,
-                                                        inertia_warning: None,
-                                                        pending_confirmations: vec![],
-                                                        meeting_experts: None,
-                                                        auto_fallback_chat: None,
-                                                        turnkey_plan: None,
-                                                    });
-                                                }
-                                                _ => {}
+                                    let stx = stream_tx.clone();
+                                    state.reset_streaming();
+                                    state.is_streaming = true;
+                                    tokio::spawn(async move {
+                                        match send_plan_and_execute_streaming(&engine, &text, stx, chat_req_ctx).await {
+                                            ApiResult::Ok(resp) => { let _ = tx.send(resp); }
+                                            ApiResult::Err(e) => {
+                                                let _ = tx.send(EngineResponse {
+                                                    text: format!("⚠️ [Plan] {}", e),
+                                                    thinking: None,
+                                                    tool_records: vec![],
+                                                    stats: None,
+                                                    progressive_state: None,
+                                                    inertia_warning: None,
+                                                    pending_confirmations: vec![],
+                                                    meeting_experts: None,
+                                                    auto_fallback_chat: None,
+                                                    turnkey_plan: None,
+                                                });
                                             }
-                                        });
-                                    } else {
-                                        tokio::spawn(async move {
-                                            use crate::tui::api::send_planner_message;
-                                            match send_planner_message(&engine, &text, chat_req_ctx).await {
-                                                ApiResult::Ok(resp) => { let _ = tx.send(resp); }
-                                                ApiResult::Err(e) => {
-                                                    let _ = tx.send(EngineResponse {
-                                                        text: format!("⚠️ [Plan] {}", e),
-                                                        thinking: None,
-                                                        tool_records: vec![],
-                                                        stats: None,
-                                                        progressive_state: None,
-                                                        inertia_warning: None,
-                                                        pending_confirmations: vec![],
-                                                        meeting_experts: None,
-                                                        auto_fallback_chat: None,
-                                                        turnkey_plan: None,
-                                                    });
-                                                }
-                                                _ => {}
-                                            }
-                                        });
-                                    }
+                                            _ => { let _ = tx.send(EngineResponse::default()); }
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -2031,7 +2129,8 @@ fn format_undo_result(r: &abacus_core::undo::UndoResult) -> String {
         let detail = match c {
             abacus_core::undo::UndoConflict::ExternalModification { observed_sha256, expected_sha256 } =>
                 format!("文件被外部修改\n  expected sha256: {}\n  observed sha256: {}",
-                    &expected_sha256[..16], &observed_sha256[..16]),
+                    expected_sha256.get(..16).unwrap_or(&expected_sha256),
+                    observed_sha256.get(..16).unwrap_or(&observed_sha256)),
             abacus_core::undo::UndoConflict::FileGone =>
                 "文件已被外部删除".to_string(),
             abacus_core::undo::UndoConflict::DirectoryNotEmpty { entries } =>

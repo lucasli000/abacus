@@ -87,6 +87,7 @@ impl ServerSessionManager {
     }
 
     /// Get existing session or create new one. Returns (session, is_new).
+    /// Eviction is performed within the same write-lock critical section to avoid TOCTOU.
     pub async fn get_or_create(&self, session_id: &str) -> (Arc<RwLock<SessionState>>, bool) {
         let mut sessions = self.sessions.write().await;
         let is_new = !sessions.contains_key(session_id);
@@ -99,9 +100,16 @@ impl ServerSessionManager {
             });
         entry.last_access = std::time::Instant::now();
         let s = entry.session.clone();
-        drop(sessions);
-        if is_new {
-            self.evict_if_needed().await;
+        // Inline eviction within the same lock to prevent TOCTOU race
+        if is_new && sessions.len() > self.max_sessions {
+            let to_remove = sessions.len() - self.max_sessions;
+            let mut entries: Vec<_> = sessions.iter()
+                .map(|(k, v)| (k.clone(), v.last_access))
+                .collect();
+            entries.sort_by_key(|&(_, t)| t);
+            for (key, _) in entries.into_iter().take(to_remove) {
+                sessions.shift_remove(&key);
+            }
         }
         (s, is_new)
     }
@@ -128,21 +136,6 @@ impl ServerSessionManager {
         infos
     }
 
-    /// LRU 驱逐: 移除最少访问的会话 (L2-6: FIFO→LRU)
-    pub async fn evict_if_needed(&self) {
-        let mut sessions = self.sessions.write().await;
-        if sessions.len() > self.max_sessions {
-            let to_remove = sessions.len() - self.max_sessions;
-            // 按 last_access 排序，移除最久未访问的
-            let mut entries: Vec<_> = sessions.iter()
-                .map(|(k, v)| (k.clone(), v.last_access))
-                .collect();
-            entries.sort_by_key(|&(_, t)| t);
-            for (key, _) in entries.into_iter().take(to_remove) {
-                sessions.shift_remove(&key);
-            }
-        }
-    }
 
     /// Remove a session by id. Returns true if it existed.
     pub async fn remove(&self, session_id: &str) -> bool {
@@ -631,8 +624,9 @@ impl AbacusServer {
         let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls")
             .map(|n| n as u32).unwrap_or(100);
         let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
+        // V40: 对齐 TUI 默认值 64000（支持 DeepSeek thinking 长输出）
         let max_tokens = cfg_mgr.get_number("core.max_tokens")
-            .map(|n| n as u32).unwrap_or(32000);
+            .map(|n| n as u32).unwrap_or(64000);
         let context_window = cfg_mgr.get_number("core.context_window")
             .map(|n| n as usize).unwrap_or(128_000);
         let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
@@ -705,12 +699,12 @@ impl AbacusServer {
             // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
             lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
             // Task #96：单 session 模型升级预算
-            max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(2),
+            max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
             // W2 (Task #100)：tool result dedup —— 默认关；运维通过 core.dedup.* 显式开启
             tool_result_dedup_enabled: cfg_mgr.get_bool("core.dedup.enabled").unwrap_or(false),
             tool_result_dedup_ttl_secs: cfg_mgr.get_number("core.dedup.ttl_secs").map(|n| n as u64).unwrap_or(60),
-            tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(256),
-            adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(false),
+            tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(2048),
+            adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),
             event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
             scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
             policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),

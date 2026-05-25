@@ -25,8 +25,6 @@ use crate::tui::theme::{SemanticIntent, TextRole};
 
 /// render_card_bar lives in super (mod.rs); re-used here for panel content areas.
 use super::render_card_bar;
-/// format_duration_ms_padded comes from block_detail (glob-imported in mod.rs → visible in super).
-use super::format_duration_ms_padded;
 
 // ════════════════════════════════════════════════════════════════
 // Panel public entry point
@@ -340,6 +338,17 @@ fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             cache_cost_spans.push(Span::styled(format!("${:.4}", cost), Style::default().fg(state.theme.gold)));
         }
         lines.push(Line::from(cache_cost_spans));
+
+        // 压缩统计（仅在发生过压缩时展示）
+        if state.session_tokens.compress_count > 0 {
+            let saved_str = format_ctx(state.session_tokens.compress_tokens_saved as usize);
+            lines.push(Line::from(vec![
+                Span::styled(if narrow { "  ♻" } else { "   compress " }, muted),
+                Span::styled(format!("{}×", state.session_tokens.compress_count), Style::default().fg(state.theme.text)),
+                Span::styled(if narrow { " · " } else { "  freed " }, dim),
+                Span::styled(saved_str, Style::default().fg(state.theme.success)),
+            ]));
+        }
     }
 
     f.render_widget(Paragraph::new(lines), area);

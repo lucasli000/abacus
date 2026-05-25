@@ -454,7 +454,7 @@ pub(super) fn format_duration_ms_padded(ms: u64) -> String {
 /// 从 tool args JSON 中提取关键参数作为单行摘要。
 ///
 /// 优先级: `path` → `file_path` → `url` → `query` → `command` → 首行截断60字符
-pub(super) fn extract_tool_param_summary(args_json: &str) -> String {
+pub(crate) fn extract_tool_param_summary(args_json: &str) -> String {
     // 辅助: UTF-8 安全截断 — 按 char 数而非字节切,避免多字节字符中间切断 panic
     fn truncate_chars(s: &str, max: usize) -> String {
         if s.chars().count() <= max { s.to_string() }

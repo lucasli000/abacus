@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use abacus_types::{
     KernelError, ModelId, ToolId, ToolOutput, TurnStats,
@@ -956,10 +956,16 @@ impl<'a> TurnPipeline<'a> {
         }
 
         // ── 路径 1：regex 提取 <name>/<arguments> 子标签格式 ──
+        static RE_NAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"<name>\s*([^<]+)\s*</name>").unwrap()
+        });
+        static RE_ARGS: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"<arguments>\s*([\s\S]*?)\s*</arguments>").unwrap()
+        });
         let mut calls = Vec::new();
-        let re_name = regex::Regex::new(r"<name>\s*([^<]+)\s*</name>").ok();
-        let re_args = regex::Regex::new(r"<arguments>\s*([\s\S]*?)\s*</arguments>").ok();
-        if let (Some(rn), Some(ra)) = (re_name, re_args) {
+        {
+            let rn = &*RE_NAME;
+            let ra = &*RE_ARGS;
             let names: Vec<&str> = rn.captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str())).collect();
             let args: Vec<&str> = ra.captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str())).collect();
             for (i, name) in names.iter().enumerate() {
@@ -1129,8 +1135,18 @@ impl<'a> TurnPipeline<'a> {
             let effective_temperature = self.req_ctx.temperature
                 .or(ctx.complexity_temperature)
                 .unwrap_or(self.core.config.default_temperature);
-            let effective_max_tokens = self.req_ctx.max_tokens
+            // V40: 动态自适应 max_tokens — 确保 prompt + max_tokens ≤ context_window
+            // 策略：min(configured_max, context_remaining - safety_margin)
+            // safety_margin = 1024：留余量给 token 估算误差 + 系统开销
+            // 下限 clamp 2048：即使 context 紧张也保证最低输出空间（触发压缩而非静默截断）
+            let configured_max = self.req_ctx.max_tokens
                 .unwrap_or(self.core.config.default_max_tokens);
+            let effective_max_tokens = {
+                let w = self.core.context_manager.window.read().await;
+                let context_remaining = w.max_tokens.saturating_sub(total).saturating_sub(1024);
+                let adaptive = (configured_max as usize).min(context_remaining).max(2048);
+                adaptive as u32
+            };
 
             // V35-1: 注入 prefix completion message（仅当 ctx 有 prefix 字段且 model 支持）
             // 引用关系：RequestContext.prefix_assistant_content（cli/api/mod.rs::send_planner_message_streaming 设置）
@@ -1228,6 +1244,47 @@ impl<'a> TurnPipeline<'a> {
             let response = match provider_result {
                 Ok(resp) => resp,
                 Err(KernelError::ApiError { status: 400, ref body }) => {
+                    let body_lower = body.to_lowercase();
+                    // ── Strategy 0: Context length exceeded → 压缩后重试 ──
+                    // Anthropic: "prompt is too long", OpenAI: "maximum context length",
+                    // DeepSeek/generic: "token limit", "too many tokens"
+                    let is_context_overflow = body_lower.contains("prompt is too long")
+                        || body_lower.contains("input is too long")
+                        || body_lower.contains("maximum context length")
+                        || body_lower.contains("too many tokens")
+                        || body_lower.contains("context_length_exceeded")
+                        || body_lower.contains("request too large")
+                        || body_lower.contains("tokens exceeds");
+                    if is_context_overflow {
+                        tracing::warn!("Context overflow detected, triggering emergency compression");
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+                        }
+                        let compressed = {
+                            let s = self.session.read().await;
+                            let mut msgs = s.messages.write().await;
+                            self.core.context_manager.auto_compress_messages(&mut msgs).await
+                        };
+                        if let Some(ref stx) = self.stream_tx {
+                            let tokens_saved: usize = compressed.iter()
+                                .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                                .sum();
+                            let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                                messages_compressed: compressed.len(),
+                                tokens_saved,
+                            });
+                        }
+                        if !compressed.is_empty() {
+                            // 压缩成功，重建消息并重试
+                            ctx.recovery_attempts += 1;
+                            if ctx.recovery_attempts > 5 {
+                                ctx.final_response = "[System] 上下文压缩多次后仍超限，请精简对话或重新开始。".into();
+                                break;
+                            }
+                            continue;
+                        }
+                        // 压缩后仍无法缩减 → fall through to normal repair
+                    }
                     // 尝试根据错误信息修复消息
                     let mut retry_messages = {
                         let s = self.session.read().await;
@@ -1436,6 +1493,7 @@ impl<'a> TurnPipeline<'a> {
                                 name: "auto_repair".into(),
                                 success: true,
                                 duration_ms: 0,
+                                failure_kind: None,
                             });
                         }
                         {
@@ -1495,6 +1553,7 @@ impl<'a> TurnPipeline<'a> {
                                     name: format!("⚡ policy: retry {}/{} (silent stop detected)", retry_count + 1, max_retries),
                                     success: true,
                                     duration_ms: 0,
+                                    failure_kind: None,
                                 });
                             }
                             {
@@ -1772,7 +1831,7 @@ impl<'a> TurnPipeline<'a> {
                     // 授权检查：优先于session 永久授权和本 turn 单次授权，匹配则跳过 MCIP 策略
                     let is_user_granted = {
                         let s = self.session.read().await;
-                        let grants = s.mcip_grants.read().unwrap();
+                        let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
                         grants.contains(tool_id.0.as_str())
                     } || self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str());
 
@@ -1802,7 +1861,7 @@ impl<'a> TurnPipeline<'a> {
                                     .take(2).collect::<Vec<_>>().join(" ");
                                 let bash_granted = {
                                     let s = self.session.read().await;
-                                    let grants = s.mcip_grants.read().unwrap();
+                                    let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
                                     grants.contains(&format!("bash:{}", cmd_prefix))
                                 };
                                 if bash_granted {
@@ -1895,7 +1954,7 @@ impl<'a> TurnPipeline<'a> {
                                             .take(2).collect::<Vec<_>>().join(" ");
                                         let grant_key = format!("bash:{}", prefix);
                                         let s = self.session.read().await;
-                                        s.mcip_grants.write().unwrap().insert(grant_key);
+                                        s.mcip_grants.write().unwrap_or_else(|p| p.into_inner()).insert(grant_key);
                                     }
                                 }
                                 // 走真 execute 路径（mag_chain.before → registry.execute → wrap → after）
@@ -2024,6 +2083,7 @@ impl<'a> TurnPipeline<'a> {
                                 name: tc.function.name.clone(),
                                 success: false,
                                 duration_ms: 0,
+                                failure_kind: Some("MCIPBlocked".into()),
                             });
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(
                                 format!("Tool dispatch failed: {}", e)
@@ -2064,6 +2124,7 @@ impl<'a> TurnPipeline<'a> {
                         name: tc.function.name.clone(),
                         success: output.success,
                         duration_ms: output.latency_ms,
+                        failure_kind: output.failure_kind.clone(),
                     });
                 }
                 ctx.all_tool_outputs.push(output.clone());

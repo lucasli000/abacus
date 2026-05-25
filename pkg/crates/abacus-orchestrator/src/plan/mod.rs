@@ -355,8 +355,19 @@ impl PlanExecutor {
     /// 返回最终 PlanStatus。
     pub async fn run(&self, plan: &mut PlanModel) -> Result<PlanStatus, KernelError> {
         plan.status = PlanStatus::InProgress;
+        // 安全上限：steps * (max_retries+1) * 2 防止无限循环
+        let avg_retries = plan.steps.iter().map(|s| s.max_retries as usize).max().unwrap_or(3);
+        let max_iterations = (plan.steps.len() * (avg_retries + 1) * 2).max(20);
+        let mut iteration = 0;
 
         loop {
+            iteration += 1;
+            if iteration > max_iterations {
+                plan.status = PlanStatus::Failed(format!(
+                    "exceeded max iterations ({}) — possible infinite retry loop", max_iterations
+                ));
+                return Ok(plan.status.clone());
+            }
             // 检查是否完成
             if plan.is_done() {
                 plan.status = if plan.has_unrecoverable_failure() {

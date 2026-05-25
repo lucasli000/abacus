@@ -500,7 +500,9 @@ impl Default for CoreConfig {
             max_tool_calls_per_turn: 100,
             default_model: ModelId("deepseek-v4-flash".into()),
             default_temperature: 0.6,
-            default_max_tokens: 32000,
+            // V40: 64000 — 对齐主流 coding agent（Claude Code 20K, OpenCode 32K）
+            // DeepSeek thinking 模式 output 可达 64K+；非 thinking 上限由模型 spec 约束
+            default_max_tokens: 64000,
             system_prompt: String::new(),
             model_spec: None,
             thinking_intent: None,
@@ -1856,6 +1858,33 @@ impl CoreLoop {
     /// 调用方：pipeline 决策 thinking 路径前先 `lookup(&effective_model)` 获取 spec。
     pub fn model_catalog(&self) -> &Arc<crate::llm::ModelCatalog> {
         &self.model_catalog
+    }
+
+    /// 获取指定工具列表的 effectiveness 快照（TUI 消费）
+    ///
+    /// ## 引用关系
+    /// - 调用方：api/mod.rs send_chat_message_streaming（turn 完成后）
+    /// - 数据源：EffectivenessTracker（持有历史统计）
+    ///
+    /// ## 设计
+    /// 返回轻量 Vec，不暴露内部 tracker 引用。
+    /// 仅评估传入的 tool_ids（避免全量遍历 200+ 工具）
+    pub async fn tool_health_snapshot(&self, tool_ids: &[ToolId]) -> Vec<crate::llm::stream::ToolHealthEntry> {
+        let eff = self.effectiveness.read().await;
+        let tools = self.registry.all_tools().await;
+        tool_ids.iter().filter_map(|tid| {
+            let provider = tools.iter()
+                .find(|t| &t.id == tid)
+                .map(|t| &t.provider)
+                .unwrap_or(&abacus_types::ToolProvider::BuiltIn);
+            let e = eff.evaluate_with_provider(tid, provider);
+            Some(crate::llm::stream::ToolHealthEntry {
+                tool_id: tid.0.clone(),
+                tier: format!("{:?}", e.tier),
+                blocked_by_env: e.blocked_by_env,
+                score: e.composite_score,
+            })
+        }).collect()
     }
 
     /// Phase γ-I：记录工具调用 turn（pipeline 在工具成功后调用）

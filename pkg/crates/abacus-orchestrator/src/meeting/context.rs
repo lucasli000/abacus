@@ -118,10 +118,29 @@ impl ContextPool {
     /// - token 计数从保留部分重算（精确）
     fn compress(&mut self) {
         let mid = self.timeline.len() / 2;
+        // 提取前半段的关键结论（取 confidence > 0.5 的，拼接为摘要）
+        let key_conclusions: Vec<&str> = self.timeline[..mid].iter()
+            .filter(|e| e.confidence > 0.5)
+            .map(|e| e.conclusion.as_str())
+            .collect();
+        let summary_text = if key_conclusions.is_empty() {
+            format!("[摘要] {} 轮对话已压缩", mid)
+        } else {
+            // 拼接关键结论，每条截取前 80 字符
+            let points: Vec<String> = key_conclusions.iter()
+                .take(5)
+                .map(|c| if c.chars().count() > 80 {
+                    format!("• {}", c.chars().take(80).collect::<String>())
+                } else {
+                    format!("• {}", c)
+                })
+                .collect();
+            format!("[摘要 {}轮] {}", mid, points.join(" | "))
+        };
         let summary = TimelineEntry {
             turn: self.timeline[0].turn,
             speaker: SpecialistId("system".into()),
-            conclusion: format!("*** 时间线压缩: {} 轮合并为摘要 ***", mid),
+            conclusion: summary_text,
             confidence: 0.0,
         };
         self.timeline.drain(..mid);
