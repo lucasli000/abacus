@@ -450,27 +450,28 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         let g_widest = groups.iter().map(|(name, _)| display_width(name) + 4).max().unwrap_or(0);
         widest.max(g_widest)
     } else { widest };
-    let extra = if matches!(p.kind, PickerKind::Theme) { 14 } else { 4 }; // 主题需 7 色块×2
-    let popup_w = ((widest + extra) as u16).max(36).min(frame.width).min(80);
-    // V29.8: 分组渲染时为每个分组多保留 1 行(组标题); thinking slider 多保留 2 行(空行 + slider)
+    let _extra = if matches!(p.kind, PickerKind::Theme) { 14 } else { 4 };
+    // V40: 弹窗布局规范 — 靠左，宽度为输入框 6/8，高度不超过消息框 1/3
+    //   宽度：input_area.width * 6 / 8
+    //   高度：内容自适应，上限 = 消息区高度 / 3（消息区 ≈ input_area.y）
+    //   位置：左对齐 input_area.x，垂直方向向上弹出（输入框正上方）
+    let popup_w = (input_area.width * 6 / 8).max(36).min(frame.width);
     let group_overhead = p.groups.as_ref().map(|g| g.len()).unwrap_or(0);
     let slider_overhead = if p.show_thinking_slider { 2 } else { 0 };
     let content_lines = p.items.len() + group_overhead + slider_overhead;
-    let max_visible = 12usize.min(content_lines);
-    let popup_h = (max_visible as u16 + 2).min(frame.height); // 2 = border 上下
+    // 高度上限：消息区（input_area.y 近似消息框高度）的 1/3
+    let msg_area_h = input_area.y as usize;
+    let max_h = (msg_area_h / 3).max(6);
+    let popup_h = ((content_lines + 2) as u16) // +2 border
+        .min(max_h as u16)
+        .min(frame.height);
 
-    // 位置：与 completion popup 一致（上方→下方→居中）
-    let above = input_area.y;
-    let below = frame.height.saturating_sub(input_area.y.saturating_add(input_area.height));
-    let popup_y = if above >= popup_h {
-        input_area.y.saturating_sub(popup_h)
-    } else if below >= popup_h {
-        input_area.y + input_area.height
-    } else {
-        frame.height.saturating_sub(popup_h) / 2
-    };
-    // V23b：左对齐到 input_area.x，与 confirm_dialog 一致（用户偏好）
-    let popup_x = input_area.x.min(frame.width.saturating_sub(popup_w));
+    // max_visible: 内容区可见行数（popup_h - 2 border）
+    let max_visible = (popup_h.saturating_sub(2)) as usize;
+
+    // 位置：靠左，向上弹出（紧贴输入框上方）
+    let popup_y = input_area.y.saturating_sub(popup_h);
+    let popup_x = input_area.x;
     let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
     f.render_widget(Clear, popup_area);

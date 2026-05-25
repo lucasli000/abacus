@@ -392,7 +392,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-        let provider_timeout = std::time::Duration::from_secs(300);
+        let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
         let response = match tokio::time::timeout(provider_timeout, provider.complete_cancellable(req, self.cancel_token())).await {
             Ok(result) => result?,
             Err(_elapsed) => {
@@ -1090,7 +1090,7 @@ impl<'a> TurnPipeline<'a> {
     async fn execute_loop(&self, ctx: &mut TurnContext) -> Result<Option<TurnResult>, KernelError> {
         // 单轮不设工具总量上限——工具限制统一由 SafetyGuard session 级控制（默认 500）
 
-        for loop_iter in 0..self.core.config.max_turns_per_request {
+        for loop_iter in 0..self.core.config.thresholds.turn_max_iterations {
             // Fix 6: Cancel check at top of each loop iteration
             if self.is_cancelled() {
                 if let Some(ref stx) = self.stream_tx {
@@ -1226,7 +1226,7 @@ impl<'a> TurnPipeline<'a> {
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
                 // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-                let provider_timeout = std::time::Duration::from_secs(300);
+                let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
                 match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(req.clone(), self.cancel_token())).await {
                     Ok(result) => result,
                     Err(_elapsed) => {
@@ -1277,7 +1277,7 @@ impl<'a> TurnPipeline<'a> {
                         if !compressed.is_empty() {
                             // 压缩成功，重建消息并重试
                             ctx.recovery_attempts += 1;
-                            if ctx.recovery_attempts > 5 {
+                            if ctx.recovery_attempts > self.core.config.thresholds.turn_max_recovery {
                                 ctx.final_response = "[System] 上下文压缩多次后仍超限，请精简对话或重新开始。".into();
                                 break;
                             }
@@ -1330,7 +1330,7 @@ impl<'a> TurnPipeline<'a> {
                                     ));
                                 }
                                 ctx.recovery_attempts += 1;
-                                if ctx.recovery_attempts > 5 {
+                                if ctx.recovery_attempts > self.core.config.thresholds.turn_max_recovery {
                                     ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
                                     break;
                                 }
@@ -1359,7 +1359,7 @@ impl<'a> TurnPipeline<'a> {
                             ));
                         }
                         ctx.recovery_attempts += 1;
-                        if ctx.recovery_attempts > 5 {
+                        if ctx.recovery_attempts > self.core.config.thresholds.turn_max_recovery {
                             ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
                             break;
                         }
@@ -1389,7 +1389,7 @@ impl<'a> TurnPipeline<'a> {
                             ));
                         }
                         ctx.recovery_attempts += 1;
-                        if ctx.recovery_attempts > 5 {
+                        if ctx.recovery_attempts > self.core.config.thresholds.turn_max_recovery {
                             ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
                             break;
                         }
@@ -1667,6 +1667,24 @@ impl<'a> TurnPipeline<'a> {
                     });
                 }
                 continue;
+            }
+
+            // 80% Warning: 接近单轮工具上限时注入 hint（仅一次）
+            let tool_limit = self.core.config.thresholds.turn_max_tool_calls;
+            let warning_threshold = (tool_limit as f64 * 0.8) as u32;
+            if ctx.total_tool_calls >= warning_threshold && ctx.total_tool_calls - batch_size < warning_threshold {
+                let s = self.session.read().await;
+                let mut msgs = s.messages.write().await;
+                msgs.push(Message {
+                    role: MessageRole::User,
+                    content: Some(MessageContent::Text(format!(
+                        "[System Hint] You have used {}/{} tool calls this turn (80%). \
+                         Consider whether you can wrap up soon. You can continue in the next turn if needed.",
+                        ctx.total_tool_calls, tool_limit
+                    ))),
+                    name: None, tool_calls: None, tool_call_id: None,
+                    reasoning_content: None, prefix: false,
+                });
             }
 
             let user_role = { let s = self.session.read().await; s.user_role };
@@ -2244,7 +2262,7 @@ impl<'a> TurnPipeline<'a> {
             }
 
             // Fix 3: Warn user when approaching loop limit (80% threshold)
-            let limit = self.core.config.max_turns_per_request;
+            let limit = self.core.config.thresholds.turn_max_iterations;
             if loop_iter >= (limit * 80 / 100) && loop_iter < limit {
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
@@ -2394,7 +2412,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（escalation 路径同样受保护）
-        let provider_timeout = std::time::Duration::from_secs(300);
+        let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
         let escalation_result = match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(escalated_req, self.cancel_token())).await {
             Ok(result) => result,
             Err(_elapsed) => {

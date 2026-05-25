@@ -282,6 +282,91 @@ impl RequestContext {
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// 三层阈值体系：Turn 级（防呆）+ Execution 级（资源保护）+ Quality 级（智能优化）
+///
+/// ## 设计原则
+/// - Session 级不设限：长对话完全自由
+/// - Turn 级防呆：防止单轮死循环，到达时引导 LLM 输出结论，不终止 session
+/// - Execution 级保护：防止单个工具/SubAgent 失控占用资源
+/// - Quality 级优化：软性引导，永不中断执行
+///
+/// ## 触发行为
+/// - 80% → Warning hint（LLM 可忽略继续工作）
+/// - 100% → Soft limit（强指令输出结论，不 panic/terminate）
+/// - Hard limit 不存在
+///
+/// ## 引用关系
+/// - 消费方：pipeline/mod.rs (turn 级)、tool dispatch (execution 级)、
+///   context.rs (quality 级)、subagent/specialist (execution 级)
+/// - 生命周期：CoreLoop 构造时从 CoreConfig.thresholds 读取，session 内不变
+///   （可通过 config_set 运行时修改）
+#[derive(Debug, Clone)]
+pub struct ThresholdConfig {
+    // ─── Turn 级（防呆层）────────────────────────────────────────
+    /// 单轮工具调用总量上限（一次用户消息 → LLM 回复内的累积工具调用）
+    pub turn_max_tool_calls: u32,
+    /// 单轮内 LLM 循环迭代上限（agentic loop iterations）
+    pub turn_max_iterations: u32,
+    /// 单轮内错误恢复最大尝试次数
+    pub turn_max_recovery: u32,
+    /// 单次 LLM provider 请求超时（秒）
+    pub turn_provider_timeout_secs: u64,
+    /// 单轮提前停止（premature stop）最大重试次数
+    pub turn_premature_stop_retries: u32,
+
+    // ─── Execution 级（资源保护层）────────────────────────────────
+    /// Bash 命令最大执行时间（秒）
+    pub tool_bash_timeout_secs: u64,
+    /// 通用工具执行超时（秒）
+    pub tool_default_timeout_secs: u64,
+    /// SubAgent 最大执行时间（秒）
+    pub subagent_max_duration_secs: u64,
+    /// SubAgent token 消耗上限
+    pub subagent_max_tokens: usize,
+    /// Meeting 中 Specialist 响应超时（秒）
+    pub specialist_timeout_secs: u64,
+    /// 单次 Meeting 最大持续时间（分钟）
+    pub meeting_max_duration_mins: u32,
+    /// 用户确认等待超时（秒）
+    pub confirm_timeout_secs: u64,
+
+    // ─── Quality 级（智能优化层）──────────────────────────────────
+    /// 上下文压缩触发比例（超过 context_budget × ratio 时触发）
+    pub context_compress_ratio: f64,
+    /// 工具 N turn 未使用后从 LLM schema 隐藏
+    pub tool_prune_after_turns: u32,
+    /// 模型升级最大次数（防 KV cache 振荡）
+    pub max_model_escalations: u32,
+    /// 用户输入最大字符数（超出截断，不拒绝）
+    pub input_max_chars: usize,
+}
+
+impl Default for ThresholdConfig {
+    fn default() -> Self {
+        Self {
+            // Turn 级
+            turn_max_tool_calls: 500,
+            turn_max_iterations: 200,
+            turn_max_recovery: 5,
+            turn_provider_timeout_secs: 300,
+            turn_premature_stop_retries: 3,
+            // Execution 级
+            tool_bash_timeout_secs: 120,
+            tool_default_timeout_secs: 60,
+            subagent_max_duration_secs: 900,
+            subagent_max_tokens: 200_000,
+            specialist_timeout_secs: 900,
+            meeting_max_duration_mins: 60,
+            confirm_timeout_secs: 15,
+            // Quality 级
+            context_compress_ratio: 0.60,
+            tool_prune_after_turns: 20,
+            max_model_escalations: 10,
+            input_max_chars: 100_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreConfig {
     pub max_turns_per_request: u32,
@@ -490,6 +575,15 @@ pub struct CoreConfig {
     ///
     /// 生命周期：进程启动时 PolicyConfig::load()，session 内不变
     pub policy: Arc<policy::PolicyConfig>,
+
+    /// 三层阈值配置（统一管理所有限制，替代分散的硬编码）
+    ///
+    /// ## 引用关系
+    /// - pipeline: turn_max_tool_calls, turn_max_iterations, turn_max_recovery, turn_provider_timeout_secs
+    /// - tool dispatch: tool_bash_timeout_secs, tool_default_timeout_secs, confirm_timeout_secs
+    /// - orchestrator: subagent_max_duration_secs, subagent_max_tokens, specialist_timeout_secs
+    /// - context: context_compress_ratio
+    pub thresholds: ThresholdConfig,
 }
 
 impl Default for CoreConfig {
@@ -539,6 +633,8 @@ impl Default for CoreConfig {
             event_sink_enabled: true,
             // 行为策略：从 ~/.abacus/policy.toml 加载
             policy: Arc::new(policy::PolicyConfig::load()),
+            // 三层阈值体系
+            thresholds: ThresholdConfig::default(),
         }
     }
 }
@@ -3168,7 +3264,8 @@ impl CoreLoop {
                 "[Awareness]\n\
                  Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
                  Task: {} | Role: {} | Max output: {}tok\n\
-                 Capabilities: {} tools/turn, {} escalations available | scene_loading: {} | router: {}\n\
+                 [Limits] tools: 0/{} per turn | iterations: 0/{} | No session limit\n\
+                 Capabilities: {} escalations available | scene_loading: {} | router: {}\n\
                  Policy: entropy_guard={} | explicit_decl={} | stop_threshold={}chars | confirm_timeout={}s",
                 current_turn, max_turns,
                 tool_calls_used,
@@ -3177,7 +3274,8 @@ impl CoreLoop {
                 task_kind_str,
                 user_role,
                 max_tokens,
-                max_tool_calls,
+                self.config.thresholds.turn_max_tool_calls,
+                self.config.thresholds.turn_max_iterations,
                 escalations_left,
                 if self.config.scene_tool_loading_enabled { "on" } else { "off" },
                 if self.config.silent_router_enabled { "on" } else { "off" },

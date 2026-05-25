@@ -534,7 +534,7 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("core.thinking_display".into(), ConfigValue::String("summarized".into()));
     defaults.insert("core.context_window".into(), ConfigValue::Number(128000.0));
     defaults.insert("safety.max_input_length".into(), ConfigValue::Number(100000.0));
-    defaults.insert("safety.max_session_duration".into(), ConfigValue::Number(3600.0));
+    defaults.insert("safety.max_tool_calls".into(), ConfigValue::Number(500.0));
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "/tmp".into());

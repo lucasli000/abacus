@@ -1272,6 +1272,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // - 非 streaming：仅在有状态变化时渲染（事件/响应/resize/toast）
                 // ratatui 双缓冲 diff 保证即使每帧调也只写变化区域到终端
                 let needs_draw = state.is_streaming
+                    || !matches!(state.input_state, InputState::Ready) // spinner 动画需要持续渲染
                     || state.rendered_lines_dirty.get()
                     || state.resize_debounce_frames > 0
                     || !state.toasts.is_empty()
@@ -1928,8 +1929,8 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         }
         SlashCommand::SafetyStatus => {
             let s = engine.core.safety_status();
-            format!("🔒 安全限制\n  最大输入: {} 字符\n  最大工具: {} 次\n  递归上限: {} 层\n  会话超时: {}s",
-                s.max_input_length, s.max_total_tool_calls, s.max_recursion_depth, s.max_session_duration_secs)
+            format!("🔒 安全限制（Turn 级）\n  最大输入: {} 字符\n  单轮工具上限: {} 次\n  Session 级: 无限制",
+                s.max_input_length, s.max_total_tool_calls)
         }
         SlashCommand::ModelList => {
             let models = engine.core.list_models().await;

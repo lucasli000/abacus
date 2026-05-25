@@ -178,61 +178,32 @@ impl<'a> MdRenderer<'a> {
         match tag {
             Tag::CodeBlock(kind) => {
                 self.flush_line(LineType::Normal);
-                // 代码块前留一行空白，与上下文分隔
-                if !self.output.is_empty() {
-                    self.push_empty_line();
-                }
+                // 代码块紧凑设计：无前置空行，╭ 边框即视觉边界
                 self.in_code_block = true;
                 self.code_line_num = 0;
                 self.code_lang = match kind {
                     CodeBlockKind::Fenced(lang) => lang.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                // 输出 ╭── lang 标记行（box drawing 风格，── 填充至 max_width）
-                let lang_label = if self.code_lang.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {} ", self.code_lang)
-                };
-                // 填充宽度：max_width - "╭──" 前缀(3) - lang_label.len() - 余量(1)
-                let prefix = "╭──";
-                let fill_len = self.max_width.saturating_sub(3 + lang_label.len() + 1);
-                let fill: String = "─".repeat(fill_len);
+                // ╭ + lang 紧凑标注行（无全宽填充，lang 作为标签）
                 self.current_spans.push(StyledSpan {
-                    text: prefix.to_string(),
+                    text: "╭".to_string(),
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
-                if !lang_label.is_empty() {
+                if !self.code_lang.is_empty() {
                     self.current_spans.push(StyledSpan {
-                        text: lang_label,
-                        style: Style::default().fg(self.theme.gold),
+                        text: format!(" {}", self.code_lang),
+                        style: Style::default().fg(self.theme.gold).add_modifier(Modifier::DIM),
                     });
                 }
-                self.current_spans.push(StyledSpan {
-                    text: fill,
-                    style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
-                });
                 self.flush_line(LineType::CodeFence);
             }
             Tag::Heading { level, .. } => {
                 self.flush_line(LineType::Normal);
-                // 标题前留一行空白（文档开头除外）
-                if !self.output.is_empty() {
-                    self.push_empty_line();
-                }
+                // 标题无前置空行——标题视觉重量本身就是段落的分隔
                 self.in_heading = true;
                 self.heading_level = level as u8;
-                // 标题级别视觉前缀（dim 色，不喧宾夺主）
-                let (prefix, prefix_style) = match level as u8 {
-                    1 => ("◆ ", Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM)),
-                    2 => ("◇ ", Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM)),
-                    3 => ("› ",  Style::default().fg(self.theme.muted)),
-                    _ => ("· ",  Style::default().fg(self.theme.muted)),
-                };
-                self.current_spans.push(StyledSpan {
-                    text: prefix.to_string(),
-                    style: prefix_style,
-                });
+                // 无前缀 span：H2 在 TagEnd 时内联分隔线，H1/H3+ 用样式区分
             }
             Tag::Emphasis => {
                 self.in_emphasis = true;
@@ -291,45 +262,51 @@ impl<'a> MdRenderer<'a> {
         match tag {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                // 输出 ╰── 标记行（box drawing 风格，── 填充至 max_width）
-                let close_prefix = "╰──";
-                let close_fill_len = self.max_width.saturating_sub(3 + 1);
-                let close_fill: String = "─".repeat(close_fill_len);
+                // 极简关闭符：╰（与 ╭ 对齐，无填充）
                 self.current_spans.push(StyledSpan {
-                    text: close_prefix.to_string(),
-                    style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
-                });
-                self.current_spans.push(StyledSpan {
-                    text: close_fill,
+                    text: "╰".to_string(),
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
-                // 代码块后留一行空白，与后续文本分隔
+                // 代码块后一行空白（唯一使用空行的场景，确保代码与正文可区分）
                 self.push_empty_line();
             }
             TagEnd::Heading(_) => {
                 let level = self.heading_level;
                 self.in_heading = false;
-                self.flush_line(LineType::Heading);
-                // H1/H2 追加底部分隔线；H3+ 只留一行空白
+
+                // 标题样式策略：
+                // H1 — BOLD accent，文字前加 "# "（级别标识），直接 flush，无分隔线
+                // H2 — BOLD 文字 + 尾部内联填充线（文字 ── 横线）
+                // H3+ — 无特殊处理，直接 flush（样式本身区分层级）
                 match level {
                     1 => {
+                        // H1 在文字前添加 "# " 标记
+                        let text_spans = std::mem::take(&mut self.current_spans);
                         self.current_spans.push(StyledSpan {
-                            text: "═══════════════════════════".to_string(),
+                            text: "# ".to_string(),
                             style: Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM),
                         });
-                        self.flush_line(LineType::Normal);
+                        self.current_spans.extend(text_spans);
+                        self.flush_line(LineType::Heading);
                     }
                     2 => {
-                        self.current_spans.push(StyledSpan {
-                            text: "───────────────────────────".to_string(),
-                            style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
-                        });
-                        self.flush_line(LineType::Normal);
+                        // H2 文字后追加内联填充线 " ──────" 至 max_width 的 60%
+                        let text_w: usize = self.current_spans.iter()
+                            .map(|s| s.text.chars().count())
+                            .sum();
+                        let target = (self.max_width * 60 / 100).saturating_sub(text_w + 1);
+                        if target > 2 {
+                            self.current_spans.push(StyledSpan {
+                                text: format!(" {}", "─".repeat(target.min(36))),
+                                style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+                            });
+                        }
+                        self.flush_line(LineType::Heading);
                     }
                     _ => {
-                        // H3+：无分隔线，仅空行分隔（避免视觉过重）
-                        self.push_empty_line();
+                        // H3+：直接 flush，无分隔线，无空行
+                        self.flush_line(LineType::Heading);
                     }
                 }
             }
@@ -351,6 +328,9 @@ impl<'a> MdRenderer<'a> {
             }
             TagEnd::Paragraph => {
                 self.flush_line(LineType::Normal);
+                // 段落间距：唯一靠空行分隔的场景（1行，dedup 防双行）
+                // 列表项内的段落不触发此逻辑（list items 用 TagEnd::Item）
+                self.push_empty_line();
             }
             // ── 表格结束事件 ────────────────────────────────────────────
             TagEnd::TableCell => {
@@ -381,19 +361,50 @@ impl<'a> MdRenderer<'a> {
         if self.in_code_block {
             // 代码块内容：语法高亮 或 Diff 渲染
             if effects::is_diff_content(text) {
-                // Diff 模式：+绿 -红 @蓝（diff 自带行号语义，不叠加行号）
+                // Diff 模式：与 render_simple_diff 保持一致的视觉风格
+                // 无行号（Markdown diff 块无法回溯行号），以符号区分：
+                //   ─ 删除（红）  + 新增（绿）  · 上下文（dim）  @@ header（accent）
                 for line in text.lines() {
+                    use effects::DiffType;
                     let diff_type = effects::detect_diff_line(line);
-                    let style = effects::diff_style(
-                        diff_type,
-                        self.theme.success,
-                        self.theme.error,
-                        self.theme.accent,
-                    );
-                    self.current_spans.push(StyledSpan {
-                        text: line.to_string(),
-                        style,
-                    });
+                    match diff_type {
+                        DiffType::Added => {
+                            self.current_spans.push(StyledSpan {
+                                text: "+ ".to_string(),
+                                style: Style::default().fg(self.theme.success).add_modifier(Modifier::BOLD),
+                            });
+                            self.current_spans.push(StyledSpan {
+                                text: line[1..].to_string(), // 去掉原 '+' 前缀
+                                style: Style::default().fg(self.theme.success),
+                            });
+                        }
+                        DiffType::Removed => {
+                            self.current_spans.push(StyledSpan {
+                                text: "─ ".to_string(),
+                                style: Style::default().fg(self.theme.error).add_modifier(Modifier::BOLD),
+                            });
+                            self.current_spans.push(StyledSpan {
+                                text: line[1..].to_string(), // 去掉原 '-' 前缀
+                                style: Style::default().fg(self.theme.error),
+                            });
+                        }
+                        DiffType::Header => {
+                            self.current_spans.push(StyledSpan {
+                                text: line.to_string(),
+                                style: Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
+                            });
+                        }
+                        DiffType::Context => {
+                            self.current_spans.push(StyledSpan {
+                                text: "· ".to_string(),
+                                style: Style::default().fg(self.theme.muted).add_modifier(Modifier::DIM),
+                            });
+                            self.current_spans.push(StyledSpan {
+                                text: if line.starts_with(' ') { line[1..].to_string() } else { line.to_string() },
+                                style: Style::default().fg(self.theme.muted).add_modifier(Modifier::DIM),
+                            });
+                        }
+                    }
                     self.flush_line(LineType::Code);
                 }
             } else {
@@ -539,7 +550,13 @@ impl<'a> MdRenderer<'a> {
             style = style.add_modifier(Modifier::BOLD);
         }
         if self.in_heading {
-            style = style.fg(self.theme.accent).add_modifier(Modifier::BOLD);
+            // 标题层级颜色：H1 accent+BOLD，H2 accent+BOLD，H3 text+BOLD，H4+ text
+            style = match self.heading_level {
+                1 => style.fg(self.theme.accent).add_modifier(Modifier::BOLD),
+                2 => style.fg(self.theme.accent).add_modifier(Modifier::BOLD),
+                3 => style.fg(self.theme.text).add_modifier(Modifier::BOLD),
+                _ => style.fg(self.theme.muted).add_modifier(Modifier::BOLD),
+            };
         }
         if self.in_strong {
             style = style.add_modifier(Modifier::BOLD);
@@ -600,22 +617,26 @@ pub fn styled_line_to_ratatui(
         return Line::from(vec![bar.clone()]);
     }
 
+    // 统一缩进设计（从 bar 开始）：
+    //   正文/标题/列表/引用：2sp（紧凑，避免过度缩进浪费宽度）
+    //   代码 fence（╭╰）：  2sp → ╭╰ 与 │ 垂直对齐
+    //   代码行（│）：       2sp + │ + sp（│ 与 ╭╰ 同列 x=3）
+    //   代码行（行号）：     2sp + │ + 右对齐行号 + sp
     let (indent, indent_style): (String, Style) = if let Some(n) = styled.line_num {
-        // 代码行：│ + 右对齐行号 + 空格（box-drawing 左边框 + 行号）
-        (format!("│{:>3} ", n), theme.text_style(TextRole::Caption))
+        // 代码行（行号）：保持 │ 与 ╭╰ 对齐，2sp 前缀
+        (format!("  │{:>3} ", n), theme.text_style(TextRole::Caption))
     } else {
         let s: String = match styled.line_type {
-            LineType::Code     => "│   ".to_string(),   // │ + 3 空格（diff 行，无行号，保持 box-drawing 边框）
-            LineType::CodeFence => "   ".to_string(),   // 3 空格（fence 标记行）
-            LineType::Heading  => "   ".to_string(),
+            LineType::Code     => "  │ ".to_string(),   // 2sp + │ + 1sp（对齐 ╭╰）
+            LineType::CodeFence => "  ".to_string(),    // 2sp（╭ 在 x=3 与 │ 同列）
+            LineType::Heading  => "  ".to_string(),     // 2sp
             LineType::Quote    => {
-                // 多级引用：每级一个 ▎，后跟 1 空格
                 let bars = "▎".repeat(styled.quote_depth.max(1));
-                format!("   {} ", bars)
+                format!("  {} ", bars)                  // 2sp + 引用条
             }
-            LineType::ListItem => "   ".to_string(),
-            LineType::Normal | LineType::Empty => "   ".to_string(),
-            LineType::Table    => String::new(),        // V27: 表格行自带布局，豁免额外缩进
+            LineType::ListItem => "  ".to_string(),     // 2sp
+            LineType::Normal | LineType::Empty => "  ".to_string(), // 2sp
+            LineType::Table    => String::new(),         // 表格自带布局
         };
         (s, Style::default())
     };

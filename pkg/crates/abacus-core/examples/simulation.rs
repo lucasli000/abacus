@@ -192,6 +192,7 @@ async fn main() {
             tool_result_dedup_capacity_kb: 256,
         adaptive_d_tier_hide: false,
         event_sink_enabled: false,
+        thresholds: abacus_core::core::ThresholdConfig::default(),
         policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::default()),
         },
     ).await;
@@ -276,7 +277,7 @@ fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
     defaults.insert("core.max_tokens".into(), ConfigValue::Number(4096.0));
     defaults.insert("safety.max_input_length".into(), ConfigValue::Number(100000.0));
-    defaults.insert("safety.max_session_duration".into(), ConfigValue::Number(3600.0));
+    defaults.insert("safety.max_tool_calls".into(), ConfigValue::Number(500.0));
     defaults.insert("log.level".into(), ConfigValue::String("info".into()));
     defaults
 }

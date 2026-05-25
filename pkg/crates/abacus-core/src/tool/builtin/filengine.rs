@@ -361,12 +361,13 @@ async fn fs_edit(args: Value, session: &mut FilengineSession) -> Result<Value, S
     let new = get_str(&args, "new_string")?;
     let p = NativeFilengine::resolve(path, session)?;
     let content = fs::read_to_string(&p).await.map_err(|e| format!("read: {e}"))?;
-    if !content.contains(old) {
-        return Err("old_string not found".into());
-    }
+    let byte_offset = content.find(old).ok_or("old_string not found")?;
+    // 计算 old_string 在文件中的起始行号（1-based）
+    // 消费方：TUI diff 渲染用此值将相对行号映射为文件实际行号
+    let start_line = content[..byte_offset].chars().filter(|&c| c == '\n').count() + 1;
     fs::write(&p, content.replace(old, new)).await.map_err(|e| format!("write: {e}"))?;
     session.track_write(path);
-    Ok(json!({"edited": true, "path": path}))
+    Ok(json!({"edited": true, "path": path, "start_line": start_line}))
 }
 
 async fn fs_move(args: Value, session: &mut FilengineSession) -> Result<Value, String> {

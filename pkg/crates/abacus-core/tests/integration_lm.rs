@@ -134,6 +134,7 @@ async fn make_engine(api_key: String) -> EngineHandle {
         adaptive_d_tier_hide: false,
         // 测试场景关闭 event sink—— ABACUS_HOME 可能未配置且不需观测层
         event_sink_enabled: false,
+        thresholds: abacus_core::core::ThresholdConfig::default(),
         policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::default()),
     };
 

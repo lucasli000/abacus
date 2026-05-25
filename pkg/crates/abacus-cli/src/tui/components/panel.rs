@@ -680,7 +680,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     // ═══ Section 1: Pipeline 执行进度 ═══
     lines.push(Line::from(vec![
-        Span::styled("Pipeline", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.pipeline"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
     ]));
 
     // 从 trace_events 提取执行步骤（ToolCall 类型）
@@ -702,7 +702,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let total_lines = think_lines + state.streaming_thinking.lines().count();
             lines.push(Line::from(vec![
                 Span::styled(" ✓ ", Style::default().fg(state.theme.success)),
-                Span::styled(format!("推理 {}行", total_lines), Style::default().fg(state.theme.text)),
+                Span::styled(format!("{} {}行", t("timeline.thinking"), total_lines), Style::default().fg(state.theme.text)),
             ]));
         }
 
@@ -711,7 +711,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let skip = tool_events.len().saturating_sub(max_tools_shown);
         if skip > 0 {
             lines.push(Line::from(vec![
-                Span::styled(format!(" … {} 更早的步骤", skip), state.theme.text_style(TextRole::Caption)),
+                Span::styled(format!(" … {} {}", skip, t("timeline.earlier")), state.theme.text_style(TextRole::Caption)),
             ]));
         }
         for evt in tool_events.iter().skip(skip) {
@@ -793,7 +793,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if !changed_files.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("Changes", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(t("panel.changes"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" · {}", changed_files.len()), Style::default().fg(state.theme.muted)),
         ]));
         for (path, ctype) in changed_files.iter().take(6) {
@@ -1010,7 +1010,7 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if !state.knowledge_calls.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "   📚 知识",
+            t("panel.knowledge_short"),
             state.theme.text_style(TextRole::BodyEmphasis),
         ));
         let total_calls: u32 = state.knowledge_calls.iter().map(|e| e.count).sum();
@@ -1174,7 +1174,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ];
         if cached > 0 {
             input_spans.push(Span::styled(
-                format!(" (缓存 {} · {:.0}%)", cached, cache_hit_pct),
+                format!(" ({} {} · {:.0}%)", t("stat.cache_hit"), cached, cache_hit_pct),
                 state.theme.text_style(TextRole::Caption),
             ));
         }
@@ -1231,7 +1231,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             else { state.theme.success };
 
         lines.push(Line::styled(
-            " 📦 上下文",
+            t("panel.context"),
             Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
         ));
 
@@ -1245,7 +1245,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Span::styled(format!(" {}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("    已用 ", Style::default().fg(state.theme.muted)),
+            Span::styled(t("stat.used"), Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", crate::tui::components::bars::format_ctx(used)), Style::default().fg(state.theme.text)),
             Span::styled(" / ", Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", crate::tui::components::bars::format_ctx(max_ctx)), Style::default().fg(state.theme.text)),
@@ -1260,7 +1260,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 else if hit_pct >= 30.0 { state.theme.gold }
                 else { state.theme.muted };
             lines.push(Line::from(vec![
-                Span::styled("    KV缓存 ", Style::default().fg(state.theme.muted)),
+                Span::styled(t("stat.kv_cache"), Style::default().fg(state.theme.muted)),
                 Span::styled(format!("{:.0}%", hit_pct), Style::default().fg(hit_color).add_modifier(Modifier::BOLD)),
                 Span::styled(format!(" ({}/{})", cached, prompt), state.theme.text_style(TextRole::Caption)),
             ]));
@@ -1271,7 +1271,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let comp_saved = state.session_tokens.compress_tokens_saved;
         if comp_count > 0 {
             lines.push(Line::from(vec![
-                Span::styled("    压缩 ", Style::default().fg(state.theme.muted)),
+                Span::styled(t("stat.compress"), Style::default().fg(state.theme.muted)),
                 Span::styled(format!("{}次", comp_count), Style::default().fg(state.theme.text)),
                 Span::styled(format!(" · 释放 {}", crate::tui::components::bars::format_ctx(comp_saved as usize)), state.theme.text_style(TextRole::Caption)),
             ]));

@@ -221,9 +221,10 @@ fn build_message_lines(
                             // 超宽行需要拆分：提取纯文本内容并 word-wrap
                             // 色条+缩进 由 styled_line_to_ratatui 已添加在前两个 span
                             // 实际文本从第 2 个 span 之后开始
+                            // word-wrap 续行缩进与 styled_line_to_ratatui 对齐（统一 2sp）
                             let indent_str = match styled.line_type {
-                                LineType::Code => "  ",
-                                _ => " ",
+                                LineType::Code => "  │ ",  // 保持 │ 边框对齐
+                                _ => "  ",                 // 2sp（与 normal 行一致）
                             };
                             // 合并所有内容 span 的文本
                             let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
@@ -1032,6 +1033,26 @@ pub fn render_messages_in_card(
     // 记录 base lines 长度，streaming 追加后用于截断回写缓存
     let base_lines_len = lines.len();
 
+    // ── 等待状态：API 请求已发出但首个 token 尚未到达 ──
+    // 视觉焦点在消息框时，此处提供状态反馈（避免用户以为卡死）
+    if !state.is_streaming && !matches!(state.input_state, crate::tui::state::InputState::Ready) {
+        let bar = Span::styled("▎", Style::default().fg(state.theme.session));
+        let phase = if state.processing_phase.is_empty() {
+            "connecting...".to_string()
+        } else {
+            state.processing_phase.clone()
+        };
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            bar.clone(),
+            Span::raw(" "),
+            Span::styled(
+                format!("⠋ {}", phase),
+                Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    }
+
     // ── 流式消息：追加 streaming 状态（thinking + tools + text）──
     // build_message_lines 只渲染 header + cursor，这里补充完整的流式内容
     if state.is_streaming {
@@ -1399,8 +1420,8 @@ mod tool_diff_render_tests {
         let result = try_render_edit_diff("fs_edit", args, &theme(), 0);
         assert!(result.is_some(), "fs_edit 应触发 diff 视图");
         let lines = result.unwrap();
-        // 头行(📝 path) + 2 旧行 + 2 新行 + footer = 6
-        assert_eq!(lines.len(), 6);
+        // 头行(📝 path) + 分隔线 + 2 旧行 + 2 新行 + footer = 7
+        assert_eq!(lines.len(), 7);
     }
 
     #[test]
@@ -1410,8 +1431,8 @@ mod tool_diff_render_tests {
         let result = try_render_edit_diff("fs_write", args, &theme(), 0);
         assert!(result.is_some());
         let lines = result.unwrap();
-        // 头行 + 0 旧行 + 2 新行 + footer = 4
-        assert_eq!(lines.len(), 4);
+        // 头行 + 分隔线 + 0 旧行 + 2 新行 + footer = 5
+        assert_eq!(lines.len(), 5);
     }
 
     #[test]
@@ -1455,8 +1476,8 @@ mod tool_diff_render_tests {
         let result = try_render_edit_diff("fs_edit", &args, &theme(), 4);
         assert!(result.is_some());
         let lines = result.unwrap();
-        // 头行(1) + 4 diff 行 + 省略(1) + footer(1) = 7
-        assert_eq!(lines.len(), 7);
+        // 头行(1) + 分隔线(1) + 4 diff 行 + 省略(1) + footer(1) = 8
+        assert_eq!(lines.len(), 8);
     }
 
     #[test]
@@ -1466,7 +1487,7 @@ mod tool_diff_render_tests {
         let result = try_render_edit_diff("fs_edit", args, &theme(), 0);
         assert!(result.is_some());
         let lines = result.unwrap();
-        // 头行 + 1 新行 + footer = 3 (无旧行)
-        assert_eq!(lines.len(), 3);
+        // 头行 + 分隔线 + 1 新行 + footer = 4 (无旧行)
+        assert_eq!(lines.len(), 4);
     }
 }

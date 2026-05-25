@@ -172,8 +172,10 @@ pub(super) fn render_single_trace_event<'a>(
             ]));
             if !args.is_empty() {
                 // V29.11: 工具特化视图链
-                let arg_lines = try_render_edit_diff(
-                    name, args, theme, max_lines_tool,
+                // 将 output 传入 diff 渲染以提取 start_line（文件实际行号）
+                let output_ref = output.as_deref();
+                let arg_lines = try_render_edit_diff_with_output(
+                    name, args, output_ref, theme, max_lines_tool,
                 ).or_else(|| try_render_bash_exec(
                     name, args, theme, max_lines_tool,
                 )).unwrap_or_else(|| render_block_detail_with_limit(
@@ -344,8 +346,8 @@ pub(super) fn render_merged_tool_run<'a>(
                         ),
                     ]));
                 }
-                let arg_lines = try_render_edit_diff(
-                    &tool_name, args, theme, max_lines_tool,
+                let arg_lines = try_render_edit_diff_with_output(
+                    &tool_name, args, output.as_deref(), theme, max_lines_tool,
                 ).unwrap_or_else(|| {
                     // fallback: 提取 path 摘要（单条时已有 path_hint 不重复）
                     vec![Line::from(Span::styled(
@@ -489,9 +491,22 @@ pub(crate) fn extract_tool_param_summary(args_json: &str) -> String {
 /// 设计取舍:
 ///   - 简单 diff (全旧 - / 全新 +) 而非 LCS 智能对比 — 编辑工具的 old/new
 ///     通常已是聚焦 chunk, 简单视图够用; 后续要更准可引 `similar` crate
+/// output_json: 工具输出 JSON（可选）—— 从中提取 `start_line` 用于显示文件真实行号
+/// fs_edit 在成功时返回 `{"edited":true,"path":"...","start_line":N}`
+/// 无 output_json 或字段缺失时行号从 1 开始（相对编号）
 pub(super) fn try_render_edit_diff<'a>(
     name: &str,
     args_json: &str,
+    theme: &Theme,
+    max_total_lines: usize,
+) -> Option<Vec<Line<'a>>> {
+    try_render_edit_diff_with_output(name, args_json, None, theme, max_total_lines)
+}
+
+pub(super) fn try_render_edit_diff_with_output<'a>(
+    name: &str,
+    args_json: &str,
+    output_json: Option<&str>,
     theme: &Theme,
     max_total_lines: usize,
 ) -> Option<Vec<Line<'a>>> {
@@ -509,12 +524,12 @@ pub(super) fn try_render_edit_diff<'a>(
         .unwrap_or("(unknown)");
 
     let mut lines: Vec<Line<'a>> = Vec::new();
-    // 头行: 📝 path
+    // 头行：📝 path + 下方一条极细分隔线（区分文件路径与 diff 内容）
     lines.push(Line::from(vec![
         Span::styled("📝 ", Style::default().fg(theme.accent)),
         Span::styled(
             path.to_string(),
-            Style::default().fg(theme.muted).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -536,13 +551,21 @@ pub(super) fn try_render_edit_diff<'a>(
         (String::new(), c.to_string())
     };
 
-    render_simple_diff(&mut lines, &old, &new, theme, max_total_lines);
+    // 从工具输出提取 start_line（文件中的实际起始行号）
+    // fs_edit 成功时返回 {"edited":true,"start_line":N}，无字段则从 1 开始（相对行号）
+    let line_offset: usize = output_json
+        .and_then(|o| serde_json::from_str::<serde_json::Value>(o).ok())
+        .and_then(|v| v.get("start_line").and_then(|n| n.as_u64()))
+        .map(|n| n as usize)
+        .unwrap_or(1);
+
+    render_simple_diff(&mut lines, &old, &new, line_offset, theme, max_total_lines);
     Some(lines)
 }
 
 /// LCS diff 渲染 — 基于 `similar` crate 的行级差分
 ///
-/// 引用关系: 仅 try_render_edit_diff 内部调用
+/// 引用关系: 仅 try_render_edit_diff_with_output 内部调用
 /// 限行算法: max_total_lines==0 不限; >0 时超额后截断 + 省略提示
 /// 设计取舍:
 ///   - 用 similar::TextDiff::from_lines (Myers LCS, O(N·D))
@@ -553,6 +576,7 @@ fn render_simple_diff<'a>(
     lines: &mut Vec<Line<'a>>,
     old: &str,
     new: &str,
+    line_offset: usize,  // 文件实际起始行号（1-based），从 fs_edit output.start_line 注入
     theme: &Theme,
     max_total_lines: usize,
 ) {
@@ -577,15 +601,23 @@ fn render_simple_diff<'a>(
         }
     }
 
-    // 计算行号宽度（取 old/new 最大行数）
+    // 计算行号宽度（考虑起始偏移，如文件第 150 行需要 3 位宽）
     let old_line_count = old.lines().count();
     let new_line_count = new.lines().count();
-    let max_line_num = old_line_count.max(new_line_count);
-    let num_width = if max_line_num >= 100 { 3 } else if max_line_num >= 10 { 2 } else { 1 };
+    let max_line_num = (line_offset - 1 + old_line_count.max(new_line_count)).max(1);
+    let num_width = if max_line_num >= 1000 { 4 } else if max_line_num >= 100 { 3 } else if max_line_num >= 10 { 2 } else { 1 };
 
-    // 跟踪行号
-    let mut old_line = 0usize;
-    let mut new_line = 0usize;
+    // 行号计数：从 line_offset 开始（文件实际行号，非相对行号）
+    let mut old_line = line_offset.saturating_sub(1); // 下方 += 1 后为 line_offset
+    let mut new_line = line_offset.saturating_sub(1);
+
+    // 文件路径下方轻量分隔（同 code block ╭ 风格，无额外空行）
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{:─<w$}", "", w = num_width + 2),
+            Style::default().fg(theme.border).add_modifier(Modifier::DIM),
+        ),
+    ]));
 
     let mut skipped_run = false;
     for (i, change) in changes.iter().enumerate() {
@@ -594,16 +626,17 @@ fn render_simple_diff<'a>(
             ChangeTag::Delete => {
                 old_line += 1;
                 if skipped_run {
+                    // skip 指示符：右对齐行号列宽后显示 ⋯（视觉连续性）
                     rendered.push(Line::from(vec![Span::styled(
-                        format!("{:>w$}   ···", "", w = num_width),
+                        format!("{:>w$} ⋯", "", w = num_width),
                         theme.text_style(TextRole::Caption),
                     )]));
                     skipped_run = false;
                 }
-                // 字符级高亮：删除行整体红色，内容加粗
+                // 删除行：行号(dim) + "─ "(error bold) + 内容(error)
                 rendered.push(Line::from(vec![
                     Span::styled(format!("{:>w$} ", old_line, w = num_width), Style::default().fg(theme.muted)),
-                    Span::styled("- ", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
+                    Span::styled("─ ", Style::default().fg(theme.error).add_modifier(Modifier::BOLD)),
                     Span::styled(text.to_string(), Style::default().fg(theme.error)),
                 ]));
                 delete_count += 1;
@@ -612,12 +645,12 @@ fn render_simple_diff<'a>(
                 new_line += 1;
                 if skipped_run {
                     rendered.push(Line::from(vec![Span::styled(
-                        format!("{:>w$}   ···", "", w = num_width),
+                        format!("{:>w$} ⋯", "", w = num_width),
                         theme.text_style(TextRole::Caption),
                     )]));
                     skipped_run = false;
                 }
-                // 字符级高亮：新增行整体绿色，内容加粗
+                // 新增行：行号(dim) + "+ "(success bold) + 内容(success)
                 rendered.push(Line::from(vec![
                     Span::styled(format!("{:>w$} ", new_line, w = num_width), Style::default().fg(theme.muted)),
                     Span::styled("+ ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
@@ -631,15 +664,16 @@ fn render_simple_diff<'a>(
                 if show_equal[i] {
                     if skipped_run {
                         rendered.push(Line::from(vec![Span::styled(
-                            format!("{:>w$}   ···", "", w = num_width),
+                            format!("{:>w$} ⋯", "", w = num_width),
                             theme.text_style(TextRole::Caption),
                         )]));
                         skipped_run = false;
                     }
+                    // 上下文行：行号(dim) + "· "(muted dim) + 内容(muted)
                     rendered.push(Line::from(vec![
-                        Span::styled(format!("{:>w$} ", new_line, w = num_width), Style::default().fg(theme.muted)),
-                        Span::styled("  ", Style::default()),
-                        Span::styled(text.to_string(), Style::default().fg(theme.muted)),
+                        Span::styled(format!("{:>w$} ", new_line, w = num_width), Style::default().fg(theme.muted).add_modifier(Modifier::DIM)),
+                        Span::styled("· ", Style::default().fg(theme.muted).add_modifier(Modifier::DIM)),
+                        Span::styled(text.to_string(), Style::default().fg(theme.muted).add_modifier(Modifier::DIM)),
                     ]));
                 } else {
                     skipped_run = true;
@@ -653,7 +687,7 @@ fn render_simple_diff<'a>(
         let mut truncated: Vec<Line<'a>> = rendered.into_iter().take(max_total_lines).collect();
         truncated.push(Line::from(vec![
             Span::styled(
-                format!("{:>w$}   ↳ 省略 (总 {} 行 diff)", "", total_changes, w = num_width),
+                format!("{:>w$} ↳ 已截断（共 {} 行）", "", total_changes, w = num_width),
                 theme.text_style(TextRole::Caption),
             ),
         ]));
@@ -663,13 +697,17 @@ fn render_simple_diff<'a>(
     };
     lines.extend(shown);
 
-    // 统计 footer
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{:>w$}   ↳ +{} / −{}", "", insert_count, delete_count, w = num_width),
-            theme.text_style(TextRole::Caption),
-        ),
-    ]));
+    // 统计 footer：紧凑 "+ N − N"，无斜杠
+    if insert_count > 0 || delete_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{:>w$} ", "", w = num_width),
+                Style::default(),
+            ),
+            Span::styled(format!("+{} ", insert_count), Style::default().fg(theme.success).add_modifier(Modifier::DIM)),
+            Span::styled(format!("−{}", delete_count), Style::default().fg(theme.error).add_modifier(Modifier::DIM)),
+        ]));
+    }
 }
 
 /// V28: 带行数软上限的 detail 渲染。`max_lines = 0` 表示不限(旧行为);
