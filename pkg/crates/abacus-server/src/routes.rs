@@ -650,6 +650,10 @@ async fn chat_stream_handler(
                     let data = serde_json::json!({"messages_compressed": messages_compressed, "tokens_saved": tokens_saved}).to_string();
                     yield Ok(Event::default().event("compress_end").data(data));
                 }
+                StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
+                    let data = serde_json::json!({"attempt": attempt, "max_attempts": max_attempts, "reason": reason}).to_string();
+                    yield Ok(Event::default().event("retry_progress").data(data));
+                }
             }
         }
 

@@ -30,6 +30,10 @@ pub enum StreamEvent {
     ToolCallEnd { id: String },
     /// 用量统计（流结束时）
     Usage { prompt_tokens: u64, completion_tokens: u64 },
+    /// Provider 层错误（stream 中断或 HTTP 失败时发出，pipeline 转发为 StreamChunk::Error）
+    /// - 生产者: LlmProvider::stream_complete() 遇到不可恢复错误时
+    /// - 消费者: TurnPipeline::execute_loop → 转发为 StreamChunk::Error
+    Error(String),
     /// 流结束信号
     Done,
 }
@@ -72,6 +76,10 @@ pub enum StreamChunk {
     CompressEnd { messages_compressed: usize, tokens_saved: usize },
     /// Turn 完成（携带最终统计）
     Complete(TurnStats),
+    /// Provider retry 通知（用户在等待重试时可见）
+    /// - 生产者: TurnPipeline（从 complete() 的 retry 路径发出，未来可扩展）
+    /// - 消费者: TUI run loop（显示 retry 进度）
+    RetryProgress { attempt: u32, max_attempts: u32, reason: String },
     /// 错误（stream 中断）
     Error(String),
 }

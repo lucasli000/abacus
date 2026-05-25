@@ -609,6 +609,12 @@ impl LlmProvider for DeepSeekProvider {
                     if retries < max_retries {
                         retries += 1;
                         let delay = Duration::from_secs(retries);
+                        tracing::info!(
+                            attempt = retries,
+                            max = max_retries,
+                            error = %e,
+                            "deepseek: retrying after transport error"
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -716,6 +722,9 @@ impl LlmProvider for DeepSeekProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
+            let _ = tx.send(StreamEvent::Error(
+                format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
+            ));
             // V18：把请求摘要也带进错误消息，便于 TUI 立刻看出协议错配
             let summary = body.messages.iter().enumerate()
                 .map(|(i, m)| {
@@ -749,7 +758,15 @@ impl LlmProvider for DeepSeekProvider {
         let mut completion_tokens = 0u64;
 
         while let Some(chunk) = byte_stream.next().await {
-            let bytes = chunk.map_err(|e| KernelError::Provider(format!("stream read: {e}")))?;
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(
+                        format!("stream interrupted: {e}")
+                    ));
+                    return Err(KernelError::Provider(format!("stream read: {e}")));
+                }
+            };
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
             // Process complete lines

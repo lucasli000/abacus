@@ -379,7 +379,19 @@ impl<'a> TurnPipeline<'a> {
             user_message_preamble: None,
         };
 
-        let response = provider.complete_cancellable(req, self.cancel_token()).await?;
+        // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
+        let provider_timeout = std::time::Duration::from_secs(300);
+        let response = match tokio::time::timeout(provider_timeout, provider.complete_cancellable(req, self.cancel_token())).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        "LLM request timed out after 300s".into()
+                    ));
+                }
+                return Err(KernelError::Provider("request timeout: 300s".into()));
+            }
+        };
         let final_response = super::extract_text(&response.message);
 
         // Store in session
@@ -1162,6 +1174,9 @@ impl<'a> TurnPipeline<'a> {
                         crate::llm::stream::StreamEvent::ToolCallStart { name, .. } => {
                             let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart { name });
                         }
+                        crate::llm::stream::StreamEvent::Error(msg) => {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(msg));
+                        }
                         crate::llm::stream::StreamEvent::Done => break,
                         _ => {} // ArgDelta/Usage handled via final response
                     }
@@ -1171,7 +1186,19 @@ impl<'a> TurnPipeline<'a> {
                     .map_err(|e| KernelError::Other(format!("stream task panicked: {e}")))?
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
-                ctx.provider.complete_cancellable(req.clone(), self.cancel_token()).await
+                // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
+                let provider_timeout = std::time::Duration::from_secs(300);
+                match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(req.clone(), self.cancel_token())).await {
+                    Ok(result) => result,
+                    Err(_elapsed) => {
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                "LLM request timed out after 300s".into()
+                            ));
+                        }
+                        Err(KernelError::Provider("request timeout: 300s".into()))
+                    }
+                }
             };
 
             // ── 400 Auto-Repair: 检测到 400 时尝试修复消息序列并重试一次 ──
@@ -1375,6 +1402,12 @@ impl<'a> TurnPipeline<'a> {
                 // 自动追加续写请求（一次），让 LLM 从断点继续
                 if response.finish_reason == "length" && !text.is_empty() {
                     tracing::warn!(text_len = text.len(), "response truncated by max_tokens, requesting continuation");
+                    // 通知用户输出被截断、正在续写
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(
+                            "\n[...output truncated, continuing...]\n".into()
+                        ));
+                    }
                     // 把截断的响应存为 assistant message（已在上方 push 了）
                     // 追加一条 user 续写提示
                     {
@@ -2057,7 +2090,20 @@ impl<'a> TurnPipeline<'a> {
             user_message_preamble: ctx.user_message_preamble.clone(),
         };
 
-        match ctx.provider.complete_cancellable(escalated_req, self.cancel_token()).await {
+        // 5-minute hard timeout 安全网（escalation 路径同样受保护）
+        let provider_timeout = std::time::Duration::from_secs(300);
+        let escalation_result = match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(escalated_req, self.cancel_token())).await {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        "LLM escalation request timed out after 300s".into()
+                    ));
+                }
+                Err(KernelError::Provider("escalation request timeout: 300s".into()))
+            }
+        };
+        match escalation_result {
             Ok(escalated_resp) => {
                 let escalated_text = super::extract_text(&escalated_resp.message);
                 ctx.prompt_tokens += escalated_resp.usage.prompt_tokens;
@@ -2088,7 +2134,14 @@ impl<'a> TurnPipeline<'a> {
                 }
                 ctx.final_response = escalated_text;
             }
-            Err(_) => {
+            Err(e) => {
+                tracing::error!(error = %e, "model escalation failed, falling back to flash analysis");
+                // 通知用户 escalation 失败
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        format!("Model escalation failed: {}. Using preliminary analysis.", e)
+                    ));
+                }
                 {
                     let s = self.session.read().await;
                     let mut msgs = s.messages.write().await;

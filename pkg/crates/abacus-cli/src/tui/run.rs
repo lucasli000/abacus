@@ -1056,6 +1056,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             while stream_rx.try_recv().is_ok() {}
                             break;
                         }
+                        StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
+                            state.processing_phase = format!("重试 {}/{}: {}", attempt, max_attempts, reason);
+                            state.rendered_lines_dirty.set(true);
+                        }
                     }
                 }
 

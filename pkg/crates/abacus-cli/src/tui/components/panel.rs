@@ -652,145 +652,169 @@ fn resolve_color_hint(hint: &Option<String>, state: &AppState) -> Color {
 fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use crate::tui::state::{TraceKind, ToolStatus};
 
-    /// 单事件 inline 展开时的最大可见行数(thinking/tool 详情)
-    const TIMELINE_DETAIL_MAX: usize = 3;
-
     let mut lines: Vec<Line> = Vec::new();
-    let max_content = (area.width as usize).saturating_sub(12);
+    let max_w = (area.width as usize).saturating_sub(2);
 
     // V28.1: 清空 row map 准备本帧重建
     let mut row_map = state.timeline_row_map.borrow_mut();
     row_map.clear();
 
+    // ═══ Section 1: Pipeline 执行进度 ═══
     lines.push(Line::from(vec![
-        Span::styled(t("panel.timeline"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" · {}", state.trace_events.len()), Style::default().fg(state.theme.muted)),
+        Span::styled("Pipeline", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
     ]));
 
-    let max_events = (area.height as usize).saturating_sub(1);
-    let total = state.trace_events.len();
-    // V30 timeline 边界修复：
-    //   1. 写 last_timeline_visible 给 event handler 作 clamp 依据（下次 += 后能重裁）
-    //   2. 本帧渲染用 min 守门：超界 offset 临时裁取避免空白页（不回写 state，
-    //      因为 render 函数是 &AppState 不可变。超界状态在下次 ScrollUp/Up 事件裁
-    //      取后自然修正，或在 +new_event 后被新增的 total 带回合法区间。
-    state.last_timeline_visible.set(max_events);
-    let max_offset = total.saturating_sub(max_events);
-    let effective_offset = state.timeline_scroll_offset.min(max_offset);
-    let end = total.saturating_sub(effective_offset);
-    let start = end.saturating_sub(max_events);
+    // 从 trace_events 提取执行步骤（ToolCall 类型）
+    let tool_events: Vec<&crate::tui::state::TraceEvent> = state.trace_events.iter()
+        .filter(|e| matches!(e.kind, TraceKind::ToolCall { .. }))
+        .collect();
 
-    if effective_offset > 0 && total > max_events {
-        lines.push(Line::from(Span::styled(
-            format!("   ↓ +{} 更新", effective_offset),
-            state.theme.text_style(TextRole::Caption),
-        )));
-    }
+    if tool_events.is_empty() && state.streaming_thinking.is_empty() && !state.is_streaming {
+        lines.push(Line::styled(" —", Style::default().fg(state.theme.muted)));
+    } else {
+        // Thinking 进度
+        let think_events: Vec<&crate::tui::state::TraceEvent> = state.trace_events.iter()
+            .filter(|e| matches!(e.kind, TraceKind::Thinking { .. }))
+            .collect();
+        if !think_events.is_empty() || !state.streaming_thinking.is_empty() {
+            let think_lines: usize = think_events.iter().map(|e| {
+                if let TraceKind::Thinking { lines, .. } = &e.kind { *lines } else { 0 }
+            }).sum();
+            let total_lines = think_lines + state.streaming_thinking.lines().count();
+            lines.push(Line::from(vec![
+                Span::styled(" ✓ ", Style::default().fg(state.theme.success)),
+                Span::styled(format!("推理 {}行", total_lines), Style::default().fg(state.theme.text)),
+            ]));
+        }
 
-    let event_count_before = lines.len();
-    for evt in state.trace_events.iter().skip(start).take(end - start) {
-        let (icon, ic) = match evt.category.as_str() {
-            "llm" => ("◐", state.theme.accent),
-            "tool" => ("⚙", state.theme.gold),
-            "session" => ("●", state.theme.user),
-            _ => ("○", state.theme.muted),
-        };
-
-        // V28.1: 已展开的 event 显示 ▾ 前缀,未展开显示 ▸(仅对有详情可展开的 kind 有意义)
-        let is_expanded = state.timeline_expanded_ids.contains(&evt.id);
-        let has_detail = matches!(&evt.kind,
-            TraceKind::Thinking { .. } | TraceKind::ToolCall { .. });
-        let arrow = if has_detail {
-            if is_expanded { "▾ " } else { "▸ " }
-        } else {
-            "  " // 占位保持对齐
-        };
-
-        let raw_text = match &evt.kind {
-            TraceKind::Generic { content } => content.clone(),
-            TraceKind::Thinking { lines, .. } => format!("thinking · {}行", lines),
-            TraceKind::ToolCall { name, status, .. } => {
-                let status_icon = match status {
-                    ToolStatus::Success => "✓",
-                    ToolStatus::Failed => "✗",
-                    ToolStatus::Running => "⟳",
+        // 工具执行列表（最近 N 个）
+        let max_tools_shown = ((area.height as usize) / 2).max(3).min(8);
+        let skip = tool_events.len().saturating_sub(max_tools_shown);
+        if skip > 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" … {} 更早的步骤", skip), state.theme.text_style(TextRole::Caption)),
+            ]));
+        }
+        for evt in tool_events.iter().skip(skip) {
+            if let TraceKind::ToolCall { name, status, args, .. } = &evt.kind {
+                let (icon, color) = match status {
+                    ToolStatus::Success => ("✓", state.theme.success),
+                    ToolStatus::Failed => ("✗", state.theme.error),
+                    ToolStatus::Running => ("⏳", state.theme.gold),
                 };
-                let dur = evt.duration_ms.map(|ms| format_duration_ms_padded(ms)).unwrap_or_default();
-                format!("{} · {}{}", name, status_icon, dur)
+                let dur = evt.duration_ms
+                    .map(|ms| format!(" {:.1}s", ms as f64 / 1000.0))
+                    .unwrap_or_default();
+                // 提取路径/URL 等上下文
+                let context: String = serde_json::from_str::<serde_json::Value>(args).ok()
+                    .and_then(|json| {
+                        json.get("path").or(json.get("file_path")).and_then(|v| v.as_str())
+                            .map(|p| {
+                                let parts: Vec<&str> = p.rsplitn(3, '/').collect();
+                                if parts.len() >= 2 { format!(" {}/{}", parts[1], parts[0]) }
+                                else { format!(" {}", p) }
+                            })
+                            .or_else(|| json.get("command").and_then(|v| v.as_str())
+                                .map(|c| { let s = if c.len() > 20 { &c[..18] } else { c }; format!(" `{}`", s) }))
+                            .or_else(|| json.get("query").or(json.get("pattern")).and_then(|v| v.as_str())
+                                .map(|q| { let s = if q.len() > 15 { &q[..13] } else { q }; format!(" \"{}\"", s) }))
+                    })
+                    .unwrap_or_default();
+                let text = format!("{}{}{}", name, context, dur);
+                let truncated = crate::tui::util::truncate_to_width(&text, max_w.saturating_sub(4));
+                // row_map 记录
+                let abs_y = area.y.saturating_add(lines.len() as u16);
+                row_map.push((abs_y, evt.id));
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {} ", icon), Style::default().fg(color)),
+                    Span::styled(truncated, Style::default().fg(state.theme.text)),
+                ]));
             }
-            TraceKind::Reply { tokens } => format!("↩ reply · {} tok", tokens),
-        };
-        let content = crate::tui::util::truncate_to_width(&raw_text, max_content.saturating_sub(2));
+        }
 
-        // V28.1: 记录这一行的 (绝对屏幕 y, event id) 用于鼠标点击反查
-        // area.y + lines.len() = 该 line 渲染后的绝对 y(Paragraph 顺序铺行)
-        let abs_y = area.y.saturating_add(lines.len() as u16);
-        row_map.push((abs_y, evt.id));
-
-        // V28.4: focused 锚点行加 highlight bg(theme.surface 同消息卡片背景,温和不刺眼)
-        let is_focused = state.focused_event_id == Some(evt.id);
-        let row_bg = if is_focused {
-            Style::default().bg(state.theme.surface)
-        } else {
-            Style::default()
-        };
-        let line = Line::from(vec![
-            Span::raw("   "),
-            Span::styled(evt.time.clone(), state.theme.text_style(TextRole::Caption)),
-            Span::raw(" "),
-            Span::styled(icon, Style::default().fg(ic)),
-            Span::raw(" "),
-            Span::styled(arrow.to_string(), Style::default().fg(state.theme.muted)),
-            Span::styled(content, Style::default().fg(state.theme.text)),
-        ]).style(row_bg);
-        lines.push(line);
-
-        // V28.1: 展开态 — inline 渲染详情,限 TIMELINE_DETAIL_MAX 行
-        if is_expanded && has_detail {
-            let detail_lines: Vec<&str> = match &evt.kind {
-                TraceKind::Thinking { text, .. } => text.lines().collect(),
-                TraceKind::ToolCall { args, output, .. } => {
-                    if let Some(out) = output {
-                        if !out.is_empty() {
-                            out.lines().collect()
-                        } else { args.lines().collect() }
-                    } else { args.lines().collect() }
+        // 当前正在执行的工具（streaming 期间）
+        if state.is_streaming {
+            for (name, status, _, _) in state.streaming_tools.iter() {
+                if matches!(status, crate::tui::state::StreamingToolStatus::Running) {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ⏳ ", Style::default().fg(state.theme.gold)),
+                        Span::styled(name.clone(), Style::default().fg(state.theme.gold)),
+                    ]));
                 }
-                _ => Vec::new(),
-            };
-            let detail_w = max_content.saturating_sub(3);
-            let total_detail = detail_lines.len();
-            let show_count = total_detail.min(TIMELINE_DETAIL_MAX);
-            for d_line in detail_lines.iter().take(show_count) {
-                let truncated = crate::tui::util::truncate_to_width(d_line, detail_w);
-                // event 子行的 row_map 也指向同一 event id,点这些行也能 toggle 收回
-                // V29.12 修复: 使用 area.y 偏移计算绝对屏幕 y (与主行 line 3120 一致)
-                let abs_y_d = area.y.saturating_add(lines.len() as u16);
-                row_map.push((abs_y_d, evt.id));
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(truncated, state.theme.text_style(TextRole::Caption)),
-                ]));
-            }
-            if total_detail > TIMELINE_DETAIL_MAX {
-                let abs_y_more = area.y.saturating_add(lines.len() as u16);
-                row_map.push((abs_y_more, evt.id));
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("↳ +{} 行 (消息区 ▾ trace 看全部)", total_detail - TIMELINE_DETAIL_MAX),
-                        state.theme.text_style(TextRole::Hint),
-                    ),
-                ]));
             }
         }
     }
 
-    if lines.len() == event_count_before {
-        lines.push(Line::styled("   —", Style::default().fg(state.theme.muted)));
+    // ═══ Section 2: 文件变更追踪 ═══
+    // 从 tool_events 中提取编辑/写入过的文件
+    let mut changed_files: Vec<(String, &str)> = Vec::new(); // (path, type: M/A)
+    for evt in &tool_events {
+        if let TraceKind::ToolCall { name, args, status, .. } = &evt.kind {
+            if !matches!(status, ToolStatus::Success) { continue; }
+            let lower = name.to_lowercase();
+            if lower.contains("edit") || lower.contains("write") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
+                    if let Some(p) = json.get("path").or(json.get("file_path")).and_then(|v| v.as_str()) {
+                        let short: String = {
+                            let parts: Vec<&str> = p.rsplitn(3, '/').collect();
+                            if parts.len() >= 2 { format!("{}/{}", parts[1], parts[0]) }
+                            else { p.to_string() }
+                        };
+                        let change_type = if lower.contains("write") { "A" } else { "M" };
+                        // 去重
+                        if !changed_files.iter().any(|(f, _)| *f == short) {
+                            changed_files.push((short, change_type));
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    drop(row_map); // 释放 borrow_mut 让 render_widget 能借 state(虽然此处不需要,谨慎)
+    if !changed_files.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("Changes", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" · {}", changed_files.len()), Style::default().fg(state.theme.muted)),
+        ]));
+        for (path, ctype) in changed_files.iter().take(6) {
+            let (prefix, color) = match *ctype {
+                "A" => ("A", state.theme.success),
+                _ => ("M", state.theme.gold),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", prefix), Style::default().fg(color)),
+                Span::styled(path.clone(), Style::default().fg(state.theme.text)),
+            ]));
+        }
+        if changed_files.len() > 6 {
+            lines.push(Line::from(vec![
+                Span::styled(format!("   +{} more", changed_files.len() - 6), state.theme.text_style(TextRole::Caption)),
+            ]));
+        }
+    }
+
+    // ═══ 底部统计 ═══
+    let total_tools = tool_events.len();
+    let succeeded = tool_events.iter().filter(|e| {
+        matches!(&e.kind, TraceKind::ToolCall { status: ToolStatus::Success, .. })
+    }).count();
+    let failed = tool_events.iter().filter(|e| {
+        matches!(&e.kind, TraceKind::ToolCall { status: ToolStatus::Failed, .. })
+    }).count();
+    if total_tools > 0 {
+        lines.push(Line::raw(""));
+        let total_dur: u64 = tool_events.iter().filter_map(|e| e.duration_ms).sum();
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" ✓{} ✗{} · {:.1}s", succeeded, failed, total_dur as f64 / 1000.0),
+                state.theme.text_style(TextRole::Caption),
+            ),
+        ]));
+    }
+
+    state.last_timeline_visible.set(area.height as usize);
+    drop(row_map);
     f.render_widget(Paragraph::new(lines), area);
 }
 

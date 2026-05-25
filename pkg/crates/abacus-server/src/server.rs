@@ -713,6 +713,7 @@ impl AbacusServer {
             adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(false),
             event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
             scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
+            policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
         };
 
         // ─── Progressive Gate config ────────────────────────────────────
