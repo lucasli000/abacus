@@ -1339,6 +1339,17 @@ impl<'a> TurnPipeline<'a> {
                                 text_len = text.len(),
                                 "LLM stopped without explicit declaration after tool failures"
                             );
+                            // 用户感知：通知 TUI policy 拦截生效
+                            if let Some(ref stx) = self.stream_tx {
+                                let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart {
+                                    name: format!("⚡ policy: retry {}/{} (silent stop detected)", retry_count + 1, max_retries),
+                                });
+                                let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
+                                    name: format!("⚡ policy: retry {}/{} (silent stop detected)", retry_count + 1, max_retries),
+                                    success: true,
+                                    duration_ms: 0,
+                                });
+                            }
                             {
                                 let s = self.session.read().await;
                                 let mut msgs = s.messages.write().await;
