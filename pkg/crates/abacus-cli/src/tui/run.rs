@@ -379,17 +379,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                         }
 
-                        // 3. 组装 parts: 主体只有 Reply 文本 + Trace 引用(取代旧 Block 内嵌)
-                        let mut parts: Vec<MsgContent> = vec![MsgContent::Stream(response.text.clone())];
+                        // 3. 组装 parts: Trace 在上方（工作报告），Reply 文本在下方（用户焦点）
+                        let mut parts: Vec<MsgContent> = Vec::new();
                         if !trace_ids.is_empty() {
-                            // 默认折叠 trace — 消息区仅展示最终回复内容
-                            //   用户可按 Space 展开查看 thinking/tool 细节
+                            // trace 摘要在正文上方，折叠态，用户可 Space 展开
                             parts.push(MsgContent::Trace {
                                 event_ids: trace_ids,
                                 collapsed: true,
                                 expanded_event_ids: std::collections::HashSet::new(),
                             });
                         }
+                        parts.push(MsgContent::Stream(response.text.clone()));
 
                         state.add_message(Message::new_session(parts, &ts));
 

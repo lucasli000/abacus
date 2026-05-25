@@ -1266,30 +1266,41 @@ pub fn schemas() -> Vec<ToolSchema> {
     vec![
         schema("fs_read",  "读取文件完整内容（支持单 path 字符串或 paths 数组批量）",
             json!({
-                "path": {"type": "string", "description": "单文件路径"},
+                "path": {"type": "string", "description": "单文件绝对路径"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "批量文件路径(最多20)；与 path 二选一"}
             }), &["path"], false, 64, "10ms", "low"),
-        schema("fs_write", "写入文件内容（创建或覆盖）",
-            json!({"path": {"type":"string"}, "content": {"type":"string"}}),
-            &["path","content"], true, 64, "10ms", "medium"),
-        schema("fs_edit", "精确替换文件中的文本段",
-            json!({"path": {"type":"string"}, "old_string": {"type":"string"}, "new_string": {"type":"string"}}),
-            &["path","old_string","new_string"], false, 96, "15ms", "medium"),
-        schema("fs_move", "移动或重命名文件或目录",
-            json!({"source": {"type":"string"}, "destination": {"type":"string"}}),
-            &["source","destination"], true, 48, "10ms", "medium"),
-        schema("fs_info", "获取文件或目录元数据",
-            json!({"path": {"type":"string"}}), &["path"], false, 32, "5ms", "low"),
-        schema("fs_search", "按 Glob 模式搜索文件名",
-            json!({"pattern": {"type":"string"}, "path": {"type":"string"}}),
-            &["pattern"], false, 48, "50ms", "low"),
+        schema("fs_write", "创建或覆盖文件",
+            json!({
+                "path": {"type":"string", "description": "目标文件绝对路径"},
+                "content": {"type":"string", "description": "写入的完整文件内容"}
+            }), &["path","content"], true, 64, "10ms", "medium"),
+        schema("fs_edit", "精确替换文件中的文本段（old_string 必须在文件中唯一匹配）",
+            json!({
+                "path": {"type":"string", "description": "文件绝对路径"},
+                "old_string": {"type":"string", "description": "要替换的原始文本（必须精确匹配文件中的内容）"},
+                "new_string": {"type":"string", "description": "替换后的新文本"}
+            }), &["path","old_string","new_string"], false, 96, "15ms", "medium"),
+        schema("fs_move", "移动或重命名文件/目录",
+            json!({
+                "source": {"type":"string", "description": "源文件/目录绝对路径"},
+                "destination": {"type":"string", "description": "目标绝对路径"}
+            }), &["source","destination"], true, 48, "10ms", "medium"),
+        schema("fs_info", "获取文件或目录元数据（大小/权限/修改时间）",
+            json!({"path": {"type":"string", "description": "文件或目录绝对路径"}}),
+            &["path"], false, 32, "5ms", "low"),
+        schema("fs_search", "按 Glob 模式搜索文件名（如 **/*.rs）",
+            json!({
+                "pattern": {"type":"string", "description": "Glob 模式（如 **/*.ts, src/**/mod.rs）"},
+                "path": {"type":"string", "description": "搜索根目录（默认当前工作目录）"}
+            }), &["pattern"], false, 48, "50ms", "low"),
         schema("fs_ls", "列出目录内容（recursive=true 时递归 5 层树）",
             json!({
                 "path": {"type": "string"},
                 "recursive": {"type": "boolean", "description": "true=递归树形(最多5层)；false=单层(默认)"}
             }), &["path"], false, 32, "5ms", "low"),
-        schema("fs_mkdir", "递归创建目录",
-            json!({"path": {"type":"string"}}), &["path"], true, 32, "5ms", "low"),
+        schema("fs_mkdir", "递归创建目录（含所有父目录）",
+            json!({"path": {"type":"string", "description": "要创建的目录绝对路径"}}),
+            &["path"], true, 32, "5ms", "low"),
         schema("web_fetch", "HTTP GET 请求获取网页内容",
             json!({"url": {"type":"string", "description":"完整 URL"},
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"}}),
@@ -1299,12 +1310,12 @@ pub fn schemas() -> Vec<ToolSchema> {
                    "count": {"type":"number", "description":"返回条数(默认10,最大20)"},
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"}}),
             &["query"], false, 128, "2s", "low"),
-        schema("fs_grep", "按正则表达式搜索文件内容",
-            json!({"pattern": {"type":"string", "description":"正则表达式"},
-                   "path": {"type":"string", "description":"搜索根目录(默认session.cwd)"},
-                   "include": {"type":"string", "description":"文件glob过滤(如 *.rs)"},
-                   "max_results": {"type":"number", "description":"最大结果数(默认20,最大100)"},
-                   "context": {"type":"number", "description":"匹配行前后文行数(0-5,默认0)"}}),
+        schema("fs_grep", "搜索文件内容（正则匹配，返回匹配行+文件路径+行号）",
+            json!({"pattern": {"type":"string", "description":"正则表达式（如 fn main|class.*Error）"},
+                   "path": {"type":"string", "description":"搜索根目录绝对路径（默认当前工作目录）"},
+                   "include": {"type":"string", "description":"文件名 glob 过滤（如 *.rs, *.{ts,tsx}）"},
+                   "max_results": {"type":"number", "description":"最大结果数（默认20,最大100）"},
+                   "context": {"type":"number", "description":"匹配行前后上下文行数（0-5,默认0）"}}),
             &["pattern"], false, 96, "500ms", "low"),
         // Wrapping-B：fs_read_multiple 已合并到 fs_read（接受 paths 数组），schema 不再注册
         // executor 路径"fs_read_multiple"仍 dispatch 旧函数（向后兼容）
