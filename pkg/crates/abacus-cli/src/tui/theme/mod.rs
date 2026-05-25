@@ -637,20 +637,31 @@ impl Theme {
     /// 按 TextRole 派生样式（Tier 1）
     /// 调用方：components/render_*、markdown/*、modes/*
     /// 设计意图：统一管理 fg + Modifier 组合，消除“挑色 + 加 BOLD”的散乱
+    /// 按 TextRole 派生样式（视觉层级设计）
+    ///
+    /// 层级（从亮到暗）：
+    ///   L1: 回复正文 Body — 最亮，用户核心关注
+    ///   L2: 标题/代码 — 正常亮度 + 修饰符
+    ///   L3: 工具/状态 — muted 色（变淡但可读）
+    ///   L4: Trace/折叠摘要 — muted + DIM（最暗，背景信息）
     pub fn text_style(&self, role: TextRole) -> Style {
         match role {
+            // L1: 核心内容（最高对比度）
+            TextRole::Body         => Style::default().fg(self.text),
+            TextRole::BodyEmphasis => Style::default().fg(self.text).add_modifier(Modifier::BOLD),
+            // L2: 结构标题 + 代码
             TextRole::H1           => Style::default().fg(self.text).add_modifier(Modifier::BOLD),
             TextRole::H2           => Style::default().fg(self.accent).add_modifier(Modifier::BOLD),
             TextRole::H3           => Style::default().fg(self.text).add_modifier(Modifier::BOLD | Modifier::ITALIC),
-            TextRole::Body         => Style::default().fg(self.text),
-            TextRole::BodyEmphasis => Style::default().fg(self.text).add_modifier(Modifier::BOLD),
-            TextRole::Caption      => Style::default().fg(self.muted).add_modifier(Modifier::DIM),
-            TextRole::Hint         => Style::default().fg(self.muted).add_modifier(Modifier::ITALIC),
-            TextRole::InlineCode   => Style::default().fg(self.gold).add_modifier(Modifier::DIM),
             TextRole::CodeBlock    => Style::default().fg(self.text),
+            TextRole::InlineCode   => Style::default().fg(self.gold),
             TextRole::Link         => Style::default().fg(self.accent).add_modifier(Modifier::UNDERLINED),
+            // L3: 辅助信息（变淡但不加 DIM，保持可读性）
+            TextRole::Status       => Style::default().fg(self.muted),
             TextRole::Quote        => Style::default().fg(self.muted).add_modifier(Modifier::ITALIC),
-            TextRole::Status       => Style::default().fg(self.accent),
+            TextRole::Hint         => Style::default().fg(self.muted).add_modifier(Modifier::ITALIC),
+            // L4: 背景信息（最淡——muted + DIM）
+            TextRole::Caption      => Style::default().fg(self.muted).add_modifier(Modifier::DIM),
         }
     }
 }
