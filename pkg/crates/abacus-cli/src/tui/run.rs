@@ -382,12 +382,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // 3. 组装 parts: 主体只有 Reply 文本 + Trace 引用(取代旧 Block 内嵌)
                         let mut parts: Vec<MsgContent> = vec![MsgContent::Stream(response.text.clone())];
                         if !trace_ids.is_empty() {
-                            // V29.11: 默认展开 trace — 让用户直接看到 thinking/tool 过程
-                            //   用户可按 Space 折叠(toggle_block); 历史长消息重开后仍展开
-                            //   设计变更: 原 collapsed=true 导致"工具/思考看不到"的反馈
+                            // 默认折叠 trace — 消息区仅展示最终回复内容
+                            //   用户可按 Space 展开查看 thinking/tool 细节
                             parts.push(MsgContent::Trace {
                                 event_ids: trace_ids,
-                                collapsed: false,
+                                collapsed: true,
                                 expanded_event_ids: std::collections::HashSet::new(),
                             });
                         }
