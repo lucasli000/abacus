@@ -768,7 +768,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 let abs_y_d = area.y.saturating_add(lines.len() as u16);
                 row_map.push((abs_y_d, evt.id));
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw("  "),
                     Span::styled(truncated, state.theme.text_style(TextRole::Caption)),
                 ]));
             }
@@ -776,7 +776,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 let abs_y_more = area.y.saturating_add(lines.len() as u16);
                 row_map.push((abs_y_more, evt.id));
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw("  "),
                     Span::styled(
                         format!("↳ +{} 行 (消息区 ▾ trace 看全部)", total_detail - TIMELINE_DETAIL_MAX),
                         state.theme.text_style(TextRole::Hint),
