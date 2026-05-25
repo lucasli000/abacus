@@ -3190,6 +3190,27 @@ impl CoreLoop {
             }
             // Awareness block 每轮变化（turn/tool_calls 递增）→ 放在动态段
             s = format!("{}\n\n---\n\n{}", s, awareness_block);
+
+            // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
+            // 内核级约束：LLM 在执行文件操作/任务前必须先结构化思考
+            // byte-stable（不含变量），不影响 KV cache
+            s.push_str(concat!(
+                "\n\n[Entropy Guard]\n",
+                "Before any file creation, folder creation, or multi-step task execution:\n",
+                "1. STATE — What exists now? Read before write. Never create what already exists.\n",
+                "2. GOAL — What specific outcome? One sentence, no ambiguity.\n",
+                "3. PLACEMENT — Where does it belong in the project structure? Follow existing conventions.\n",
+                "4. NAMING — Use existing naming patterns. Check siblings for style (case, prefix, suffix).\n",
+                "5. IMPACT — What depends on this? What breaks if this changes?\n",
+                "6. MINIMAL — Smallest change that achieves the goal. No speculative files.\n",
+                "Rules:\n",
+                "- NEVER create a new file if an existing file can be extended.\n",
+                "- NEVER create a folder without checking the existing tree first.\n",
+                "- NEVER output content without a clear target path and purpose.\n",
+                "- Prefer editing over creating. Prefer appending over new files.\n",
+                "- One task = one coherent change. Do not scatter related logic across new files.\n",
+                "- If unsure about placement, ask. Do not guess.",
+            ));
             s
         };
         let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());

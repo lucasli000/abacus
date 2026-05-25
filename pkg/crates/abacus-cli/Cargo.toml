@@ -53,6 +53,10 @@ glob = "0.3"
 clipboard = { package = "arboard", version = "3", default-features = false }
 # V29.11: LCS line-diff 用于 fs_edit trace 渲染 — 标记 unchanged/insert/delete 上下文
 similar = "2.7"
+# 流式 Markdown 增量渲染引擎 — committed/pending 模型（替代每帧全量重解析）
+# 引用关系：tui/md_stream.rs 唯一消费方
+# 生命周期：streaming 期间活跃，reset_streaming 时 drop
+mdstream = { version = "0.2", default-features = false }
 # Phase1-1.1: 同步 HTTP 替代 curl 子进程（setup.rs fetch_model_list_sync）
 # 引用关系：tui/setup.rs::fetch_model_list_sync 唯一消费方
 # 生命周期：每次 fetch 调用创建临时 Agent，无长连接
