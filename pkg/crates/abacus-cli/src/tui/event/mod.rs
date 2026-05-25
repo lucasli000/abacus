@@ -1203,10 +1203,22 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 state.cursor_pos = idx;
             }
             state.recalculate_cursor();
+        } else if !state.input.is_empty() {
+            // cursor_pos == 0 但 input 非空：cursor 与 input 不同步（防御性修复）
+            // 强制删除第一个字符
+            if state.input.len() > 0 {
+                let first_char_len = state.input.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                if first_char_len > 0 {
+                    state.input.drain(..first_char_len);
+                    state.cursor_pos = 0;
+                    state.recalculate_cursor();
+                }
+            }
         }
         if state.input.is_empty() {
             state.input_state = InputState::Ready;
         }
+        state.rendered_lines_dirty.set(true);
         return;
     }
 

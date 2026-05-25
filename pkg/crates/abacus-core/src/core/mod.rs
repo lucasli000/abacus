@@ -840,6 +840,22 @@ pub struct SessionState {
     ///
     /// 字段含义见 CacheTelemetry struct 定义。
     pub cache_telemetry: Arc<RwLock<crate::core::CacheTelemetry>>,
+
+    /// Mid-turn user signal：用户在 LLM 执行工具循环期间发送的消息
+    ///
+    /// ## 引用关系
+    /// - 写入方：TUI event handler（忙碌态 Enter 时 push）
+    /// - 消费方：pipeline execute_loop 每次迭代间隙 drain
+    ///
+    /// ## 生命周期
+    /// - 创建：SessionState 构造时初始化为空 Vec
+    /// - 写入：TUI 通过 EngineHandle.session 访问后 push
+    /// - 消费：pipeline drain 后注入为 `[User update]` 格式的 User message
+    /// - 销毁：随 SessionState drop
+    ///
+    /// ## 并发模型
+    /// tokio::sync::Mutex（TUI 写 + pipeline 读，临界区极短——push/drain）
+    pub mid_turn_signals: tokio::sync::Mutex<Vec<String>>,
 }
 
 impl SessionState {
@@ -869,6 +885,8 @@ impl SessionState {
             escalated_model: Arc::new(RwLock::new(None)),
             // Task #95：初始空 cache 统计
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
+            // Mid-turn signal：初始为空（用户工具循环期间注入消息的缓冲区）
+            mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -897,6 +915,7 @@ impl SessionState {
             escalation_count: std::sync::atomic::AtomicU32::new(0),
             escalated_model: Arc::new(RwLock::new(None)),
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
+            mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -930,6 +949,7 @@ impl SessionState {
             escalation_count: std::sync::atomic::AtomicU32::new(0),
             escalated_model: Arc::new(RwLock::new(None)),
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
+            mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 

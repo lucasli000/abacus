@@ -287,13 +287,20 @@ impl ClusterRegistry {
         me
     }
 
-    /// 注册一个 cluster——同名 tool_id 重复会 panic（防误配）
+    /// 注册一个 cluster——同名 tool_id 重复时 warn + 覆盖（不再 panic 崩溃启动）
+    ///
+    /// ## 旧行为
+    /// panic → 开发者配置错误直接崩溃进程，阻塞启动
+    ///
+    /// ## 新行为
+    /// warn log + 覆盖到新 cluster（最后注册的赢）
+    /// 生产安全：启动不被配置漂移阻塞；CI 通过 lint audit 捕获重复
     fn register(&mut self, cluster: ToolCluster) {
         let cluster_idx = self.clusters.len();
         for m in &cluster.members {
             if let Some(prev_idx) = self.tool_index.get(m.tool_id) {
-                panic!(
-                    "Tool '{}' registered in multiple clusters: '{}' and '{}'",
+                tracing::warn!(
+                    "Tool '{}' re-registered: cluster '{}' → '{}' (overwriting)",
                     m.tool_id, self.clusters[*prev_idx].id, cluster.id
                 );
             }
@@ -490,28 +497,28 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_tool_in_clusters_panics() {
-        // 自己手工构造冲突 → 验证 panic 防护
-        let result = std::panic::catch_unwind(|| {
-            let mut r = ClusterRegistry::empty();
-            r.register(ToolCluster {
-                id: "c1",
-                purpose: "x",
-                members: vec![ToolMember {
-                    tool_id: "shared_tool",
-                    differentiator: "first",
-                }],
-            });
-            r.register(ToolCluster {
-                id: "c2",
-                purpose: "y",
-                members: vec![ToolMember {
-                    tool_id: "shared_tool",
-                    differentiator: "second",
-                }],
-            });
+    fn duplicate_tool_in_clusters_overwrites() {
+        // 重复 tool_id 不再 panic，改为 warn + 覆盖到新 cluster
+        let mut r = ClusterRegistry::empty();
+        r.register(ToolCluster {
+            id: "c1",
+            purpose: "x",
+            members: vec![ToolMember {
+                tool_id: "shared_tool",
+                differentiator: "first",
+            }],
         });
-        assert!(result.is_err(), "重复 tool_id 应 panic");
+        r.register(ToolCluster {
+            id: "c2",
+            purpose: "y",
+            members: vec![ToolMember {
+                tool_id: "shared_tool",
+                differentiator: "second",
+            }],
+        });
+        // 最后注册的 cluster 赢
+        let c = r.cluster_for("shared_tool").unwrap();
+        assert_eq!(c.id, "c2");
     }
 
     #[test]

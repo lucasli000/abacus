@@ -575,12 +575,18 @@ pub fn handle_issue(issue: &LintIssue) {
                 suggestion = %issue.suggestion.as_deref().unwrap_or(""),
                 "{}", issue.reason
             );
-            if !panic_bypassed() {
-                panic!(
-                    "schema lint Error (set ABACUS_LINT_PANIC=0 to bypass): \
-                     tool={} rule={} field={} reason={}",
-                    issue.tool_id.0, issue.rule, issue.field, issue.reason
-                );
+            // 仅 debug build 下 panic（CI 可捕获）；release 不崩溃启动
+            // 旧行为: 任何 Error 直接 panic → 微小 schema 漂移崩溃生产启动
+            // 新行为: debug panic + release 仅 log（issues 已累积到 lint_issues 供审计）
+            #[cfg(debug_assertions)]
+            {
+                if !panic_bypassed() {
+                    panic!(
+                        "schema lint Error (set ABACUS_LINT_PANIC=0 to bypass): \
+                         tool={} rule={} field={} reason={}",
+                        issue.tool_id.0, issue.rule, issue.field, issue.reason
+                    );
+                }
             }
         }
     }

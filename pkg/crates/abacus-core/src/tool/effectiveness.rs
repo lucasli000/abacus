@@ -116,9 +116,10 @@ impl ToolOutcome {
     /// - 调用方明确知道是 Success 时直接构造 ToolOutcome::Success（不走本函数）
     pub fn classify_error(err_kind: &str) -> Self {
         match err_kind {
-            // 环境层失败——网络/认证/限流/sandbox/超时
+            // 环境层失败——网络/认证/限流/sandbox/超时/panic
             "Network" | "Timeout" | "Unauthorized" | "RateLimited"
-            | "ServiceUnavailable" | "SandboxDenied" | "DependencyMissing" => ToolOutcome::EnvFailure,
+            | "ServiceUnavailable" | "SandboxDenied" | "DependencyMissing"
+            | "Panic" => ToolOutcome::EnvFailure,
             // 其他 → 工具层失败
             _ => ToolOutcome::ToolFailure,
         }
@@ -297,6 +298,8 @@ impl EffectivenessTracker {
     }
 
     /// Evict least-used tools when stats map exceeds capacity.
+    ///
+    /// 触发时记录 warn 日志——帮助运维发现工具膨胀或监控数据丢失
     fn evict_if_needed(&mut self) {
         if self.stats.len() <= MAX_TRACKED_TOOLS {
             return;
@@ -308,6 +311,14 @@ impl EffectivenessTracker {
             .collect();
         candidates.sort_by_key(|(_, inv)| *inv);
         let to_remove = self.stats.len() - MAX_TRACKED_TOOLS;
+        let evicted_ids: Vec<_> = candidates.iter().take(to_remove)
+            .map(|(id, _)| id.0.as_str())
+            .collect();
+        tracing::warn!(
+            count = to_remove, total = self.stats.len(),
+            evicted = %evicted_ids.join(","),
+            "effectiveness stats eviction triggered (cap={})", MAX_TRACKED_TOOLS
+        );
         for (id, _) in candidates.into_iter().take(to_remove) {
             self.stats.remove(&id);
         }
@@ -445,6 +456,9 @@ impl EffectivenessTracker {
         }
         let score = Self::tool_composite_score(stats);
         let tier = Self::score_to_tier(score);
+        // env_failures ≥ 80% of invocations → 标记环境阻塞
+        let env_blocked = stats.invocations > 0
+            && stats.env_failures as f64 / stats.invocations as f64 >= 0.8;
         ToolEffectiveness {
             tool_id: tool_id.clone(),
             composite_score: score,
@@ -454,7 +468,7 @@ impl EffectivenessTracker {
                 VisibilityTier::D => 30,
                 _ => 0,
             },
-            blocked_by_env: false,
+            blocked_by_env: env_blocked,
             insufficient_data: false,
         }
     }
@@ -505,6 +519,9 @@ impl EffectivenessTracker {
         }
         let score = Self::tool_composite_score(stats);
         let tier = Self::score_to_tier(score);
+        // env_failures ≥ 80% of invocations → 标记环境阻塞
+        let env_blocked = stats.invocations > 0
+            && stats.env_failures as f64 / stats.invocations as f64 >= 0.8;
         ToolEffectiveness {
             tool_id: tool_id.clone(),
             composite_score: score,
@@ -514,7 +531,7 @@ impl EffectivenessTracker {
                 VisibilityTier::D => 30,
                 _ => 0,
             },
-            blocked_by_env: false,
+            blocked_by_env: env_blocked,
             insufficient_data: false,
         }
     }

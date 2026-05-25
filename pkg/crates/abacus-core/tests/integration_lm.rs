@@ -134,6 +134,7 @@ async fn make_engine(api_key: String) -> EngineHandle {
         adaptive_d_tier_hide: false,
         // 测试场景关闭 event sink—— ABACUS_HOME 可能未配置且不需观测层
         event_sink_enabled: false,
+        policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::default()),
     };
 
     let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;

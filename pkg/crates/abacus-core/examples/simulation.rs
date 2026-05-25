@@ -192,6 +192,7 @@ async fn main() {
             tool_result_dedup_capacity_kb: 256,
         adaptive_d_tier_hide: false,
         event_sink_enabled: false,
+        policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::default()),
         },
     ).await;
 

@@ -120,6 +120,18 @@ struct TurnContext {
     /// ICL 等"本轮检索素材"放 system 会破前缀 cache。改放到 latest user message 顶部，
     /// system+history 全 stable，仅 last user 携带 preamble（永不缓存），不破 cache。
     user_message_preamble: Option<String>,
+    /// Error-recovery: LLM provider 连续失败计数
+    /// 引用：execute_loop 中 provider 错误分支——retry <= 2 时注入错误并 continue，否则 graceful break
+    /// 生命周期：每次 provider 成功后重置为 0；连续失败时递增
+    provider_retries: u32,
+    /// Error-recovery: 全局恢复尝试计数（防止无限恢复循环）
+    /// 引用：execute_loop 中每次走恢复路径（非 break/return）时递增
+    /// 上限：5 次——超过后 graceful break，避免死循环
+    recovery_attempts: u32,
+    /// Error-recovery: 工具调用耗尽标记
+    /// 引用：MAX_TOTAL_TOOL_CALLS 或 safety guard 触发后设为 true
+    /// 效果：下次构建 LlmRequest 时传空 tools 数组，强制 LLM 仅产出文本总结
+    tools_exhausted: bool,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -787,6 +799,9 @@ impl<'a> TurnPipeline<'a> {
             complexity_thinking,
             complexity_temperature,
             user_message_preamble, // Phase 4：setup() 阶段已构建（ICL 检索结果）
+            provider_retries: 0,
+            recovery_attempts: 0,
+            tools_exhausted: false,
         })
     }
 
@@ -1137,7 +1152,8 @@ impl<'a> TurnPipeline<'a> {
                 // KV 缓存优化: 多段 system prompt，稳定段标记 cacheable
                 // Anthropic provider 优先使用 system_segments 实现 block 级缓存
                 system_segments: ctx.system_segments.clone(),
-                tools: ctx.tool_defs.clone(),
+                // Error-recovery: tools_exhausted 时传空数组，强制 LLM 仅产出文本总结
+                tools: if ctx.tools_exhausted { Vec::new() } else { ctx.tool_defs.clone() },
                 temperature: Some(effective_temperature),
                 max_tokens: Some(effective_max_tokens),
                 top_p: None, stop: Vec::new(), stream: false,
@@ -1246,25 +1262,111 @@ impl<'a> TurnPipeline<'a> {
                             extra_body: req.extra_body.clone(),
                             user_message_preamble: req.user_message_preamble.clone(),
                         };
-                        ctx.provider.complete_cancellable(retry_req, self.cancel_token()).await?
+                        match ctx.provider.complete_cancellable(retry_req, self.cancel_token()).await {
+                            Ok(resp) => resp,
+                            Err(retry_err) => {
+                                // Error-recovery: 400 repair retry also failed
+                                let err_desc = format!("{}", retry_err);
+                                if let Some(ref stx) = self.stream_tx {
+                                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                        format!("LLM retry after repair also failed: {}", err_desc)
+                                    ));
+                                }
+                                ctx.recovery_attempts += 1;
+                                if ctx.recovery_attempts > 5 {
+                                    ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
+                                    break;
+                                }
+                                {
+                                    let s = self.session.read().await;
+                                    let mut msgs = s.messages.write().await;
+                                    msgs.push(Message {
+                                        role: MessageRole::User,
+                                        content: Some(MessageContent::Text(format!(
+                                            "[System Error] LLM request failed after repair attempt: {}. Adapt your approach.",
+                                            err_desc
+                                        ))),
+                                        name: None, tool_calls: None, tool_call_id: None,
+                                        reasoning_content: None, prefix: false,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
                     } else {
+                        // Error-recovery: 400 无法自动修复 → 注入错误上下文让 LLM 适应
+                        let err_desc = body.chars().take(200).collect::<String>();
                         if let Some(ref stx) = self.stream_tx {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("LLM API error (400): {}", body.chars().take(200).collect::<String>())
+                                format!("LLM API error (400): {}", err_desc)
                             ));
                         }
-                        return Err(KernelError::ApiError { status: 400, body: body.clone() });
+                        ctx.recovery_attempts += 1;
+                        if ctx.recovery_attempts > 5 {
+                            ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
+                            break;
+                        }
+                        {
+                            let s = self.session.read().await;
+                            let mut msgs = s.messages.write().await;
+                            msgs.push(Message {
+                                role: MessageRole::User,
+                                content: Some(MessageContent::Text(format!(
+                                    "[System Error] LLM API returned 400: {}. Adapt your approach or report to user.",
+                                    err_desc
+                                ))),
+                                name: None, tool_calls: None, tool_call_id: None,
+                                reasoning_content: None, prefix: false,
+                            });
+                        }
+                        continue;
                     }
                 }
                 Err(e) => {
-                    if let Some(ref stx) = self.stream_tx {
-                        let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                            format!("LLM provider error: {}", e)
-                        ));
+                    // Error-recovery: non-400 provider errors → retry with backoff context
+                    ctx.provider_retries += 1;
+                    if ctx.provider_retries <= 2 {
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                format!("Provider error (retrying {}/3): {}", ctx.provider_retries, e)
+                            ));
+                        }
+                        ctx.recovery_attempts += 1;
+                        if ctx.recovery_attempts > 5 {
+                            ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
+                            break;
+                        }
+                        {
+                            let s = self.session.read().await;
+                            let mut msgs = s.messages.write().await;
+                            msgs.push(Message {
+                                role: MessageRole::User,
+                                content: Some(MessageContent::Text(format!(
+                                    "[System] LLM request failed: {}. This is attempt {}/3. I will retry.",
+                                    e, ctx.provider_retries
+                                ))),
+                                name: None, tool_calls: None, tool_call_id: None,
+                                reasoning_content: None, prefix: false,
+                            });
+                        }
+                        continue;
+                    } else {
+                        // Final failure after 3 attempts: graceful end (not Err)
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                format!("Provider unavailable after 3 attempts: {}", e)
+                            ));
+                        }
+                        ctx.final_response = format!(
+                            "[System] 无法连接 LLM 服务（{}）。请检查网络或 API key。", e
+                        );
+                        break;
                     }
-                    return Err(e);
                 }
             };
+
+            // Error-recovery: provider 成功响应 → 重置重试计数
+            ctx.provider_retries = 0;
 
             ctx.prompt_tokens += response.usage.prompt_tokens;
             ctx.completion_tokens += response.usage.completion_tokens;
@@ -1480,34 +1582,85 @@ impl<'a> TurnPipeline<'a> {
             }
 
             if ctx.total_tool_calls + tool_calls.len() as u32 > MAX_TOTAL_TOOL_CALLS {
+                // Error-recovery: 工具总量耗尽 → 告知 LLM 总结，不终止 pipeline
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                        format!("Reached maximum tool calls limit ({}). Ending turn.", ctx.total_tool_calls)
+                        format!("Reached maximum tool calls limit ({}). LLM will summarize.", ctx.total_tool_calls)
                     ));
                 }
-                ctx.final_response = "(max total tool calls reached)".to_string();
-                break;
+                ctx.tools_exhausted = true;
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::User,
+                        content: Some(MessageContent::Text(
+                            "[System] Maximum tool calls reached. Summarize current progress now. \
+                             Do NOT call more tools.".into()
+                        )),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                }
+                continue;
             }
             if tool_calls.len() > self.core.config.max_tool_calls_per_turn as usize {
+                // Error-recovery: 单 turn 工具调用超限 → 告知 LLM 减少工具调用
                 let err_msg = format!(
-                    "tool calls exceed limit: {} > {}",
+                    "tool calls exceed per-turn limit: {} > {}",
                     tool_calls.len(), self.core.config.max_tool_calls_per_turn
                 );
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(err_msg.clone()));
                 }
-                return Err(KernelError::Other(err_msg));
+                ctx.recovery_attempts += 1;
+                if ctx.recovery_attempts > 5 {
+                    ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
+                    break;
+                }
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::User,
+                        content: Some(MessageContent::Text(format!(
+                            "[System] You have reached the tool call limit for this turn. \
+                             Do NOT call more tools. Summarize what you've accomplished so far \
+                             and report to the user. (limit: {} per turn, you attempted: {})",
+                            self.core.config.max_tool_calls_per_turn, tool_calls.len()
+                        ))),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                }
+                continue;
             }
 
             ctx.total_tool_calls += tool_calls.len() as u32;
             if let Err(e) = self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls) {
+                // Error-recovery: safety guard → 告知 LLM 寻找替代方案
                 let err_msg = e.to_string();
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
                         format!("Safety guard: {}", err_msg)
                     ));
                 }
-                return Err(KernelError::Other(err_msg));
+                ctx.tools_exhausted = true;
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::User,
+                        content: Some(MessageContent::Text(format!(
+                            "[System] Safety guard blocked this action: {}. \
+                             Find an alternative approach or summarize current progress.",
+                            err_msg
+                        ))),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                }
+                continue;
             }
 
             let user_role = { let s = self.session.read().await; s.user_role };
@@ -1850,7 +2003,8 @@ impl<'a> TurnPipeline<'a> {
                 let mut output = match output_result {
                     Ok(o) => o,
                     Err(e) => {
-                        // Fix 5: ToolStart was already sent — send ToolEnd with success=false before propagating
+                        // Error-recovery: tool dispatch failure → synthesize failed ToolOutput
+                        // instead of terminating. LLM sees the error via Tool message and adapts.
                         if let Some(ref stx) = self.stream_tx {
                             let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
                                 name: tc.function.name.clone(),
@@ -1861,7 +2015,18 @@ impl<'a> TurnPipeline<'a> {
                                 format!("Tool dispatch failed: {}", e)
                             ));
                         }
-                        return Err(e);
+                        // Synthesize a failed output so the tool loop continues
+                        ToolOutput {
+                            tool_id: tool_id.clone(),
+                            success: false,
+                            output: serde_json::json!({
+                                "error": format!("Tool dispatch error: {}", e),
+                                "recoverable": true
+                            }),
+                            latency_ms: 0,
+                            failure_kind: Some("DispatchError".into()),
+                            try_instead: Vec::new(),
+                        }
                     }
                 };
                 // V29.11: ToolOutput — 工具返回内容(让 TUI trace 展开时显示 output)
@@ -2021,6 +2186,38 @@ impl<'a> TurnPipeline<'a> {
                 let s = self.session.read().await;
                 let mut msgs = s.messages.write().await;
                 msgs.extend(tool_results);
+            }
+
+            // ── Mid-turn user signal injection ──────────────────────────────
+            // 检查用户是否在工具执行期间发送了新消息。
+            // 如果有，drain 后注入为特殊格式 user message，让 LLM 下次迭代时自主决策。
+            //
+            // ## 死锁预防
+            // mid_turn_signals lock 在独立 scope 内获取并 drain，
+            // 然后释放后再获取 messages write lock，避免嵌套锁。
+            {
+                let user_signals: Vec<String> = {
+                    let s = self.session.read().await;
+                    let mut signals = s.mid_turn_signals.lock().await;
+                    signals.drain(..).collect()
+                };
+                if !user_signals.is_empty() {
+                    let combined = user_signals.join("\n");
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::User,
+                        content: Some(MessageContent::Text(format!(
+                            "[User update while you were working]: {}\n\nYou may adjust your approach based on this update, or continue with your current plan if it's still relevant.",
+                            combined
+                        ))),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        prefix: false,
+                    });
+                }
             }
 
             // Fix 3: Warn user when approaching loop limit (80% threshold)
