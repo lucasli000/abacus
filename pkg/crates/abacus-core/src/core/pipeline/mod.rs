@@ -1157,37 +1157,50 @@ impl<'a> TurnPipeline<'a> {
                 let text = super::extract_text(&response.message);
 
                 // V30: 检测 LLM 任务未完成即停止（premature stop）
-                // 条件：本轮有工具全部失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
-                // 机制：注入续写提示，让 LLM 继续尝试其他方法而非放弃
+                // 条件：本轮有工具失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
+                // 机制：注入续写提示，让 LLM 继续尝试或显式声明阻塞
                 // 限制：每 session 最多触发 3 次，避免无限循环
-                if ctx.total_tool_calls > 0 && text.len() < 200 && loop_iter > 0 {
-                    let last_tools_all_failed = ctx.all_tool_outputs.iter()
+                if ctx.total_tool_calls > 0 && loop_iter > 0 {
+                    let has_recent_failures = ctx.all_tool_outputs.iter()
                         .rev()
-                        .take(5) // 检查最近 5 个工具结果
-                        .all(|o| !o.success);
-                    let retry_count = ctx.premature_stop_retries;
-                    if last_tools_all_failed && retry_count < 3 {
-                        ctx.premature_stop_retries += 1;
-                        tracing::warn!(
-                            retry = retry_count + 1,
-                            text_len = text.len(),
-                            "LLM stopped prematurely after tool failures, injecting continuation"
-                        );
-                        {
-                            let s = self.session.read().await;
-                            let mut msgs = s.messages.write().await;
-                            msgs.push(Message {
-                                role: MessageRole::User,
-                                content: Some(MessageContent::Text(
-                                    "The previous tool calls failed but the task is not complete. \
-                                     Try alternative approaches or different tools to accomplish the goal. \
-                                     Do not give up.".into()
-                                )),
-                                name: None, tool_calls: None, tool_call_id: None,
-                                reasoning_content: None, prefix: false,
-                            });
+                        .take(5)
+                        .any(|o| !o.success);
+
+                    if has_recent_failures {
+                        // 检查 LLM 是否显式声明了状态（遵守 [Explicit Declaration]）
+                        let has_declaration = text.contains("[Blocked]")
+                            || text.contains("[Stuck]")
+                            || text.contains("[Need Input]")
+                            || text.contains("[Partial]");
+
+                        let retry_count = ctx.premature_stop_retries;
+
+                        // 短文本 + 无声明 + 未用完重试配额 → 注入提醒
+                        if !has_declaration && text.len() < 200 && retry_count < 3 {
+                            ctx.premature_stop_retries += 1;
+                            tracing::warn!(
+                                retry = retry_count + 1,
+                                text_len = text.len(),
+                                "LLM stopped without explicit declaration after tool failures"
+                            );
+                            {
+                                let s = self.session.read().await;
+                                let mut msgs = s.messages.write().await;
+                                msgs.push(Message {
+                                    role: MessageRole::User,
+                                    content: Some(MessageContent::Text(
+                                        "Some tools failed. You MUST either:\n\
+                                         1. Try alternative approaches to complete the task, OR\n\
+                                         2. Explicitly state what happened using [Blocked], [Stuck], [Need Input], or [Partial] prefix.\n\
+                                         Do not stop silently.".into()
+                                    )),
+                                    name: None, tool_calls: None, tool_call_id: None,
+                                    reasoning_content: None, prefix: false,
+                                });
+                            }
+                            continue;
                         }
-                        continue;
+                        // 有声明 → 允许停下（LLM 已告知用户问题所在）
                     }
                 }
 
