@@ -1146,8 +1146,8 @@ pub fn render_messages_in_card(
                 }
                 // else: thinking 非空时，工具已合并到 thinking 折叠摘要中（Phase 1）
             } else {
-                // 当前在工具阶段 → 展示每个工具的实时状态
-                for (name, status, duration_ms, _trace_id) in state.streaming_tools.iter() {
+                // 当前在工具阶段 → 展示每个工具的实时状态 + diff 预览
+                for (name, status, duration_ms, trace_id) in state.streaming_tools.iter() {
                     let (icon, style) = match status {
                         StreamingToolStatus::Running => (
                             "⏳",
@@ -1167,15 +1167,80 @@ pub fn render_messages_in_card(
                             format!(" ({:.1}s)", *d as f64 / 1000.0),
                         _ => String::new(),
                     };
+                    // 工具摘要行：完整名称 + 关键上下文（路径/URL/命令）
+                    // 从 trace args 提取上下文摘要
+                    let context_hint: String = state.trace_event_index.get(trace_id)
+                        .and_then(|&i| state.trace_events.get(i))
+                        .and_then(|ev| {
+                            if let crate::tui::state::TraceKind::ToolCall { ref args, .. } = ev.kind {
+                                let json: serde_json::Value = serde_json::from_str(args).ok()?;
+                                // 文件路径
+                                if let Some(p) = json.get("path").or(json.get("file_path")).and_then(|v| v.as_str()) {
+                                    // 截取最后 2 段路径
+                                    let parts: Vec<&str> = p.rsplitn(3, '/').collect();
+                                    let short_path = if parts.len() >= 2 {
+                                        format!("{}/{}", parts[1], parts[0])
+                                    } else {
+                                        p.to_string()
+                                    };
+                                    return Some(short_path);
+                                }
+                                // URL
+                                if let Some(u) = json.get("url").and_then(|v| v.as_str()) {
+                                    // 提取域名
+                                    let domain = u.trim_start_matches("https://").trim_start_matches("http://")
+                                        .split('/').next().unwrap_or(u);
+                                    return Some(domain.to_string());
+                                }
+                                // 命令
+                                if let Some(c) = json.get("command").and_then(|v| v.as_str()) {
+                                    let short_cmd = if c.len() > 30 { format!("{}…", &c[..27]) } else { c.to_string() };
+                                    return Some(format!("`{}`", short_cmd));
+                                }
+                                // 搜索查询
+                                if let Some(q) = json.get("query").or(json.get("pattern")).and_then(|v| v.as_str()) {
+                                    let short_q = if q.len() > 25 { format!("{}…", &q[..22]) } else { q.to_string() };
+                                    return Some(format!("\"{}\"", short_q));
+                                }
+                                None
+                            } else { None }
+                        })
+                        .unwrap_or_default();
+                    let context_span = if context_hint.is_empty() {
+                        Span::raw("")
+                    } else {
+                        Span::styled(format!(" {}", context_hint), Style::default().fg(state.theme.accent))
+                    };
                     lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                         bar.clone(),
                         Span::raw(" "),
-                        Span::styled(
-                            format!("⚙ {} → {}{}", name, icon, dur_text),
-                            style,
-                        ),
+                        Span::styled(format!("⚙ {}", name), Style::default().fg(state.theme.muted)),
+                        context_span,
+                        Span::styled(format!(" → {}{}", icon, dur_text), style),
                     ]));
                     stream_offset += 1;
+
+                    // 编辑类工具完成时：内联 diff 预览
+                    if matches!(status, StreamingToolStatus::Success | StreamingToolStatus::Failed) {
+                        if let Some(ev) = state.trace_event_index.get(trace_id)
+                            .and_then(|&i| state.trace_events.get(i))
+                        {
+                            if let crate::tui::state::TraceKind::ToolCall { ref args, .. } = ev.kind {
+                                if !args.is_empty() {
+                                    if let Some(diff_lines) = block_detail::try_render_edit_diff(
+                                        name, args, &state.theme, 8, // 最多显示 8 行 diff
+                                    ) {
+                                        for dl in diff_lines {
+                                            let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
+                                            spans.extend(dl.spans);
+                                            lines.insert(stream_insert_base + stream_offset, Line::from(spans));
+                                            stream_offset += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
