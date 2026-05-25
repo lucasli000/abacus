@@ -1082,14 +1082,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 }
 
                 // 渲染（每帧一次，在所有状态更新之后）
-                // 性能优化：无变更时跳过整帧渲染
-                let needs_draw = state.rendered_lines_dirty.get()
-                    || !state.streaming_text.is_empty()
-                    || !state.streaming_thinking.is_empty()
-                    || !state.toasts.is_empty()
-                    || state.confirm_dialog.is_some()
-                    || state.picker.is_some()
-                    || state.input_state != InputState::Ready;
+                // 每帧都渲染：输入栏光标闪烁需要持续刷新，且 ratatui 双缓冲 diff
+                // 机制保证无变化区域不会产生终端 I/O，开销极小。
+                // 之前的 skip 优化导致输入删到空时残影 bug。
+                let needs_draw = true;
                 if needs_draw {
                     if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {
                         tracing::error!(?e, "TUI 渲染错误");

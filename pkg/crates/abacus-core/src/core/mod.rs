@@ -1,6 +1,7 @@
 pub mod context;
 pub mod compute;
 pub mod env;
+pub mod policy;
 pub mod fallible;
 pub mod health;
 pub mod task_analyzer;
@@ -479,6 +480,16 @@ pub struct CoreConfig {
     pub tool_result_dedup_ttl_secs: u64,
     /// **Default: 256 KB** — 缓存总权重上限（按 serialized output 字节加权 LRU 逐出）。
     pub tool_result_dedup_capacity_kb: usize,
+
+    /// LLM 行为策略（从 ~/.abacus/policy.toml 加载，运行时可调）
+    ///
+    /// 引用关系：
+    /// - build_system_output: 注入 guard/declaration 到 system prompt
+    /// - execute_loop: 读取 thresholds（premature_stop_chars、confirm_timeout_secs）
+    /// - preflight.rs: 读取 destructive_patterns
+    ///
+    /// 生命周期：进程启动时 PolicyConfig::load()，session 内不变
+    pub policy: Arc<policy::PolicyConfig>,
 }
 
 impl Default for CoreConfig {
@@ -524,6 +535,8 @@ impl Default for CoreConfig {
             adaptive_d_tier_hide: true,
             // cross-session: 默认开——观测层零业务侵入
             event_sink_enabled: true,
+            // 行为策略：从 ~/.abacus/policy.toml 加载
+            policy: Arc::new(policy::PolicyConfig::load()),
         }
     }
 }
@@ -3194,23 +3207,16 @@ impl CoreLoop {
             // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
             // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
             // byte-stable（不含变量），被 prefix cache 覆盖
-            // ~150 tokens，精简版——避免 LLM 简单操作也空转
-            s.push_str(concat!(
-                "\n\n[Entropy Guard]\n",
-                "Creating files/folders or multi-step tasks → think first:\n",
-                "• Read before write. Edit > create. Append > new file.\n",
-                "• Follow existing naming/structure. Check siblings.\n",
-                "• One task = one coherent change. No speculative files.\n",
-                "• Unsure about placement? Ask, don't guess.\n",
-                "Exempt: single-file edits, appending to existing, running commands.\n",
-                "\n[Explicit Declaration]\n",
-                "NEVER go silent. If you encounter ANY of these, you MUST state it explicitly in your response:\n",
-                "• Blocked — tool denied, permission missing, file not found, command failed\n",
-                "• Stuck — tried multiple approaches, none worked, need different strategy\n",
-                "• Need input — ambiguous requirement, multiple valid options, missing context\n",
-                "• Partial — task partially done, remaining steps require user action\n",
-                "Format: start with [Blocked], [Stuck], [Need Input], or [Partial], then explain in 1-2 sentences.",
-            ));
+            // 策略注入（从 policy.toml 加载，运行时可调）
+            let policy = &self.config.policy;
+            if !policy.guard.entropy_guard.is_empty() {
+                s.push_str("\n\n[Entropy Guard]\n");
+                s.push_str(&policy.guard.entropy_guard);
+            }
+            if !policy.guard.explicit_declaration.is_empty() {
+                s.push_str("\n\n[Explicit Declaration]\n");
+                s.push_str(&policy.guard.explicit_declaration);
+            }
             s
         };
         let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());

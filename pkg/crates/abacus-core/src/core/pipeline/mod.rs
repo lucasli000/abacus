@@ -1176,7 +1176,9 @@ impl<'a> TurnPipeline<'a> {
                         let retry_count = ctx.premature_stop_retries;
 
                         // 短文本 + 无声明 + 未用完重试配额 → 注入提醒
-                        if !has_declaration && text.len() < 200 && retry_count < 3 {
+                        let stop_chars = self.core.config.policy.thresholds.premature_stop_chars;
+                        let max_retries = self.core.config.policy.thresholds.premature_stop_max_retries;
+                        if !has_declaration && text.len() < stop_chars && retry_count < max_retries {
                             ctx.premature_stop_retries += 1;
                             tracing::warn!(
                                 retry = retry_count + 1,
@@ -1471,7 +1473,7 @@ impl<'a> TurnPipeline<'a> {
                             // 等待用户决策，带超时保护（15s）防止 TUI 无响应时 pipeline 永久挂起
                             // 超时 → 非破坏性自动允许，破坏性自动拒绝（与 TUI 侧 timeout 行为一致）
                             let approved = match tokio::time::timeout(
-                                std::time::Duration::from_secs(15),
+                                std::time::Duration::from_secs(self.core.config.policy.thresholds.confirm_timeout_secs),
                                 rx_one,
                             ).await {
                                 Ok(Ok(v)) => v,          // 正常收到用户决策
