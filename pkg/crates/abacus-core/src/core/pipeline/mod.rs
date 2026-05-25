@@ -102,6 +102,10 @@ struct TurnContext {
     /// 引用：execute_loop 中检测 "工具全失败 + 短文本输出" 时递增
     /// 上限：3 次（避免无限续写循环）
     premature_stop_retries: u32,
+    /// V39: Tool-in-text fallback retry counter — 防止 LLM 把工具名写进文本而非发起 tool_call
+    /// 引用：execute_loop 中 tool_calls 为空 + 文本含已注册工具名时递增
+    /// 上限：1 次（纠正一次足够，再失败说明模型不支持 tool calling）
+    tool_text_fallback_retries: u32,
     /// Complexity-driven temperature（优先级：req_ctx.temperature > 此值 > config.default_temperature）
     /// 引用：analyze_complexity() → task_temperature() → execute_loop LlmRequest.temperature
     /// 生命周期：setup() 写入 → execute_loop() 消费
@@ -767,6 +771,7 @@ impl<'a> TurnPipeline<'a> {
             inertia_warning: None,
             pending_confirmations: Vec::new(),
             premature_stop_retries: 0,
+            tool_text_fallback_retries: 0,
             complexity_thinking,
             complexity_temperature,
             user_message_preamble, // Phase 4：setup() 阶段已构建（ICL 检索结果）
@@ -905,6 +910,95 @@ impl<'a> TurnPipeline<'a> {
     /// ## 引用关系
     /// - 调用点：execute_loop 中 provider 400 响应后
     /// - 依赖：sanitize_dangling_tool_calls (Case 1-3)
+    /// V39: 尝试从消息 content 中解析 XML 格式的工具调用（DeepSeek 有时输出 <tool_calls> XML）
+    ///
+    /// 支持两种 XML 格式：
+    /// 1. `<tool_call><name>X</name><arguments>{...}</arguments></tool_call>`（原有格式）
+    /// 2. `<tool_calls><tool_call>{"name":"X","arguments":{...}}</tool_call></tool_calls>`（JSON 内嵌格式）
+    ///
+    /// 引用关系：execute_loop 在 structured tool_calls 为空时调用（兜底防御层）
+    /// 返回解析出的 ToolCall 列表；解析失败或无 XML 时返回空 vec。
+    fn try_parse_xml_tool_calls(message: &Message) -> Vec<crate::llm::ToolCall> {
+        let text = match &message.content {
+            Some(MessageContent::Text(t)) => t,
+            _ => return Vec::new(),
+        };
+        // 检测 <tool_call> 或 <function_call> 或 <tool_calls> 格式
+        if !text.contains("<tool_call") && !text.contains("<function_call") {
+            return Vec::new();
+        }
+
+        // ── 路径 1：regex 提取 <name>/<arguments> 子标签格式 ──
+        let mut calls = Vec::new();
+        let re_name = regex::Regex::new(r"<name>\s*([^<]+)\s*</name>").ok();
+        let re_args = regex::Regex::new(r"<arguments>\s*([\s\S]*?)\s*</arguments>").ok();
+        if let (Some(rn), Some(ra)) = (re_name, re_args) {
+            let names: Vec<&str> = rn.captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str())).collect();
+            let args: Vec<&str> = ra.captures_iter(text).filter_map(|c| c.get(1).map(|m| m.as_str())).collect();
+            for (i, name) in names.iter().enumerate() {
+                let arg_str = args.get(i).unwrap_or(&"{}");
+                calls.push(crate::llm::ToolCall {
+                    id: format!("xml_tc_{}", i),
+                    type_: "function".into(),
+                    function: crate::llm::ToolFunction {
+                        name: name.trim().to_string(),
+                        arguments: arg_str.to_string(),
+                    },
+                });
+            }
+        }
+
+        // ── 路径 2：JSON 内嵌格式 <tool_calls><tool_call>{JSON}</tool_call></tool_calls> ──
+        // 仅当路径 1 无结果时尝试（避免重复解析）
+        if calls.is_empty() {
+            if let Some(start) = text.find("<tool_calls>") {
+                if let Some(end) = text.find("</tool_calls>") {
+                    let block = &text[start + "<tool_calls>".len()..end];
+                    for segment in block.split("<tool_call>") {
+                        let segment = segment.trim();
+                        if segment.is_empty() {
+                            continue;
+                        }
+                        let content = segment
+                            .strip_suffix("</tool_call>")
+                            .unwrap_or(segment)
+                            .trim();
+                        if content.is_empty() {
+                            continue;
+                        }
+                        // 解析 JSON: {"name": "xxx", "arguments": {...}}
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                            let name = val
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let args = val
+                                .get("arguments")
+                                .map(|v| serde_json::to_string(v).unwrap_or_default())
+                                .unwrap_or_default();
+                            if !name.is_empty() {
+                                calls.push(crate::llm::ToolCall {
+                                    id: format!("xml_tc_{}", calls.len()),
+                                    type_: "function".into(),
+                                    function: crate::llm::ToolFunction {
+                                        name,
+                                        arguments: args,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !calls.is_empty() {
+            tracing::info!(count = calls.len(), "Parsed XML tool calls from response text");
+        }
+        calls
+    }
+
     fn try_repair_messages(msgs: &mut Vec<Message>, error_body: &str) -> bool {
         let body_lower = error_body.to_lowercase();
         let mut repaired = false;
@@ -1150,6 +1244,15 @@ impl<'a> TurnPipeline<'a> {
             }
             let tool_calls = response.message.tool_calls.clone().unwrap_or_default();
 
+            // 兜底：解析 content 中的 XML 格式工具调用（DeepSeek 某些版本的回退行为）
+            // 当 API 未通过 structured tool_calls 返回、而是在 content 输出 <tool_calls> XML 时触发
+            // 引用关系：依赖 crate::llm::ToolCall / ToolFunction；消费方为下方 tool execution 逻辑
+            let tool_calls = if tool_calls.is_empty() {
+                Self::try_parse_xml_tool_calls(&response.message)
+            } else {
+                tool_calls
+            };
+
             {
                 let s = self.session.read().await;
                 let mut msgs = s.messages.write().await;
@@ -1158,6 +1261,54 @@ impl<'a> TurnPipeline<'a> {
 
             if tool_calls.is_empty() {
                 let text = super::extract_text(&response.message);
+
+                // ── V39: Tool-Call-in-Text Detection ──────────────────────────────
+                // DeepSeek 等模型偶尔会在文本中写出工具名/命令而非发起 structured tool_call。
+                // 检测条件：response text 包含已注册工具名 + tool_calls 为空 + 重试 < 1
+                // 机制：注入纠正提示，让 LLM 用 function calling 而非文本输出来调工具。
+                if ctx.tool_text_fallback_retries < 1 && !text.is_empty() {
+                    let text_lower = text.to_lowercase();
+                    let registered_names: Vec<String> = self.core.registry
+                        .tool_names()
+                        .await;
+                    let found_tool = registered_names.iter().find(|name| {
+                        // 只检测长度 >= 4 的工具名（避免 "ls" 等短串误判）
+                        name.len() >= 4 && text_lower.contains(name.as_str())
+                    });
+                    if let Some(tool_name) = found_tool {
+                        ctx.tool_text_fallback_retries += 1;
+                        tracing::warn!(
+                            tool = %tool_name,
+                            "LLM wrote tool name in text without function call — injecting correction"
+                        );
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart {
+                                name: "auto_repair".into(),
+                            });
+                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
+                                name: "auto_repair".into(),
+                                success: true,
+                                duration_ms: 0,
+                            });
+                        }
+                        {
+                            let s = self.session.read().await;
+                            let mut msgs = s.messages.write().await;
+                            msgs.push(Message {
+                                role: MessageRole::User,
+                                content: Some(MessageContent::Text(
+                                    "You wrote a tool name in your text response instead of calling it. \
+                                     Do NOT write tool names or commands in text. \
+                                     Use the function calling mechanism to invoke tools with JSON parameters. \
+                                     Now call the tool properly.".into()
+                                )),
+                                name: None, tool_calls: None, tool_call_id: None,
+                                reasoning_content: None, prefix: false,
+                            });
+                        }
+                        continue; // 重试本轮
+                    }
+                }
 
                 // V30: 检测 LLM 任务未完成即停止（premature stop）
                 // 条件：本轮有工具失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
@@ -1513,6 +1664,8 @@ impl<'a> TurnPipeline<'a> {
                                         session_id: s.session_id.clone(),
                                         filengine: s.filengine_session.clone(),
                                         turn_number: ctx.turn_number,
+                                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
                                     }
                                 };
                                 let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
@@ -1581,6 +1734,8 @@ impl<'a> TurnPipeline<'a> {
                                         session_id: s.session_id.clone(),
                                         filengine: s.filengine_session.clone(),
                                         turn_number: ctx.turn_number,
+                                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
                                     }
                                 };
                                 // W2 (Task #100): clone params 因下游 dedup.record 还需要原值
@@ -2051,6 +2206,7 @@ impl<'a> TurnPipeline<'a> {
 
         Ok(result)
     }
+
 }
 
 // ─── Complexity → LLM parameter 映射函数 ────────────────────────────────────

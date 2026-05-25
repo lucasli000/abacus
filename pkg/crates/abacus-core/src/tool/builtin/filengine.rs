@@ -91,6 +91,10 @@ pub struct FilengineSession {
     /// 注入：CoreLoop 启动时如启用 undo 则 set；测试 / 未启用 → None
     /// 引用：fs.write/edit/move/mkdir 在 dispatch 时读
     pub undo_logger: Option<Arc<crate::undo::UndoLogger>>,
+    /// Bash 默认超时（秒）— 从 policy.toml 注入，默认 30
+    pub bash_default_timeout: u64,
+    /// Bash 最大超时（秒）— 从 policy.toml 注入，默认 120
+    pub bash_max_timeout: u64,
 }
 
 impl std::fmt::Debug for FilengineSession {
@@ -121,6 +125,8 @@ impl FilengineSession {
             modified: Vec::new(),
             open_context: None,
             undo_logger: None,
+            bash_default_timeout: 30,
+            bash_max_timeout: 120,
         }
     }
 
@@ -1097,7 +1103,9 @@ fn is_command_allowed(command: &str) -> bool {
 
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let command = get_str(&args, "command")?;
-    let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30).min(120);
+    let timeout = args.get("timeout").and_then(|v| v.as_u64())
+        .unwrap_or(session.bash_default_timeout)
+        .min(session.bash_max_timeout);
     let workdir = args.get("workdir").and_then(|v| v.as_str())
         .map(|p| NativeFilengine::resolve(p, session))
         .unwrap_or(Ok(session.cwd.clone()))?;
@@ -1175,6 +1183,9 @@ impl ToolExecutor for FilengineToolExecutor {
         // Phase 2 undo 注入：写工具前 snapshot/record，成功后 commit
         // 仅当 session.undo_logger=Some 时启用；None 走原路径（向后兼容）
         let mut session = ctx.filengine.write().await;
+        // 同步 policy 阈值到 session（ExecutionContext 每轮注入最新值）
+        session.bash_default_timeout = ctx.bash_default_timeout;
+        session.bash_max_timeout = ctx.bash_max_timeout;
         let pending = if let Some(logger) = session.undo_logger.clone() {
             match tool_name {
                 "fs_write" | "fs_edit" => {
@@ -1767,6 +1778,8 @@ mod tests {
             session_id: session_id.into(),
             filengine: Arc::new(RwLock::new(session)),
             turn_number: 7,
+            bash_default_timeout: 30,
+            bash_max_timeout: 120,
         };
         (logger, ctx)
     }
@@ -1903,6 +1916,8 @@ mod tests {
             session_id: "sess-nologger".into(),
             filengine: Arc::new(RwLock::new(session)),
             turn_number: 1,
+            bash_default_timeout: 30,
+            bash_max_timeout: 120,
         };
 
         let target = tmp_path.join("nolog.txt");

@@ -66,6 +66,11 @@ struct DeepSeekRequest {
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ToolDef>>,
+    /// Function calling 模式控制：tools 非空时发送 "auto"，让 API 通过 tool_calls 字段返回调用
+    /// 而非在 content 中输出 XML 格式的 <tool_calls>。
+    /// 引用关系：build_request 根据 tools 是否存在设置此字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
 }
@@ -354,6 +359,14 @@ impl DeepSeekProvider {
         let reasoning_effort = raw_effort.as_deref()
             .map(|s| deepseek_effort_clamp(s).unwrap_or("high").to_string());
 
+        // tools 非空时发送 tool_choice="auto"，确保 API 通过 structured tool_calls 字段返回
+        // 而非在 content 中以 XML <tool_calls> 格式输出（DeepSeek 缺少此字段时的回退行为）
+        let tool_choice = if tools.is_some() {
+            Some(serde_json::json!("auto"))
+        } else {
+            None
+        };
+
         DeepSeekRequest {
             model: req.model.0.clone(),
             messages,
@@ -365,6 +378,7 @@ impl DeepSeekProvider {
             thinking,
             reasoning_effort,
             tools,
+            tool_choice,
             extra: req.extra_body.clone(),
         }
     }

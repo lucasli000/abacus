@@ -82,6 +82,10 @@ pub struct ExecutionContext {
     /// 由 `TurnPipeline` 构建 ExecutionContext 时从 `TurnContext.turn_number` 注入。
     /// 默认 0（noop / 无 turn 上下文场景）。
     pub turn_number: u32,
+    /// Bash 默认超时（秒）— 从 policy.toml 注入
+    pub bash_default_timeout: u64,
+    /// Bash 最大超时（秒）— 从 policy.toml 注入
+    pub bash_max_timeout: u64,
 }
 
 impl ExecutionContext {
@@ -96,6 +100,8 @@ impl ExecutionContext {
                 crate::tool::builtin::filengine::FilengineSession::new()
             )),
             turn_number: 0,
+            bash_default_timeout: 30,
+            bash_max_timeout: 120,
         }
     }
 }
@@ -377,6 +383,11 @@ impl ToolRegistry {
 
     pub fn add_lazy_loader(&mut self, loader: Box<dyn LazyToolLoader>) {
         self.lazy_loaders.push(loader);
+    }
+
+    /// 返回所有已注册工具名列表（用于 tool-in-text 检测）
+    pub async fn tool_names(&self) -> Vec<String> {
+        self.tools.read().await.keys().map(|k| k.0.clone()).collect()
     }
 }
 
