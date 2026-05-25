@@ -3192,24 +3192,17 @@ impl CoreLoop {
             s = format!("{}\n\n---\n\n{}", s, awareness_block);
 
             // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
-            // 内核级约束：LLM 在执行文件操作/任务前必须先结构化思考
-            // byte-stable（不含变量），不影响 KV cache
+            // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
+            // byte-stable（不含变量），被 prefix cache 覆盖
+            // ~120 tokens，精简版——避免 LLM 简单操作也空转 6 步
             s.push_str(concat!(
                 "\n\n[Entropy Guard]\n",
-                "Before any file creation, folder creation, or multi-step task execution:\n",
-                "1. STATE — What exists now? Read before write. Never create what already exists.\n",
-                "2. GOAL — What specific outcome? One sentence, no ambiguity.\n",
-                "3. PLACEMENT — Where does it belong in the project structure? Follow existing conventions.\n",
-                "4. NAMING — Use existing naming patterns. Check siblings for style (case, prefix, suffix).\n",
-                "5. IMPACT — What depends on this? What breaks if this changes?\n",
-                "6. MINIMAL — Smallest change that achieves the goal. No speculative files.\n",
-                "Rules:\n",
-                "- NEVER create a new file if an existing file can be extended.\n",
-                "- NEVER create a folder without checking the existing tree first.\n",
-                "- NEVER output content without a clear target path and purpose.\n",
-                "- Prefer editing over creating. Prefer appending over new files.\n",
-                "- One task = one coherent change. Do not scatter related logic across new files.\n",
-                "- If unsure about placement, ask. Do not guess.",
+                "Creating files/folders or multi-step tasks → think first:\n",
+                "• Read before write. Edit > create. Append > new file.\n",
+                "• Follow existing naming/structure. Check siblings.\n",
+                "• One task = one coherent change. No speculative files.\n",
+                "• Unsure about placement? Ask, don't guess.\n",
+                "Exempt: single-file edits, appending to existing, running commands.",
             ));
             s
         };

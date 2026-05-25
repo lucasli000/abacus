@@ -728,6 +728,16 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.flash_state.mark_new_lines(&added);
                             }
                             state.streaming_text.push_str(&t);
+                            // 增量送入 streaming md 引擎（mdstream committed/pending 分割）
+                            {
+                                let mut smd_ref = state.streaming_md.borrow_mut();
+                                if smd_ref.is_none() {
+                                    *smd_ref = Some(crate::tui::md_stream::StreamingMd::new());
+                                }
+                                if let Some(ref mut smd) = *smd_ref {
+                                    smd.append(&t);
+                                }
+                            }
                             state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::Thinking(t) => {

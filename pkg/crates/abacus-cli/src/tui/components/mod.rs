@@ -1309,7 +1309,18 @@ pub fn render_messages_in_card(
         if !state.streaming_text.is_empty() {
             // 统一缩进：所有内容（文本/代码/表格）使用 bar + "   "（3空格）
             // 代码块继续行额外 1 空格对齐（视觉上与 fence 标记缩进一致）
-            let styled_lines = markdown::render_markdown_bounded(&state.streaming_text, &state.theme, false, content_w);
+            // 使用 mdstream 增量引擎：committed（缓存）+ pending（仅尾部重渲染）
+            let styled_lines: Vec<markdown::StyledLine> = {
+                let mut smd_ref = state.streaming_md.borrow_mut();
+                if let Some(ref mut smd) = *smd_ref {
+                    let committed = smd.committed_styled(&state.theme, false, content_w).to_vec();
+                    let pending = smd.pending_styled(&state.theme, false, content_w);
+                    committed.into_iter().chain(pending).collect()
+                } else {
+                    // fallback：mdstream 未初始化时走原始全量解析
+                    markdown::render_markdown_bounded(&state.streaming_text, &state.theme, false, content_w)
+                }
+            };
             for styled in &styled_lines {
                 let rline = markdown::styled_line_to_ratatui(styled, &bar, &state.theme);
                 // 表格行豁免 word-wrap (box-drawing 字符不可拆)

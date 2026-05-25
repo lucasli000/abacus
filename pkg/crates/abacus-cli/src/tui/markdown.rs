@@ -148,21 +148,22 @@ impl<'a> MdRenderer<'a> {
                     CodeBlockKind::Fenced(lang) => lang.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                // 输出 ▾ code 标记行
+                // 输出 ╭── code 标记行（box drawing 风格）
                 let label = if self.code_lang.is_empty() {
-                    "▾ code".to_string()
+                    "╭── code".to_string()
                 } else {
-                    format!("▾ code · {}", self.code_lang)
+                    format!("╭── code · {}", self.code_lang)
                 };
                 self.current_spans.push(StyledSpan {
                     text: label,
                     style: Style::default().fg(self.theme.gold),
                 });
                 self.current_spans.push(StyledSpan {
-                    text: " ────────────────────".to_string(),
+                    text: " ─────────────────".to_string(),
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
+
             }
             Tag::Heading { level, .. } => {
                 self.flush_line(LineType::Normal);
@@ -214,20 +215,29 @@ impl<'a> MdRenderer<'a> {
         match tag {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                // 输出 ▴ /code 标记行
+                // 输出 ╰── /code 标记行（box drawing 风格）
                 self.current_spans.push(StyledSpan {
-                    text: "▴ /code".to_string(),
+                    text: "╰── /code".to_string(),
                     style: Style::default().fg(self.theme.gold),
                 });
                 self.current_spans.push(StyledSpan {
-                    text: " ────────────────────".to_string(),
+                    text: " ─────────────────".to_string(),
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
             }
             TagEnd::Heading(_) => {
+                let level = self.heading_level;
                 self.in_heading = false;
                 self.flush_line(LineType::Heading);
+                // H1/H2 追加底部分隔线（termimad 风格）
+                if level <= 2 {
+                    self.current_spans.push(StyledSpan {
+                        text: "───────────────────────────".to_string(),
+                        style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+                    });
+                    self.flush_line(LineType::Normal);
+                }
             }
             TagEnd::Emphasis => {
                 self.in_emphasis = false;
@@ -497,7 +507,7 @@ pub fn styled_line_to_ratatui(
             LineType::Code     => "    ",   // 4 空格（diff 行，无行号）
             LineType::CodeFence => "   ",   // 3 空格（▾/▴ 标记行）
             LineType::Heading  => "   ",
-            LineType::Quote    => "   │ ",  // 引用块竖线
+            LineType::Quote    => "   ▎ ",  // 引用块柔和竖线 (U+258E LIGHT VERTICAL BAR)
             LineType::ListItem => "   ",
             LineType::Normal | LineType::Empty => "   ",
             LineType::Table    => "",        // V27: 表格行自带布局，豁免额外缩进（见 enum 定义注释）

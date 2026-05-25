@@ -972,6 +972,11 @@ pub struct AppState {
     pub(crate) streaming_parsed_lines: std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
     /// streaming_text 中已被解析的字节数（增量解析游标）
     pub(crate) streaming_parsed_len: std::cell::Cell<usize>,
+    /// 流式 Markdown 增量渲染状态（mdstream committed/pending 模型）
+    /// 引用关系：run.rs TextDelta → append；components 渲染 → committed_styled/pending_styled
+    /// 生命周期：首次 TextDelta 时 lazy 创建，reset_streaming 时 drop
+    /// 使用 RefCell：渲染函数持有 &self 但 committed_styled 需 &mut self
+    pub streaming_md: std::cell::RefCell<Option<crate::tui::md_stream::StreamingMd>>,
 
     // ─── V0.3 IDE Effects ──────────────────────────────────────────
     /// 代码行 flash 高亮状态（新行出现时高亮 300ms）
@@ -2097,6 +2102,7 @@ impl AppState {
             streaming_tools: Vec::new(),
             streaming_parsed_lines: std::cell::RefCell::new(Vec::new()),
             streaming_parsed_len: std::cell::Cell::new(0),
+            streaming_md: std::cell::RefCell::new(None),
             flash_state: crate::tui::effects::FlashState::new(),
             anim_tick: std::cell::Cell::new(0),
             code_blocks_expanded: false,
@@ -2582,6 +2588,8 @@ impl AppState {
         self.streaming_trace_ids.clear();
         self.streaming_parsed_lines.borrow_mut().clear();
         self.streaming_parsed_len.set(0);
+        // 流式 Markdown 增量引擎：drop 释放 mdstream 状态
+        *self.streaming_md.borrow_mut() = None;
     }
 
     pub fn add_message(&mut self, msg: Message) {
