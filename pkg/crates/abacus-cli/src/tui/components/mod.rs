@@ -82,9 +82,9 @@ fn build_message_lines(
     focused_event_id: Option<u64>,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
-    // 色条风格：┃ + 缩进（替代旧版 gutter 空格）
-    // 缩进层级：header=1空格, content=3空格, code=4空格
-    let bar_indent = 4usize; // ┃ + 3空格（内容行）
+    // 排版布局：参考英文 CLI 工具风格
+    // 色条 "│" + 1 空格 + 内容（简洁留白，不过度缩进）
+    let bar_indent = 2usize; // │ + 1空格
     let content_width = (max_width as usize).saturating_sub(bar_indent + 1);
 
     // V30 复制修复：selection 高亮范围。由于 build_message_lines 过程中 markdown 渲染 +
@@ -105,7 +105,7 @@ fn build_message_lines(
         let hint_style = theme.text_style(TextRole::Hint);
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw(" "),
             Span::styled("输入问题开始对话，/help 查看命令", hint_style),
         ]));
         return lines;
@@ -125,10 +125,15 @@ fn build_message_lines(
             MsgRole::Expert(name) => (name.as_str(), theme.expert, "🧠"),
         };
 
-        // ── 色条（贯穿该消息所有行）──
-        let bar = Span::styled("┃", Style::default().fg(role_color));
+        // ── 消息间空行分隔（首条消息除外）──
+        if visible_idx > 0 {
+            lines.push(Line::raw(""));
+        }
 
-        // ── Header: ┃ icon name · time ──
+        // ── 色条（贯穿该消息所有行）──
+        let bar = Span::styled("│", Style::default().fg(role_color));
+
+        // ── Header: icon name · time ──
         let display_name = match &msg.role {
             MsgRole::User => "You",
             MsgRole::Session => "Abacus",
@@ -168,7 +173,7 @@ fn build_message_lines(
                                 if cb_hidden > 0 {
                                     lines.push(Line::from(vec![
                                         bar.clone(),
-                                        Span::raw("   "),
+                                        Span::raw(" "),
                                         Span::styled(
                                             format!("↳ +{} 行  Ctrl+E 展开全部", cb_hidden),
                                             muted_dim,
@@ -202,8 +207,8 @@ fn build_message_lines(
                             // 色条+缩进 由 styled_line_to_ratatui 已添加在前两个 span
                             // 实际文本从第 2 个 span 之后开始
                             let indent_str = match styled.line_type {
-                                LineType::Code => "    ",
-                                _ => "   ",
+                                LineType::Code => "  ",
+                                _ => " ",
                             };
                             // 合并所有内容 span 的文本
                             let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
@@ -246,7 +251,7 @@ fn build_message_lines(
                     trace_part_positions.push((lines.len(), actual_idx, bi));
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::raw("   "),
+                        Span::raw(" "),
                         Span::styled(
                             format!("{} {} {}", arrow, icon, summary),
                             Style::default().fg(block_color).add_modifier(Modifier::ITALIC),
@@ -314,7 +319,7 @@ fn build_message_lines(
                     };
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::raw("   "),
+                        Span::raw(" "),
                         Span::styled(
                             format!("{} ", arrow),
                             Style::default().fg(theme.accent),
@@ -437,11 +442,11 @@ fn build_message_lines(
         if cursor_visible {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw("   "),
+                Span::raw(" "),
                 Span::styled("▌", Style::default().fg(theme.session)),
             ]));
         } else {
-            lines.push(Line::from(vec![bar, Span::raw("   ")]));
+            lines.push(Line::from(vec![bar, Span::raw(" ")]));
         }
     }
     lines
@@ -987,7 +992,7 @@ pub fn render_messages_in_card(
                 Span::styled(" · now", state.theme.text_style(TextRole::Caption)),
             ]));
             // 占位光标行（thinking/tools/text 通过 saturating_sub(1) 插到此行之前）
-            lines.push(Line::from(vec![bar.clone(), Span::raw("   ")]));
+            lines.push(Line::from(vec![bar.clone(), Span::raw(" ")]));
         }
 
         // V38: Streaming trace + text 顺序渲染（修复同时弹出问题）
@@ -1009,7 +1014,7 @@ pub fn render_messages_in_card(
             // Header
             lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                 bar.clone(),
-                Span::raw("   "),
+                Span::raw(" "),
                 Span::styled(format!("💭 Thinking · {}行", total), state.theme.text_style(TextRole::Caption)),
             ]));
             stream_offset += 1;
@@ -1018,7 +1023,7 @@ pub fn render_messages_in_card(
                 let truncated: String = tline.chars().take(content_w).collect();
                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(if truncated.is_empty() { " ".to_string() } else { truncated }, think_style),
                 ]));
                 stream_offset += 1;
@@ -1026,7 +1031,7 @@ pub fn render_messages_in_card(
             if total > max_show {
                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(format!("↳ +{} 行", total - max_show), state.theme.text_style(TextRole::Caption)),
                 ]));
                 stream_offset += 1;
@@ -1047,7 +1052,7 @@ pub fn render_messages_in_card(
                 // 工具标题行
                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(format!("⚙ {}{} {}", name, dur, icon), Style::default().fg(color)),
                 ]));
                 stream_offset += 1;
@@ -1067,7 +1072,7 @@ pub fn render_messages_in_card(
                                 // diff 解析失败时 fallback 到单行预览
                                 let preview: String = args.chars().take(content_w).collect();
                                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                    bar.clone(), Span::raw("   "),
+                                    bar.clone(), Span::raw(" "),
                                     Span::styled(preview, state.theme.text_style(TextRole::Caption)),
                                 ]));
                                 stream_offset += 1;
@@ -1084,7 +1089,7 @@ pub fn render_messages_in_card(
                                     let content_text: String = fl.chars().take(content_w.saturating_sub(num_width + 1)).collect();
                                     lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                                         bar.clone(),
-                                        Span::raw("   "),
+                                        Span::raw(" "),
                                         Span::styled(line_num, Style::default().fg(state.theme.muted)),
                                         Span::styled(content_text, Style::default().fg(state.theme.text)),
                                     ]));
@@ -1092,7 +1097,7 @@ pub fn render_messages_in_card(
                                 }
                                 if total_lines > 8 {
                                     lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                        bar.clone(), Span::raw("   "),
+                                        bar.clone(), Span::raw(" "),
                                         Span::styled(format!("↳ +{} 行", total_lines - 8), state.theme.text_style(TextRole::Caption)),
                                     ]));
                                     stream_offset += 1;
@@ -1107,14 +1112,14 @@ pub fn render_messages_in_card(
                                 for ol in &out_lines {
                                     let truncated: String = ol.chars().take(content_w).collect();
                                     lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                        bar.clone(), Span::raw("   "),
+                                        bar.clone(), Span::raw(" "),
                                         Span::styled(truncated, Style::default().fg(state.theme.muted)),
                                     ]));
                                     stream_offset += 1;
                                 }
                                 if total_lines > 5 {
                                     lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                        bar.clone(), Span::raw("   "),
+                                        bar.clone(), Span::raw(" "),
                                         Span::styled(format!("↳ +{} 行输出", total_lines - 5), state.theme.text_style(TextRole::Caption)),
                                     ]));
                                     stream_offset += 1;
@@ -1122,7 +1127,7 @@ pub fn render_messages_in_card(
                             } else if !args.is_empty() {
                                 let preview: String = args.chars().take(content_w).collect();
                                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
-                                    bar.clone(), Span::raw("   "),
+                                    bar.clone(), Span::raw(" "),
                                     Span::styled(preview, state.theme.text_style(TextRole::Caption)),
                                 ]));
                                 stream_offset += 1;
@@ -1137,7 +1142,7 @@ pub fn render_messages_in_card(
         if stream_offset > 0 && !state.streaming_text.is_empty() {
             lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                 bar.clone(),
-                Span::raw("   "),
+                Span::raw(" "),
                 Span::styled("╌╌╌╌╌╌╌╌", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
             ]));
             stream_offset += 1;
@@ -1159,7 +1164,7 @@ pub fn render_messages_in_card(
             // Header
             lines.insert(insert_pos, Line::from(vec![
                 bar.clone(),
-                Span::raw("   "),
+                Span::raw(" "),
                 Span::styled("💭 ", Style::default().fg(state.theme.accent)),
                 Span::styled(
                     format!("Thinking · {}行", total),
@@ -1189,7 +1194,7 @@ pub fn render_messages_in_card(
                     };
                     lines.insert(insert_pos + 1 + row_offset, Line::from(vec![
                         bar.clone(),
-                        Span::raw("   "),
+                        Span::raw(" "),
                         Span::styled(chunk.to_string(), think_style),
                     ]));
                     row_offset += 1;
@@ -1201,7 +1206,7 @@ pub fn render_messages_in_card(
                 let hint_pos = lines.len().saturating_sub(1);
                 lines.insert(hint_pos, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(
                         format!("↳ +{} 行（落档后可完整展开）", hidden_lines),
                         state.theme.text_style(TextRole::Caption),
@@ -1215,7 +1220,7 @@ pub fn render_messages_in_card(
                 let sep_pos = lines.len().saturating_sub(1);
                 lines.insert(sep_pos, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(
                         "╌╌╌╌╌╌╌╌",
                         Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
@@ -1245,7 +1250,7 @@ pub fn render_messages_in_card(
                 };
                 let mut spans: Vec<Span<'static>> = vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled("⚙ ".to_string(), Style::default().fg(state.theme.gold)),
                     Span::styled(name.to_string(), Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD)),
                     Span::raw(" · "),
@@ -1268,7 +1273,7 @@ pub fn render_messages_in_card(
             if hidden > 0 {
                 lines.insert(insert_pos, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(format!("(+{} more tools)", hidden), state.theme.text_style(TextRole::Caption)),
                 ]));
             }
@@ -1277,7 +1282,7 @@ pub fn render_messages_in_card(
                 let sep_pos = lines.len().saturating_sub(1);
                 lines.insert(sep_pos, Line::from(vec![
                     bar.clone(),
-                    Span::raw("   "),
+                    Span::raw(" "),
                     Span::styled(
                         "╌╌╌╌╌╌╌╌",
                         Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
@@ -1414,13 +1419,13 @@ pub fn render_streaming_cursor(lines: &mut Vec<Line<'_>>, state: &AppState) {
     if cursor_visible {
         lines.push(Line::from(vec![
             bar,
-            Span::raw("   "),
+            Span::raw(" "),
             Span::styled("▌", Style::default().fg(state.theme.session)),
         ]));
     } else {
         lines.push(Line::from(vec![
             bar,
-            Span::raw("   "),
+            Span::raw(" "),
         ]));
     }
 }

@@ -138,7 +138,7 @@ pub(super) fn render_single_trace_event<'a>(
             //   与 ToolCall (`⚙ name · ✓ · dur`) 风格对称
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw("     "),
+                Span::raw("  "),
                 Span::styled("💭 ", Style::default().fg(theme.accent)),
                 Span::styled(
                     format!("Thinking · {}行", l_count),
@@ -163,7 +163,7 @@ pub(super) fn render_single_trace_event<'a>(
             let dur_str = ev.duration_ms.map(|ms| format_duration_ms_padded(ms)).unwrap_or_default();
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw("     "),
+                Span::raw("  "),
                 Span::styled("⚙ ", Style::default().fg(theme.gold)),
                 Span::styled(name.clone(), Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)),
                 Span::raw(" · "),
@@ -206,7 +206,7 @@ pub(super) fn render_single_trace_event<'a>(
         TraceKind::Generic { content } => {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw("     "),
+                Span::raw("  "),
                 Span::styled(
                     format!("· {} · {}", ev.time, content),
                     theme.text_style(TextRole::Caption),
@@ -216,7 +216,7 @@ pub(super) fn render_single_trace_event<'a>(
         TraceKind::Reply { tokens } => {
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw("     "),
+                Span::raw("  "),
                 Span::styled(
                     format!("↩ reply · {} tok", tokens),
                     theme.text_style(TextRole::Caption),
@@ -262,7 +262,7 @@ pub(super) fn render_merged_tool_run<'a>(
         // 全部过期: 显示占位提示
         lines.push(Line::from(vec![
             bar.clone(),
-            Span::raw("     "),
+            Span::raw("  "),
             Span::styled(
                 format!("[{} events 已过期]", run.len()),
                 theme.text_style(TextRole::Hint),
@@ -310,7 +310,7 @@ pub(super) fn render_merged_tool_run<'a>(
     // Header: ⚙ name ×N · status · dur
     lines.push(Line::from(vec![
         bar.clone(),
-        Span::raw("     "),
+        Span::raw("  "),
         Span::styled("⚙ ", Style::default().fg(theme.gold)),
         Span::styled(
             format!("{} ×{}", tool_name, events.len()),
