@@ -35,6 +35,8 @@ pub fn render_markdown_bounded(text: &str, theme: &Theme, is_user: bool, max_wid
 pub struct StyledLine {
     pub spans: Vec<StyledSpan>,
     pub line_type: LineType,
+    /// 引用块嵌套深度（0 = 非引用块；1+ = 引用深度）
+    pub quote_depth: usize,
     /// 代码块行号（Some(n) = 代码内容行 1-based；None = 其他行或 diff 模式行）
     pub line_num: Option<u32>,
 }
@@ -74,8 +76,10 @@ struct MdRenderer<'a> {
     heading_level: u8,
     in_emphasis: bool,
     in_strong: bool,
-    in_quote: bool,
+    quote_depth: usize,
     list_depth: usize,
+    /// 有序列表计数器栈（每层 list 一个元素；None = 无序列表，Some(n) = 当前序号）
+    list_counters: Vec<Option<u64>>,
     // ── 表格状态 ────────────────────────────────────────────────
     in_table: bool,
     /// 所有已完成的行（索引 0 = 表头行）
@@ -101,8 +105,9 @@ impl<'a> MdRenderer<'a> {
             heading_level: 0,
             in_emphasis: false,
             in_strong: false,
-            in_quote: false,
+            quote_depth: 0,
             list_depth: 0,
+            list_counters: Vec::new(),
             in_table: false,
             table_rows: Vec::new(),
             current_table_row: Vec::new(),
@@ -148,22 +153,31 @@ impl<'a> MdRenderer<'a> {
                     CodeBlockKind::Fenced(lang) => lang.to_string(),
                     CodeBlockKind::Indented => String::new(),
                 };
-                // 输出 ╭── code 标记行（box drawing 风格）
-                let label = if self.code_lang.is_empty() {
-                    "╭── code".to_string()
+                // 输出 ╭── lang 标记行（box drawing 风格，── 填充至 max_width）
+                let lang_label = if self.code_lang.is_empty() {
+                    String::new()
                 } else {
-                    format!("╭── code · {}", self.code_lang)
+                    format!(" {} ", self.code_lang)
                 };
+                // 填充宽度：max_width - "╭──" 前缀(3) - lang_label.len() - 余量(1)
+                let prefix = "╭──";
+                let fill_len = self.max_width.saturating_sub(3 + lang_label.len() + 1);
+                let fill: String = "─".repeat(fill_len);
                 self.current_spans.push(StyledSpan {
-                    text: label,
-                    style: Style::default().fg(self.theme.gold),
+                    text: prefix.to_string(),
+                    style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
+                if !lang_label.is_empty() {
+                    self.current_spans.push(StyledSpan {
+                        text: lang_label,
+                        style: Style::default().fg(self.theme.gold),
+                    });
+                }
                 self.current_spans.push(StyledSpan {
-                    text: " ─────────────────".to_string(),
+                    text: fill,
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
-
             }
             Tag::Heading { level, .. } => {
                 self.flush_line(LineType::Normal);
@@ -177,18 +191,30 @@ impl<'a> MdRenderer<'a> {
                 self.in_strong = true;
             }
             Tag::BlockQuote => {
-                self.in_quote = true;
+                self.quote_depth += 1;
             }
-            Tag::List(_) => {
+            Tag::List(start) => {
                 self.list_depth += 1;
+                self.list_counters.push(start);
             }
             Tag::Item => {
                 self.flush_line(LineType::Normal);
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1));
+                // 有序列表：数字右对齐 + . + 空格；无序列表：• + 空格
+                let marker = if let Some(Some(n)) = self.list_counters.last() {
+                    let s = format!("{:>2}. ", n);
+                    s
+                } else {
+                    "•  ".to_string()
+                };
                 self.current_spans.push(StyledSpan {
-                    text: format!("{}• ", indent),
+                    text: format!("{}{}", indent, marker),
                     style: Style::default().fg(self.theme.accent),
                 });
+                // 有序列表递增计数器
+                if let Some(Some(ref mut n)) = self.list_counters.last_mut() {
+                    *n += 1;
+                }
             }
             // MD1: pulldown-cmark Paragraph Start 不需要主动行为；
             // 段落结束的换行由 TagEnd::Paragraph → flush_line 处理。
@@ -215,13 +241,16 @@ impl<'a> MdRenderer<'a> {
         match tag {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                // 输出 ╰── /code 标记行（box drawing 风格）
+                // 输出 ╰── 标记行（box drawing 风格，── 填充至 max_width）
+                let close_prefix = "╰──";
+                let close_fill_len = self.max_width.saturating_sub(3 + 1);
+                let close_fill: String = "─".repeat(close_fill_len);
                 self.current_spans.push(StyledSpan {
-                    text: "╰── /code".to_string(),
-                    style: Style::default().fg(self.theme.gold),
+                    text: close_prefix.to_string(),
+                    style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.current_spans.push(StyledSpan {
-                    text: " ─────────────────".to_string(),
+                    text: close_fill,
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
@@ -246,10 +275,11 @@ impl<'a> MdRenderer<'a> {
                 self.in_strong = false;
             }
             TagEnd::BlockQuote => {
-                self.in_quote = false;
+                self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             TagEnd::List(_) => {
                 self.list_depth = self.list_depth.saturating_sub(1);
+                self.list_counters.pop();
             }
             TagEnd::Item => {
                 self.flush_line(LineType::ListItem);
@@ -333,7 +363,7 @@ impl<'a> MdRenderer<'a> {
             });
             // 中间行需要 flush
             if i < lines.len() - 1 {
-                self.flush_line(if self.in_quote { LineType::Quote } else { LineType::Normal });
+                self.flush_line(if self.quote_depth > 0 { LineType::Quote } else { LineType::Normal });
             }
         }
     }
@@ -446,7 +476,7 @@ impl<'a> MdRenderer<'a> {
         if self.in_emphasis {
             style = style.add_modifier(Modifier::ITALIC);
         }
-        if self.in_quote {
+        if self.quote_depth > 0 {
             style = style.fg(self.theme.muted).add_modifier(Modifier::ITALIC);
         }
 
@@ -456,11 +486,11 @@ impl<'a> MdRenderer<'a> {
     /// 带行号的 flush（代码块语法高亮行使用）
     fn flush_line_with_num(&mut self, line_type: LineType, line_num: Option<u32>) {
         if self.current_spans.is_empty() && line_type != LineType::Empty {
-            self.output.push(StyledLine { spans: vec![], line_type: LineType::Empty, line_num: None });
+            self.output.push(StyledLine { spans: vec![], line_type: LineType::Empty, quote_depth: 0, line_num: None });
             return;
         }
         let spans = std::mem::take(&mut self.current_spans);
-        self.output.push(StyledLine { spans, line_type, line_num });
+        let qd = self.quote_depth; self.output.push(StyledLine { spans, line_type, quote_depth: qd, line_num });
     }
 
     fn flush_line(&mut self, line_type: LineType) {
@@ -500,19 +530,23 @@ pub fn styled_line_to_ratatui(
     }
 
     let (indent, indent_style): (String, Style) = if let Some(n) = styled.line_num {
-        // 代码行：右对齐行号 + │ 分隔符，使用主题 muted（跟随明/暗主题切换）
-        (format!("{:>3}│ ", n), theme.text_style(TextRole::Caption))
+        // 代码行：│ + 右对齐行号 + 空格（box-drawing 左边框 + 行号）
+        (format!("│{:>3} ", n), theme.text_style(TextRole::Caption))
     } else {
-        let s = match styled.line_type {
-            LineType::Code     => "    ",   // 4 空格（diff 行，无行号）
-            LineType::CodeFence => "   ",   // 3 空格（▾/▴ 标记行）
-            LineType::Heading  => "   ",
-            LineType::Quote    => "   ▎ ",  // 引用块柔和竖线 (U+258E LIGHT VERTICAL BAR)
-            LineType::ListItem => "   ",
-            LineType::Normal | LineType::Empty => "   ",
-            LineType::Table    => "",        // V27: 表格行自带布局，豁免额外缩进（见 enum 定义注释）
+        let s: String = match styled.line_type {
+            LineType::Code     => "│   ".to_string(),   // │ + 3 空格（diff 行，无行号，保持 box-drawing 边框）
+            LineType::CodeFence => "   ".to_string(),   // 3 空格（fence 标记行）
+            LineType::Heading  => "   ".to_string(),
+            LineType::Quote    => {
+                // 多级引用：每级一个 ▎，后跟 1 空格
+                let bars = "▎".repeat(styled.quote_depth.max(1));
+                format!("   {} ", bars)
+            }
+            LineType::ListItem => "   ".to_string(),
+            LineType::Normal | LineType::Empty => "   ".to_string(),
+            LineType::Table    => String::new(),        // V27: 表格行自带布局，豁免额外缩进
         };
-        (s.to_string(), Style::default())
+        (s, Style::default())
     };
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(styled.spans.len() + 2);

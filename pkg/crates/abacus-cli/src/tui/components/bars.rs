@@ -127,16 +127,31 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 /// 引用关系：被 modes/chat.rs 等调用
 /// 生命周期：每帧渲染
 pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    let status_icon = if state.paused { "⏸" } else { "●" };
-    let status_color = if state.paused { state.theme.semantic_fg(SemanticIntent::Warning) } else { state.theme.success };
     let muted_dim = state.theme.text_style(TextRole::Caption);
 
-    // V28: 切到 trace_events SSOT
-    let evt_count = state.trace_events.len();
+    // ── 左侧：mode 标签（mode_color）──
+    let mode_label = match state.mode {
+        crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
+        crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
+        crate::tui::state::AbacusMode::Plan => t("mode.plan"),
+        crate::tui::state::AbacusMode::Team => t("mode.team"),
+    };
+    let mode_color = state.theme.mode;
+    let status_icon = if state.paused { "⏸" } else { "●" };
+    let status_color = if state.paused { state.theme.semantic_fg(SemanticIntent::Warning) } else { state.theme.success };
     let mut left = vec![
         Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
-        Span::styled(format!("t{} · {}ev", state.turn_count, evt_count), muted_dim),
+        Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
     ];
+
+    // ── 中间：processing_phase（活跃时）──
+    if !state.processing_phase.is_empty() {
+        left.push(Span::styled(
+            format!(" · {}",  state.processing_phase),
+            muted_dim,
+        ));
+    }
+
     // LSP 诊断指示器（有错误/警告时显示）
     if state.lsp_diag_errors > 0 {
         left.push(Span::styled(
@@ -151,10 +166,10 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ));
     }
 
-    // K1 焦点反馈：根据焦点 + 输入状态派生 Tab 意图 hint
-    // V28.6 (PR12-3): paused 优先级最高 — 用户最需要知道"怎么退出暂停态"
-    // V32: 三档焦点对应文案（Focus::Input 默认 / Panel / CommandHint）
-    let right_text = if state.paused {
+    // ── 右侧：token 计数（紧凑格式）+ 快捷键 hint ──
+    let real_tokens = state.session_tokens.total_tokens as usize;
+    let tok_str = if real_tokens > 0 { format_ctx(real_tokens) } else { "0".to_string() };
+    let right_hint = if state.paused {
         t("hint.paused")
     } else if matches!(state.input_state, InputState::Completing) {
         t("hint.completing")
@@ -163,28 +178,30 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     } else if state.focus == Focus::CommandHint {
         t("hint.cmd_focus")
     } else {
-        // Focus::Input（默认）
         t("hint.input_default")
     };
-    // paused 时 right hint 用 warning 色高亮 — 与 left status_icon 颜色一致, 视觉绑定
     let right_style = if state.paused {
         state.theme.semantic_style(SemanticIntent::Warning, Strength::Default)
     } else {
         muted_dim
     };
-    let right = Span::styled(right_text, right_style);
 
-    // 走 tui::util::display_width 统一治理（防止 chars 陷阱第 6 现场）
+    let right_spans = vec![
+        Span::styled(format!("{} tok  ", tok_str), muted_dim),
+        Span::styled(right_hint, right_style),
+    ];
+
+    // 走 tui::util::display_width 统一治理
     let available = area.width.saturating_sub(2) as usize;
     let left_len: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
-    let right_len = display_width(right.content.as_ref());
+    let right_len: usize = right_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
     let gap = available.saturating_sub(left_len + right_len);
 
     let mut spans = left;
     if gap > 0 {
         spans.push(Span::raw(" ".repeat(gap)));
     }
-    spans.push(right);
+    spans.extend(right_spans);
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -295,9 +312,18 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     } else {
         visible_lines.len().saturating_sub(1)
     };
-
+    // placeholder：输入为空且 Ready 态时显示 muted italic 提示
+    let show_placeholder = state.input.is_empty() && matches!(state.input_state, InputState::Ready);
     for (i, line) in visible_lines.iter().enumerate() {
-        if i == cursor_visible_line {
+        if show_placeholder && i == 0 {
+            input_lines.push(Line::from(vec![
+                Span::styled("▎", Style::default().fg(cursor_color)),
+                Span::styled(
+                    " Ask anything...",
+                    Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else if i == cursor_visible_line {
             let char_pos = state.cursor_col.min(line.chars().count());
             let line_chars: Vec<char> = line.chars().collect();
             let split_pos = char_pos.min(line_chars.len());
