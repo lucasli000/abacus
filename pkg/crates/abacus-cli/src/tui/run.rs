@@ -1137,32 +1137,44 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::CompressStart => {
+                            // 显式状态切换：压缩是可见操作阶段
+                            state.pre_compress_input_state = Some(state.input_state);
                             state.input_state = InputState::Executing;
-                            state.processing_phase = "🗜️ 正在压缩上下文...".into();
-                            // 在主对话流中插入系统提示，让用户明确感知压缩正在发生
-                            state.add_toast("⏳ 上下文接近容量上限，正在压缩历史消息...", Duration::from_secs(5));
+                            state.processing_phase = crate::tui::i18n::t("compress.phase").to_string();
+                            state.add_toast(crate::tui::i18n::t("compress.toast_start"), Duration::from_secs(3));
                             state.rendered_lines_dirty.set(true);
+                            state.frame_dirty.set(true);
                         }
                         StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
+                            // 显式恢复压缩前状态
+                            if let Some(prev) = state.pre_compress_input_state.take() {
+                                state.input_state = prev;
+                            }
                             if messages_compressed > 0 {
-                                state.add_event(&ts, "context", &format!("压缩 {} 条消息，释放 ~{} tok", messages_compressed, tokens_saved), crate::tui::state::EventLevel::Info);
-                                // 在主对话流中插入系统提示卡片，让用户明确感知压缩边界
+                                state.add_event(
+                                    &ts, "context",
+                                    &format!("{} {} msgs · ~{} tok", crate::tui::i18n::t("compress.event"), messages_compressed, tokens_saved),
+                                    crate::tui::state::EventLevel::Info,
+                                );
                                 let note = format!(
-                                    "--- 上下文压缩 ---\n{} 条历史消息已压缩为摘要（释放 ~{} tokens）\n核心结论和关键决策已保留，后续输出继续。",
-                                    messages_compressed, tokens_saved
+                                    "--- {} ---\n{} messages → summary (~{} tokens freed)",
+                                    crate::tui::i18n::t("compress.note"), messages_compressed, tokens_saved
                                 );
                                 state.push_system_note(&note);
-                                // 联动上下文展示：减去压缩释放的 tokens
                                 state.session_tokens.total_tokens = state.session_tokens.total_tokens
                                     .saturating_sub(tokens_saved as u64);
                                 state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
                                     .saturating_sub(tokens_saved as u64);
-                                // 累计压缩统计
                                 state.session_tokens.compress_count += 1;
                                 state.session_tokens.compress_tokens_saved += tokens_saved as u64;
+                                state.add_toast(
+                                    format!("{} · -{} tok", crate::tui::i18n::t("compress.toast_done"), tokens_saved),
+                                    Duration::from_secs(3),
+                                );
                             }
                             state.processing_phase.clear();
                             state.rendered_lines_dirty.set(true);
+                            state.frame_dirty.set(true);
                         }
                         StreamChunk::ToolHealth(entries) => {
                             // 工具健康快照：写入 state 供 panel 渲染
@@ -1173,8 +1185,6 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         StreamChunk::Complete(stats) => {
                             // V40: 实时更新 token 统计（面板每帧可见最新数据）
-                            // 不重复累加——EngineResponse 路径会用聚合值覆盖
-                            // 这里仅用于 streaming 期间的实时显示
                             state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
                                 .max(stats.prompt_tokens);
                             state.session_tokens.completion_tokens = state.session_tokens.completion_tokens
@@ -1183,6 +1193,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 .max(stats.total_tokens);
                             state.session_tokens.cached_tokens = state.session_tokens.cached_tokens
                                 .max(stats.cached_tokens);
+                            // 实时同步上下文占用（Panel 进度条实时反映）
+                            if let Some(ctx_tok) = stats.context_tokens {
+                                state.session_tokens.total_tokens = ctx_tok;
+                            }
+                            if let Some(ctx_max) = stats.context_max {
+                                state.context_window = ctx_max as usize;
+                            }
                             // ST1：清理流式累积避免双显示
                             state.reset_streaming();
                             // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"
@@ -1234,6 +1251,38 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 }
                             }).collect();
                             state.processing_phase = format!("team/{}", phase);
+                            had_streaming_update = true;
+                        }
+                        // ── 预留事件处理（轻量级 — trace event + toast）──
+                        StreamChunk::ModelEscalation { from_model, to_model, reason } => {
+                            state.add_event(&ts, "model", &format!("{} → {} ({})", from_model, to_model, reason), crate::tui::state::EventLevel::Info);
+                            state.add_toast(format!("模型升级: {} → {}", from_model, to_model), Duration::from_secs(3));
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::SessionFocusUpdate { goal, phase, .. } => {
+                            state.add_event(&ts, "focus", &format!("[{}] {}", phase, goal), crate::tui::state::EventLevel::Info);
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::ToolBlocked { tool_id, kind, message, .. } => {
+                            state.add_event(&ts, "tool", &format!("⚠ {} blocked: {} ({})", tool_id, message, kind), crate::tui::state::EventLevel::Warning);
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::MeetingStatusChange { new_status, .. } => {
+                            state.add_event(&ts, "meeting", &format!("状态: {}", new_status), crate::tui::state::EventLevel::Info);
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::SpecialistThinking { specialist_id, content } => {
+                            state.add_event(&ts, "specialist", &format!("[{}] {}", specialist_id, content.chars().take(60).collect::<String>()), crate::tui::state::EventLevel::Info);
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::SandboxProgress { phase, message } => {
+                            state.processing_phase = format!("sandbox/{}", phase);
+                            state.add_event(&ts, "sandbox", &message, crate::tui::state::EventLevel::Info);
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::InertiaDetected { recommendation, .. } => {
+                            state.add_event(&ts, "inertia", &recommendation, crate::tui::state::EventLevel::Warning);
+                            state.add_toast(format!("⚠ 检测到循环: {}", recommendation), Duration::from_secs(5));
                             had_streaming_update = true;
                         }
                     }

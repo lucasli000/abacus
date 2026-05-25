@@ -2305,16 +2305,40 @@ impl ToolExecutor for ContextToolExecutor {
             }
 
             "context_compress" => {
-                let segments: Vec<String> = params["segments"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let level = CompressLevel::from_str(params["level"].as_str().unwrap_or("brief"));
-                let compressed = self.manager.compress(&segments, level).await?;
-                Ok(serde_json::json!({
-                    "compressed": compressed.len(),
-                    "segments": compressed.iter().map(|(id, _)| id).collect::<Vec<_>>()
-                }))
+                let mode = params["mode"].as_str().unwrap_or("segments");
+                match mode {
+                    // 主动 messages 压缩（LLM 选择时机，配合 context_status 使用）
+                    // 设计：LLM 先输出摘要到对话流 → 再调此工具触发规则式压缩
+                    // 摘要天然在保留区内（最近 8 条不压缩），无需额外 LLM 调用
+                    "messages" => {
+                        let mut msgs = self.context_messages.write().await;
+                        let compressed = self.manager.auto_compress_messages(&mut msgs).await;
+                        let tokens_saved: usize = compressed.iter()
+                            .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                            .sum();
+                        Ok(serde_json::json!({
+                            "mode": "messages",
+                            "compressed_count": compressed.len(),
+                            "tokens_freed": tokens_saved,
+                            "status": if compressed.is_empty() { "no_compression_needed" } else { "success" },
+                            "tip": "Your recent messages (last 8) are preserved. Output key conclusions BEFORE calling this tool to ensure they survive compression."
+                        }))
+                    }
+                    // 原有 segments 压缩路径
+                    _ => {
+                        let segments: Vec<String> = params["segments"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let level = CompressLevel::from_str(params["level"].as_str().unwrap_or("brief"));
+                        let compressed = self.manager.compress(&segments, level).await?;
+                        Ok(serde_json::json!({
+                            "mode": "segments",
+                            "compressed": compressed.len(),
+                            "segments": compressed.iter().map(|(id, _)| id).collect::<Vec<_>>()
+                        }))
+                    }
+                }
             }
 
             // Phase Z1：session.recall——从 cold tier 按 query 召回历史 SessionSnapshot
@@ -2389,6 +2413,61 @@ impl ToolExecutor for ContextToolExecutor {
                     "pinned_turns": pinned,
                     "count": pinned.len(),
                 }))
+            }
+
+            // 查询上下文占用状态（LLM 主动决策 Layer 1 基础）
+            "context_status" => {
+                let detail = params["detail"].as_bool().unwrap_or(false);
+                let w = self.manager.window.read().await;
+                let current = w.current_tokens;
+                let max = w.max_tokens;
+                let pct = w.usage_pct();
+                let trigger = w.compression_trigger_pct;
+                drop(w);
+
+                let status = if pct >= 95.0 {
+                    "critical"
+                } else if pct >= trigger as f64 {
+                    "elevated"
+                } else {
+                    "normal"
+                };
+
+                let suggestion = if pct >= 80.0 && pct < trigger as f64 {
+                    Some("approaching threshold — consider compressing non-essential history")
+                } else if pct >= trigger as f64 {
+                    Some("above threshold — system will auto-compress if not acted upon")
+                } else {
+                    None
+                };
+
+                let messages = self.context_messages.read().await;
+                let msg_count = messages.len();
+                drop(messages);
+
+                let pinned = self.manager.pinned_turns_list().await;
+
+                let mut result = serde_json::json!({
+                    "current_tokens": current,
+                    "max_tokens": max,
+                    "usage_pct": (pct * 10.0).round() / 10.0,
+                    "status": status,
+                    "compression_trigger_pct": trigger,
+                    "messages_count": msg_count,
+                    "pinned_turns": pinned.len(),
+                    "suggestion": suggestion,
+                });
+
+                if detail {
+                    let usage = self.manager.usage.read().await;
+                    result["subsystems"] = serde_json::json!({
+                        "messages": usage.messages,
+                        "result_store": usage.result_store,
+                        "compressed_messages": usage.compressed_messages,
+                    });
+                }
+
+                Ok(result)
             }
 
             other => Err(KernelError::Other(format!("unknown context tool: {other}"))),
@@ -2490,14 +2569,14 @@ pub async fn register_context_tools(
             id: ToolId("context_compress".into()),
             schema: ToolSchema {
                 name: "context_compress".into(),
-                description: "Compress selected segments to save context space.".into(),
+                description: "Compress context to free tokens. mode='messages': compress old conversation history (output your summary FIRST, then call this — recent 8 messages are preserved). mode='segments': compress declared segments by ID.".into(),
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "segments": {"type": "array", "items": {"type": "string"}, "description": "Segment IDs from GeneralizedIndex"},
-                        "level": {"type": "string", "enum": ["detailed", "brief", "minimal"], "description": "Compression level"}
-                    },
-                    "required": ["segments", "level"]
+                        "mode": {"type": "string", "enum": ["messages", "segments"], "description": "What to compress (default: segments)"},
+                        "segments": {"type": "array", "items": {"type": "string"}, "description": "Segment IDs (only for mode=segments)"},
+                        "level": {"type": "string", "enum": ["detailed", "brief", "minimal"], "description": "Compression level (only for mode=segments)"}
+                    }
                 }),
                 returns: None,
                 security: Some(ToolSecurity {
@@ -2642,6 +2721,29 @@ pub async fn register_context_tools(
                 returns: None,
                 security: None,
                 cost: Some(ToolCost { tokens: 8, latency: "1ms".into(), risk: "low".into() }),
+                examples: Vec::new(),
+                applicable_task_kinds: None,
+                idempotent: true,
+            },
+            provider: ToolProvider::BuiltIn,
+            state: ToolState::Loaded,
+            effectiveness: ToolEffectiveness::default(),
+        },
+        // LLM 主动查询上下文占用状态（双层决策 Layer 1 的基础）
+        ToolHandle {
+            id: ToolId("context_status".into()),
+            schema: ToolSchema {
+                name: "context_status".into(),
+                description: "Query current context window usage: tokens used/max, compression history, and pressure status. Use to decide when to proactively compress.".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "detail": {"type": "boolean", "description": "Include per-subsystem breakdown (default false)"}
+                    }
+                }),
+                returns: None,
+                security: None,
+                cost: Some(ToolCost { tokens: 16, latency: "1ms".into(), risk: "low".into() }),
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,

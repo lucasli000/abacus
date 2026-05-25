@@ -685,6 +685,7 @@ impl AbacusServer {
             default_model: ModelId(default_model.to_string()),
             default_temperature: temperature,
             default_max_tokens: max_tokens,
+            context_window_ratio: 0.5,
             system_prompt: system_prompt.to_string(),
             model_spec,
             thinking_intent,
@@ -709,6 +710,8 @@ impl AbacusServer {
             scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
             policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
             thresholds: abacus_core::core::ThresholdConfig::default(),
+            prompt_roles_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/prompt_roles.toml")),
+            subscenes_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/subscenes.toml")),
         };
 
         // ─── Progressive Gate config ────────────────────────────────────

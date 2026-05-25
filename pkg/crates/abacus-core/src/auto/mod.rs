@@ -21,11 +21,17 @@ mod pipeline;
 mod cron;
 mod trigger;
 pub mod store;
+pub mod health;
+pub mod watcher;
+pub mod runner;
 
 pub use pipeline::{Pipeline, Step, StepKind, StepResult, PipelineState};
 pub use cron::CronScheduler;
 pub use trigger::{Trigger, TriggerEvent};
 pub use store::{AutoStore, PipelineRunRecord};
+pub use health::{AutoHealth, JobStatus, JobKind, JobState};
+pub use watcher::{FileWatcher, FileChangeEvent, FileChangeKind};
+pub use runner::{JobRunner, RunnerConfig, RunnerHandle};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -38,7 +44,8 @@ use tokio::sync::RwLock;
 /// Pipeline 定义本身留内存（重启丢失），与 Skill/LSP 一致。
 pub struct AutoEngine {
     pub pipelines: RwLock<Vec<Pipeline>>,
-    pub cron: CronScheduler,
+    /// Cron 调度器（需 mut tick，故用 tokio::sync::Mutex 保护）
+    pub cron: tokio::sync::Mutex<CronScheduler>,
     pub triggers: RwLock<Vec<Trigger>>,
     /// 可选 SQLite 持久化层（None → 不写历史）
     pub store: Option<Arc<AutoStore>>,
@@ -48,7 +55,7 @@ impl AutoEngine {
     pub fn new() -> Self {
         Self {
             pipelines: RwLock::new(Vec::new()),
-            cron: CronScheduler::new(),
+            cron: tokio::sync::Mutex::new(CronScheduler::new()),
             triggers: RwLock::new(Vec::new()),
             store: None,
         }
@@ -61,7 +68,7 @@ impl AutoEngine {
     pub fn with_store(store: Arc<AutoStore>) -> Self {
         Self {
             pipelines: RwLock::new(Vec::new()),
-            cron: CronScheduler::new(),
+            cron: tokio::sync::Mutex::new(CronScheduler::new()),
             triggers: RwLock::new(Vec::new()),
             store: Some(store),
         }
@@ -73,8 +80,8 @@ impl AutoEngine {
     }
 
     /// 注册一个定时任务
-    pub async fn register_cron(&mut self, expr: &str, pipeline_id: &str) {
-        self.cron.add(expr, pipeline_id.to_string());
+    pub async fn register_cron(&self, expr: &str, pipeline_id: &str) {
+        self.cron.lock().await.add(expr, pipeline_id.to_string());
     }
 
     /// 注册一个事件触发器

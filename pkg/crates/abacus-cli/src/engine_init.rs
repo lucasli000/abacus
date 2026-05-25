@@ -115,6 +115,8 @@ pub async fn create_engine(
     // DeepSeek v4-flash thinking 模式支持最高 64K+ output
     let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(64000);
     let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
+    // 可用窗口比例：用户配置占模型最大上下文的比例（0.1-1.0，默认 0.5）
+    let context_window_ratio = cfg_mgr.get_number("core.context_window_ratio").unwrap_or(0.5);
     let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
 
     // Phase 3：统一 thinking 入口。
@@ -184,6 +186,7 @@ pub async fn create_engine(
         default_model: ModelId(resolved_model.to_string()),
         default_temperature: temperature,
         default_max_tokens: max_tokens,
+        context_window_ratio,
         system_prompt: system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string(),
         model_spec,
         thinking_intent,
@@ -210,6 +213,8 @@ pub async fn create_engine(
         scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
         policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
         thresholds: abacus_core::core::ThresholdConfig::default(),
+        prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
+        subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
     };
 
     let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;

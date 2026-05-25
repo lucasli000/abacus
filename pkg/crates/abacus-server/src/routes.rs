@@ -21,6 +21,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/chat", post(chat_handler))
         .route("/api/v1/chat/stream", post(chat_stream_handler))
         .route("/api/v1/chat/continue", post(continue_handler))
+        .route("/api/v1/chat/confirm", post(confirm_tool_handler))
         // Sessions
         .route("/api/v1/sessions", get(list_sessions))
         .route("/api/v1/sessions/{id}", delete(delete_session))
@@ -634,11 +635,24 @@ async fn chat_stream_handler(
                     yield Ok(Event::default().event("tool_end").data(data));
                 }
                 StreamChunk::Complete(stats) => {
-                    let done_data = serde_json::json!({"tokens":stats.total_tokens,"latency_ms":stats.latency_ms,"turn":stats.turn_number}).to_string();
+                    let done_data = serde_json::json!({
+                        "total_tokens": stats.total_tokens,
+                        "prompt_tokens": stats.prompt_tokens,
+                        "completion_tokens": stats.completion_tokens,
+                        "cached_tokens": stats.cached_tokens,
+                        "latency_ms": stats.latency_ms,
+                        "turn": stats.turn_number,
+                    }).to_string();
                     yield Ok(Event::default().event("done").data(done_data));
                 }
                 StreamChunk::Error(e) => {
-                    yield Ok(Event::default().event("error").data(e));
+                    // is_fatal=false: pipeline 继续运行，前端可显示 warning 但不应中止
+                    // 真正的终止通过 stream 关闭信号（channel drop）传达
+                    let data = serde_json::json!({
+                        "message": e,
+                        "is_fatal": false,
+                    }).to_string();
+                    yield Ok(Event::default().event("error").data(data));
                 }
                 StreamChunk::ConfirmRequired(req) => {
                     // V28：MCIP 实时授权请求转 SSE 事件，前端弹窗收集决策
@@ -657,27 +671,56 @@ async fn chat_stream_handler(
                     yield Ok(Event::default().event("tool_args").data(data));
                 }
                 StreamChunk::ToolOutput { name, output_json } => {
-                    // 输出可能很大（文件内容等），截取前 ~2000 字节防止 SSE frame 过大
-                    // P0 修复：UTF-8 安全切片，找到不超过 2000 bytes 的 char boundary
-                    let truncated = if output_json.len() > 2000 {
-                        let mut end = 2000;
-                        while !output_json.is_char_boundary(end) { end -= 1; }
-                        format!("{}...[truncated]", &output_json[..end])
+                    // 检测 mode_switch 工具输出 → 发出专门 SSE 事件
+                    if name == "mode_switch" {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
+                            if val.get("action").and_then(|v| v.as_str()) == Some("switch_mode") {
+                                let mode_data = serde_json::json!({
+                                    "target": val.get("target").and_then(|v| v.as_str()).unwrap_or(""),
+                                    "reason": val.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                                    "display_name": val.get("display_name").and_then(|v| v.as_str()).unwrap_or(""),
+                                }).to_string();
+                                yield Ok(Event::default().event("mode_switch").data(mode_data));
+                            }
+                        }
+                    }
+                    // 对齐 pipeline 发送端（≤4096 才发送），SSE 同样用 4KB 上限
+                    let (truncated, is_truncated) = if output_json.len() > 4096 {
+                        let mut end = 4096;
+                        while end > 0 && !output_json.is_char_boundary(end) { end -= 1; }
+                        if end == 0 { (output_json, false) } // fallback: 不截断
+                        else { (output_json[..end].to_string(), true) }
                     } else {
-                        output_json
+                        (output_json, false)
                     };
-                    let data = serde_json::json!({"name": name, "output": truncated}).to_string();
+                    let data = serde_json::json!({
+                        "name": name,
+                        "output": truncated,
+                        "truncated": is_truncated,
+                    }).to_string();
                     yield Ok(Event::default().event("tool_output").data(data));
                 }
                 // Iteration/Compress 是 CoreLoop 内部生命周期信号，SSE 转为轻量状态事件
                 StreamChunk::IterationStart { iteration } => {
-                    yield Ok(Event::default().event("iteration_start").data(iteration.to_string()));
+                    // 前端应：清空 thinking 累积、重置 text_started 状态
+                    let data = serde_json::json!({
+                        "iteration": iteration,
+                        "action": "clear_thinking",
+                    }).to_string();
+                    yield Ok(Event::default().event("iteration_start").data(data));
                 }
                 StreamChunk::CompressStart => {
-                    yield Ok(Event::default().event("compress_start").data(""));
+                    let data = serde_json::json!({
+                        "message": "上下文接近容量上限，正在压缩历史消息...",
+                    }).to_string();
+                    yield Ok(Event::default().event("compress_start").data(data));
                 }
                 StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
-                    let data = serde_json::json!({"messages_compressed": messages_compressed, "tokens_saved": tokens_saved}).to_string();
+                    let data = serde_json::json!({
+                        "messages_compressed": messages_compressed,
+                        "tokens_saved": tokens_saved,
+                        "message": format!("压缩完成：{} 条消息已摘要（释放 ~{} tokens）", messages_compressed, tokens_saved),
+                    }).to_string();
                     yield Ok(Event::default().event("compress_end").data(data));
                 }
                 StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
@@ -686,10 +729,14 @@ async fn chat_stream_handler(
                 }
                 StreamChunk::TeamProgress { phase, tasks } => {
                     let agents: Vec<serde_json::Value> = tasks.iter().map(|t| {
+                        let progress = match t.status.as_str() {
+                            "done" => 100u8, "running" => 50, "failed" => 100, _ => 0,
+                        };
                         serde_json::json!({
                             "id": t.id,
                             "title": t.title,
                             "status": t.status,
+                            "progress": progress,
                             "output_preview": t.output_preview,
                         })
                     }).collect();
@@ -706,6 +753,35 @@ async fn chat_stream_handler(
                         })
                     }).collect();
                     yield Ok(Event::default().event("tool_health").data(serde_json::json!(data).to_string()));
+                }
+                // ─── 预留事件 SSE 转发 ─────────────────────────────────
+                StreamChunk::ModelEscalation { from_model, to_model, reason } => {
+                    let data = serde_json::json!({"from": from_model, "to": to_model, "reason": reason}).to_string();
+                    yield Ok(Event::default().event("model_escalation").data(data));
+                }
+                StreamChunk::SessionFocusUpdate { goal, phase, next_step } => {
+                    let data = serde_json::json!({"goal": goal, "phase": phase, "next_step": next_step}).to_string();
+                    yield Ok(Event::default().event("session_focus").data(data));
+                }
+                StreamChunk::ToolBlocked { tool_id, kind, message, recoverable } => {
+                    let data = serde_json::json!({"tool_id": tool_id, "kind": kind, "message": message, "recoverable": recoverable}).to_string();
+                    yield Ok(Event::default().event("tool_blocked").data(data));
+                }
+                StreamChunk::MeetingStatusChange { meeting_id, old_status, new_status } => {
+                    let data = serde_json::json!({"meeting_id": meeting_id, "old": old_status, "new": new_status}).to_string();
+                    yield Ok(Event::default().event("meeting_status").data(data));
+                }
+                StreamChunk::SpecialistThinking { specialist_id, content } => {
+                    let data = serde_json::json!({"specialist_id": specialist_id, "content": content}).to_string();
+                    yield Ok(Event::default().event("specialist_thinking").data(data));
+                }
+                StreamChunk::SandboxProgress { phase, message } => {
+                    let data = serde_json::json!({"phase": phase, "message": message}).to_string();
+                    yield Ok(Event::default().event("sandbox_progress").data(data));
+                }
+                StreamChunk::InertiaDetected { signals, recommendation } => {
+                    let data = serde_json::json!({"signals": signals, "recommendation": recommendation}).to_string();
+                    yield Ok(Event::default().event("inertia_detected").data(data));
                 }
             }
         }
@@ -830,4 +906,52 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> String {
     let session_count = state.sessions.list().await.len();
     let team_count = state.team_manager.list().await.len();
     state.metrics.render_prometheus(session_count, team_count)
+}
+
+// ─── MCIP Tool Confirm ──────────────────────────────────────────────────────
+
+/// Web 前端工具授权确认 API
+///
+/// ## 引用关系
+/// - 生产者：前端收到 SSE `confirm_required` 事件后，用户做出决策，POST 到此端点
+/// - 消费者：pipeline 的 mcip_confirm_channels[nonce] oneshot receiver
+///
+/// ## 生命周期
+/// - pipeline 发出 ConfirmRequired + 创建 oneshot channel
+/// - 前端弹窗 → 用户决策 → POST /api/v1/chat/confirm
+/// - 此 handler 通过 nonce 找到 sender，发送 allow/deny
+/// - pipeline 收到决策继续执行
+#[derive(Debug, Deserialize)]
+pub struct ConfirmToolRequest {
+    pub session_id: String,
+    pub nonce: String,
+    pub allow: bool,
+}
+
+async fn confirm_tool_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ConfirmToolRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let session = state.sessions.get(&req.session_id).await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+            error: "session not found".into(),
+        })))?;
+
+    let s = session.read().await;
+    let sender = {
+        let mut channels = s.mcip_confirm_channels.lock().unwrap_or_else(|p| p.into_inner());
+        channels.remove(&req.nonce)
+    };
+
+    match sender {
+        Some(tx) => {
+            let _ = tx.send(req.allow);
+            Ok(Json(serde_json::json!({"status": "ok", "nonce": req.nonce, "allow": req.allow})))
+        }
+        None => {
+            Err((StatusCode::GONE, Json(ErrorResponse {
+                error: format!("confirm nonce '{}' expired or already responded", req.nonce),
+            })))
+        }
+    }
 }

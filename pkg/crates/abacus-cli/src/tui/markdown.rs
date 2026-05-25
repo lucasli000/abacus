@@ -292,8 +292,9 @@ impl<'a> MdRenderer<'a> {
                     }
                     2 => {
                         // H2 文字后追加内联填充线 " ──────" 至 max_width 的 60%
+                        // 使用 display_width（CJK 全角=2列），否则中文标题会导致填充过长溢出
                         let text_w: usize = self.current_spans.iter()
-                            .map(|s| s.text.chars().count())
+                            .map(|s| crate::tui::util::display_width(s.text.as_str()))
                             .sum();
                         let target = (self.max_width * 60 / 100).saturating_sub(text_w + 1);
                         if target > 2 {
@@ -328,9 +329,13 @@ impl<'a> MdRenderer<'a> {
             }
             TagEnd::Paragraph => {
                 self.flush_line(LineType::Normal);
-                // 段落间距：唯一靠空行分隔的场景（1行，dedup 防双行）
-                // 列表项内的段落不触发此逻辑（list items 用 TagEnd::Item）
-                self.push_empty_line();
+                // 段落间距：仅在 list 外添加空行
+                // 在 loose list 内（list_depth > 0），Paragraph 事件会在每个 list item 内触发，
+                // 若此处 push_empty_line，TagEnd::Item 的空 flush 会再加一个空行 → 双行 bug
+                // 紧凑列表视觉已足够，间距依靠 • 符号区分
+                if self.list_depth == 0 {
+                    self.push_empty_line();
+                }
             }
             // ── 表格结束事件 ────────────────────────────────────────────
             TagEnd::TableCell => {

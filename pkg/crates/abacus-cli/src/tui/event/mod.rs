@@ -251,8 +251,11 @@ fn auto_route_focus(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
     if mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::ALT) {
         return;
     }
-    // 补全弹窗独占
-    if state.input_state == InputState::Completing {
+    // 弹窗独占焦点：picker / confirm / completion 打开时不做焦点切换
+    if state.input_state == InputState::Completing
+        || state.picker.is_some()
+        || state.confirm_dialog.is_some()
+    {
         return;
     }
 

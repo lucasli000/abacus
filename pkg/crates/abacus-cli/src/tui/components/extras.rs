@@ -197,15 +197,22 @@ pub fn render_global_background(f: &mut ratatui::Frame, state: &AppState) {
     }
 }
 
+
 // ════════════════════════════════════════════════════════════════
-/// 命令行提示面板（输入框右侧，看板打开时显示，圆角边框，支持滚动）
+/// V40: 仪表盘 — 双 tab（健康 | 自动化）
+///
+/// 替代旧的命令提示框。展示实时健康数据和自动化状态。
+/// 引用关系：被 modes/common.rs 布局调用（原 render_shortcuts_hints 入口保留兼容）
+/// 生命周期：每帧渲染
 pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use crate::tui::state::DashboardTab;
+    use crate::tui::state::Focus;
+
     if area.width < 14 || area.height < 4 {
         return;
     }
 
-    // V26: 焦点反馈对称化——上边框 primary, 其他三边 border (与 panel 统一)
-    let is_focused = state.focus == crate::tui::state::Focus::CommandHint;
+    let is_focused = state.focus == Focus::CommandHint;
     let block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
@@ -214,7 +221,7 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // V26.1: 同 panel — 缩小 area 避免覆盖角字符 ╭╮
+    // 焦点上边框
     if is_focused && area.width >= 3 {
         let mut top_style = Style::default().fg(state.theme.primary);
         if state.focus_pulsing() {
@@ -226,8 +233,6 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
             width: area.width.saturating_sub(2),
             height: 1,
         };
-        // V28.6 (PR12-1 续): 与 panel 焦点反馈对称, 上边框粗线 ━ 与看板内 ┃ 色条同属
-        //   box drawings heavy 家族, 字符粗细 + primary 色一致, 视觉锚点统一
         let top_overlay = Block::default()
             .borders(Borders::TOP)
             .border_type(BorderType::Thick)
@@ -235,146 +240,219 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
         f.render_widget(top_overlay, top_segment);
     }
 
-    let all_commands = &state.commands;
-
-    let cmd_style = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
-    let desc_style = Style::default().fg(state.theme.muted);
-    let sep_style = Style::default().fg(state.theme.border);
-    // V13: 选中行用 accent 反色 + BOLD（仅焦点时高亮）
-    let selected_cmd_style = Style::default()
-        .fg(state.theme.bg)
-        .bg(state.theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let selected_desc_style = Style::default()
-        .fg(state.theme.bg)
-        .bg(state.theme.accent);
-
-    // 计算可见行数（内框高度 - 标题行 - 底部状态行 = 内容行数）
-    let content_rows = inner.height.saturating_sub(2) as usize;
-    if content_rows == 0 {
-        return;
+    // Tab header
+    let mut header_spans: Vec<Span> = Vec::new();
+    let tabs: &[(DashboardTab, &str)] = &[
+        (DashboardTab::Health, "健康"),
+        (DashboardTab::Auto, "自动化"),
+    ];
+    for (i, (tab, label)) in tabs.iter().enumerate() {
+        if i > 0 {
+            header_spans.push(Span::styled("│", Style::default().fg(state.theme.border)));
+        }
+        if state.dashboard_tab == *tab {
+            header_spans.push(Span::styled(
+                format!("▸{}", label),
+                Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            header_spans.push(Span::styled(
+                format!(" {}", label),
+                Style::default().fg(state.theme.muted),
+            ));
+        }
     }
+    let header_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    f.render_widget(Paragraph::new(Line::from(header_spans)), header_area);
 
-    // 自适应布局：双列（宽≥22）/ 单列（窄屏）
-    let is_wide = inner.width >= 22;
-    let cols_per_row = if is_wide { 2 } else { 1 };
-    let total_rows = (all_commands.len() + cols_per_row - 1) / cols_per_row;
-    let max_scroll = total_rows.saturating_sub(content_rows);
-    let scroll = state.cmd_scroll.min(max_scroll);
+    // Content
+    let content = Rect::new(inner.x, inner.y + 1, inner.width, inner.height.saturating_sub(1));
+    match state.dashboard_tab {
+        DashboardTab::Health => render_dashboard_health(f, state, content),
+        DashboardTab::Auto => render_dashboard_auto(f, state, content),
+    }
+}
+
+/// 健康仪表盘：Context 进度条 + 费用/KV/轮次 + 模型
+fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use crate::tui::components::bars::format_ctx;
 
     let mut lines: Vec<Line> = Vec::new();
+    let muted = Style::default().fg(state.theme.muted);
 
-    // V13: 标题加焦点提示
-    let title = if is_focused {
-        t("cmd.title_focused")
-    } else {
-        t("cmd.title_unfocused")
+    // Context 进度条（▓░ 半高）
+    let total = state.session_tokens.total_tokens as usize;
+    let max_ctx = state.context_window;
+    let pct = if max_ctx > 0 { (total * 100 / max_ctx).min(100) } else { 0 };
+    let bar_color = match pct {
+        0..=49 => state.theme.success,
+        50..=79 => state.theme.gold,
+        _ => state.theme.error,
     };
+    let pct_mod = if pct >= 80 { Modifier::BOLD } else { Modifier::empty() };
+
+    let bar_w: usize = 16.min(area.width.saturating_sub(8) as usize);
+    let filled = (pct * bar_w / 100).min(bar_w);
+    let empty = bar_w - filled;
     lines.push(Line::from(vec![
-        Span::styled(title.to_string(), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled("▓".repeat(filled), Style::default().fg(bar_color)),
+        Span::styled("░".repeat(empty), muted),
+        Span::styled(format!(" {}%", pct), Style::default().fg(bar_color).add_modifier(pct_mod)),
     ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(format!("{} / {}", format_ctx(total), format_ctx(max_ctx)), muted),
+    ]));
+    lines.push(Line::raw(""));
 
-    let sel = state.cmd_selected.min(all_commands.len().saturating_sub(1));
-
-    // V28.7: ── 双列对齐计算（修复上下行 │ 分界不齐）──
-    // 引用关系：
-    //   - 输入：inner.width（外层 block.inner 已减边框）、is_wide（是否双列）
-    //   - 输出：left_col_w 固定左列总显示宽度
-    //   - 分界 "  │  " 显示宽度恒为 5（│ 是单列字符）
-    // 设计：左列 cmd_part(▶ /xxx) + " " + desc 按 display_width 截断+补白到 left_col_w，
-    //   保证每行进入分界 │ 之前的视觉宽度恒等→分界自然对齐
-    use crate::tui::util::{display_width, truncate_to_width};
-    const SEP_DISPLAY_WIDTH: usize = 5; // "  │  "
-    let inner_w = inner.width as usize;
-    let left_col_w: usize = if is_wide {
-        // 双列：减分界宽度后均分，左列略宽 1 列吸收奇数余数
-        let remain = inner_w.saturating_sub(SEP_DISPLAY_WIDTH);
-        remain.saturating_sub(remain / 2).max(8)
-    } else {
-        inner_w
+    // 指标列表
+    let cost = state.session_tokens.cost_cny;
+    let prompt = state.session_tokens.prompt_tokens;
+    let cached = state.session_tokens.cached_tokens;
+    let completion = state.session_tokens.completion_tokens;
+    let kv_pct = if prompt > 0 { (cached * 100 / prompt).min(100) } else { 0 };
+    let kv_color = match kv_pct {
+        70..=100 => state.theme.success,
+        30..=69 => state.theme.gold,
+        _ => state.theme.muted,
     };
 
-    // 把 (cmd, desc, is_sel) 渲染为 [cmd Span, desc Span, padding Span]，三段累计 display_width == col_w
-    // padding 用 Span::raw 不染色——避免选中行的 bg 染到尾部空白产生视觉拖尾
-    let render_cell = |cmd: &str, desc: &str, marker: &str, is_sel: bool, col_w: usize| -> Vec<Span<'static>> {
-        let cmd_part = format!("{} {}", marker, cmd);
-        let cmd_w = display_width(&cmd_part);
-        // desc 可用宽度 = col_w - cmd_w - 1（cmd 与 desc 之间的空格）
-        let desc_max = col_w.saturating_sub(cmd_w + 1);
-        let desc_text = if display_width(desc) > desc_max {
-            // 截断 + 省略号（… 占 1 列）
-            let cut = desc_max.saturating_sub(1).max(1);
-            let mut t = truncate_to_width(desc, cut);
-            t.push('…');
-            t
-        } else {
-            desc.to_string()
-        };
-        let used_w = cmd_w + 1 + display_width(&desc_text);
-        let pad_w = col_w.saturating_sub(used_w);
-        let (cs, ds) = if is_sel { (selected_cmd_style, selected_desc_style) } else { (cmd_style, desc_style) };
-        let mut out = vec![
-            Span::styled(cmd_part, cs),
-            Span::styled(format!(" {}", desc_text), ds),
-        ];
-        if pad_w > 0 {
-            out.push(Span::raw(" ".repeat(pad_w)));
-        }
-        out
-    };
-
-    // V32 · 填充 cmd_row_map：每个内容行的屏幕 y 与起始 cmd_idx 关系，给鼠标点击反查用
-    // 渲染前清空旧映射避免悬挂；inner.y 已是 block 内框起点，加偏移得到屏幕 y
-    {
-        let mut m = state.cmd_row_map.borrow_mut();
-        m.clear();
+    if cost > 0.001 {
+        lines.push(Line::from(vec![
+            Span::styled("  费用  ", muted),
+            Span::styled(crate::tui::cost::format_cny(cost), Style::default().fg(state.theme.gold)),
+        ]));
     }
-    // 标题行已 push，所以内容行从 inner.y + 1 开始
-    let content_y_base = inner.y + 1;
-
-    // 内容行（自适应双列/单列）
-    for row_idx in 0..content_rows {
-        let cmd_idx = (scroll + row_idx) * cols_per_row;
-        if cmd_idx >= all_commands.len() {
-            break;
-        }
-        // 行 row_idx 的屏幕 y
-        let screen_y = content_y_base.saturating_add(row_idx as u16);
-        state.cmd_row_map.borrow_mut().push((screen_y, cmd_idx));
-
-        let (cmd1, desc1) = &all_commands[cmd_idx];
-        let is_sel1 = is_focused && cmd_idx == sel;
-        let marker1 = if is_sel1 { "▶" } else { " " };
-        let mut spans: Vec<Span<'static>> = render_cell(cmd1, desc1, marker1, is_sel1, left_col_w);
-
-        if is_wide && cmd_idx + 1 < all_commands.len() {
-            let (cmd2, desc2) = &all_commands[cmd_idx + 1];
-            let is_sel2 = is_focused && cmd_idx + 1 == sel;
-            let marker2 = if is_sel2 { "▶" } else { " " };
-            spans.push(Span::styled("  │  ", sep_style));
-            // 右列宽度：剩余可用 = inner_w - left_col_w - sep_width
-            let right_col_w = inner_w.saturating_sub(left_col_w + SEP_DISPLAY_WIDTH);
-            spans.extend(render_cell(cmd2, desc2, marker2, is_sel2, right_col_w));
-        } else if is_wide {
-            // 双列模式但右列无内容（命令总数为奇数最后一行）：补满左列即可，
-            // 不画分界——避免 "│" 后悬空看着突兀。render_cell 已 padding 到 left_col_w。
-        }
-
-        lines.push(Line::from(spans));
+    if prompt > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  缓存  ", muted),
+            Span::styled(format!("{}%", kv_pct), Style::default().fg(kv_color)),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("  轮次  ", muted),
+        Span::styled(format!("{}", state.turn_count), Style::default().fg(state.theme.text)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  输入  ", muted),
+        Span::styled(format_ctx(prompt as usize), Style::default().fg(state.theme.text)),
+        Span::styled("  输出  ", muted),
+        Span::styled(format_ctx(completion as usize), Style::default().fg(state.theme.text)),
+    ]));
+    let comp = state.session_tokens.compress_count;
+    if comp > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  压缩  ", muted),
+            Span::styled(format!("{}×", comp), Style::default().fg(state.theme.text)),
+            Span::styled("  释放  ", muted),
+            Span::styled(format_ctx(state.session_tokens.compress_tokens_saved as usize), Style::default().fg(state.theme.success)),
+        ]));
     }
 
-    // 底部状态行（V13: 含选中位置）
-    let visible_count = content_rows * cols_per_row;
-    let status_text = if is_focused {
-        format!(" {} / {} 选中 · Enter 填充输入 ", sel + 1, all_commands.len())
-    } else if all_commands.len() > visible_count {
-        format!(" ↑↓滚动 · {}/{} ", scroll + 1, max_scroll + 1)
-    } else {
-        format!(" 共 {} 条 ｜ 全部可见 ", all_commands.len())
-    };
+    lines.push(Line::raw(""));
+    let model_short = state.model_name.split('-').next_back().unwrap_or(&state.model_name);
     lines.push(Line::from(vec![
-        Span::styled(status_text, state.theme.text_style(TextRole::Caption)),
+        Span::raw("  "),
+        Span::styled(model_short, Style::default().fg(state.theme.accent)),
+        Span::styled(" · ", muted),
+        Span::styled(&state.thinking_depth, Style::default().fg(state.theme.text)),
     ]));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    let visible = area.height as usize;
+    if lines.len() > visible { lines.truncate(visible); }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// 自动化仪表盘：显示 JobRunner 推送的健康数据
+///
+/// 引用关系：读取 state.auto_health（由 run.rs 从 JobRunner health_rx 更新）
+fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use abacus_core::auto::{JobState, JobKind};
+
+    let muted = Style::default().fg(state.theme.muted);
+    let health = &state.auto_health;
+    let mut lines: Vec<Line> = Vec::new();
+
+    if !health.runner_active || health.jobs.is_empty() {
+        // 未启用状态
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ⚡ ", muted),
+            Span::styled("未启用", muted),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  配置 ~/.abacus/auto.yaml", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+        ]));
+    } else {
+        // 概览行
+        let total = health.total_count();
+        let active = health.active_count();
+        let failed = health.failed_count();
+        lines.push(Line::from(vec![
+            Span::styled("  任务  ", muted),
+            Span::styled(format!("{}", total), Style::default().fg(state.theme.text)),
+            Span::styled("  运行  ", muted),
+            Span::styled(format!("{}", active), Style::default().fg(state.theme.success)),
+            if failed > 0 {
+                Span::styled(format!("  失败 {}", failed), Style::default().fg(state.theme.error))
+            } else {
+                Span::raw("")
+            },
+        ]));
+        lines.push(Line::raw(""));
+
+        // 任务列表（最多显示 area.height - 3 条）
+        let max_jobs = area.height.saturating_sub(3) as usize;
+        for job in health.jobs.iter().take(max_jobs) {
+            let kind_icon = match job.kind {
+                JobKind::Cron => "⏰",
+                JobKind::Watch => "👁",
+                JobKind::Event => "⚡",
+            };
+            let state_style = match job.state {
+                JobState::Idle => Style::default().fg(state.theme.muted),
+                JobState::Running => Style::default().fg(state.theme.success),
+                JobState::Failed => Style::default().fg(state.theme.error),
+                JobState::Paused => Style::default().fg(state.theme.gold),
+            };
+            let state_char = match job.state {
+                JobState::Idle => "·",
+                JobState::Running => "▸",
+                JobState::Failed => "✗",
+                JobState::Paused => "⏸",
+            };
+
+            // 截断 label 到可用宽度
+            let label_max = area.width.saturating_sub(8) as usize;
+            let label: String = job.label.chars().take(label_max).collect();
+
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(kind_icon),
+                Span::styled(format!(" {} ", state_char), state_style),
+                Span::styled(label, Style::default().fg(state.theme.text)),
+            ]));
+        }
+
+        // 运行时长
+        if health.uptime.as_secs() > 0 {
+            lines.push(Line::raw(""));
+            let mins = health.uptime.as_secs() / 60;
+            let uptime_str = if mins >= 60 {
+                format!("{}h{}m", mins / 60, mins % 60)
+            } else {
+                format!("{}m", mins)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  运行  ", muted),
+                Span::styled(uptime_str, Style::default().fg(state.theme.text)),
+            ]));
+        }
+    }
+
+    let visible = area.height as usize;
+    if lines.len() > visible { lines.truncate(visible); }
+    f.render_widget(Paragraph::new(lines), area);
 }

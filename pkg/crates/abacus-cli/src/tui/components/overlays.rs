@@ -67,32 +67,25 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
         None => return,
     };
 
-    // 动态高度：标题(1) + 操作(1) + 详情(N) + 空行(1) + 倒计时(1) + 按钮(1) + 边框(2)
-    // B7：未展开时折叠到 3 行，展开时最多 8 行；总数超出则加一行 "+N more" 提示
+    // V40: 统一弹窗布局规范（与 picker_popup 一致）
+    //   宽度：输入框宽度 × 6/8
+    //   高度：内容自适应，上限 = 消息框高度 1/3
+    //   位置：靠左对齐 input_area.x，向上弹出
     let max_visible = if dialog.details_expanded { 8 } else { 3 };
     let visible_count = dialog.details.len().min(max_visible);
     let has_more = dialog.details.len() > max_visible;
     let detail_lines = visible_count + if has_more { 1 } else { 0 };
-    let mut popup_h = (6 + detail_lines) as u16;
-    // K3c：popup 宽度基于整个 frame 而非 input_area，避免窄终端下越界
+    let content_h = (6 + detail_lines) as u16;
     let frame_size = f.area();
-    let popup_w: u16 = std::cmp::max(40, std::cmp::min(64, frame_size.width.saturating_sub(4)));
-
-    // K3a 位置自适应：优先上方 → 不足走下方 → 再不足居中并 cap 高度
-    let above_space = input_area.y;
-    let below_space = frame_size.height
-        .saturating_sub(input_area.y.saturating_add(input_area.height));
-    let popup_y = if above_space > popup_h {
-        input_area.y - popup_h - 1
-    } else if below_space > popup_h {
-        input_area.y + input_area.height + 1
-    } else {
-        popup_h = std::cmp::min(popup_h, (frame_size.height * 3) / 4);
-        frame_size.height.saturating_sub(popup_h) / 2
-    };
-    // V23b：与 picker_popup 一致——左对齐到 input_area.x
-    //   用户偏好：confirm/picker 两个弹窗都靠左跟消息卡片左边界对齐，视觉一致
-    let popup_x = input_area.x.min(frame_size.width.saturating_sub(popup_w));
+    // 宽度：输入框 6/8
+    let popup_w: u16 = (input_area.width * 6 / 8).max(40).min(frame_size.width);
+    // 高度：上限 = 消息区（≈ input_area.y）的 1/3
+    let msg_area_h = input_area.y;
+    let max_h = (msg_area_h / 3).max(8);
+    let popup_h = content_h.min(max_h).min(frame_size.height);
+    // 位置：靠左，向上弹出
+    let popup_y = input_area.y.saturating_sub(popup_h);
+    let popup_x = input_area.x;
     let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
     // K3b 穿透根治：Clear 后用 elevated 填底，杠杀背景残影
@@ -478,8 +471,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(state.theme.primary).add_modifier(Modifier::BOLD))
-        .style(Style::default().bg(state.theme.elevated));
+        // V40: 与 toast 色彩一致 — accent 边框 + surface 背景，简洁统一
+        .border_style(Style::default().fg(state.theme.accent))
+        .bg(state.theme.surface);
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
@@ -487,51 +481,47 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     //   未来若 model 多到需滚动, 可加 scroll_start 计算
     let mut lines: Vec<Line> = Vec::new();
 
-    // 渲染模型项的闭包(单行)
+    // V40: 渲染项闭包 — 紧凑排版，固定 3 字符前缀（marker），无冗余 padding
+    // 格式: " ▶● label" 或 "    label"（3 字符对齐前缀 + 1 空格）
     let render_item = |idx: usize, lines: &mut Vec<Line>| {
         let label = &p.labels[idx];
         let id = &p.items[idx];
         let is_sel = idx == p.selected;
         let is_cur = p.current == Some(idx);
-        let marker = if is_sel && is_cur { "▶●" }
-            else if is_sel { "▶ " }
+        // 固定 3 字符宽前缀：确保所有行文本起始位置对齐
+        let marker = if is_sel && is_cur { "▶●" }  // 2 宽（全角类）
+            else if is_sel { " ▶" }
             else if is_cur { " ●" }
             else { "  " };
         let row_style = if is_sel {
-            state.theme.semantic_style(SemanticIntent::Success, Strength::Strong)
+            Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
         } else if is_cur {
             Style::default().fg(state.theme.primary)
         } else {
             Style::default().fg(state.theme.text)
         };
         let mut spans: Vec<Span> = Vec::new();
-        // V29.8: 分组模式下加 2 空格缩进, 让分组层级更明显
-        let indent = if p.groups.is_some() { "  " } else { "" };
-        spans.push(Span::styled(format!("{} {} ", indent, marker), row_style));
-        spans.push(Span::styled(crate::tui::util::pad_to_width(label, widest), row_style));
+        spans.push(Span::styled(format!(" {} ", marker), row_style));
+        // 直接输出 label（不做 pad_to_width，避免多余空格浪费弹窗宽度）
+        spans.push(Span::styled(label.clone(), row_style));
 
         if matches!(p.kind, PickerKind::Theme) {
             let t = crate::tui::theme::from_name(id);
             spans.push(Span::raw(" "));
-            spans.push(Span::styled("█", Style::default().fg(t.primary)));
-            spans.push(Span::styled("█", Style::default().fg(t.accent)));
-            spans.push(Span::styled("█", Style::default().fg(t.success)));
-            spans.push(Span::styled("█", Style::default().fg(t.error)));
-            spans.push(Span::styled("█", Style::default().fg(t.gold)));
-            spans.push(Span::styled("█", Style::default().fg(t.muted)));
-            spans.push(Span::styled("▓", Style::default().fg(t.text).bg(t.bg)));
+            spans.push(Span::styled("██", Style::default().fg(t.primary)));
+            spans.push(Span::styled("██", Style::default().fg(t.accent)));
+            spans.push(Span::styled("██", Style::default().fg(t.success)));
         }
         lines.push(Line::from(spans));
     };
 
-    // V29.8: 分组渲染分支
+    // V40: 分组渲染 — 紧凑组标题 + 子项
     if let Some(ref groups) = p.groups {
         for (provider, range) in groups {
-            // 组标题: 灰色加粗, 不可选
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" ▾ {}", provider),
-                    Style::default().fg(state.theme.muted).add_modifier(Modifier::BOLD),
+                    format!(" ─ {}", provider),
+                    Style::default().fg(state.theme.muted),
                 ),
             ]));
             for idx in range.clone() {

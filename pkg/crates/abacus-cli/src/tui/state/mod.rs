@@ -326,6 +326,15 @@ pub enum PanelTab {
     Custom(usize), // index into AppState.custom_tabs
 }
 
+/// V40: 仪表盘 Tab（右下区域）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DashboardTab {
+    /// 健康仪表盘（默认）：Context% + KV + 费用 + 轮次
+    Health,
+    /// 自动化状态：Cron/Watch 任务 + 待审阅
+    Auto,
+}
+
 /// 面板滚动焦点区块（↑↓ 操作哪个区块）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PanelSection {
@@ -818,6 +827,9 @@ pub struct AppState {
 
     pub input: String,
     pub input_state: InputState,
+    /// 压缩前的 input_state 快照（CompressEnd 时恢复）
+    /// 生命周期：CompressStart 设置 → CompressEnd 消费（take）
+    pub pre_compress_input_state: Option<InputState>,
     pub cursor_pos: usize,
     /// 缓存光标所在行号（避免每帧 O(n²) 计算）
     pub(crate) cursor_line: usize,
@@ -828,6 +840,10 @@ pub struct AppState {
     pub focus: Focus,
     pub panel_visible: bool,
     pub panel_tab: PanelTab,
+    /// V40: 仪表盘当前 tab
+    pub dashboard_tab: DashboardTab,
+    /// V40: 自动化模块健康快照（由 JobRunner 推送更新）
+    pub auto_health: abacus_core::auto::AutoHealth,
     /// 面板 tab 键盘焦点（None = 焦点不在面板）
     pub panel_focus: Option<PanelFocus>,
     /// 打字机光标——最新消息已展示的字符数
@@ -898,6 +914,18 @@ pub struct AppState {
     /// - 创建：每 turn 覆盖更新（不累积，只保留最近已调用工具的状态）
     /// - 销毁：reset_session 时 clear
     pub tool_health: std::collections::HashMap<String, abacus_core::llm::stream::ToolHealthEntry>,
+    /// 流式 diff 渲染缓存 — key = trace_id，value = 已渲染好的 diff 行
+    ///
+    /// ## 引用关系
+    /// - 写入：components/mod.rs 流式时间线渲染，工具首次完成时计算并存入
+    /// - 读取：同一渲染路径，后续帧直接复用（跳过 LCS 重计算和 JSON 重解析）
+    ///
+    /// ## 生命周期
+    /// - 创建：首次渲染该工具的 diff 时
+    /// - 销毁：reset_streaming() 清除（每 turn 结束后）
+    /// - 设计意图：消除流式阶段每帧重复 similar::TextDiff::from_lines() 的 CPU 浪费
+    /// RefCell 允许在 &AppState 渲染路径中写入缓存（render_messages_in_card 接收 &AppState）
+    pub streaming_diff_cache: RefCell<std::collections::HashMap<u64, Vec<ratatui::text::Line<'static>>>>,
     pub thinking_text: String,
 
     pub experts: Vec<Expert>,
@@ -2094,12 +2122,15 @@ impl AppState {
             last_content_width: std::cell::Cell::new(0),
             input: String::new(),
             input_state: InputState::Ready,
+            pre_compress_input_state: None,
             cursor_pos: 0,
             cursor_line: 0,
             cursor_col: 0,
             focus: Focus::Input,
             panel_visible: true,
             panel_tab: PanelTab::Timeline,
+            dashboard_tab: DashboardTab::Health,
+            auto_health: abacus_core::auto::AutoHealth::default(),
             panel_focus: None,
             stream_cursor: 0,
             cmd_scroll: 0,
@@ -2121,6 +2152,7 @@ impl AppState {
             focused_event_id: None,
             tool_records: Vec::new(),
             tool_health: std::collections::HashMap::new(),
+            streaming_diff_cache: RefCell::new(std::collections::HashMap::new()),
             thinking_text: String::new(),
             experts: Vec::new(),
             expert_names_cache: HashSet::new(),
@@ -2620,6 +2652,7 @@ impl AppState {
         self.focused_event_id = None;
         self.tool_records.clear();
         self.tool_health.clear();
+        self.streaming_diff_cache.borrow_mut().clear();
         self.thinking_text.clear();
         self.turn_count = 0;
         self.set_scroll(ScrollAction::ToBottom);

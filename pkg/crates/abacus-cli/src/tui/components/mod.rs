@@ -1161,21 +1161,33 @@ pub fn render_messages_in_card(
 
                     // 编辑类工具完成时：内联 diff 预览
                     if matches!(status, StreamingToolStatus::Success | StreamingToolStatus::Failed) {
-                        if let Some(ev) = state.trace_event_index.get(trace_id)
+                        // diff 渲染缓存：首次计算后存入 streaming_diff_cache
+                        // 避免每帧重复 LCS + JSON 解析（多次 fs_edit 时每帧开销 = O(N) × LCS）
+                        // 缓存 key = trace_id，reset_streaming 时清除
+                        let cached = state.streaming_diff_cache.borrow().get(trace_id).cloned();
+                        let diff_lines = if let Some(cached) = cached {
+                            Some(cached)
+                        } else if let Some(ev) = state.trace_event_index.get(trace_id)
                             .and_then(|&i| state.trace_events.get(i))
                         {
-                            if let crate::tui::state::TraceKind::ToolCall { ref args, .. } = ev.kind {
+                            if let crate::tui::state::TraceKind::ToolCall { ref args, ref output, .. } = ev.kind {
                                 if !args.is_empty() {
-                                    if let Some(diff_lines) = block_detail::try_render_edit_diff(
-                                        name, args, &state.theme, 8,
-                                    ) {
-                                        for dl in diff_lines {
-                                            let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("   ")];
-                                            spans.extend(dl.spans);
-                                            lines.push(Line::from(spans));
-                                        }
+                                    let result = block_detail::try_render_edit_diff_with_output(
+                                        name, args, output.as_deref(), &state.theme, 8,
+                                    );
+                                    if let Some(ref dl) = result {
+                                        state.streaming_diff_cache.borrow_mut().insert(*trace_id, dl.clone());
                                     }
-                                }
+                                    result
+                                } else { None }
+                            } else { None }
+                        } else { None };
+
+                        if let Some(diff_lines) = diff_lines {
+                            for dl in diff_lines {
+                                let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
+                                spans.extend(dl.spans);
+                                lines.push(Line::from(spans));
                             }
                         }
                     }
@@ -1184,7 +1196,7 @@ pub fn render_messages_in_card(
                     if !summary.is_empty() {
                         lines.push(Line::from(vec![
                             bar.clone(),
-                            Span::raw("   "),
+                            Span::raw("  "), // 2sp 与正文一致
                             Span::styled(
                                 format!("└ {}", summary),
                                 Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
@@ -1221,7 +1233,11 @@ pub fn render_messages_in_card(
                             if line_w <= content_w + 4 {
                                 lines.push(rline);
                             } else {
-                                let indent_str = "   ";
+                                // 2sp 与 build_message_lines 的 word-wrap 保持一致
+                                let indent_str = match styled.line_type {
+                                    crate::tui::markdown::LineType::Code => "  │ ",
+                                    _ => "  ",
+                                };
                                 let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                                 let text_style = styled.spans.first().map(|s| s.style)
                                     .unwrap_or(Style::default().fg(state.theme.text));

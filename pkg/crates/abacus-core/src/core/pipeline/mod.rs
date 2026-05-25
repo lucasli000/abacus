@@ -129,9 +129,11 @@ struct TurnContext {
     /// 上限：5 次——超过后 graceful break，避免死循环
     recovery_attempts: u32,
     /// Error-recovery: 工具调用耗尽标记
-    /// 引用：MAX_TOTAL_TOOL_CALLS 或 safety guard 触发后设为 true
+    /// 引用：turn_max_tool_calls 或 safety guard 触发后设为 true
     /// 效果：下次构建 LlmRequest 时传空 tools 数组，强制 LLM 仅产出文本总结
     tools_exhausted: bool,
+    /// 80% 工具配额 warning 是否已发出（确保单轮只触发一次）
+    tool_warning_emitted: bool,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -379,7 +381,9 @@ impl<'a> TurnPipeline<'a> {
             system_segments: Vec::new(),
             tools: tool_defs,
             temperature: Some(self.core.config.default_temperature),
-            max_tokens: Some(self.core.config.default_max_tokens),
+            max_tokens: Some(self.core.config.model_spec.as_ref()
+                .map(|s| s.max_output_tokens)
+                .unwrap_or(self.core.config.default_max_tokens)),
             top_p: None, stop: Vec::new(), stream: false,
             // L1 + Task #94: thinking_intent 单通道——continue_gated 路径只读 sticky
             // 避免在此处用 None 写入 sticky 污染首轮决策（execute_loop 才是主写入点）
@@ -401,7 +405,7 @@ impl<'a> TurnPipeline<'a> {
                         "LLM request timed out after 300s".into()
                     ));
                 }
-                return Err(KernelError::Provider("request timeout: 300s".into()));
+                return Err(KernelError::Provider(format!("request timeout: {}s", self.core.config.thresholds.turn_provider_timeout_secs)));
             }
         };
         let final_response = super::extract_text(&response.message);
@@ -438,17 +442,22 @@ impl<'a> TurnPipeline<'a> {
 
         Ok(TurnResult {
             response: final_response,
-            stats: TurnStats {
-                turn_number, tool_calls: 0,
-                provider_id,
-                model_id: self.core.config.default_model.0.clone(),
-                prompt_tokens: response.usage.prompt_tokens,
-                completion_tokens: response.usage.completion_tokens,
-                cached_tokens: response.usage.cached_tokens,
-                total_tokens: response.usage.total_tokens,
-                thinking_tokens: response.usage.thinking_tokens,
-                latency_ms: start_time.elapsed().as_millis() as u64,
-                skills_matched: vec![],
+            stats: {
+                let ctx_window = self.core.context_manager.window.read().await;
+                TurnStats {
+                    turn_number, tool_calls: 0,
+                    provider_id,
+                    model_id: self.core.config.default_model.0.clone(),
+                    prompt_tokens: response.usage.prompt_tokens,
+                    completion_tokens: response.usage.completion_tokens,
+                    cached_tokens: response.usage.cached_tokens,
+                    total_tokens: response.usage.total_tokens,
+                    thinking_tokens: response.usage.thinking_tokens,
+                    latency_ms: start_time.elapsed().as_millis() as u64,
+                    skills_matched: vec![],
+                    context_tokens: Some(ctx_window.current_tokens as u64),
+                    context_max: Some(ctx_window.max_tokens as u64),
+                }
             },
             tool_outputs: vec![],
             matched_skills: vec![],
@@ -468,25 +477,44 @@ impl<'a> TurnPipeline<'a> {
 
         // Phase Ctx-A: pressure shed pending 检查——若上一轮 pressure_monitor 报警，
         // 这里立即触发 auto_compress 让 prefix 字节回到稳定区间
+        // 修复：仅在实际压缩发生时才发 CompressStart（避免每轮空弹 toast）
         if self.core.context_manager.take_shed_pending() {
-            if let Some(ref stx) = self.stream_tx {
-                let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
-            }
             let s = self.session.read().await;
             let mut msgs = s.messages.write().await;
             let compressed = self.core.context_manager.auto_compress_messages(&mut msgs).await;
             if !compressed.is_empty() {
-                tracing::info!("pressure shed: compressed {} messages", compressed.len());
-            }
-            if let Some(ref stx) = self.stream_tx {
                 let tokens_saved: usize = compressed.iter()
                     .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
                     .sum();
-                let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
-                    messages_compressed: compressed.len(),
-                    tokens_saved,
+                tracing::info!("pressure shed: compressed {} messages, freed ~{} tok", compressed.len(), tokens_saved);
+
+                // 通知 TUI（显式状态变更）
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                        messages_compressed: compressed.len(),
+                        tokens_saved,
+                    });
+                }
+
+                // 注入 system message 通知 LLM 上下文已被压缩
+                // LLM 在下次看到此消息时能感知历史被摘要化，避免引用已压缩细节
+                msgs.push(crate::llm::Message {
+                    role: crate::llm::MessageRole::System,
+                    content: Some(crate::llm::MessageContent::Text(format!(
+                        "[Context auto-compressed] {} messages summarized, ~{} tokens freed. \
+                         Use `messages_recover` tool with recover_id if you need original details. \
+                         Use `context_status` tool to check current usage.",
+                        compressed.len(), tokens_saved
+                    ))),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    prefix: false,
                 });
             }
+            // 无压缩时静默——shed 标记已消费，下轮不会重复触发
         }
 
         // Copy session messages to session-level context_messages
@@ -500,7 +528,11 @@ impl<'a> TurnPipeline<'a> {
 
         if turn_number == 1 {
             if let Some(ref spec) = self.core.config.model_spec {
-                self.core.context_manager.set_window(spec.context_window, spec.context_window);
+                // 可用窗口 = 模型最大上下文 × ratio，下限 128K
+                // ratio 由用户配置 core.context_window_ratio（默认 0.5）
+                let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
+                let available = ((spec.context_window as f64 * ratio) as usize).max(128_000);
+                self.core.context_manager.set_window(available, spec.context_window);
             }
         }
 
@@ -802,6 +834,7 @@ impl<'a> TurnPipeline<'a> {
             provider_retries: 0,
             recovery_attempts: 0,
             tools_exhausted: false,
+            tool_warning_emitted: false,
         })
     }
 
@@ -1136,11 +1169,15 @@ impl<'a> TurnPipeline<'a> {
                 .or(ctx.complexity_temperature)
                 .unwrap_or(self.core.config.default_temperature);
             // V40: 动态自适应 max_tokens — 确保 prompt + max_tokens ≤ context_window
+            // 优先级：req_ctx 显式覆盖 > model_spec.max_output_tokens > config.default_max_tokens
             // 策略：min(configured_max, context_remaining - safety_margin)
             // safety_margin = 1024：留余量给 token 估算误差 + 系统开销
             // 下限 clamp 2048：即使 context 紧张也保证最低输出空间（触发压缩而非静默截断）
-            let configured_max = self.req_ctx.max_tokens
+            let model_max_output = self.core.config.model_spec.as_ref()
+                .map(|s| s.max_output_tokens)
                 .unwrap_or(self.core.config.default_max_tokens);
+            let configured_max = self.req_ctx.max_tokens
+                .unwrap_or(model_max_output);
             let effective_max_tokens = {
                 let w = self.core.context_manager.window.read().await;
                 let context_remaining = w.max_tokens.saturating_sub(total).saturating_sub(1024);
@@ -1235,7 +1272,7 @@ impl<'a> TurnPipeline<'a> {
                                 "LLM request timed out after 300s".into()
                             ));
                         }
-                        Err(KernelError::Provider("request timeout: 300s".into()))
+                        Err(KernelError::Provider(format!("request timeout: {}s", self.core.config.thresholds.turn_provider_timeout_secs)))
                     }
                 }
             };
@@ -1257,22 +1294,22 @@ impl<'a> TurnPipeline<'a> {
                         || body_lower.contains("tokens exceeds");
                     if is_context_overflow {
                         tracing::warn!("Context overflow detected, triggering emergency compression");
-                        if let Some(ref stx) = self.stream_tx {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
-                        }
                         let compressed = {
                             let s = self.session.read().await;
                             let mut msgs = s.messages.write().await;
                             self.core.context_manager.auto_compress_messages(&mut msgs).await
                         };
-                        if let Some(ref stx) = self.stream_tx {
-                            let tokens_saved: usize = compressed.iter()
-                                .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
-                                .sum();
-                            let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
-                                messages_compressed: compressed.len(),
-                                tokens_saved,
-                            });
+                        if !compressed.is_empty() {
+                            if let Some(ref stx) = self.stream_tx {
+                                let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+                                let tokens_saved: usize = compressed.iter()
+                                    .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                                    .sum();
+                                let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                                    messages_compressed: compressed.len(),
+                                    tokens_saved,
+                                });
+                            }
                         }
                         if !compressed.is_empty() {
                             // 压缩成功，重建消息并重试
@@ -1643,8 +1680,70 @@ impl<'a> TurnPipeline<'a> {
             // Session 级不设限——用户可持续多轮对话不受累积约束
             let batch_size = tool_calls.len() as u32;
             ctx.total_tool_calls += batch_size;
+            let tool_limit = self.core.config.thresholds.turn_max_tool_calls;
+            let threshold_75 = (tool_limit as f64 * 0.75) as u32;
+            let threshold_95 = (tool_limit as f64 * 0.95) as u32;
+
+            // ── 75% Warning：提示 LLM 调整策略（仅一次）──
+            if !ctx.tool_warning_emitted && ctx.total_tool_calls >= threshold_75 {
+                ctx.tool_warning_emitted = true;
+                let s = self.session.read().await;
+                let mut msgs = s.messages.write().await;
+                msgs.push(Message {
+                    role: MessageRole::User,
+                    content: Some(MessageContent::Text(format!(
+                        "[System Hint] Tool usage: {}/{} this turn (75%). You have {} calls remaining. \
+                         Continue working — prioritize the most impactful actions. \
+                         Consider batching related operations and skipping non-essential checks.",
+                        ctx.total_tool_calls, tool_limit, tool_limit - ctx.total_tool_calls
+                    ))),
+                    name: None, tool_calls: None, tool_call_id: None,
+                    reasoning_content: None, prefix: false,
+                });
+            }
+
+            // ── 95% 强制压缩：压缩上下文释放空间，LLM 继续工作（不终止）──
+            if ctx.total_tool_calls >= threshold_95 && !ctx.tools_exhausted {
+                ctx.tools_exhausted = true; // 防止重复触发
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
+                }
+                let compressed = {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    self.core.context_manager.auto_compress_messages(&mut msgs).await
+                };
+                if let Some(ref stx) = self.stream_tx {
+                    let tokens_saved: usize = compressed.iter()
+                        .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                        .sum();
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                        messages_compressed: compressed.len(),
+                        tokens_saved,
+                    });
+                }
+                // 注入压缩通知——让 LLM 知道历史已压缩，调整引用策略
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::User,
+                        content: Some(MessageContent::Text(format!(
+                            "[System] Tool budget at 95% ({}/{}). Context has been compressed to free memory. \
+                             Prioritize completing your current task with remaining budget. \
+                             Early conversation details are now summarized — rely on recent context.",
+                            ctx.total_tool_calls, tool_limit
+                        ))),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                }
+                // 重置 tools_exhausted 让 LLM 继续调用工具（压缩释放了空间）
+                ctx.tools_exhausted = false;
+            }
+
+            // ── 100% 硬上限：SafetyGuard 检查 ──
             if let Err(e) = self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls) {
-                // 单轮工具总量耗尽 → 告知 LLM 输出当前结论
                 let err_msg = e.to_string();
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
@@ -1658,8 +1757,8 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::User,
                         content: Some(MessageContent::Text(format!(
-                            "[System] Tool call limit for this turn reached ({}). \
-                             Output your conclusion now. You can continue in the next turn.",
+                            "[System] Tool budget fully exhausted ({} calls). \
+                             Output your progress summary now. The user can continue in the next message.",
                             ctx.total_tool_calls
                         ))),
                         name: None, tool_calls: None, tool_call_id: None,
@@ -1667,24 +1766,6 @@ impl<'a> TurnPipeline<'a> {
                     });
                 }
                 continue;
-            }
-
-            // 80% Warning: 接近单轮工具上限时注入 hint（仅一次）
-            let tool_limit = self.core.config.thresholds.turn_max_tool_calls;
-            let warning_threshold = (tool_limit as f64 * 0.8) as u32;
-            if ctx.total_tool_calls >= warning_threshold && ctx.total_tool_calls - batch_size < warning_threshold {
-                let s = self.session.read().await;
-                let mut msgs = s.messages.write().await;
-                msgs.push(Message {
-                    role: MessageRole::User,
-                    content: Some(MessageContent::Text(format!(
-                        "[System Hint] You have used {}/{} tool calls this turn (80%). \
-                         Consider whether you can wrap up soon. You can continue in the next turn if needed.",
-                        ctx.total_tool_calls, tool_limit
-                    ))),
-                    name: None, tool_calls: None, tool_call_id: None,
-                    reasoning_content: None, prefix: false,
-                });
             }
 
             let user_role = { let s = self.session.read().await; s.user_role };
@@ -2092,6 +2173,17 @@ impl<'a> TurnPipeline<'a> {
                         duration_ms: output.latency_ms,
                         failure_kind: output.failure_kind.clone(),
                     });
+                    // 环境阻塞时发出 ToolBlocked（LLM + 前端双向感知）
+                    if let Some(ref fk) = output.failure_kind {
+                        if !output.success && fk != "BusinessError" {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolBlocked {
+                                tool_id: tc.function.name.clone(),
+                                kind: fk.clone(),
+                                message: format!("Tool '{}' blocked: {}", tc.function.name, fk),
+                                recoverable: fk != "Unauthorized" && fk != "DestructiveOp",
+                            });
+                        }
+                    }
                 }
                 ctx.all_tool_outputs.push(output.clone());
                 // W2 (Task #100)：写入 dedup 池——仅在 idempotent && success && 非缓存命中时
@@ -2400,7 +2492,9 @@ impl<'a> TurnPipeline<'a> {
             system_segments: ctx.system_segments.clone(),
             tools: ctx.tool_defs.clone(),
             temperature: Some(self.core.config.default_temperature),
-            max_tokens: Some(self.core.config.default_max_tokens),
+            max_tokens: Some(self.core.config.model_spec.as_ref()
+                .map(|s| s.max_output_tokens)
+                .unwrap_or(self.core.config.default_max_tokens)),
             top_p: None, stop: Vec::new(), stream: false,
             // L1: thinking_intent 单通道——per-request 覆盖优先，否则 escalation 沿用 sticky 决策
             thinking_intent: self.req_ctx.thinking_intent.clone()
@@ -2445,6 +2539,14 @@ impl<'a> TurnPipeline<'a> {
                     let s = self.session.read().await;
                     s.escalation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     *s.escalated_model.write().await = Some(abacus_types::ModelId(escalate_to.to_string()));
+                }
+                // 发送 ModelEscalation 事件（前端 + LLM 双向感知）
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::ModelEscalation {
+                        from_model: current_model.to_string(),
+                        to_model: escalate_to.to_string(),
+                        reason: "LLM self-escalation for deeper reasoning".into(),
+                    });
                 }
                 {
                     let s = self.session.read().await;
@@ -2497,25 +2599,30 @@ impl<'a> TurnPipeline<'a> {
         s.turn_count = ctx.turn_number;
         TurnResult {
             response: text,
-            stats: TurnStats {
-                turn_number: ctx.turn_number,
-                tool_calls: ctx.total_tool_calls,
-                provider_id: ctx.provider_id.clone(),
-                model_id: self.core.config.default_model.0.clone(),
-                prompt_tokens: ctx.prompt_tokens,
-                completion_tokens: ctx.completion_tokens,
-                cached_tokens: ctx.cached_tokens,
-                total_tokens: ctx.prompt_tokens + ctx.completion_tokens,
-                thinking_tokens: ctx.thinking_tokens,
-                latency_ms: ctx.start_time.elapsed().as_millis() as u64,
-                skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
+            stats: {
+                let ctx_window = self.core.context_manager.window.read().await;
+                TurnStats {
+                    turn_number: ctx.turn_number,
+                    tool_calls: ctx.total_tool_calls,
+                    provider_id: ctx.provider_id.clone(),
+                    model_id: self.core.config.default_model.0.clone(),
+                    prompt_tokens: ctx.prompt_tokens,
+                    completion_tokens: ctx.completion_tokens,
+                    cached_tokens: ctx.cached_tokens,
+                    total_tokens: ctx.prompt_tokens + ctx.completion_tokens,
+                    thinking_tokens: ctx.thinking_tokens,
+                    latency_ms: ctx.start_time.elapsed().as_millis() as u64,
+                    skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
+                    context_tokens: Some(ctx_window.current_tokens as u64),
+                    context_max: Some(ctx_window.max_tokens as u64),
+                }
             },
             tool_outputs: ctx.all_tool_outputs.clone(),
             matched_skills: ctx.matched_skills.clone(),
             session_id,
             progressive_state,
             inertia_warning: None,
-            pending_confirmations: Vec::new(), // gated 结果未进入工具分发阶段
+            pending_confirmations: Vec::new(),
         }
     }
 
@@ -2556,18 +2663,23 @@ impl<'a> TurnPipeline<'a> {
 
         let result = TurnResult {
             response: ctx.final_response,
-            stats: TurnStats {
-                turn_number: ctx.turn_number,
-                tool_calls: ctx.total_tool_calls,
-                provider_id: ctx.provider_id,
-                model_id: self.core.config.default_model.0.clone(),
-                prompt_tokens: ctx.prompt_tokens,
-                completion_tokens: ctx.completion_tokens,
-                cached_tokens: ctx.cached_tokens,
-                total_tokens: ctx.prompt_tokens + ctx.completion_tokens,
-                thinking_tokens: ctx.thinking_tokens,
-                latency_ms: latency,
-                skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
+            stats: {
+                let ctx_window = self.core.context_manager.window.read().await;
+                TurnStats {
+                    turn_number: ctx.turn_number,
+                    tool_calls: ctx.total_tool_calls,
+                    provider_id: ctx.provider_id,
+                    model_id: self.core.config.default_model.0.clone(),
+                    prompt_tokens: ctx.prompt_tokens,
+                    completion_tokens: ctx.completion_tokens,
+                    cached_tokens: ctx.cached_tokens,
+                    total_tokens: ctx.prompt_tokens + ctx.completion_tokens,
+                    thinking_tokens: ctx.thinking_tokens,
+                    latency_ms: latency,
+                    skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
+                    context_tokens: Some(ctx_window.current_tokens as u64),
+                    context_max: Some(ctx_window.max_tokens as u64),
+                }
             },
             tool_outputs: ctx.all_tool_outputs,
             matched_skills: ctx.matched_skills,

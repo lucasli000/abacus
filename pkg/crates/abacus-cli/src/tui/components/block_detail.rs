@@ -50,7 +50,7 @@ pub(super) fn try_render_bash_exec<'a>(
     let command = json.get("command").and_then(|v| v.as_str()).unwrap_or("(empty)");
     let workdir = json.get("workdir").and_then(|v| v.as_str());
 
-    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // 命令行 — 多行命令每行都加 $ / > 前缀
     let cmd_lines: Vec<&str> = command.lines().collect();
     for (i, l) in cmd_lines.iter().enumerate() {
@@ -494,22 +494,23 @@ pub(crate) fn extract_tool_param_summary(args_json: &str) -> String {
 /// output_json: 工具输出 JSON（可选）—— 从中提取 `start_line` 用于显示文件真实行号
 /// fs_edit 在成功时返回 `{"edited":true,"path":"...","start_line":N}`
 /// 无 output_json 或字段缺失时行号从 1 开始（相对编号）
-pub(super) fn try_render_edit_diff<'a>(
+pub(super) fn try_render_edit_diff(
     name: &str,
     args_json: &str,
     theme: &Theme,
     max_total_lines: usize,
-) -> Option<Vec<Line<'a>>> {
+) -> Option<Vec<Line<'static>>> {
     try_render_edit_diff_with_output(name, args_json, None, theme, max_total_lines)
 }
 
-pub(super) fn try_render_edit_diff_with_output<'a>(
+/// 返回 `'static` 生命周期：所有 span 内容均为 owned String，可安全缓存在 AppState
+pub(super) fn try_render_edit_diff_with_output(
     name: &str,
     args_json: &str,
     output_json: Option<&str>,
     theme: &Theme,
     max_total_lines: usize,
-) -> Option<Vec<Line<'a>>> {
+) -> Option<Vec<Line<'static>>> {
     let lower = name.to_lowercase();
     // ToolId 单一命名：filengine register 直接产 "filengine_fs_edit"/"filengine_fs_write"
     // 保留无前缀 "fs_edit"/"fs_write" 作 demo / 测试 fixture 兜底
@@ -523,7 +524,7 @@ pub(super) fn try_render_edit_diff_with_output<'a>(
         .and_then(|v| v.as_str())
         .unwrap_or("(unknown)");
 
-    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     // 头行：📝 path + 下方一条极细分隔线（区分文件路径与 diff 内容）
     lines.push(Line::from(vec![
         Span::styled("📝 ", Style::default().fg(theme.accent)),
@@ -572,8 +573,8 @@ pub(super) fn try_render_edit_diff_with_output<'a>(
 ///   - Equal 行显示为 context（theme.muted, 无前缀符号），但只保留变更临近 ±1 行
 ///   - Insert → `+ line` 绿; Delete → `- line` 红; 远离变更的 Equal 跳过
 ///   - Write (old 为空) 时 similar 全产出 Insert — 效果等同旧实现
-fn render_simple_diff<'a>(
-    lines: &mut Vec<Line<'a>>,
+fn render_simple_diff(
+    lines: &mut Vec<Line<'static>>,
     old: &str,
     new: &str,
     line_offset: usize,  // 文件实际起始行号（1-based），从 fs_edit output.start_line 注入
@@ -583,7 +584,7 @@ fn render_simple_diff<'a>(
     use similar::{ChangeTag, TextDiff};
 
     let diff = TextDiff::from_lines(old, new);
-    let mut rendered: Vec<Line<'a>> = Vec::new();
+    let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut insert_count = 0usize;
     let mut delete_count = 0usize;
 
@@ -684,7 +685,7 @@ fn render_simple_diff<'a>(
 
     // 限行裁剪
     let shown = if max_total_lines > 0 && rendered.len() > max_total_lines {
-        let mut truncated: Vec<Line<'a>> = rendered.into_iter().take(max_total_lines).collect();
+        let mut truncated: Vec<Line<'static>> = rendered.into_iter().take(max_total_lines).collect();
         truncated.push(Line::from(vec![
             Span::styled(
                 format!("{:>w$} ↳ 已截断（共 {} 行）", "", total_changes, w = num_width),

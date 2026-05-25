@@ -106,8 +106,78 @@ pub enum StreamChunk {
     /// 轻量：只传本轮工具的 tier + blocked_by_env，不传全量 200+ 工具
     /// TUI 用于：工具名称旁标注 tier badge、blocked 工具灰色警示
     ToolHealth(Vec<ToolHealthEntry>),
-    /// 错误（stream 中断）
+    /// 错误（非致命，pipeline 继续；致命错误通过 channel drop 信号）
     Error(String),
+
+    // ─── 预留事件（已定义接口，逐步接入生产者）─────────────────────────
+
+    /// 模型升级通知（LLM 自动从低价模型切换到高能力模型）
+    ///
+    /// - 生产者: pipeline handle_model_escalation
+    /// - 消费者: TUI toast + Web 前端成本提示
+    ModelEscalation {
+        from_model: String,
+        to_model: String,
+        reason: String,
+    },
+
+    /// Session 焦点更新（LLM 通过 session_set_focus 工具设置）
+    ///
+    /// - 生产者: session_set_focus 工具执行后
+    /// - 消费者: 前端焦点面板、多端同步
+    SessionFocusUpdate {
+        goal: String,
+        phase: String,
+        next_step: String,
+    },
+
+    /// 工具被环境阻塞详情（比 ToolHealth 更具体的失败原因）
+    ///
+    /// - 生产者: tool dispatch 失败后的 classify_env_failure
+    /// - 消费者: 前端显示"缺少 API key"/"网络超时"等可操作提示
+    ToolBlocked {
+        tool_id: String,
+        kind: String,       // Network/Timeout/Unauthorized/RateLimited/DependencyMissing
+        message: String,
+        recoverable: bool,
+    },
+
+    /// 会议状态变更（Meeting 模式下实时推送）
+    ///
+    /// - 生产者: MeetingSession 状态机转换
+    /// - 消费者: 前端会议面板状态指示器
+    MeetingStatusChange {
+        meeting_id: String,
+        old_status: String,
+        new_status: String,
+    },
+
+    /// Specialist 思考中间过程（Meeting 模式下）
+    ///
+    /// - 生产者: MeetingEngineAdapter 调用 Specialist 时
+    /// - 消费者: 前端 specialist 卡片的 thinking indicator
+    SpecialistThinking {
+        specialist_id: String,
+        content: String,
+    },
+
+    /// Sandbox 执行进度（代码执行/编译/测试）
+    ///
+    /// - 生产者: sandbox executor
+    /// - 消费者: 前端执行进度条
+    SandboxProgress {
+        phase: String,      // "compiling" / "linking" / "running" / "testing"
+        message: String,
+    },
+
+    /// 惰性检测通知（LLM 陷入循环时的诊断信息）
+    ///
+    /// - 生产者: pipeline inertia detector
+    /// - 消费者: 前端显示循环警告 + 可选干预按钮
+    InertiaDetected {
+        signals: Vec<String>,
+        recommendation: String,
+    },
 }
 
 /// 单个工具的健康状态（StreamChunk::ToolHealth 的载荷）

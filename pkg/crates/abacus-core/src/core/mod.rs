@@ -374,6 +374,10 @@ pub struct CoreConfig {
     pub default_model: ModelId,
     pub default_temperature: f64,
     pub default_max_tokens: u32,
+    /// 可用上下文窗口占模型最大上下文的比例（0.1-1.0，默认 0.5）
+    /// 用户可通过 core.context_window_ratio 配置
+    /// 实际可用 = max(model_context * ratio, 128K)
+    pub context_window_ratio: f64,
     pub system_prompt: String,
     /// Per-model specification for the default model (thinking, context_window, etc.)
     pub model_spec: Option<ModelSpec>,
@@ -584,6 +588,22 @@ pub struct CoreConfig {
     /// - orchestrator: subagent_max_duration_secs, subagent_max_tokens, specialist_timeout_secs
     /// - context: context_compress_ratio
     pub thresholds: ThresholdConfig,
+
+    /// 提示词引擎配置文件路径（Expert Roles + Topics）
+    ///
+    /// 默认：`~/.abacus/prompt_roles.toml`
+    /// 不存在时 fallback 到内置 roles
+    ///
+    /// ## 引用关系
+    /// - 消费方：DynamicInjector 启动加载 + 热重载
+    /// - 生命周期：CoreLoop::new() 时一次性加载，config_set reload 时重新加载
+    pub prompt_roles_path: Option<std::path::PathBuf>,
+
+    /// 场景映射配置文件路径（TaskKind → abacusbr sections）
+    ///
+    /// 默认：`~/.abacus/subscenes.toml`
+    /// 不存在时 fallback 到内置 default_subscene_map()
+    pub subscenes_path: Option<std::path::PathBuf>,
 }
 
 impl Default for CoreConfig {
@@ -597,6 +617,7 @@ impl Default for CoreConfig {
             // V40: 64000 — 对齐主流 coding agent（Claude Code 20K, OpenCode 32K）
             // DeepSeek thinking 模式 output 可达 64K+；非 thinking 上限由模型 spec 约束
             default_max_tokens: 64000,
+            context_window_ratio: 0.5,
             system_prompt: String::new(),
             model_spec: None,
             thinking_intent: None,
@@ -635,6 +656,9 @@ impl Default for CoreConfig {
             policy: Arc::new(policy::PolicyConfig::load()),
             // 三层阈值体系
             thresholds: ThresholdConfig::default(),
+            // 提示词引擎配置路径（默认 ~/.abacus/）
+            prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
+            subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
         }
     }
 }
@@ -3260,13 +3284,33 @@ impl CoreLoop {
             let guard_status = if policy.guard.entropy_guard.is_empty() { "off" } else { "on" };
             let decl_status = if policy.guard.explicit_declaration.is_empty() { "off" } else { "on" };
 
+            // 上下文占用感知（让 LLM 每轮知道剩余空间、预算比例、模型容量）
+            let ctx_window = self.context_manager.window.read().await;
+            let ctx_pct = ctx_window.usage_pct();
+            let ctx_status = if ctx_pct >= 95.0 { "CRITICAL" }
+                else if ctx_pct >= ctx_window.compression_trigger_pct as f64 { "ELEVATED" }
+                else if ctx_pct >= 70.0 { "WARNING" }
+                else { "OK" };
+            let ratio_pct = (self.config.context_window_ratio * 100.0) as u32;
+            let ctx_info = format!("Context: {:.0}% ({}/{}tok) [{}] | Budget: {}% of {}tok model capacity",
+                ctx_pct, ctx_window.current_tokens, ctx_window.max_tokens, ctx_status,
+                ratio_pct, ctx_window.model_limit);
+            drop(ctx_window);
+
             let block = format!(
                 "[Awareness]\n\
                  Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
                  Task: {} | Role: {} | Max output: {}tok\n\
+                 {} \n\
                  [Limits] tools: 0/{} per turn | iterations: 0/{} | No session limit\n\
                  Capabilities: {} escalations available | scene_loading: {} | router: {}\n\
-                 Policy: entropy_guard={} | explicit_decl={} | stop_threshold={}chars | confirm_timeout={}s",
+                 Policy: entropy_guard={} | explicit_decl={} | stop_threshold={}chars | confirm_timeout={}s\n\
+                 [Context Management] HARD RULE: your output + existing context MUST stay within the budget shown above. \
+                 When status=OK: output freely within max_output. \
+                 When status=WARNING (70-84%): be concise, avoid redundant explanations, prefer structured output. \
+                 When status=ELEVATED (85-94%): output key conclusions ONLY, then immediately call context_compress(mode=\"messages\"). \
+                 When status=CRITICAL (95%+): output ≤200 tokens summary, then compress. Exceeding budget causes data loss. \
+                 Last 8 messages are always preserved after compression.",
                 current_turn, max_turns,
                 tool_calls_used,
                 model_name,
@@ -3274,6 +3318,7 @@ impl CoreLoop {
                 task_kind_str,
                 user_role,
                 max_tokens,
+                ctx_info,
                 self.config.thresholds.turn_max_tool_calls,
                 self.config.thresholds.turn_max_iterations,
                 escalations_left,

@@ -367,6 +367,13 @@ pub struct TurnStats {
     pub thinking_tokens: u64,
     pub latency_ms: u64,
     pub skills_matched: Vec<String>,
+    /// 本轮结束后的上下文总占用（token）
+    /// 来源：pipeline persist_and_build_result 从 context_manager.window 读取
+    #[serde(default)]
+    pub context_tokens: Option<u64>,
+    /// 上下文窗口容量上限（token）
+    #[serde(default)]
+    pub context_max: Option<u64>,
 }
 
 // ─── Security / Role System ────────────────────────────────────────────────

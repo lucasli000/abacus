@@ -28,7 +28,7 @@ impl<'a> TurnPipeline<'a> {
             // 由 persist_and_build_result 兜底处理。
         }
 
-        // Context compression — 仅在实际压缩发生时才 emit 事件通知 TUI
+        // Context compression — 仅在实际压缩发生时才通知 TUI + LLM
         {
             let s = self.session.read().await;
             let mut msgs = s.messages.write().await;
@@ -38,6 +38,8 @@ impl<'a> TurnPipeline<'a> {
                     .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
                     .sum();
                 tracing::info!("compressed {} messages in turn {}", compressed.len(), ctx.turn_number);
+
+                // 通知 TUI
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
                     let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
@@ -45,11 +47,20 @@ impl<'a> TurnPipeline<'a> {
                         tokens_saved,
                     });
                 }
-            } else if let Some(ref stx) = self.stream_tx {
-                // 无压缩发生，不发 CompressStart，只发空 End（让 TUI 知道 post 完成）
-                let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
-                    messages_compressed: 0,
-                    tokens_saved: 0,
+
+                // 注入 system message 通知 LLM
+                msgs.push(crate::llm::Message {
+                    role: crate::llm::MessageRole::System,
+                    content: Some(crate::llm::MessageContent::Text(format!(
+                        "[Context auto-compressed] {} messages summarized, ~{} tokens freed. \
+                         Use `messages_recover` tool with recover_id if you need original details.",
+                        compressed.len(), tokens_saved
+                    ))),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    prefix: false,
                 });
             }
         }
@@ -382,6 +393,13 @@ impl<'a> TurnPipeline<'a> {
                     break;
                 }
                 inertia::InertiaIntervention::FlagWarning { signal, .. } => {
+                    // 发出 InertiaDetected 事件（前端 + LLM 感知）
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::InertiaDetected {
+                            signals: vec![format!("{:?}", signal)],
+                            recommendation: "Consider changing approach or breaking the task into smaller steps.".into(),
+                        });
+                    }
                     ctx.inertia_warning = Some(signal);
                     break;
                 }

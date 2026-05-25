@@ -31,7 +31,59 @@ use serde_json::Value;
 /// TOML 格式的子场景映射
 #[derive(Debug, Clone, Deserialize)]
 struct SubsceneConfig {
-    subscene_map: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    mappings: HashMap<String, Vec<String>>,
+}
+
+// ─── Prompt Hook System ─────────────────────────────────────────────────────
+
+/// Prompt 注入钩子上下文（每轮组装时传入）
+pub struct HookContext {
+    pub input: String,
+    pub task_kind: String,
+    pub turn_number: u32,
+    pub session_metadata: HashMap<String, String>,
+}
+
+/// Prompt 注入钩子 trait
+///
+/// ## 设计
+/// 在 assemble() 组装时遍历所有注册的 hooks，按 priority 排序注入。
+/// 比 InjectionSource 更通用——不依赖 DynamicInjector 的 TTL/budget 机制。
+///
+/// ## KV Cache 约束
+/// cacheable()=true 的 hook 输出必须 session 内字节稳定，
+/// 否则会导致 Tier 2 之后的所有层 cache miss。
+///
+/// ## 引用关系
+/// - 注册方：CoreLoop::new() 或 MCP server 动态注册
+/// - 消费方：assemble() / assemble_segments()
+/// - 生命周期：随 PromptAssembly 销毁
+pub trait PromptHook: Send + Sync {
+    /// 唯一标识
+    fn id(&self) -> &str;
+    /// 注入层优先级（255=最高，0=最低）
+    fn priority(&self) -> u8;
+    /// 判定是否注入（每轮调用）
+    fn should_inject(&self, ctx: &HookContext) -> bool;
+    /// 生产注入文本
+    fn inject(&self, ctx: &HookContext) -> String;
+    /// 是否 cacheable（KV cache 友好——输出 session 内字节稳定时返回 true）
+    fn cacheable(&self) -> bool { false }
+}
+
+/// 从指定路径加载 subscene 映射（外部 API 用）
+///
+/// ## 文件格式
+/// ```toml
+/// [mappings]
+/// code_reading = ["system", "code"]
+/// debugging = ["system", "system_deep", "debug", "code"]
+/// ```
+pub fn load_subscene_map_from(path: &Path) -> Option<HashMap<String, Vec<String>>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let config: SubsceneConfig = toml::from_str(&content).ok()?;
+    if config.mappings.is_empty() { None } else { Some(config.mappings) }
 }
 
 /// Prompt 分段，带层级信息
@@ -51,6 +103,13 @@ pub struct PromptAssembly {
     enable_process_layer: bool,
     /// TaskKind label → sub-scene name list（从 TOML 加载 + 默认合并）
     subscene_map: HashMap<String, Vec<String>>,
+    /// 通用 Prompt Hook registry（按 priority 降序排列）
+    ///
+    /// ## 引用关系
+    /// - 注册方：register_hook()
+    /// - 消费方：assemble() 在层级组装完成后遍历 hooks 注入
+    /// - 生命周期：随 PromptAssembly 创建/销毁
+    hooks: Vec<Box<dyn PromptHook>>,
 }
 
 impl PromptAssembly {
@@ -110,7 +169,24 @@ impl PromptAssembly {
             injector,
             enable_process_layer: false,
             subscene_map,
+            hooks: Vec::new(),
         }
+    }
+
+    /// 注册一个 Prompt Hook（按 priority 降序自动排列）
+    ///
+    /// ## 使用方式
+    /// ```rust,ignore
+    /// assembly.register_hook(Box::new(McpRulesHook::new()));
+    /// ```
+    pub fn register_hook(&mut self, hook: Box<dyn PromptHook>) {
+        self.hooks.push(hook);
+        self.hooks.sort_by(|a, b| b.priority().cmp(&a.priority()));
+    }
+
+    /// 获取已注册 hooks 数量（用于测试/诊断）
+    pub fn hook_count(&self) -> usize {
+        self.hooks.len()
     }
 
     /// 获取原始 abacusbr 全文（用于知识库优先级等场景）
@@ -532,7 +608,7 @@ fn load_subscene_map() -> HashMap<String, Vec<String>> {
     if let Some(ref path) = path {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(config) = toml::from_str::<SubsceneConfig>(&content) {
-                for (key, values) in config.subscene_map {
+                for (key, values) in config.mappings {
                     if values.is_empty() {
                         map.remove(&key);
                     } else {

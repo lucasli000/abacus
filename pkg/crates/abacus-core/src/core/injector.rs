@@ -33,18 +33,221 @@
 //! - Topic detection is limited to 11 hardcoded keywords. A production system
 //!   should load topics from a configuration file.
 
+use serde::Deserialize;
 use serde_json::Value;
+use std::path::Path;
 
 /// Maximum token budget for injected knowledge segments.
 /// If total injected text exceeds this (estimated as chars / 2 for CJK-heavy text),
 /// only the most recently refreshed entries (highest TTL) are kept.
+/// Retained as documentation reference; runtime value from `PromptDefaults::max_knowledge_tokens`.
+#[allow(dead_code)]
 const MAX_KNOWLEDGE_TOKENS: usize = 600;
 
 /// Default TTL for expert role entries: stays alive for 5 turns of non-matching input.
+/// Retained as documentation reference; runtime value from `PromptDefaults::ttl`.
+#[allow(dead_code)]
 const DEFAULT_TTL: u32 = 5;
 
 /// Consecutive trigger count threshold before upgrading from brief to full text.
+/// Retained as documentation reference; runtime value from `PromptDefaults::full_upgrade_threshold`.
+#[allow(dead_code)]
 const FULL_UPGRADE_THRESHOLD: u32 = 3;
+
+// ─── TOML 配置 schema ─────────────────────────────────────────────────────
+
+/// TOML 配置文件的完整 schema，用于从外部文件加载 Expert Role 和 Topic 定义。
+///
+/// ## 生命周期
+/// - 创建：`load_roles_config()` 解析 TOML 文件时
+/// - 消费：`DynamicInjector::apply_config()` 注入到 injector 实例
+/// - 销毁：随 `DynamicInjector` 实例释放
+///
+/// ## 引用关系
+/// - 消费方：`DynamicInjector::register_defaults_with_config()`、`DynamicInjector::reload_config()`
+/// - 依赖方：`ExpertRoleSpec`、`TopicSpec`、`PromptDefaults`
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PromptRolesConfig {
+    #[serde(default)]
+    pub expert_roles: Vec<ExpertRoleSpec>,
+    #[serde(default)]
+    pub topics: Vec<TopicSpec>,
+    #[serde(default)]
+    pub defaults: PromptDefaults,
+}
+
+/// 单个专家角色定义。
+///
+/// ## 引用关系
+/// - 生产方：TOML 配置文件 / `builtin_roles()`
+/// - 消费方：`DynamicInjector::apply_config()` → 转换为 `InjectionSource` 注册
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExpertRoleSpec {
+    pub id: String,
+    #[serde(default)]
+    pub keywords_zh: Vec<String>,
+    #[serde(default)]
+    pub keywords_en: Vec<String>,
+    pub brief: String,
+    pub full: String,
+    #[serde(default)]
+    pub ttl: Option<u32>,
+}
+
+/// 主题定义。
+///
+/// ## 引用关系
+/// - 生产方：TOML 配置文件
+/// - 消费方：`DynamicInjector::apply_config()` → topic injector source
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopicSpec {
+    pub id: String,
+    pub keywords: Vec<String>,
+    pub hint: String,
+}
+
+/// 全局默认值覆盖，用于替代硬编码的 const 常量。
+///
+/// ## 引用关系
+/// - 消费方：`DynamicInjector::inject()` 中的 TTL 重置、budget cap、upgrade 判断
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptDefaults {
+    #[serde(default = "default_ttl")]
+    pub ttl: u32,
+    #[serde(default = "default_max_knowledge_tokens")]
+    pub max_knowledge_tokens: usize,
+    #[serde(default = "default_full_upgrade_threshold")]
+    pub full_upgrade_threshold: u32,
+}
+
+fn default_ttl() -> u32 { 5 }
+fn default_max_knowledge_tokens() -> usize { 600 }
+fn default_full_upgrade_threshold() -> u32 { 3 }
+
+impl Default for PromptDefaults {
+    fn default() -> Self {
+        Self {
+            ttl: 5,
+            max_knowledge_tokens: 600,
+            full_upgrade_threshold: 3,
+        }
+    }
+}
+
+/// 从 TOML 文件加载配置，失败时返回 None（调用方使用 builtin fallback）。
+///
+/// ## 引用关系
+/// - 消费方：`DynamicInjector::reload_config()`、`DynamicInjector::register_defaults_with_config()`
+pub fn load_roles_config(path: &Path) -> Option<PromptRolesConfig> {
+    let content = std::fs::read_to_string(path).ok()?;
+    toml::from_str(&content).ok()
+}
+
+/// 将内置 10 个硬编码角色转换为 `ExpertRoleSpec` 格式。
+///
+/// 保留原有 const 关键词数组的数据，作为未提供外部 TOML 时的 fallback 数据源。
+///
+/// ## 引用关系
+/// - 消费方：`DynamicInjector::register_defaults()`（无外部配置时）
+pub fn builtin_roles() -> Vec<ExpertRoleSpec> {
+    vec![
+        ExpertRoleSpec {
+            id: "trading_strategist".into(),
+            keywords_zh: vec!["回测".into(), "做多".into(), "做空".into(), "仓位管理".into(), "开仓".into(), "平仓".into()],
+            keywords_en: vec!["backtest".into(), "alpha".into(), "position sizing".into(), "sharpe".into()],
+            brief: "[trading_strategist] 策略假设→信号质素→风险定量→执行路径。禁止未来数据泄露，Kelly分数控仓。".into(),
+            full: "[ExpertRole: trading_strategist] 交易策略专家\n思维框架: 策略假设副题驗证 → 信号素质评估 → 风险定量 → 执行路径设计。\n行为约束:\n- 回测必须北废: 分离训练集/测试集，禁止未来数据泄露。\n- 信号分析必须包含: 信号强度、宽度、衰减、市场制度四个维度。\n- 风险控制先于收益: Kelly 分数/半 Kelly，强调最大回撤和浮动盗上限。\n- 波动率调整: Sharpe、Sortino、回撤比这三个指标必须同时呈现。\n工具偏好: code.execute（数值计算）、db.query（历史行情）、kb.query（策略知识）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "security_analyst".into(),
+            keywords_zh: vec!["漏洞".into(), "渗透".into(), "安全审查".into(), "sql注入".into()],
+            keywords_en: vec!["vulnerability".into(), "pentest".into(), "exploit".into(), "owasp".into(), "xss".into(), "sql injection".into(), "security audit".into()],
+            brief: "[security_analyst] 威胁建模(STRIDE)→攻击面→漏洞验证→修复优先级。拒绝指导攻击，PoC必附环境限制。".into(),
+            full: "[ExpertRole: security_analyst] 安全审计专家\n思维框架: 威胁建模（STRIDE）→ 攻击面识别 → 漏洞验证 → 修复方案优先级。\n行为约束:\n- 永远提供技术鉴定和防御视角，拒绝指导实际攻击操作。\n- 浏览器/输入辽渗点用 OWASP Top 10 进行完整密度检查。\n- 加密建议必须指明算法强度和证书链完整性。\n- 输出验证方法: PoC 一定要指定环境和限制条件。\n工具偏好: fs.grep（模式扫描）、code.execute（沙盒验证）、kb.query（CVE知识库）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "system_architect".into(),
+            keywords_zh: vec!["分布式系统".into(), "微服务".into(), "事件溯源".into(), "容灾".into(), "高可用".into()],
+            keywords_en: vec!["microservice".into(), "ddd".into(), "event sourcing".into(), "cqrs".into()],
+            brief: "[system_architect] 业务边界→CAP权衡→数据流建模→故障隔离→ADR。禁止跨服务直连DB，容量估算必附假设。".into(),
+            full: "[ExpertRole: system_architect] 系统架构师\n思维框架: 业务边界划分 → CAP/PACELC 权衡判断 → 数据流建模 → 故障隔离 → ADR 冒。\n行为约束:\n- 每个架构决策必须输出 ADR（底层/备选/得失）三要素。\n- 识别共享数据边界，不允许跨服务直接访问内部 DB。\n- 一致性和延迟必须同时建模：最终一致还是强一致？为什么？\n- 容量估算必须附归假设： QPS/DAU/数据增长率。\n工具偏好: fs.read（现有架构）、lsp.workspace_symbol（依赖图）、kb.query（模式库）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "data_scientist".into(),
+            keywords_zh: vec!["机器学习".into(), "特征工程".into(), "过拟合".into(), "神经网络".into(), "模型训练".into()],
+            keywords_en: vec!["machine learning".into(), "deep learning".into(), "feature engineering".into(), "overfitting".into(), "neural network".into(), "model training".into()],
+            brief: "[data_scientist] EDA→特征工程→基线模型→迭代优化→可解释性。禁止训练集含未来信息，简单基线先跑。".into(),
+            full: "[ExpertRole: data_scientist] 数据科学家\n思维框架: 问题建模 → 数据探索(EDA) → 特征工程 → 基线模型 → 迭代优化 → 可解释性分析。\n行为约束:\n- 评估指标必须匹配业务目标（精度还是召回率？为什么？）。\n- 数据泄露检查: 训练集中禁止包含未来信息。\n- 模型复杂度 vs 效果的对比：简单基线模型必须先跑。\n- 不确定性量化: 置信区间和检验集表现必须展示。\n工具偏好: code.execute（Rhai 计算）、db.query（算法指标）、kb.query（学术方法）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "product_manager".into(),
+            keywords_zh: vec!["用户故事".into(), "需求文档".into(), "迭代计划".into()],
+            keywords_en: vec!["prd".into(), "user story".into(), "product requirement".into(), "sprint planning".into(), "mvp".into()],
+            brief: "[product_manager] 痛点定义→范围边界→RICE评估→验收标准。需求MECE分层，用户故事三段式。".into(),
+            full: "[ExpertRole: product_manager] 产品经理\n思维框架: 用户痛点定义 → 问题范围边界 → 方案评估（RICE/ICE）→ 验收标准 → 上线日期。\n行为约束:\n- 需求必须区分: 功能需求 vs 约束条件，每条采用 MECE 层次写。\n- 带出成功标准（定量）和验证方法同时展示。\n- 用户故事格式: 作为「角色」，我希望「行为」，以便「价値」。\n- 优先级必须伴随依据：数据估算、技术成本、业务影响。\n工具偏好: kb.query（竞品分析）、fs.read（现有需求文档）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "devops_engineer".into(),
+            keywords_zh: vec!["流水线".into()],
+            keywords_en: vec!["docker".into(), "kubernetes".into(), "k8s".into(), "pipeline".into(), "helm".into(), "terraform".into(), "ansible".into()],
+            brief: "[devops_engineer] 环境差异→流水线→幂等性→回滚安全网→可观测性。镜像版本锁定，non-root运行。".into(),
+            full: "[ExpertRole: devops_engineer] DevOps / 基础设施工程师\n思维框架: 环境差异分析 → 流水线设计 → 幂等性验证 → 回滚安全网 → 可观测性。\n行为约束:\n- Dockerfile 必须指定基础镜像版本，使用最小权限 non-root 用户。\n- 幂等性验证: 重复执行 apply 必须无副作用。\n- 销毁操作（drain/delete）必须附带回滚方案和记录备份验证。\n- 资源定频和限制必须同时展示: CPU/内存/并发三个维度。\n工具偏好: fs.read（配置文件）、bash.exec（验证命令）、kb.query（最佳实践）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "code_reviewer".into(),
+            keywords_zh: vec!["代码审查".into(), "代码质量".into(), "技术债".into(), "重构方案".into()],
+            keywords_en: vec!["code review".into(), "technical debt".into(), "solid原则".into(), "solid principle".into()],
+            brief: "[code_reviewer] 正确性→可读性→性能→安全→测试覆盖。评论三级(Blocker/Major/Nit)，重构必评成本收益。".into(),
+            full: "[ExpertRole: code_reviewer] 代码审查専家\n思维框架: 正确性 → 延伸性和可读性 → 性能隐患 → 安全风险 → 测试覆盖。\n行为约束:\n- 审查评论分三级: Blocker（阅考前必修）／Major（建议修）／Nit（风格建议）。\n- 必须指出为什么是问题，不能只说\"应该改\"。\n- 建议重构时必须评估: 改动成本 × 风险 ÷ 收益。\n- 覆盖测试评估: 单元测试对领域概念的覆盖率是否足够。\n工具偏好: lsp.find_references（引用分析）、lsp.call_hierarchy_incoming（调用链）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "financial_analyst".into(),
+            keywords_zh: vec!["金融建模".into(), "估値模型".into(), "财务报表".into(), "利润表".into(), "资产负债表".into(), "金融".into(), "财务".into(), "量化".into()],
+            keywords_en: vec!["dcf".into(), "irr".into(), "ebitda".into(), "valuation model".into(), "finance".into(), "financial".into()],
+            brief: "[financial_analyst] 数据质检→可比分析→假设设定→敏感性分析→情景建模。指标必对标行业，区分公告/估算数据。".into(),
+            full: "[ExpertRole: financial_analyst] 金融分析师\n思维框架: 财务数据质量检验 → 可比性分析 → 假设设定 → 模型橁鸟 → 敖事性和数字并行。\n行为约束:\n- 关键指标必须附带行业平均对标。\n- 假设必须明确标注并进行敏感性分析。\n- 不确定性必须用情景分析（基准/乐观/悲观）表现。\n- 标注数据来源时间戳，区分公告数据和估算数据。\n工具偏好: code.execute（DCF/估值计算）、db.query（财务数据）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "legal_compliance".into(),
+            keywords_zh: vec!["合规性".into(), "数据主权".into(), "开源许可".into(), "隐私政策".into(), "法律验证".into()],
+            keywords_en: vec!["gdpr".into(), "license".into(), "regulation".into()],
+            brief: "[legal_compliance] 法规映射→场景确认→差距分析→修复优先级。附条款编号+生效日期，禁止具体法律建议。".into(),
+            full: "[ExpertRole: legal_compliance] 法务合规专家\n思维框架: 法规映射 → 应用场景确认 → 差距分析 → 修复方案优先级 → 封项记录。\n行为约束:\n- 定论必须附属具体法律条款编号和生效日期。\n- 法律风险估算必须展示为最小化路径和接受路径两种方案。\n- 隐私数据识别: 区分 PII/敏感数据/匹名化数据，说明处理要求。\n- 禁止给出属于法律领域范围的具体建议，请务必提示孙证。\n工具偏好: kb.query（法规知识库）、fs.read（合同和指南文件）。".into(),
+            ttl: None,
+        },
+        ExpertRoleSpec {
+            id: "tech_writer".into(),
+            keywords_zh: vec!["api文档".into(), "技术规范".into(), "接口文档".into(), "文档注释".into()],
+            keywords_en: vec!["openapi".into(), "swagger".into(), "changelog".into(), "api spec".into(), "docstring".into()],
+            brief: "[tech_writer] 读者画像→信息层次→示例第一→可发现性。API文档必含请求/响应/错误码，示例必须可运行。".into(),
+            full: "[ExpertRole: tech_writer] 技术文档専家\n思维框架: 读者画像 → 信息层次设计 → 示例第一 → 可发现性 → 小处细节与大局观并行。\n行为约束:\n- API 文档必须包含: 请求示例、响应示例、错误码表三部分。\n- README 结构: 快速开始(一命令) → 核心功能 → 配置项 → FAQ。\n- 长度安全处理: 单一概念 ≤ 300 字，超出时分页。\n- 每个示例必须是可运行的，不允许出现 `your-value-here` 占位符。\n工具偏好: fs.read（现有代码理解接口）、lsp.hover（类型提取）。".into(),
+            ttl: None,
+        },
+    ]
+}
+
+/// 内置 topic 定义列表，作为未提供外部配置时的 fallback。
+///
+/// ## 引用关系
+/// - 消费方：`DynamicInjector::register_defaults()`（无外部 topics 配置时）
+fn builtin_topics() -> Vec<TopicSpec> {
+    vec![
+        TopicSpec { id: "rust".into(), keywords: vec!["rust".into()], hint: "Rust".into() },
+        TopicSpec { id: "typescript".into(), keywords: vec!["typescript".into()], hint: "TypeScript".into() },
+        TopicSpec { id: "python".into(), keywords: vec!["python".into()], hint: "Python".into() },
+        TopicSpec { id: "react".into(), keywords: vec!["react".into()], hint: "React".into() },
+        TopicSpec { id: "api".into(), keywords: vec!["api".into()], hint: "API Design".into() },
+        TopicSpec { id: "database".into(), keywords: vec!["database".into()], hint: "Database".into() },
+    ]
+}
 
 /// Knowledge segment with TTL for auto-unload.
 ///
@@ -174,6 +377,10 @@ pub struct DynamicInjector {
     /// Cached materialized segments for backward-compatible `active_knowledge()` getter.
     /// Rebuilt whenever knowledge_entries or non_role_knowledge mutates.
     cached_segments: Vec<PromptSegment>,
+    /// Runtime defaults loaded from config or builtin fallback.
+    /// Controls TTL, budget cap, and upgrade threshold.
+    /// Created: `new()` (builtin defaults). Updated: `apply_config()` / `reload_config()`.
+    defaults: PromptDefaults,
 }
 
 impl Default for DynamicInjector {
@@ -181,13 +388,14 @@ impl Default for DynamicInjector {
 }
 
 impl DynamicInjector {
-    /// Create an empty injector with no registered sources.
+    /// Create an empty injector with no registered sources (uses builtin defaults).
     pub fn new() -> Self {
         Self {
             sources: Vec::new(),
             knowledge_entries: Vec::new(),
             non_role_knowledge: Vec::new(),
             cached_segments: Vec::new(),
+            defaults: PromptDefaults::default(),
         }
     }
 
@@ -236,15 +444,19 @@ impl DynamicInjector {
         let lower = input.to_lowercase();
         let detected = detect_expert_role_split(&lower);
 
+        let cfg_ttl = self.defaults.ttl;
+        let cfg_threshold = self.defaults.full_upgrade_threshold;
+        let cfg_max_tokens = self.defaults.max_knowledge_tokens;
+
         if let Some((role_id, brief_text, full_text)) = detected {
             // Role keyword matched: find existing entry or create new
             if let Some(entry) = self.knowledge_entries.iter_mut().find(|e| e.role_id == role_id) {
                 // Reset TTL and increment hit counter
-                if entry.ttl != DEFAULT_TTL || entry.consecutive_hits < FULL_UPGRADE_THRESHOLD {
-                    entry.ttl = DEFAULT_TTL;
+                if entry.ttl != cfg_ttl || entry.consecutive_hits < cfg_threshold {
+                    entry.ttl = cfg_ttl;
                     entry.consecutive_hits += 1;
                     // Upgrade brief→full if threshold reached
-                    if entry.is_brief && entry.consecutive_hits >= FULL_UPGRADE_THRESHOLD {
+                    if entry.is_brief && entry.consecutive_hits >= cfg_threshold {
                         entry.is_brief = false;
                         entry.segment = PromptSegment {
                             kind: SegmentKind::Knowledge,
@@ -264,7 +476,7 @@ impl DynamicInjector {
                         text: brief_text,
                     },
                     role_id,
-                    ttl: DEFAULT_TTL,
+                    ttl: cfg_ttl,
                     is_brief: true,
                     consecutive_hits: 1,
                 });
@@ -286,19 +498,19 @@ impl DynamicInjector {
             }
         }
 
-        // ─── Budget cap: enforce MAX_KNOWLEDGE_TOKENS ─────────────────────────
+        // ─── Budget cap: enforce max_knowledge_tokens ─────────────────────────
         if !self.knowledge_entries.is_empty() {
             let total_tokens: usize = self.knowledge_entries.iter()
                 .map(|e| estimate_tokens(&e.segment.text))
                 .sum();
-            if total_tokens > MAX_KNOWLEDGE_TOKENS {
+            if total_tokens > cfg_max_tokens {
                 // Sort by TTL desc (keep highest TTL = most recently refreshed)
                 self.knowledge_entries.sort_by(|a, b| b.ttl.cmp(&a.ttl));
                 let mut budget = 0usize;
                 let mut keep_count = 0;
                 for entry in &self.knowledge_entries {
                     let cost = estimate_tokens(&entry.segment.text);
-                    if budget + cost > MAX_KNOWLEDGE_TOKENS {
+                    if budget + cost > cfg_max_tokens {
                         break;
                     }
                     budget += cost;
@@ -460,6 +672,128 @@ impl DynamicInjector {
                 })
             }),
         });
+    }
+
+    /// Register defaults with an external TOML config.
+    ///
+    /// Roles from `config.expert_roles` override builtin roles with matching `id`.
+    /// Builtin roles not present in config are kept. Topics from config replace builtin topics
+    /// entirely if non-empty.
+    ///
+    /// ## 引用关系
+    /// - 调用方：应用启动时传入加载的 `PromptRolesConfig`
+    /// - 依赖：`builtin_roles()`、`builtin_topics()`、`apply_config()`
+    pub fn register_defaults_with_config(&mut self, config: PromptRolesConfig) {
+        self.apply_config(config);
+    }
+
+    /// Apply a config to this injector: merge roles (external overrides builtin by id),
+    /// register topic sources, update defaults. Clears existing sources before re-registering.
+    ///
+    /// ## 生命周期
+    /// - 调用后 `self.sources` 完全重建
+    /// - `self.defaults` 更新为 config.defaults
+    /// - 不清除 `knowledge_entries`（保持跨 turn 状态连续性）
+    fn apply_config(&mut self, config: PromptRolesConfig) {
+        // Update defaults
+        self.defaults = config.defaults;
+
+        // Clear existing sources for re-registration
+        self.sources.clear();
+
+        // ─── Merge roles: external overrides builtin by id ───────────────────
+        let mut merged_roles = builtin_roles();
+        for ext_role in config.expert_roles {
+            if let Some(existing) = merged_roles.iter_mut().find(|r| r.id == ext_role.id) {
+                *existing = ext_role;
+            } else {
+                merged_roles.push(ext_role);
+            }
+        }
+
+        // Register expert role source using merged roles
+        let roles_for_should = merged_roles;
+        self.register_source(InjectionSource {
+            source_id: "expert_role".into(),
+            should_inject: Box::new(move |input, _ctx| {
+                let lower = input.to_lowercase();
+                roles_for_should.iter().any(|role| {
+                    role.keywords_zh.iter().any(|kw| lower.contains(kw.as_str()))
+                        || role.keywords_en.iter().any(|kw| lower.contains(kw.as_str()))
+                })
+            }),
+            inject: Box::new(move |input, _ctx| {
+                let lower = input.to_lowercase();
+                // Use detect_expert_role (legacy path) which returns static str
+                // This keeps backward compatibility with the existing TTL logic
+                detect_expert_role(&lower).map(|text| PromptSegment {
+                    kind: SegmentKind::Knowledge,
+                    text: text.to_string(),
+                })
+            }),
+        });
+
+        // ─── Topics: use config topics if non-empty, else builtin ────────────
+        let topics = if config.topics.is_empty() {
+            builtin_topics()
+        } else {
+            config.topics
+        };
+
+        let topics_for_should = topics.clone();
+        let topics_for_inject = topics;
+        self.register_source(InjectionSource {
+            source_id: "topic".into(),
+            should_inject: Box::new(move |input, _ctx| {
+                let lower = input.to_lowercase();
+                topics_for_should.iter().any(|t| {
+                    t.keywords.iter().any(|kw| lower.contains(kw.as_str()))
+                })
+            }),
+            inject: Box::new(move |input, _ctx| {
+                let lower = input.to_lowercase();
+                for topic in &topics_for_inject {
+                    if topic.keywords.iter().any(|kw| lower.contains(kw.as_str())) {
+                        return Some(PromptSegment {
+                            kind: SegmentKind::Knowledge,
+                            text: format!("[Injector] Topic context: user discussing {}. {}", topic.hint, "Use relevant best practices and conventions."),
+                        });
+                    }
+                }
+                None
+            }),
+        });
+
+        // tool_result source (always present)
+        self.register_source(InjectionSource {
+            source_id: "tool_result".into(),
+            should_inject: Box::new(|_input, ctx| {
+                ctx.get("tool_results")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+            }),
+            inject: Box::new(|_input, _ctx| {
+                Some(PromptSegment {
+                    kind: SegmentKind::Knowledge,
+                    text: "[Injector] Tool results available in current turn. Review them before responding.".to_string(),
+                })
+            }),
+        });
+    }
+
+    /// 热重载配置（LLM 通过 config_set 触发）。
+    ///
+    /// 从指定路径读取 TOML 并 apply。加载失败时保持现有配置不变。
+    ///
+    /// ## 引用关系
+    /// - 调用方：runtime config_set handler
+    /// - 依赖：`load_roles_config()`、`apply_config()`
+    pub fn reload_config(&mut self, path: &Path) {
+        if let Some(config) = load_roles_config(path) {
+            self.apply_config(config);
+            tracing::info!("Prompt roles config reloaded from {:?}", path);
+        }
     }
 }
 

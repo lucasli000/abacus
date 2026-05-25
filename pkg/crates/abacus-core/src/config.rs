@@ -533,6 +533,7 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     //   summarized | omitted（仅 Anthropic adaptive 路径生效）
     defaults.insert("core.thinking_display".into(), ConfigValue::String("summarized".into()));
     defaults.insert("core.context_window".into(), ConfigValue::Number(128000.0));
+    defaults.insert("core.context_window_ratio".into(), ConfigValue::Number(0.5));
     defaults.insert("safety.max_input_length".into(), ConfigValue::Number(100000.0));
     defaults.insert("safety.max_tool_calls".into(), ConfigValue::Number(500.0));
     let home = std::env::var("HOME")
