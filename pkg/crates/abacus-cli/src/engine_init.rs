@@ -206,6 +206,7 @@ pub async fn create_engine(
         // cross-session: 默认开启 jsonl 事件流写入
         event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
         scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
+        policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
     };
 
     let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;

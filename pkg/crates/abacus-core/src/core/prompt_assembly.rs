@@ -252,7 +252,13 @@ impl PromptAssembly {
 
         // Layer 3 (200): Strategy + AntiPattern
         layers.entry(200).or_default().push(
-            "## Execution Strategy\n\
+            "## Tool Usage\n\
+            You have access to tools via function calling. To use a tool, emit a tool_call with the tool name and JSON parameters — do NOT write tool names or commands in your text response. The system will execute the tool and return results.\n\
+            - To run shell commands: call `bash_exec` with {\"command\": \"...\"}. Do NOT write shell commands in code blocks.\n\
+            - To read files: call `fs_read` with {\"path\": \"/absolute/path\"}. Do NOT write `cat` or `head` in text.\n\
+            - To search files: call `fs_search` (by filename glob) or `fs_grep` (by content regex).\n\
+            - All parameters are JSON objects, not CLI flags. Never use --flag syntax.\n\n\
+            ## Execution Strategy\n\
             - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
             - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
             - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
@@ -262,9 +268,11 @@ impl PromptAssembly {
             - Context management: when you make important decisions or receive critical user confirmations, call context_pin to protect that turn from compression.".into());
         layers.entry(190).or_default().push(
             "## Constraints\n\
+            - NEVER write tool names or commands in text/code blocks — always use function calling.\n\
             - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\
             - NEVER skip tool verification by saying \"I believe\" or \"I think\" — use the tool.\n\
             - NEVER produce placeholder code (TODO, ..., pass) — write complete implementations.\n\
+            - NEVER use CLI flag syntax (--flag) in tool parameters — use JSON key-value pairs.\n\
             - When output exceeds 50 lines: use structured sections with clear headers.\n\
             - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
 
