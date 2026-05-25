@@ -870,6 +870,8 @@ pub struct AppState {
     /// 密度模式：true=Compact(高密度), false=Comfortable(呼吸感，默认)
     /// Ctrl+D 切换。影响：消息间距、TopBar 信息密度、面板位置
     pub compact: bool,
+    /// Resize debounce：窗口大小变化后倒数 N 帧再重建消息缓存（避免拖动时卡顿）
+    pub resize_debounce_frames: u8,
     pub ctrl_c_last: Option<Instant>,
     /// 当前操作开始时间（用于显示耗时）
     pub op_started_at: Option<Instant>,
@@ -2059,6 +2061,7 @@ impl AppState {
             running: true,
             paused: false,
             compact: false,
+            resize_debounce_frames: 0,
             ctrl_c_last: None,
             op_started_at: None,
             accumulated_elapsed: std::time::Duration::ZERO,

@@ -1256,13 +1256,13 @@ impl<'a> TurnPipeline<'a> {
                         return Err(KernelError::ApiError { status: 400, body: body.clone() });
                     }
                 }
-                Err(ref e) => {
+                Err(e) => {
                     if let Some(ref stx) = self.stream_tx {
                         let _ = stx.send(crate::llm::stream::StreamChunk::Error(
                             format!("LLM provider error: {}", e)
                         ));
                     }
-                    return Err(provider_result.unwrap_err());
+                    return Err(e);
                 }
             };
 
@@ -1442,6 +1442,17 @@ impl<'a> TurnPipeline<'a> {
                     continue;
                 }
 
+                // Content policy filter — LLM response blocked
+                if response.finish_reason == "content_filter" {
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                            "Response blocked by content safety policy".into()
+                        ));
+                    }
+                    ctx.final_response = "[Content filtered by safety policy]".into();
+                    break;
+                }
+
                 // Model Self-Escalation (flash → pro)
                 if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
                     return Ok(Some(result));
@@ -1469,19 +1480,35 @@ impl<'a> TurnPipeline<'a> {
             }
 
             if ctx.total_tool_calls + tool_calls.len() as u32 > MAX_TOTAL_TOOL_CALLS {
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        format!("Reached maximum tool calls limit ({}). Ending turn.", ctx.total_tool_calls)
+                    ));
+                }
                 ctx.final_response = "(max total tool calls reached)".to_string();
                 break;
             }
             if tool_calls.len() > self.core.config.max_tool_calls_per_turn as usize {
-                return Err(KernelError::Other(format!(
+                let err_msg = format!(
                     "tool calls exceed limit: {} > {}",
                     tool_calls.len(), self.core.config.max_tool_calls_per_turn
-                )));
+                );
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(err_msg.clone()));
+                }
+                return Err(KernelError::Other(err_msg));
             }
 
             ctx.total_tool_calls += tool_calls.len() as u32;
-            self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls)
-                .map_err(|e| KernelError::Other(e.to_string()))?;
+            if let Err(e) = self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls) {
+                let err_msg = e.to_string();
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        format!("Safety guard: {}", err_msg)
+                    ));
+                }
+                return Err(KernelError::Other(err_msg));
+            }
 
             let user_role = { let s = self.session.read().await; s.user_role };
             let mut tool_results: Vec<Message> = Vec::new();
@@ -1548,7 +1575,7 @@ impl<'a> TurnPipeline<'a> {
                     (None, None)
                 };
 
-                let mut output = if let Some(cached) = dedup_hit.clone() {
+                let output_result = if let Some(cached) = dedup_hit.clone() {
                     Ok::<ToolOutput, KernelError>(cached)
                 } else if raw_name == "session_request_permission" {
                     // LLM 主动申请权限入口：向用户展示授权对话框
@@ -1720,21 +1747,26 @@ impl<'a> TurnPipeline<'a> {
                                     }
                                 }
                                 // 走真 execute 路径（mag_chain.before → registry.execute → wrap → after）
-                                self.core.mag_chain.read().await.before(&tool_id, &params).await?;
-                                let exec_ctx = {
-                                    let s = self.session.read().await;
-                                    crate::tool::ExecutionContext {
-                                        session_id: s.session_id.clone(),
-                                        filengine: s.filengine_session.clone(),
-                                        turn_number: ctx.turn_number,
-                                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
-                                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
-                                    }
-                                };
-                                let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
-                                output = self.core.mcip_gateway.wrap_output(output);
-                                self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
-                                Ok(output)
+                                // 使用 async block 捕获错误以确保 ToolEnd 在 Fix 5 outer match 中发送
+                                let exec_result: Result<ToolOutput, KernelError> = async {
+                                    self.core.mag_chain.read().await.before(&tool_id, &params).await?;
+                                    let exec_ctx = {
+                                        let s = self.session.read().await;
+                                        crate::tool::ExecutionContext {
+                                            session_id: s.session_id.clone(),
+                                            filengine: s.filengine_session.clone(),
+                                            turn_number: ctx.turn_number,
+                                            bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                                            bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                                            tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                                        }
+                                    };
+                                    let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
+                                    output = self.core.mcip_gateway.wrap_output(output);
+                                    self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
+                                    Ok(output)
+                                }.await;
+                                exec_result
                             } else {
                                 // 精简拒绝消息，减少 LLM 重试浪费的 token
                                 Ok(ToolOutput {
@@ -1788,28 +1820,50 @@ impl<'a> TurnPipeline<'a> {
                                 })
                             } else {
                                 // 正常执行：read lock 足够（before/after 均取 &self）
-                                self.core.mag_chain.read().await.before(&tool_id, &params).await?;
-                                // 构建 per-request ExecutionContext（携带当前 session 的 filengine 状态）
-                                // 持有 Arc 克隆，不阻塞 session write lock
-                                let exec_ctx = {
-                                    let s = self.session.read().await;
-                                    crate::tool::ExecutionContext {
-                                        session_id: s.session_id.clone(),
-                                        filengine: s.filengine_session.clone(),
-                                        turn_number: ctx.turn_number,
-                                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
-                                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
-                                    }
-                                };
-                                // W2 (Task #100): clone params 因下游 dedup.record 还需要原值
-                                let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
-                                output = self.core.mcip_gateway.wrap_output(output);
-                                self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
-                                Ok(output)
+                                // 使用闭包捕获错误以确保 ToolEnd 在 Fix 5 outer match 中发送
+                                let exec_result: Result<ToolOutput, KernelError> = async {
+                                    self.core.mag_chain.read().await.before(&tool_id, &params).await?;
+                                    // 构建 per-request ExecutionContext（携带当前 session 的 filengine 状态）
+                                    // 持有 Arc 克隆，不阻塞 session write lock
+                                    let exec_ctx = {
+                                        let s = self.session.read().await;
+                                        crate::tool::ExecutionContext {
+                                            session_id: s.session_id.clone(),
+                                            filengine: s.filengine_session.clone(),
+                                            turn_number: ctx.turn_number,
+                                            bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                                            bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                                            tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                                        }
+                                    };
+                                    // W2 (Task #100): clone params 因下游 dedup.record 还需要原值
+                                    let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
+                                    output = self.core.mcip_gateway.wrap_output(output);
+                                    self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
+                                    Ok(output)
+                                }.await;
+                                exec_result
                             }
                         }
                     }
-                }?;
+                };
+                let mut output = match output_result {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // Fix 5: ToolStart was already sent — send ToolEnd with success=false before propagating
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
+                                name: tc.function.name.clone(),
+                                success: false,
+                                duration_ms: 0,
+                            });
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                format!("Tool dispatch failed: {}", e)
+                            ));
+                        }
+                        return Err(e);
+                    }
+                };
                 // V29.11: ToolOutput — 工具返回内容(让 TUI trace 展开时显示 output)
                 if let Some(ref stx) = self.stream_tx {
                     let output_str = serde_json::to_string(&output.output).unwrap_or_default();
@@ -1967,6 +2021,16 @@ impl<'a> TurnPipeline<'a> {
                 let s = self.session.read().await;
                 let mut msgs = s.messages.write().await;
                 msgs.extend(tool_results);
+            }
+
+            // Fix 3: Warn user when approaching loop limit (80% threshold)
+            let limit = self.core.config.max_turns_per_request;
+            if loop_iter >= (limit * 80 / 100) && loop_iter < limit {
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                        format!("Approaching iteration limit ({}/{})", loop_iter + 1, limit)
+                    ));
+                }
             }
         }
 

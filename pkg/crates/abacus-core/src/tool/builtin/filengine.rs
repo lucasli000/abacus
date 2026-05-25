@@ -1780,6 +1780,7 @@ mod tests {
             turn_number: 7,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            tool_default_timeout: 60,
         };
         (logger, ctx)
     }
@@ -1918,6 +1919,7 @@ mod tests {
             turn_number: 1,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            tool_default_timeout: 60,
         };
 
         let target = tmp_path.join("nolog.txt");

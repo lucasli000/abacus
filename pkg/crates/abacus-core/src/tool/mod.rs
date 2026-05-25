@@ -86,6 +86,12 @@ pub struct ExecutionContext {
     pub bash_default_timeout: u64,
     /// Bash 最大超时（秒）— 从 policy.toml 注入
     pub bash_max_timeout: u64,
+    /// 通用工具执行超时（秒）— 从 policy.toml 注入
+    ///
+    /// 引用关系：由 pipeline 从 PolicyConfig.thresholds.tool_default_timeout 注入
+    /// 消费方：ToolRegistry::execute() 用作非 bash 工具的安全网超时
+    /// Bash 工具有独立内部超时机制，此字段对 bash 是冗余安全网（仍生效但较宽松）
+    pub tool_default_timeout: u64,
 }
 
 impl ExecutionContext {
@@ -102,6 +108,7 @@ impl ExecutionContext {
             turn_number: 0,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            tool_default_timeout: 60,
         }
     }
 }
@@ -316,10 +323,33 @@ impl ToolRegistry {
         match executor {
             Some(exe) => {
                 let start = std::time::Instant::now();
-                let result = exe.execute(tool_id, params, ctx).await;
+                let timeout_secs = ctx.tool_default_timeout;
+
+                // Panic isolation + timeout safety net
+                //
+                // 引用关系：
+                // - tokio::spawn 隔离 executor panic（不崩溃调用方 task）
+                // - tokio::time::timeout 防止 executor 无限挂起
+                //
+                // 生命周期：
+                // - spawned task 在 timeout 或完成后销毁
+                // - timeout 到期时 spawned task 被 abort（资源释放）
+                let tid = tool_id.clone();
+                let ctx_clone = ctx.clone();
+                let handle = tokio::spawn(async move {
+                    exe.execute(&tid, params, &ctx_clone).await
+                });
+
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    handle,
+                ).await;
+
                 let latency = start.elapsed().as_millis() as u64;
+
                 match result {
-                    Ok(output) => Ok(ToolOutput {
+                    // 正常完成 + executor 返回 Ok
+                    Ok(Ok(Ok(output))) => Ok(ToolOutput {
                         tool_id: tool_id.clone(),
                         success: true,
                         output,
@@ -327,15 +357,39 @@ impl ToolRegistry {
                         failure_kind: None,
                         try_instead: Vec::new(),
                     }),
-                    Err(e) => Ok(ToolOutput {
+                    // 正常完成 + executor 返回 Err（业务错误）
+                    Ok(Ok(Err(e))) => Ok(ToolOutput {
                         tool_id: tool_id.clone(),
                         success: false,
                         output: serde_json::json!({"error": e.to_string()}),
                         latency_ms: latency,
-                        // BusinessError 是默认兜底——具体业务错误执行器可在 output 内部加字段
                         failure_kind: Some("BusinessError".into()),
                         try_instead: Vec::new(),
                     }),
+                    // Executor panic（JoinError）— 隔离成功，不崩溃调用方
+                    Ok(Err(join_err)) => {
+                        tracing::error!("tool executor panicked: {tool_id} — {join_err}");
+                        Ok(ToolOutput {
+                            tool_id: tool_id.clone(),
+                            success: false,
+                            output: serde_json::json!({"error": format!("executor panicked: {tool_id}")}),
+                            latency_ms: latency,
+                            failure_kind: Some("Panic".into()),
+                            try_instead: Vec::new(),
+                        })
+                    }
+                    // 超时 — abort spawned task，释放资源
+                    Err(_elapsed) => {
+                        tracing::warn!("tool execution timeout: {tool_id} after {timeout_secs}s");
+                        Ok(ToolOutput {
+                            tool_id: tool_id.clone(),
+                            success: false,
+                            output: serde_json::json!({"error": format!("timeout after {timeout_secs}s")}),
+                            latency_ms: latency,
+                            failure_kind: Some("Timeout".into()),
+                            try_instead: Vec::new(),
+                        })
+                    }
                 }
             }
             None => Ok(ToolOutput {

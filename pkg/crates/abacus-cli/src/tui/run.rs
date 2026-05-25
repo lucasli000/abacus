@@ -313,7 +313,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             }
             _ = interval.tick() => {
                 if let Ok(size) = terminal.size() {
-                    (rows, cols) = (size.height, size.width);
+                    let new_rows = size.height;
+                    let new_cols = size.width;
+                    if new_cols != cols || new_rows != rows {
+                        (rows, cols) = (new_rows, new_cols);
+                        // Resize debounce: 标记 dirty 但延迟 3 帧（150ms）再真正重建
+                        // 避免拖动 resize 时每帧全量重建 message lines
+                        state.resize_debounce_frames = 3;
+                    }
+                    if state.resize_debounce_frames > 0 {
+                        state.resize_debounce_frames -= 1;
+                        if state.resize_debounce_frames == 0 {
+                            // debounce 结束，触发缓存失效
+                            state.rendered_lines_dirty.set(true);
+                        }
+                    }
                 }
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {

@@ -56,6 +56,12 @@ pub struct ThresholdConfig {
     /// Bash 最大超时（秒）
     #[serde(default = "default_bash_max_timeout")]
     pub bash_max_timeout: u64,
+    /// 通用工具执行超时（秒）— 非 bash 工具的安全网
+    ///
+    /// 引用关系：注入到 ExecutionContext.tool_default_timeout → ToolRegistry::execute() 消费
+    /// 生命周期：进程启动时加载，session 内不变
+    #[serde(default = "default_tool_timeout")]
+    pub tool_default_timeout: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +105,7 @@ fn default_thresholds() -> ThresholdConfig {
         confirm_timeout_secs: default_confirm_timeout_secs(),
         bash_default_timeout: default_bash_timeout(),
         bash_max_timeout: default_bash_max_timeout(),
+        tool_default_timeout: default_tool_timeout(),
     }
 }
 
@@ -107,6 +114,8 @@ fn default_premature_stop_max_retries() -> u32 { 3 }
 fn default_confirm_timeout_secs() -> u64 { 15 }
 fn default_bash_timeout() -> u64 { 30 }
 fn default_bash_max_timeout() -> u64 { 120 }
+/// 通用工具超时默认 60s（bash 有独立超时，此为其他工具安全网）
+fn default_tool_timeout() -> u64 { 60 }
 
 fn default_preflight() -> PreflightConfig {
     PreflightConfig {
