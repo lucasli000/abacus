@@ -28,10 +28,7 @@ impl<'a> TurnPipeline<'a> {
             // 由 persist_and_build_result 兜底处理。
         }
 
-        // Context compression — emit 工作态事件让 TUI 展示 "Compacting" 状态
-        if let Some(ref stx) = self.stream_tx {
-            let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
-        }
+        // Context compression — 仅在实际压缩发生时才 emit 事件通知 TUI
         {
             let s = self.session.read().await;
             let mut msgs = s.messages.write().await;
@@ -42,12 +39,14 @@ impl<'a> TurnPipeline<'a> {
                     .sum();
                 tracing::info!("compressed {} messages in turn {}", compressed.len(), ctx.turn_number);
                 if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
                     let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
                         messages_compressed: compressed.len(),
                         tokens_saved,
                     });
                 }
             } else if let Some(ref stx) = self.stream_tx {
+                // 无压缩发生，不发 CompressStart，只发空 End（让 TUI 知道 post 完成）
                 let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
                     messages_compressed: 0,
                     tokens_saved: 0,

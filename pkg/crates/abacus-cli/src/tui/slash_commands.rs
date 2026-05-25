@@ -1309,11 +1309,11 @@ fn cmd_version(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 }
 
 fn cmd_memory(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
-    // V33: 「记忆」意图 → 路由到「量化」tab（含知识宫殿全量层级树）
+    // V33: 「记忆」意图 → 路由到「统计」tab（含知识宫殿全量层级树）
     // 旧 PanelTab::Memory 在 V33 mode 序列中已被 set_mode 兜底回 Timeline
     s.focus = crate::tui::state::Focus::Panel;
     s.panel_tab = crate::tui::state::PanelTab::Quant;
-    s.add_toast("已打开「量化」(知识宫殿全量)", std::time::Duration::from_secs(2));
+    s.add_toast("已打开「统计」(知识宫殿全量)", std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
 

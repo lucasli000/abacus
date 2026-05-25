@@ -1171,7 +1171,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.tool_health.insert(entry.tool_id.clone(), entry);
                             }
                         }
-                        StreamChunk::Complete(_) => {
+                        StreamChunk::Complete(stats) => {
+                            // V40: 实时更新 token 统计（面板每帧可见最新数据）
+                            // 不重复累加——EngineResponse 路径会用聚合值覆盖
+                            // 这里仅用于 streaming 期间的实时显示
+                            state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
+                                .max(stats.prompt_tokens);
+                            state.session_tokens.completion_tokens = state.session_tokens.completion_tokens
+                                .max(stats.completion_tokens);
+                            state.session_tokens.total_tokens = state.session_tokens.total_tokens
+                                .max(stats.total_tokens);
+                            state.session_tokens.cached_tokens = state.session_tokens.cached_tokens
+                                .max(stats.cached_tokens);
                             // ST1：清理流式累积避免双显示
                             state.reset_streaming();
                             // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"

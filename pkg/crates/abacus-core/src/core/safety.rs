@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 pub struct SafetyGuard {
     /// 最大输入长度 (字符数)
     pub max_input_length: usize,
-    /// 最大工具调用总次数（整个 pipeline 生命周期累计）
+    /// 最大工具调用次数（单轮内累计——一次用户消息到 LLM 回复的完整过程）
+    /// Session 级不设限，长对话不受累积约束
     pub max_total_tool_calls: u32,
     /// 最大递归深度
     pub max_recursion_depth: u32,

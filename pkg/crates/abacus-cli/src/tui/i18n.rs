@@ -109,7 +109,7 @@ pub fn t(key: &'static str) -> &'static str {
         // ── 面板标签 ──
         "panel.scene" => if zh { "现场" } else { "Scene" },
         "panel.tasks" => if zh { "任务" } else { "Tasks" },
-        "panel.quant" => if zh { "量化" } else { "Quant" },
+        "panel.quant" => if zh { "统计" } else { "Quant" },
         "panel.custom" => if zh { "自定义" } else { "Custom" },
 
         // ── 面板字段 ──

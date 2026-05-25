@@ -220,26 +220,31 @@ pub fn render_toasts(f: &mut ratatui::Frame, state: &AppState) {
         return;
     }
 
-    let tw = 34u16;
-    let toast_h: u16 = 3; // 卡片高度
-    let toast_gap: u16 = 1; // 卡片间距
-    let x = 1u16; // 左侧弹出（原为 f.area().width.saturating_sub(tw + 2)）
-    // B11：max_y 减去 toast_h 而非硬编码 3，确保最后一个 toast 不被截
-    let max_y = f.area().height.saturating_sub(toast_h);
-    let mut y = 2u16;
-
+    let screen = f.area();
     let now = Instant::now();
+    // 消息框顶部正中间，向下堆叠
+    // toast 宽度自适应内容（min 20, max screen_width * 60%）
+    let max_toast_w = (screen.width as usize * 60 / 100).max(20).min(80) as u16;
+    let toast_h: u16 = 3;
+    let toast_gap: u16 = 0;
+    let mut y = 2u16; // 顶部留 2 行（top bar 下方）
+
     for toast in &state.toasts {
-        if y > max_y {
+        if y + toast_h > screen.height.saturating_sub(4) {
             break;
         }
-        // 渐隐效果: 最后 800ms 逐渐 dim
         let remaining = toast.expire_at.duration_since(now);
         let is_fading = remaining < std::time::Duration::from_millis(800);
         let dim_modifier = if is_fading { Modifier::DIM } else { Modifier::empty() };
 
-        let area = Rect::new(x, y, tw, 3);
-        let border_color = if is_fading { state.theme.muted } else { state.theme.border };
+        // 自适应宽度：内容长度 + 边距(6) + icon(2)，clamp 到 [20, max_toast_w]
+        let content_chars = toast.message.chars().count();
+        let tw = ((content_chars + 8) as u16).clamp(20, max_toast_w);
+        // 水平居中
+        let x = screen.width.saturating_sub(tw) / 2;
+
+        let area = Rect::new(x, y, tw, toast_h);
+        let border_color = if is_fading { state.theme.muted } else { state.theme.accent };
         let card = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -247,26 +252,11 @@ pub fn render_toasts(f: &mut ratatui::Frame, state: &AppState) {
             .bg(state.theme.surface);
         card.render(area, f.buffer_mut());
 
-        // subtle top accent line (安全边界检查)
-        let buf_area = f.area();
-        if !is_fading {
-            for cx in x + 1..x + tw - 1 {
-                if buf_area.contains((cx, y).into()) {
-                    f.buffer_mut()[(cx, y)]
-                        .set_symbol("▄")
-                        .set_fg(state.theme.accent)
-                        .set_bg(state.theme.surface);
-                }
-            }
-        }
-
-        let inner = Rect::new(x + 2, y + 1, tw - 4, 1);
-        // B10：截断时显式加 "…" 让用户感知信息被裁
-        // 留位：边距 4 + "◈ " 2 + 截断尾 "…" 1 = 7（safe margin）
-        let max_msg_chars = (tw as usize).saturating_sub(7);
-        let total_chars = toast.message.chars().count();
-        let display_msg: String = if total_chars > max_msg_chars {
-            let mut s: String = toast.message.chars().take(max_msg_chars).collect();
+        let inner = Rect::new(x + 2, y + 1, tw.saturating_sub(4), 1);
+        // 截断显示
+        let max_msg_chars = (tw as usize).saturating_sub(6);
+        let display_msg: String = if content_chars > max_msg_chars {
+            let mut s: String = toast.message.chars().take(max_msg_chars.saturating_sub(1)).collect();
             s.push('…');
             s
         } else {
@@ -274,11 +264,10 @@ pub fn render_toasts(f: &mut ratatui::Frame, state: &AppState) {
         };
         let text_color = if is_fading { state.theme.muted } else { state.theme.text };
         let line = Line::from(vec![
-            Span::styled("◈ ", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD | dim_modifier)),
+            Span::styled(" ", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD | dim_modifier)),
             Span::styled(display_msg, Style::default().fg(text_color).add_modifier(dim_modifier)),
         ]);
         f.render_widget(Paragraph::new(line), inner);
-        // B11：间距 = toast_h + gap，与 max_y 计算保持一致
         y += toast_h + toast_gap;
     }
 }

@@ -126,7 +126,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     match state.mode {
         AbacusMode::Clarify => {
-            // V40: 双 Tab "现场 | 量化"（所有 mode 统一可达）
+            // V40: 双 Tab "现场 | 统计"（所有 mode 统一可达）
             let labels: Vec<String> = vec![
                 label_with_count(t("panel.scene"), state.trace_events.len()),
                 t("panel.stats").to_string(),
@@ -272,7 +272,7 @@ fn render_panel_overview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         sections[3],
     );
 
-    // 简化统计（原量化 Tab 的核心数据，压缩为 4 行）
+    // 简化统计（原统计 Tab 的核心数据，压缩为 4 行）
     render_compact_stats(f, state, sections[4]);
 }
 
@@ -909,13 +909,13 @@ fn render_theme_preview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 /// V33 「现场」memory section
 ///
 /// 设计意图：服务"跟现场"用户场景——只展示当下激活的实体/工具/知识小计，
-/// 不展开宫殿层级树，不显示成本统计（那些归到「量化」tab）。
+/// 不展开宫殿层级树，不显示成本统计（那些归到「统计」tab）。
 ///
 /// 引用关系：
 ///   - 被 render_panel_overview 调用作为下半区块
 ///   - 数据源：state.messages (Expert 消息→实体名)、state.tool_records (工具去重)、
 ///             state.knowledge_calls (条数+总次数小计)
-///   - 与 render_tab_quant 共用 state 字段但口径不同：现场=活跃 unique 数，量化=累计调用次数
+///   - 与 render_tab_quant 共用 state 字段但口径不同：现场=活跃 unique 数，统计=累计调用次数
 ///
 /// 排版口径（与现有看板风格延续）：
 ///   - L1 标题 col=1（accent + BOLD）+ meta · N
@@ -1062,9 +1062,9 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ]));
     }
 
-    // V33: 📊 统计 + 知识宫殿层级树已迁出到 render_tab_quant（量化 tab）
+    // V33: 📊 统计 + 知识宫殿层级树已迁出到 render_tab_quant（统计 tab）
     // 现场 tab 只保留：实体激活 / 知识小计 / 工具小计 — 服务"跟现场"用户场景
-    // 用户引导：知识区已加 "· 详情见「量化」" caption，提示去量化 tab 看完整层级
+    // 用户引导：知识区已加 "· 详情见「统计」" caption，提示去统计 tab 看完整层级
     // V33 注：summaries 计算仍保留（早期 let 绑定），让 lint 静默
     let _ = summaries;
 
@@ -1088,10 +1088,10 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-/// V33 「量化」tab — 复盘视角，单独 Tab 承载会话统计 + 知识宫殿全量层级树
+/// V33 「统计」tab — 复盘视角，单独 Tab 承载会话统计 + 知识宫殿全量层级树
 ///
-/// 设计意图：把"复盘量化"用户场景从「现场」抽出来。「现场」回答"现在 Agent 在干什么"，
-/// 「量化」回答"这次会话花了多少代价、查了哪些知识"——不同关注焦点，独立 Tab 承载。
+/// 设计意图：把"复盘统计"用户场景从「现场」抽出来。「现场」回答"现在 Agent 在干什么"，
+/// 「统计」回答"这次会话花了多少代价、查了哪些知识"——不同关注焦点，独立 Tab 承载。
 ///
 /// 引用关系：
 ///   - 被 render_panel 4 mode 分支调用（PanelTab::Quant 命中）
@@ -1116,7 +1116,7 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     );
 
     // ════════════════════════════════════════════════════════════
-    // 📊 统计 (L1) — 量化指标
+    // 📊 统计 (L1) — 统计指标
     //   引用关系：
     //     - state.turn_count: 用户提交计数（state.add_message 时 +1）
     //     - summaries: messages 中 User 角色数（与 turn_count 等价但 derive 抗漂移）

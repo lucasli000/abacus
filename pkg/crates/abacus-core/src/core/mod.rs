@@ -733,6 +733,7 @@ pub struct SessionState {
     /// - 写入：`CoreLoop::grant_and_rerun()` 处理「总是允许」决定时
     /// - 消费：pipeline Phase 4 工具分发前检查，匹配则跳过 MCIP
     /// - 销毁：session 关闭时随之销毁（不持久化）
+
     pub mcip_grants: std::sync::RwLock<std::collections::HashSet<String>>,
 
     /// V28：实时授权 channel——按 nonce 索引的 oneshot sender 集合

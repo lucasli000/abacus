@@ -1088,7 +1088,7 @@ impl<'a> TurnPipeline<'a> {
     }
 
     async fn execute_loop(&self, ctx: &mut TurnContext) -> Result<Option<TurnResult>, KernelError> {
-        const MAX_TOTAL_TOOL_CALLS: u32 = 200;
+        // 单轮不设工具总量上限——工具限制统一由 SafetyGuard session 级控制（默认 500）
 
         for loop_iter in 0..self.core.config.max_turns_per_request {
             // Fix 6: Cancel check at top of each loop iteration
@@ -1639,40 +1639,16 @@ impl<'a> TurnPipeline<'a> {
                 }
             }
 
-            if ctx.total_tool_calls + tool_calls.len() as u32 > MAX_TOTAL_TOOL_CALLS {
-                // Error-recovery: 工具总量耗尽 → 告知 LLM 总结，不终止 pipeline
-                if let Some(ref stx) = self.stream_tx {
-                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                        format!("Reached maximum tool calls limit ({}). LLM will summarize.", ctx.total_tool_calls)
-                    ));
-                }
-                ctx.tools_exhausted = true;
-                {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
-                    msgs.push(Message {
-                        role: MessageRole::User,
-                        content: Some(MessageContent::Text(
-                            "[System] Maximum tool calls reached. Summarize current progress now. \
-                             Do NOT call more tools.".into()
-                        )),
-                        name: None, tool_calls: None, tool_call_id: None,
-                        reasoning_content: None, prefix: false,
-                    });
-                }
-                continue;
-            }
-            // 注：不限制单次 LLM 响应的 tool_calls 数量。
-            // 真正的限制是 MAX_TOTAL_TOOL_CALLS（单轮总量）。
-            // LLM 在一次响应中批量调用多个工具是高效行为，不应惩罚。
-
-            ctx.total_tool_calls += tool_calls.len() as u32;
+            // 单轮工具调用限制（per-turn，由 SafetyGuard.max_total_tool_calls 控制）
+            // Session 级不设限——用户可持续多轮对话不受累积约束
+            let batch_size = tool_calls.len() as u32;
+            ctx.total_tool_calls += batch_size;
             if let Err(e) = self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls) {
-                // Error-recovery: safety guard → 告知 LLM 寻找替代方案
+                // 单轮工具总量耗尽 → 告知 LLM 输出当前结论
                 let err_msg = e.to_string();
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                        format!("Safety guard: {}", err_msg)
+                        format!("Turn tool limit reached ({}): {}", ctx.total_tool_calls, err_msg)
                     ));
                 }
                 ctx.tools_exhausted = true;
@@ -1682,9 +1658,9 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::User,
                         content: Some(MessageContent::Text(format!(
-                            "[System] Safety guard blocked this action: {}. \
-                             Find an alternative approach or summarize current progress.",
-                            err_msg
+                            "[System] Tool call limit for this turn reached ({}). \
+                             Output your conclusion now. You can continue in the next turn.",
+                            ctx.total_tool_calls
                         ))),
                         name: None, tool_calls: None, tool_call_id: None,
                         reasoning_content: None, prefix: false,
