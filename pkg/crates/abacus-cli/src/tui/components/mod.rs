@@ -411,7 +411,7 @@ fn build_message_lines(
     // ── 流式输出：完整实时消息（thinking + tools + text + cursor）──
     // 参考 Go 版 fmtStreamMsg：显示完整的流式会话状态
     if stream_cursor > 0 && !messages.is_empty() {
-        let bar = Span::styled("┃", Style::default().fg(theme.session));
+        let bar = Span::styled("│", Style::default().fg(theme.session));
 
         // Breathing space
         lines.push(Line::raw(""));
@@ -975,7 +975,7 @@ pub fn render_messages_in_card(
     // ── 流式消息：追加 streaming 状态（thinking + tools + text）──
     // build_message_lines 只渲染 header + cursor，这里补充完整的流式内容
     if state.is_streaming {
-        let bar = Span::styled("┃", Style::default().fg(state.theme.session));
+        let bar = Span::styled("│", Style::default().fg(state.theme.session));
 
         // V14 修复：build_message_lines 仅在 stream_cursor>0 时追加 🤖 Abacus ghost header；
         //          在 stream_cursor==0（流式刚启动、TextDelta 尚未到达）时本函数必须自己补 header，
@@ -1410,7 +1410,7 @@ pub fn render_messages_in_card(
 /// 生命周期：is_streaming=true 时激活，流式结束后停止
 pub fn render_streaming_cursor(lines: &mut Vec<Line<'_>>, state: &AppState) {
     if !state.is_streaming { return; }
-    let bar = Span::styled("┃", Style::default().fg(state.theme.session));
+    let bar = Span::styled("│", Style::default().fg(state.theme.session));
     // 闪烁光标（500ms 周期）
     let cursor_visible = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1452,7 +1452,7 @@ fn render_card_bar(f: &mut ratatui::Frame, theme: &crate::tui::theme::Theme, are
 
     let bar_style = Style::default().fg(theme.primary);
     let bar_lines: Vec<Line> = (0..area.height)
-        .map(|_| Line::styled("┃", bar_style))
+        .map(|_| Line::styled("│", bar_style))
         .collect();
     f.render_widget(Paragraph::new(bar_lines), split_h[0]);
 

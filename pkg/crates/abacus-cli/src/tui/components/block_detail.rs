@@ -149,7 +149,7 @@ pub(super) fn render_single_trace_event<'a>(
                 text, &BlockKind::Think, theme, max_lines_think,
             );
             for dl in detail_lines {
-                let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("       ")];
+                let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                 spans.extend(dl.spans);
                 lines.push(Line::from(spans));
             }
@@ -180,7 +180,7 @@ pub(super) fn render_single_trace_event<'a>(
                     args, &BlockKind::ToolCall, theme, max_lines_tool,
                 ));
                 for dl in arg_lines {
-                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("       ")];
+                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                     spans.extend(dl.spans);
                     lines.push(Line::from(spans));
                 }
@@ -189,14 +189,14 @@ pub(super) fn render_single_trace_event<'a>(
                 if !out.is_empty() {
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::raw("       "),
+                        Span::raw("    "),
                         Span::styled("→", theme.text_style(TextRole::Caption)),
                     ]));
                     let out_lines = render_block_detail_with_limit(
                         out, &BlockKind::ToolCall, theme, max_lines_tool,
                     );
                     for dl in out_lines {
-                        let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("       ")];
+                        let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                         spans.extend(dl.spans);
                         lines.push(Line::from(spans));
                     }
@@ -337,7 +337,7 @@ pub(super) fn render_merged_tool_run<'a>(
                     let path_hint = extract_tool_param_summary(args);
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::raw("       "),
+                        Span::raw("    "),
                         Span::styled(
                             format!("{}. {}", ei + 1, path_hint),
                             Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
@@ -354,7 +354,7 @@ pub(super) fn render_merged_tool_run<'a>(
                     ))]
                 });
                 for dl in arg_lines {
-                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("       ")];
+                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                     spans.extend(dl.spans);
                     lines.push(Line::from(spans));
                 }
@@ -371,7 +371,7 @@ pub(super) fn render_merged_tool_run<'a>(
                 }).unwrap_or_default();
                 lines.push(Line::from(vec![
                     bar.clone(),
-                    Span::raw("       "),
+                    Span::raw("    "),
                     Span::styled(si, Style::default().fg(sc)),
                     Span::raw(" "),
                     Span::styled(summary, theme.text_style(TextRole::Caption)),
@@ -384,14 +384,14 @@ pub(super) fn render_merged_tool_run<'a>(
                     if !out.is_empty() {
                         lines.push(Line::from(vec![
                             bar.clone(),
-                            Span::raw("       "),
+                            Span::raw("    "),
                             Span::styled("→", theme.text_style(TextRole::Caption)),
                         ]));
                         let out_lines = render_block_detail_with_limit(
                             out, &BlockKind::ToolCall, theme, max_lines_tool,
                         );
                         for dl in out_lines {
-                            let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("       ")];
+                            let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                             spans.extend(dl.spans);
                             lines.push(Line::from(spans));
                         }

@@ -53,7 +53,7 @@ pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
         ]));
 
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(
                 &expert.domain,
                 Style::default()
@@ -69,7 +69,7 @@ pub fn render_expert_list(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
             format!("{}: —", t("field.confidence"))
         };
         lines.push(Line::from(vec![
-            Span::raw("   "),
+            Span::raw("  "),
             Span::styled(conf_label, Style::default().fg(state.theme.muted)),
         ]));
 
@@ -138,7 +138,7 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
             ]));
 
             lines.push(Line::from(vec![
-                Span::raw("   "),
+                Span::raw("  "),
                 Span::styled(
                     format!("{}: {}", t("field.owner"), task.assignee),
                     Style::default().fg(state.theme.muted),
@@ -160,7 +160,7 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 
             if !task.deps.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::raw("   "),
+                    Span::raw("  "),
                     Span::styled(
                         format!("{}: {}", t("field.deps"), task.deps.join(", ")),
                         Style::default()
