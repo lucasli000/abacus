@@ -979,17 +979,36 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // 忙碌态下 Enter → 排队（不立即发送）
+    // 忙碌态下 Enter → mid-turn signal 注入（实时通知 LLM）
+    //
+    // ## 设计变更（mid-turn user signal）
+    // 旧行为：排队到 pending_inputs，等当前 turn 完成后作为新 turn 发送。
+    // 新行为：写入 session.mid_turn_signals，pipeline 下次迭代时 drain 并注入为
+    //   `[User update]` 格式 user message，LLM 可实时感知并自主决策是否调整。
+    //
+    // ## 引用关系
+    // - 写入：此处通过 EngineHandle.session push
+    // - 消费：abacus-core pipeline execute_loop 迭代间隙 drain
     if is_busy && code == KeyCode::Enter {
         if !state.input.trim().is_empty() {
-            state.pending_inputs.push(state.input.clone());
+            let msg = state.input.clone();
+            // 注入 mid-turn signal 让 LLM 实时感知用户更新
+            if let Some(ref handle) = state.engine_handle {
+                let session = handle.session.clone();
+                let msg_clone = msg.clone();
+                tokio::spawn(async move {
+                    let s = session.read().await;
+                    s.mid_turn_signals.lock().await.push(msg_clone);
+                });
+            }
+            // 不再写入 pending_inputs — mid-turn signal 已注入，避免重复发送
             state.input.clear();
             // EV7 修复：input.clear 后必须同步重置 cursor 三件套，
             // 否则 cursor_line/col 持有旧值，下一帧光标位置错位
             state.cursor_pos = 0;
             state.cursor_line = 0;
             state.cursor_col = 0;
-            state.add_toast("消息已排队，当前请求完成后自动发送", Duration::from_secs(2));
+            state.add_toast("已发送给 AI（工作中可感知）", Duration::from_secs(2));
         }
         return;
     }
