@@ -148,15 +148,14 @@ impl PreflightChecker {
                 dependencies.push("未指定文件路径".into());
             }
 
-        // 3. 风险识别
+        // 3. 风险识别（仅标记真正破坏性操作；edit/write/修改 是正常操作不标 risk）
+        // 原设计 "修改" 触发 risk → llm_self_review → 每次代码任务多 1-3s + 1024 tokens
+        // 收紧：只有不可逆删除/覆盖/清空才标记
         let mut risks = Vec::new();
-        let destructive_patterns = ["delete", "remove", "覆盖", "drop", "truncate", "rm"];
+        let destructive_patterns = ["delete all", "drop table", "truncate", "rm -rf", "format disk",
+            "覆盖全部", "清空", "删除所有"];
         if destructive_patterns.iter().any(|p| lower.contains(p)) {
-            risks.push("请求包含破坏性操作".into());
-        }
-        let write_patterns = ["write", "edit", "修改", "覆盖"];
-        if write_patterns.iter().any(|p| lower.contains(p)) && !lower.contains("backup") && !lower.contains("备份") {
-            risks.push("修改前未提及备份".into());
+            risks.push("请求包含不可逆破坏性操作".into());
         }
 
         // 4. 执行方案
