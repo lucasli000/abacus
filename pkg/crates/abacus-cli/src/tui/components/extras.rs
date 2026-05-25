@@ -181,20 +181,18 @@ pub fn render_task_kanban(f: &mut ratatui::Frame, state: &AppState, area: Rect) 
 // 全局背景渲染
 // ════════════════════════════════════════════════════════════════
 pub fn render_global_background(f: &mut ratatui::Frame, state: &AppState) {
-    // 性能优化：仅首帧或主题切换时重刷全屏背景
-    if state.last_rendered_theme.get() == Some(state.theme.name) {
-        return;
-    }
-    state.last_rendered_theme.set(Some(state.theme.name));
-    // 直接设置 buffer 背景色（零分配，比 Paragraph 快 10x）
+    // ratatui 双缓冲：每帧新 buffer 必须填充背景，否则未被 widget 覆盖的 cell
+    // 在 diff 时会从"有色"变"无色"导致背景闪烁/消失。
+    // 此操作对 200x50 终端约 10000 次 cell 写入（~0.1ms），不构成瓶颈。
     let area = f.area();
     let bg = state.theme.bg;
+    let fg = state.theme.text;
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             let cell = &mut f.buffer_mut()[(x, y)];
             cell.set_symbol(" ");
             cell.set_bg(bg);
-            cell.set_fg(state.theme.text);
+            cell.set_fg(fg);
         }
     }
 }

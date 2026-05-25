@@ -595,9 +595,6 @@ pub enum SlashCommand {
 pub struct AppState {
     pub theme: Theme,
     /// 上次渲染的主题名（仅首帧或主题切换时重刷全屏背景）
-    /// 引用关系：render_global_background 读写
-    /// 生命周期：首帧 None → 渲染后 Some(name)；主题切换时 set_theme 重置为 None
-    pub last_rendered_theme: std::cell::Cell<Option<&'static str>>,
     pub mode: AbacusMode,
     /// V33: 模式间携带数据 — 上阶段产出，下阶段消费
     ///
@@ -1989,7 +1986,6 @@ impl AppState {
 
         Self {
             theme,
-            last_rendered_theme: std::cell::Cell::new(None),
             mode,
             mode_artifact: None, // V33: 初始无产出
             planner_nudge_attempts: 0, // V37-1: 初始无 nudge 计数
