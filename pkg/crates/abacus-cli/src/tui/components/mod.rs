@@ -976,29 +976,56 @@ pub fn render_messages_in_card(
         paint_streaming_top_shimmer(f.buffer_mut(), area, state);
     }
 
-    // 渲染缓存复用（streaming 或 dirty 时禁用缓存，每帧重新渲染）
-    // is_streaming: 流式文本持续增长，需要每帧刷新
-    // stream_cursor > 0: 光标闪烁动画
-    // rendered_lines_dirty: 新消息到达
+    // V40: 分区渲染 — streaming 期间复用 base lines，仅重建流式尾部
+    //
+    // 渲染策略分三级：
+    //   L0: 完全无变化 → 复用 cached_lines（原有逻辑）
+    //   L1: 仅 streaming 内容变化 → 复用 cached_base_lines + 重建 streaming appendix
+    //   L2: base 消息变化 → 全量 rebuild
+    //
+    // 引用关系：
+    //   - cached_base_lines: 存储 build_message_lines 对历史消息的结果
+    //   - cached_base_msg_count: 上次缓存时的 messages.len()
+    //   - streaming_content_dirty: run.rs chunk drain 后设置
+    // 生命周期：cached_base_lines 在 messages 数量变化时失效
+
+    // L0: 完全无变化 — 直接复用最终缓存
     if !state.rendered_lines_dirty.get()
         && *state.cached_width.borrow() == inner.width
         && state.stream_cursor == 0
         && !state.is_streaming
+        && !state.streaming_content_dirty.get()
     {
         let cached = state.cached_lines.borrow();
         f.render_widget(List::new(cached.clone()).direction(ListDirection::TopToBottom), inner);
         return;
     }
 
-    // 渲染所有消息（scroll=0 表示从头开始，不跳过任何消息）
-    // V28.3: 收集 Trace/Block summary 行的 (line_idx, msg_idx, part_idx),
-    // 后面 scroll 转换为绝对屏幕 y 写入 state.message_trace_row_map
+    // 决定是否需要重建 base lines
+    let current_msg_count = state.messages.len();
+    let base_cache_valid = state.is_streaming
+        && state.cached_base_msg_count.get() == current_msg_count
+        && *state.cached_width.borrow() == inner.width
+        && !state.cached_base_lines.borrow().is_empty();
+
     let mut trace_part_positions: Vec<(usize, usize, usize)> = Vec::new();
-    let mut lines = build_message_lines(
-        &state.messages, 0, &state.theme, &state.text_selection, inner.width,
-        state.stream_cursor, state.compact, state.code_blocks_expanded,
-        &state.trace_events, &state.trace_event_index, &mut trace_part_positions, state.focused_event_id,
-    );
+    let mut lines = if base_cache_valid {
+        // L1: streaming-only 更新 — 复用 base lines（跳过全量 build_message_lines）
+        state.cached_base_lines.borrow().clone()
+    } else {
+        // L2: 全量重建（首次 / messages 变化 / 宽度变化）
+        let built = build_message_lines(
+            &state.messages, 0, &state.theme, &state.text_selection, inner.width,
+            state.stream_cursor, state.compact, state.code_blocks_expanded,
+            &state.trace_events, &state.trace_event_index, &mut trace_part_positions, state.focused_event_id,
+        );
+        // 缓存 base lines 供后续 streaming 帧复用
+        *state.cached_base_lines.borrow_mut() = built.clone();
+        state.cached_base_msg_count.set(current_msg_count);
+        built
+    };
+    // 清除 streaming_content_dirty（本帧已处理）
+    state.streaming_content_dirty.set(false);
 
     // ── 流式消息：追加 streaming 状态（thinking + tools + text）──
     // build_message_lines 只渲染 header + cursor，这里补充完整的流式内容
@@ -1417,12 +1444,11 @@ pub fn render_messages_in_card(
             // 统一缩进：所有内容（文本/代码/表格）使用 bar + "   "（3空格）
             // 代码块继续行额外 1 空格对齐（视觉上与 fence 标记缩进一致）
             // 使用 mdstream 增量引擎：committed（缓存）+ pending（仅尾部重渲染）
+            // V40: 使用 all_styled() 零拷贝路径，避免每帧 clone committed Vec
             let styled_lines: Vec<markdown::StyledLine> = {
                 let mut smd_ref = state.streaming_md.borrow_mut();
                 if let Some(ref mut smd) = *smd_ref {
-                    let committed = smd.committed_styled(&state.theme, false, content_w).to_vec();
-                    let pending = smd.pending_styled(&state.theme, false, content_w);
-                    committed.into_iter().chain(pending).collect()
+                    smd.all_styled(&state.theme, false, content_w)
                 } else {
                     // fallback：mdstream 未初始化时走原始全量解析
                     markdown::render_markdown_bounded(&state.streaming_text, &state.theme, false, content_w)
@@ -1501,12 +1527,14 @@ pub fn render_messages_in_card(
     drop(row_map);
 
     // ── Line Flash 效果：新输出的行短暂高亮背景 ──
-    // E1 修复：K6 重构注释承诺"按内容 hash 精确匹配，不再按底部偏移漂移"，
-    // 但渲染端原先仍用 `total - flash_count - 2 .. total - 2` 位置偏移；
-    // 现按行内容 hash 精确匹配 flash_state.is_flashing(hash)，与 K6 设计一致
+    // V40 优化：仅对尾部行（flash_count 范围）做 hash 匹配，而非遍历全部可见行。
+    // 原理：flash_state 只追踪最近 N 行的 hash，全部在 lines 尾部；
+    // 对头部历史行 hash 是无用计算（flash_state.is_flashing 必然返回 false）。
     if state.is_streaming && state.flash_state.active_flash_count() > 0 {
-        for line in lines.iter_mut() {
-            // 拼接行内所有 span 的可见文本作为 hash 输入（与 mark_new_lines 输入一致）
+        let flash_count = state.flash_state.active_flash_count();
+        // 只扫描尾部 flash_count 行（+2 容余：word-wrap 可能多出行）
+        let scan_start = lines.len().saturating_sub(flash_count + 2);
+        for line in lines[scan_start..].iter_mut() {
             let content: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let h = effects::FlashState::hash_line(&content);
             if state.flash_state.is_flashing(h) {

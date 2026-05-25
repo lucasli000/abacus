@@ -420,6 +420,71 @@ impl TeamSession {
         Ok(result.response)
     }
 
+    /// 流式版本: SubAgent 的 thinking/tool/text 实时流入调用方提供的 stream_tx。
+    /// 用于 Team 模式主消息区实时展示每个 SubAgent 工作过程。
+    ///
+    /// ## 引用关系
+    /// - 调用方: send_team_message (abacus-cli/src/tui/api/mod.rs) Phase 2
+    /// - 内部调用: CoreLoop::process_turn_streaming
+    ///
+    /// ## 生命周期
+    /// - stream_tx 由调用方持有，本方法仅 clone 使用
+    /// - session 为 task 级隔离，方法返回后即释放
+    pub async fn execute_task_with_core_streaming(
+        &self,
+        core: &abacus_core::core::CoreLoop,
+        task: &TaskSpec,
+        role: &AgentRole,
+        stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
+    ) -> Result<String, KernelError> {
+        use tokio::sync::RwLock as TokioRwLock;
+        use abacus_core::core::SessionState;
+
+        // Create isolated session for this task
+        let session_id = format!("team_{}_{}", self.team_id, task.id);
+        let session = SessionState::new(&session_id);
+        core.register_session_context_tools(&session).await;
+        let session = TokioRwLock::new(session);
+
+        // Build prompt from task context with role-specific framing
+        let goal = { self.shared_ctx.read().await.goal.clone() };
+        let role_context = match role {
+            AgentRole::Leader => "You are the team Leader. Focus on architecture, decisions, and quality.",
+            AgentRole::PM => "You are the Project Manager. Focus on organization, dependencies, and review.",
+            AgentRole::Advisor => "You are an Advisor. Provide expert guidance and recommendations.",
+            AgentRole::Member => "You are a team Member. Execute the task as specified.",
+        };
+        let prompt = format!(
+            "You are executing a subtask in a team workflow.\n\
+             Role: {} ({})\n\
+             Team goal: {}\n\
+             Your task: {}\n\
+             Task description: {}\n\
+             Complete this task and report the result.",
+            role, role_context, goal, task.id, task.description
+        );
+
+        // Update status to Running
+        self.update_task_status(&task.id, TaskStatus::Running {
+            agent_id: format!("{}_{}", role, task.id),
+        }).await?;
+
+        // Execute with streaming — agent output flows into caller's stream_tx
+        let result = core.process_turn_streaming(&prompt, &session, stream_tx).await?;
+
+        // Update task status
+        self.update_task_status(&task.id, TaskStatus::Completed {
+            result: serde_json::json!({"response": result.response, "role": role.to_string()}),
+        }).await?;
+
+        self.emit(TeamEvent::TaskCompleted {
+            task_id: task.id.clone(),
+            success: true,
+        });
+
+        Ok(result.response)
+    }
+
     /// Execute all ready tasks, dispatching by role.
     /// Tasks are executed role-by-role; within each role, tasks run sequentially.
     pub async fn execute_ready_tasks(

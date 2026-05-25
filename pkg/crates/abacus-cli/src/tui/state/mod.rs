@@ -922,6 +922,16 @@ pub struct AppState {
     pub processing_total_steps: u32,
     /// 消息渲染缓存（dirty 标记避免每帧重建全部行）
     pub(crate) rendered_lines_dirty: std::cell::Cell<bool>,
+    /// V40: streaming-only dirty — 仅 streaming 尾部内容变化，base 消息未改变
+    /// 引用关系：run.rs chunk drain 设置 → components/mod.rs 分区渲染路径消费
+    /// 生命周期：每帧渲染后 reset
+    pub(crate) streaming_content_dirty: std::cell::Cell<bool>,
+    /// V40: 分区渲染缓存 — 缓存 build_message_lines 的结果（streaming 期间不重建）
+    /// 引用关系：components/mod.rs 写入/读取
+    /// 生命周期：新消息加入 messages 时失效（reset_streaming / add_message 清空）
+    pub(crate) cached_base_lines: std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
+    /// V40: 上次缓存 base lines 时的 messages.len()（用于判断 base 是否需要重建）
+    pub(crate) cached_base_msg_count: std::cell::Cell<usize>,
     /// info panel 内容 — 长信息走面板不走 toast
     pub info_panel_text: String,
     /// info panel 是否自动打开
@@ -2087,6 +2097,9 @@ impl AppState {
             processing_step: 0,
             processing_total_steps: 0,
             rendered_lines_dirty: std::cell::Cell::new(true),
+            streaming_content_dirty: std::cell::Cell::new(false),
+            cached_base_lines: std::cell::RefCell::new(Vec::new()),
+            cached_base_msg_count: std::cell::Cell::new(0),
             info_panel_text: String::new(),
             info_panel_auto_open: false,
             picker: None,
@@ -2593,6 +2606,10 @@ impl AppState {
         self.streaming_parsed_len.set(0);
         // 流式 Markdown 增量引擎：drop 释放 mdstream 状态
         *self.streaming_md.borrow_mut() = None;
+        // V40: 失效分区渲染缓存（streaming 结束后 messages 即将变化）
+        self.cached_base_lines.borrow_mut().clear();
+        self.cached_base_msg_count.set(0);
+        self.streaming_content_dirty.set(false);
     }
 
     pub fn add_message(&mut self, msg: Message) {

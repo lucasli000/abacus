@@ -699,19 +699,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
                 // V0.2: 消费 streaming chunks — 实时更新 partial message（渲染前处理）
-                // V29.5: 把硬编码 100 提为命名 const, 注释说明语义
-                //   含义: 每帧最多消化的 chunk 数, 防止 LLM 突发推送堆积导致单帧延迟
-                //   选值: 20——每 chunk 都触发 rendered_lines_dirty → 全量 markdown 重解析,
-                //   100 chunks/frame 时单帧渲染开销过高导致卡顿; 降到 20 让突发 delta 分摊
-                //   到多帧,视觉上无感(20 FPS × 20 chunks = 仍可消化 400 chunks/s, 远超 LLM 产出速率)
-                const FRAME_CHUNK_BUDGET: u32 = 20;
-                let mut chunk_budget = FRAME_CHUNK_BUDGET;
-                while chunk_budget > 0 {
-                    let chunk = match stream_rx.try_recv() {
-                        Ok(c) => c,
-                        Err(_) => break,
-                    };
-                    chunk_budget -= 1;
+                // V40: 全量 drain — 移除 per-frame chunk budget 限制。
+                //   旧设计(FRAME_CHUNK_BUDGET=20)的假设是"每 chunk 触发全量重建导致单帧开销过高"。
+                //   配合分区渲染优化(streaming 期间不再全量 rebuild)，瓶颈消除，
+                //   现在单帧内 drain 所有 pending chunks 再统一渲染一次，延迟从 50ms*N 降为 0。
+                //   LLM 实际产出速率 ~100 tokens/s = ~100 chunks/50ms_frame ≈ 5 chunks/frame,
+                //   全量 drain 无 CPU 压力。
+                let mut had_streaming_update = false;
+                while let Ok(chunk) = stream_rx.try_recv() {
                     use abacus_core::llm::stream::StreamChunk;
                     let ts = chrono::Local::now().format("%H:%M").to_string();
                     match chunk {
@@ -726,7 +721,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.input_state = InputState::Thinking;
                                 state.processing_phase = format!("· iteration {}", iteration + 1);
                             }
-                            state.rendered_lines_dirty.set(true);
+                            had_streaming_update = true;
                         }
                         StreamChunk::TextDelta(t) => {
                             if !t.is_empty() && !state.streaming_text_started {
@@ -736,7 +731,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始输出", crate::tui::state::EventLevel::Info);
                             }
-                            // K6：传入实际行内容数组，flash_state 内部计算 hash（避免“底部偏移”漂移）
+                            // K6：传入实际行内容数组，flash_state 内部计算 hash（避免"底部偏移"漂移）
                             let added: Vec<&str> = t.lines().collect();
                             if !added.is_empty() {
                                 state.flash_state.mark_new_lines(&added);
@@ -752,7 +747,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     smd.append(&t);
                                 }
                             }
-                            state.rendered_lines_dirty.set(true);
+                            had_streaming_update = true;
                         }
                         StreamChunk::Thinking(t) => {
                             // V29.5: 同 TextDelta, 用 streaming_thinking_started 判首次
@@ -763,7 +758,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
                             }
                             state.streaming_thinking.push_str(&t);
-                            state.rendered_lines_dirty.set(true);
+                            had_streaming_update = true;
                         }
                         StreamChunk::ToolStart { name } => {
                             // V28 (T3): 创建 ToolCall trace 拿 trace_id, 缓存到 streaming_tools
@@ -789,7 +784,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // V38: 状态栏实时反映当前工具名（Working · tool_name）
                             state.input_state = InputState::Executing;
                             state.processing_phase = format!("· {}", name);
-                            state.rendered_lines_dirty.set(true);
+                            // V40: 主消息区内联工具指示器 — 用户在主消息区直接看到工具活动
+                            // 格式：灰色行 "▸ tool_name" — 类似 Claude Code 的工具名显示
+                            state.streaming_text.push_str(&format!("\n▸ `{}`", name));
+                            {
+                                let mut smd_ref = state.streaming_md.borrow_mut();
+                                if smd_ref.is_none() {
+                                    *smd_ref = Some(crate::tui::md_stream::StreamingMd::new());
+                                }
+                                if let Some(ref mut smd) = *smd_ref {
+                                    smd.append(&format!("\n▸ `{}`", name));
+                                }
+                            }
+                            had_streaming_update = true;
                         }
                         // V29.11: 工具输入参数 — 回填 trace event 的 args 字段
                         //   触发 try_render_edit_diff: args 含 old_string/new_string → 走 diff 视图
@@ -903,7 +910,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     }
                                 }
                             }
-                            state.rendered_lines_dirty.set(true);
+                            // V40: 主消息区工具完成指示 — 在 ToolStart 行尾追加结果
+                            let result_indicator = if success {
+                                format!(" ✓ {}ms", duration_ms)
+                            } else {
+                                format!(" ✗ failed {}ms", duration_ms)
+                            };
+                            state.streaming_text.push_str(&result_indicator);
+                            {
+                                let mut smd_ref = state.streaming_md.borrow_mut();
+                                if let Some(ref mut smd) = *smd_ref {
+                                    smd.append(&result_indicator);
+                                }
+                            }
+                            had_streaming_update = true;
                         }
                         StreamChunk::ConfirmRequired(req) => {
                             // V28：实时授权请求——pipeline dispatch 已挂起等待用户决策
@@ -1045,18 +1065,15 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::Complete(_) => {
                             // ST1：清理流式累积避免双显示
                             state.reset_streaming();
-                            // V30: Complete 到达即释放输入（不等 EngineResponse）
-                            // 防止 post_process 耗时（auto_compress LLM 调用）导致前端静默卡死
-                            // EngineResponse 到达后会再次检查并处理最终状态
-                            if state.pending_mcip_confirmations.is_empty() {
-                                state.input_state = InputState::Ready;
-                                state.op_started_at = None;
-                                state.accumulated_elapsed = Duration::ZERO;
-                            }
+                            // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"
+                            // Pipeline 可能继续执行工具 + 发起新 LLM 调用。
+                            // 只有 EngineResponse 到达才真正设 Ready。
+                            // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
+                            state.input_state = InputState::Executing;
+                            state.processing_phase = "· processing...".into();
                             state.rendered_lines_dirty.set(true);
-                            // TT4：drain 同轮残留 chunks
-                            while stream_rx.try_recv().is_ok() {}
-                            break;
+                            // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
+                            // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
                         }
                         StreamChunk::Error(e) => {
                             state.reset_streaming();
@@ -1072,7 +1089,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
                             state.processing_phase = format!("重试 {}/{}: {}", attempt, max_attempts, reason);
-                            state.rendered_lines_dirty.set(true);
+                            had_streaming_update = true;
                         }
                         // ── Team 模式进度通知 → 更新 state.tasks 面板 ──
                         StreamChunk::TeamProgress { phase, tasks } => {
@@ -1097,9 +1114,15 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 }
                             }).collect();
                             state.processing_phase = format!("team/{}", phase);
-                            state.rendered_lines_dirty.set(true);
+                            had_streaming_update = true;
                         }
                     }
+                }
+                // V40: 全量 drain 后统一设一次 dirty（替代每 chunk 重复设置）
+                // had_streaming_update 同时作为分区渲染信号：true = 仅 streaming 尾部需重建
+                if had_streaming_update {
+                    state.streaming_content_dirty.set(true);
+                    state.rendered_lines_dirty.set(true);
                 }
 
                 // V29.11 (B): drain sandbox 实时事件 → push_trace(Generic)
@@ -2166,7 +2189,7 @@ pub(crate) fn load_always_allow() -> std::collections::HashSet<String> {
             // Phase 3 (3.7): 仅补充 set 中不存在的新增 DEFAULT 项。
             // 如果用户显式删过某项（文件存在且不含该项），不强加回来。
             // 适用场景：新版本新增了 DEFAULT 工具，用户从未见过该工具——此时补充。
-            // —— 无法完美区分“用户删过”与“旧版未包含”，当前策略以简化为主：
+            // —— 无法完美区分"用户删过"与"旧版未包含"，当前策略以简化为主：
             //   文件非空且已存在 → 仅补充 set 中完全不存在的 DEFAULT 项
             //   TODO: 引入 removed_tools.json 记录用户显式 revoke，实现精确区分
             for d in DEFAULT_ALLOW {
@@ -2360,7 +2383,7 @@ pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
     std::fs::rename(&tmp_path, &path)?;
 
     // 项目层 last_session_uuid 文本 pointer — 仅本项目多实例会互覆（last-writer-wins，可接受）
-    // 跨项目不冲突，符合“项目隔离”语义。
+    // 跨项目不冲突，符合"项目隔离"语义。
     let pointer = dir.join("last_session_uuid");
     let _ = std::fs::write(&pointer, &state.session_id);
 
@@ -2884,7 +2907,7 @@ mod session_migration_tests {
 ///
 /// Phase 3 重构：从 sessions/latest.json 改为读 last_session_uuid pointer 推导
 /// 到 sessions/{uuid}.json。pointer 不存在 / 读不到 → 返回不存在路径（调用方
-/// 以 .exists() 处理“干净启动”语义）。
+/// 以 .exists() 处理"干净启动"语义）。
 ///
 /// 返回 PathBuf 而非 Option 以保留与原签名的向后兼容。
 fn session_path() -> std::path::PathBuf {

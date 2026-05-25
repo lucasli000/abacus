@@ -1000,10 +1000,27 @@ pub async fn send_team_message(
                     });
                 }
 
-                // 执行任务
-                match team.execute_task_with_core(&handle.core, task, role).await {
-                    Ok(r) => results.push((task.id.clone(), r)),
+                // ── SubAgent 分隔标识: 开始 ──
+                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                    format!("\n── {} ({:?}) ─────────────────────────\n", agent_label, role),
+                ));
+
+                // 执行任务（流式: agent 的 thinking/tool/text 实时流入主消息区）
+                match team.execute_task_with_core_streaming(
+                    &handle.core, task, role, stream_tx.clone()
+                ).await {
+                    Ok(r) => {
+                        // ── SubAgent 分隔标识: 完成 ──
+                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                            format!("\n── {} 完成 ──────────────────────────\n", agent_label),
+                        ));
+                        results.push((task.id.clone(), r));
+                    }
                     Err(e) => {
+                        // ── SubAgent 分隔标识: 失败 ──
+                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                            format!("\n── {} 失败: {} ──────────────────\n", agent_label, e),
+                        ));
                         tracing::warn!("Task {} failed: {}", task.id, e);
                     }
                 }

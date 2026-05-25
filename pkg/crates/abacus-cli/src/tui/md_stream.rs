@@ -96,6 +96,47 @@ impl StreamingMd {
         }
     }
 
+    /// V40: 零拷贝一体化方法 — 返回 committed + pending 合并结果
+    ///
+    /// 优化：committed 部分通过 `extend_from_slice` 而非 `.to_vec()` + `.into_iter().chain()`
+    /// 减少一次完整 Vec clone。内部先更新 committed 缓存（增量），再拼接 pending。
+    ///
+    /// 引用关系：components/mod.rs 流式消息渲染替代原有 committed_styled().to_vec() + pending_styled()
+    /// 生命周期：每帧调用一次，committed 缓存跨帧复用
+    pub fn all_styled(&mut self, theme: &Theme, is_user: bool, max_width: usize) -> Vec<StyledLine> {
+        // 先更新 committed 缓存（增量渲染新 block）
+        let blocks = self.stream.snapshot_blocks();
+        let committed_blocks: Vec<_> = blocks.iter()
+            .filter(|b| b.status == mdstream::BlockStatus::Committed)
+            .collect();
+        let current_count = committed_blocks.len();
+
+        if current_count > self.rendered_committed_count {
+            for block in &committed_blocks[self.rendered_committed_count..] {
+                let text = block.display_or_raw();
+                let mut lines = markdown::render_markdown_bounded(text, theme, is_user, max_width);
+                self.committed_lines.append(&mut lines);
+            }
+            self.rendered_committed_count = current_count;
+        }
+
+        // 构建结果：committed 引用 + pending 新渲染
+        let mut result = Vec::with_capacity(self.committed_lines.len() + 8);
+        result.extend_from_slice(&self.committed_lines);
+
+        // pending 部分
+        let pending_block = blocks.iter()
+            .find(|b| b.status == mdstream::BlockStatus::Pending);
+        if let Some(block) = pending_block {
+            let text = block.display_or_raw();
+            if !text.is_empty() {
+                let mut pending = markdown::render_markdown_bounded(text, theme, is_user, max_width);
+                result.append(&mut pending);
+            }
+        }
+        result
+    }
+
     /// 重置（streaming 结束时调用）
     pub fn reset(&mut self) {
         self.stream.reset();
