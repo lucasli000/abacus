@@ -244,6 +244,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             let actual_model = e.core.config().default_model.0.clone();
             state.model_name = actual_model.clone();
             state.theme.apply_model_brand(&actual_model);
+            // V40: 同步真实 context_window 到 TUI state（修复硬编码 1M 导致百分比失真）
+            if let Some(ref spec) = e.core.config().model_spec {
+                state.context_window = spec.context_window;
+            }
             e
         }
         Ok(Err(e)) => {
@@ -970,14 +974,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         .or_else(|| json.get("file_path"))
                                                         .and_then(|v| v.as_str());
                                                     if let Some(p) = path_opt {
-                                                        // 仅匹配知识/记忆类路径，避免污染随意文件操作
-                                                        if p.contains("memory")
-                                                            || p.contains("记忆宫殿")
-                                                            || p.contains("/.abacus/")
-                                                            || p.contains("knowledge")
-                                                        {
-                                                            state.track_knowledge_call(p);
-                                                        }
+                                                        // V40: 所有文件路径都追踪，palace 由路径自动推断
+                                                        state.track_knowledge_call(p);
                                                     }
                                                 }
                                             }

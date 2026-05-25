@@ -126,11 +126,12 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     match state.mode {
         AbacusMode::Clarify => {
-            // 默认单 Tab "现场"（含时间线+记忆+简化统计）；/quant 可切到完整量化
+            // V40: 双 Tab "现场 | 量化"（所有 mode 统一可达）
             let labels: Vec<String> = vec![
                 label_with_count(t("panel.scene"), state.trace_events.len()),
+                t("panel.stats").to_string(),
             ];
-            let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 0 } else { 0 };
+            let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 1 } else { 0 };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Quant => render_tab_quant(f, state, content),
@@ -141,16 +142,19 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let labels: Vec<String> =
                 std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
                     .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
+                    .chain(std::iter::once(t("panel.stats").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Custom(i) => 2 + i,
+                PanelTab::Quant => 2,
+                PanelTab::Custom(i) => 3 + i,
                 _ => 0,
             };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_team_board(f, state, content),
+                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
@@ -159,16 +163,19 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let labels: Vec<String> =
                 std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
                     .chain(std::iter::once(label_with_count(t("panel.agenda"), state.experts.len())))
+                    .chain(std::iter::once(t("panel.stats").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Custom(i) => 2 + i,
+                PanelTab::Quant => 2,
+                PanelTab::Custom(i) => 3 + i,
                 _ => 0,
             };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_meeting_agenda(f, state, content),
+                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
@@ -177,16 +184,19 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let labels: Vec<String> =
                 std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
                     .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
+                    .chain(std::iter::once(t("panel.stats").to_string()))
                     .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
                     .collect();
             let tab_idx = match state.panel_tab {
                 PanelTab::Tasks => 1,
-                PanelTab::Custom(i) => 2 + i,
+                PanelTab::Quant => 2,
+                PanelTab::Custom(i) => 3 + i,
                 _ => 0,
             };
             let content = render_panel_header(f, state, inner, &labels, tab_idx);
             match state.panel_tab {
                 PanelTab::Tasks => render_panel_team_board(f, state, content),
+                PanelTab::Quant => render_tab_quant(f, state, content),
                 PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
                 _ => render_panel_overview(f, state, content),
             }
@@ -1204,6 +1214,68 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 state.theme.text_style(TextRole::Caption),
             ),
         ]));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // V40: 📦 上下文容量 (L1) — context window 使用率 + KV 缓存命中率 + 压缩历史
+    //   引用关系：state.context_window / state.session_tokens.{total_tokens, cached_tokens, prompt_tokens}
+    //   设计意图：让用户实时感知 context 压力和缓存效率
+    // ════════════════════════════════════════════════════════════
+    if state.context_window > 0 {
+        lines.push(dotted_sep.clone());
+        let used = state.session_tokens.total_tokens as usize;
+        let max_ctx = state.context_window;
+        let pct = if max_ctx > 0 { (used * 100 / max_ctx).min(100) } else { 0 };
+        let pct_color = if pct >= 80 { state.theme.error }
+            else if pct >= 50 { state.theme.gold }
+            else { state.theme.success };
+
+        lines.push(Line::styled(
+            " 📦 上下文",
+            Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
+        ));
+
+        // 进度条（16 格）
+        let filled = (pct * 16 / 100).min(16);
+        let empty = 16 - filled;
+        lines.push(Line::from(vec![
+            Span::styled("    ", Style::default()),
+            Span::styled("█".repeat(filled), Style::default().fg(pct_color)),
+            Span::styled("░".repeat(empty), Style::default().fg(state.theme.muted)),
+            Span::styled(format!(" {}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("    已用 ", Style::default().fg(state.theme.muted)),
+            Span::styled(format!("{}", crate::tui::components::bars::format_ctx(used)), Style::default().fg(state.theme.text)),
+            Span::styled(" / ", Style::default().fg(state.theme.muted)),
+            Span::styled(format!("{}", crate::tui::components::bars::format_ctx(max_ctx)), Style::default().fg(state.theme.text)),
+        ]));
+
+        // KV 缓存命中率
+        let prompt = state.session_tokens.prompt_tokens;
+        let cached = state.session_tokens.cached_tokens;
+        if prompt > 0 {
+            let hit_pct = (cached as f64 / prompt as f64 * 100.0).min(100.0);
+            let hit_color = if hit_pct >= 70.0 { state.theme.success }
+                else if hit_pct >= 30.0 { state.theme.gold }
+                else { state.theme.muted };
+            lines.push(Line::from(vec![
+                Span::styled("    KV缓存 ", Style::default().fg(state.theme.muted)),
+                Span::styled(format!("{:.0}%", hit_pct), Style::default().fg(hit_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({}/{})", cached, prompt), state.theme.text_style(TextRole::Caption)),
+            ]));
+        }
+
+        // 压缩历史
+        let comp_count = state.session_tokens.compress_count;
+        let comp_saved = state.session_tokens.compress_tokens_saved;
+        if comp_count > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("    压缩 ", Style::default().fg(state.theme.muted)),
+                Span::styled(format!("{}次", comp_count), Style::default().fg(state.theme.text)),
+                Span::styled(format!(" · 释放 {}", crate::tui::components::bars::format_ctx(comp_saved as usize)), state.theme.text_style(TextRole::Caption)),
+            ]));
+        }
     }
 
     // ════════════════════════════════════════════════════════════

@@ -1662,37 +1662,9 @@ impl<'a> TurnPipeline<'a> {
                 }
                 continue;
             }
-            if tool_calls.len() > self.core.config.max_tool_calls_per_turn as usize {
-                // Error-recovery: 单 turn 工具调用超限 → 告知 LLM 减少工具调用
-                let err_msg = format!(
-                    "tool calls exceed per-turn limit: {} > {}",
-                    tool_calls.len(), self.core.config.max_tool_calls_per_turn
-                );
-                if let Some(ref stx) = self.stream_tx {
-                    let _ = stx.send(crate::llm::stream::StreamChunk::Error(err_msg.clone()));
-                }
-                ctx.recovery_attempts += 1;
-                if ctx.recovery_attempts > 5 {
-                    ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
-                    break;
-                }
-                {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
-                    msgs.push(Message {
-                        role: MessageRole::User,
-                        content: Some(MessageContent::Text(format!(
-                            "[System] You have reached the tool call limit for this turn. \
-                             Do NOT call more tools. Summarize what you've accomplished so far \
-                             and report to the user. (limit: {} per turn, you attempted: {})",
-                            self.core.config.max_tool_calls_per_turn, tool_calls.len()
-                        ))),
-                        name: None, tool_calls: None, tool_call_id: None,
-                        reasoning_content: None, prefix: false,
-                    });
-                }
-                continue;
-            }
+            // 注：不限制单次 LLM 响应的 tool_calls 数量。
+            // 真正的限制是 MAX_TOTAL_TOOL_CALLS（单轮总量）。
+            // LLM 在一次响应中批量调用多个工具是高效行为，不应惩罚。
 
             ctx.total_tool_calls += tool_calls.len() as u32;
             if let Err(e) = self.core.safety_guard.check_tool_call_count(ctx.total_tool_calls) {

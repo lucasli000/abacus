@@ -392,7 +392,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
 }
 
 /// 格式化上下文窗口大小为人类可读：1_000_000 → "1M", 500_000 → "500K"
-pub(super) fn format_ctx(n: usize) -> String {
+pub(crate) fn format_ctx(n: usize) -> String {
     if n >= 1_000_000 && n % 1_000_000 == 0 {
         format!("{}M", n / 1_000_000)
     } else if n >= 1_000_000 {

@@ -1406,10 +1406,8 @@ pub async fn send_meeting_message_streaming(
     message: &str,
     stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁".to_string()),
-    };
+    // 不获取 inflight_guard：内部子调用 (process_turn_streaming) 直接走 core 层，
+    // 由 run.rs dispatch 层保证同一时刻只有一条用户消息在处理
 
     let work = async {
         // Phase 1: 确保 Meeting 存在并 Running
@@ -1639,10 +1637,8 @@ pub async fn send_plan_and_execute_streaming(
     stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
     req_ctx: abacus_core::core::RequestContext,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁".to_string()),
-    };
+    // 不获取 inflight_guard：内部调用 send_chat_message_streaming 已有 permit 保护，
+    // 且后续 team 执行用 process_turn_streaming 直接走 core 层
 
     let work = async {
         // Phase 1: Planner 分析 + 生成任务列表（流式）

@@ -4208,7 +4208,7 @@ fn scene_active_prefixes(task_kind: &str) -> &'static [&'static str] {
 }
 
 fn extract_text(msg: &Message) -> String {
-    match &msg.content {
+    let raw = match &msg.content {
         Some(MessageContent::Text(t)) => t.clone(),
         Some(MessageContent::MultiPart(parts)) => {
             let mut out = String::new();
@@ -4218,7 +4218,21 @@ fn extract_text(msg: &Message) -> String {
             out
         }
         None => String::new(),
+    };
+    // 清理残留的 XML tool_call 标签（DeepSeek 幻觉：输出 <tool_call> 但内容非有效工具调用）
+    strip_xml_tool_tags(&raw)
+}
+
+/// 移除文本中 `<tool_call>...</tool_call>` 和 `<tool_calls>...</tool_calls>` 标签包裹
+/// 保留标签内的文本内容（可能是有用信息只是被错误包裹）
+fn strip_xml_tool_tags(text: &str) -> String {
+    if !text.contains("<tool_call") {
+        return text.to_string();
     }
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"</?tool_calls?>").unwrap()
+    });
+    RE.replace_all(text, "").trim().to_string()
 }
 
 #[cfg(test)]

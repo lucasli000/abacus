@@ -956,7 +956,7 @@ pub struct AppState {
     pub settings_focus: usize,
     /// 设置面板当前编辑值
     pub settings_input: String,
-    /// 会话 Token 统计
+    /// 会话 Token 统计（含压缩历史：compress_count / compress_tokens_saved）
     pub session_tokens: SessionTokenStats,
     /// 当前处理阶段描述（减少等待焦虑）
     pub processing_phase: String,
@@ -2808,25 +2808,38 @@ impl AppState {
     ///   `-home-u-myproj` → "myproj"
     ///   `-home-u` → "u"（无项目子目录则用末段，等价"主体"）
     pub fn track_knowledge_call(&mut self, file_path: &str) {
-        // 从 .abacus/projects/{slug}/memory/ 模式中提取 slug 末段
-        // 或从 记忆宫殿/ 路径推断为"主体"
+        // V40: 所有工具调用的文件路径都追踪，按路径自动推断 palace 分类
+        //   palace 分类规则：
+        //   - .abacus/projects/{slug}/memory/ → "记忆/{slug末段}"
+        //   - 记忆宫殿/ → "记忆/主体"
+        //   - .abacus/ (非 memory) → "配置"
+        //   - src/ / pkg/ / crates/ / lib/ → "代码"
+        //   - docs/ / README / .md → "文档"
+        //   - 其他 → "文件"
         let palace_owned: String;
         let palace: &str = if let Some(after_proj) = file_path.split("/.abacus/projects/").nth(1) {
-            // 取 projects/ 后第一段为 slug
             let slug = after_proj.split('/').next().unwrap_or("");
-            if slug.is_empty() || !file_path.contains("/memory/") {
-                return; // 非知识宫殿路径
+            if file_path.contains("/memory/") {
+                palace_owned = format!("记忆/{}", slug.rsplit('-').next().unwrap_or(slug));
+                &palace_owned
+            } else {
+                "配置"
             }
-            // slug 末段（最后一个 `-` 后部分）作为人类友好 palace 名
-            palace_owned = slug.rsplit('-').next().unwrap_or(slug).to_string();
-            &palace_owned
         } else if file_path.contains("记忆宫殿") {
-            "主体"
+            "记忆/主体"
+        } else if file_path.contains("/.abacus/") || file_path.contains("/.claude/") {
+            "配置"
+        } else if file_path.contains("/src/") || file_path.contains("/pkg/")
+            || file_path.contains("/crates/") || file_path.contains("/lib/") {
+            "代码"
+        } else if file_path.contains("/docs/") || file_path.contains("README")
+            || file_path.ends_with(".md") {
+            "文档"
         } else {
-            return; // 非知识宫殿路径，忽略
+            "文件"
         };
 
-        // 解析领域（memory/ 后的第一级目录）
+        // 解析领域（按路径结构推断）
         let domain = if let Some(pos) = file_path.find("memory/") {
             let after = &file_path[pos + 7..];
             let parts: Vec<&str> = after.split('/').collect();
@@ -2836,7 +2849,9 @@ impl AppState {
             let parts: Vec<&str> = after.split('/').collect();
             if parts.len() > 1 { parts[0] } else { "root" }
         } else {
-            "root"
+            // 取倒数第二段目录作为 domain
+            let parts: Vec<&str> = file_path.rsplitn(3, '/').collect();
+            if parts.len() >= 2 { parts[1] } else { "root" }
         };
 
         // 解析实体名（路径最后一段）

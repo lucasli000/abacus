@@ -222,6 +222,7 @@ impl MeetingManager {
                 target_specialist: sp_id,
                 opinion: Some(opinion),
                 engine_output: response,
+                needs_clarify: false,
             });
         }
 

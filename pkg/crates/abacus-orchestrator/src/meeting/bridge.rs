@@ -39,6 +39,9 @@ pub struct MeetingTurnResult {
     pub target_specialist: SpecialistId,
     pub opinion: Option<SpecialistOpinion>,
     pub engine_output: String,
+    /// 标记为需要澄清——当路由无法匹配专家时为 true，
+    /// 调用方可据此触发 mode_switch → clarify
+    pub needs_clarify: bool,
 }
 
 pub struct MeetingEngineAdapter {
@@ -146,6 +149,7 @@ impl MeetingEngineAdapter {
                     target_specialist: sp_id,
                     opinion: Some(opinion),
                     engine_output: engine_result.response,
+                    needs_clarify: false,
                 })
             }
             RoutingDecision::Escalate(candidates) => {
@@ -199,10 +203,24 @@ impl MeetingEngineAdapter {
                     target_specialist: sp_id.clone(),
                     opinion: Some(opinion),
                     engine_output: engine_result.response,
+                    needs_clarify: false,
                 })
             }
-            RoutingDecision::NoMatch { suggestion, .. } => {
-                Err(MeetingError::Other(suggestion))
+            RoutingDecision::NoMatch { input: user_input, suggestion } => {
+                // 需求不清晰/无匹配专家 → 返回澄清提示，附带模式切换建议
+                // 调用方可据此切换到 Clarify 模式
+                let clarify_output = format!(
+                    "我无法确定应由哪位专家来处理你的问题。{}\n\n请更具体地描述你的需求，或使用 @专家名 直接指定。",
+                    suggestion
+                );
+                Ok(MeetingTurnResult {
+                    meeting_id: self.session.id.clone(),
+                    target_specialist: SpecialistId("system".into()),
+                    opinion: None,
+                    engine_output: clarify_output,
+                    // 标记为需要澄清——TUI 层可据此触发 mode_switch → clarify
+                    needs_clarify: true,
+                })
             }
         }
     }

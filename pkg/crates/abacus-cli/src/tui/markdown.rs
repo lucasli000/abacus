@@ -125,7 +125,20 @@ impl<'a> MdRenderer<'a> {
                 Event::End(tag) => self.handle_end(tag),
                 Event::Text(text) => self.handle_text(&text),
                 Event::Code(code) => self.handle_inline_code(&code),
-                Event::SoftBreak | Event::HardBreak => self.flush_line(LineType::Normal),
+                // SoftBreak（段内单换行）→ 空格延续（Markdown spec 标准行为）
+                // HardBreak（两个空格+换行 或 \）→ 真实换行
+                // 旧行为两者都换行，导致段内文本被碎裂成多行
+                Event::SoftBreak => {
+                    if self.in_code_block {
+                        self.flush_line(LineType::Normal);
+                    } else {
+                        self.current_spans.push(StyledSpan {
+                            text: " ".to_string(),
+                            style: self.compute_text_style(),
+                        });
+                    }
+                }
+                Event::HardBreak => self.flush_line(LineType::Normal),
                 Event::Rule => {
                     self.flush_line(LineType::Normal);
                     self.current_spans.push(StyledSpan {
@@ -141,12 +154,34 @@ impl<'a> MdRenderer<'a> {
         if !self.current_spans.is_empty() {
             self.flush_line(LineType::Normal);
         }
+        // 去除尾部多余空行（段落/代码块后追加的空行若在末尾则裁掉）
+        while self.output.last().map(|l| matches!(l.line_type, LineType::Empty)).unwrap_or(false) {
+            self.output.pop();
+        }
+    }
+
+    /// 推入一个空行（用于结构元素间距）
+    /// 若上一行已是空行则跳过，防止连续空行导致间距过大
+    fn push_empty_line(&mut self) {
+        if self.output.last().map(|l| matches!(l.line_type, LineType::Empty)).unwrap_or(false) {
+            return;
+        }
+        self.output.push(StyledLine {
+            spans: vec![],
+            line_type: LineType::Empty,
+            quote_depth: 0,
+            line_num: None,
+        });
     }
 
     fn handle_start(&mut self, tag: Tag) {
         match tag {
             Tag::CodeBlock(kind) => {
                 self.flush_line(LineType::Normal);
+                // 代码块前留一行空白，与上下文分隔
+                if !self.output.is_empty() {
+                    self.push_empty_line();
+                }
                 self.in_code_block = true;
                 self.code_line_num = 0;
                 self.code_lang = match kind {
@@ -181,8 +216,23 @@ impl<'a> MdRenderer<'a> {
             }
             Tag::Heading { level, .. } => {
                 self.flush_line(LineType::Normal);
+                // 标题前留一行空白（文档开头除外）
+                if !self.output.is_empty() {
+                    self.push_empty_line();
+                }
                 self.in_heading = true;
                 self.heading_level = level as u8;
+                // 标题级别视觉前缀（dim 色，不喧宾夺主）
+                let (prefix, prefix_style) = match level as u8 {
+                    1 => ("◆ ", Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM)),
+                    2 => ("◇ ", Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM)),
+                    3 => ("› ",  Style::default().fg(self.theme.muted)),
+                    _ => ("· ",  Style::default().fg(self.theme.muted)),
+                };
+                self.current_spans.push(StyledSpan {
+                    text: prefix.to_string(),
+                    style: prefix_style,
+                });
             }
             Tag::Emphasis => {
                 self.in_emphasis = true;
@@ -254,18 +304,33 @@ impl<'a> MdRenderer<'a> {
                     style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
                 });
                 self.flush_line(LineType::CodeFence);
+                // 代码块后留一行空白，与后续文本分隔
+                self.push_empty_line();
             }
             TagEnd::Heading(_) => {
                 let level = self.heading_level;
                 self.in_heading = false;
                 self.flush_line(LineType::Heading);
-                // H1/H2 追加底部分隔线（termimad 风格）
-                if level <= 2 {
-                    self.current_spans.push(StyledSpan {
-                        text: "───────────────────────────".to_string(),
-                        style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
-                    });
-                    self.flush_line(LineType::Normal);
+                // H1/H2 追加底部分隔线；H3+ 只留一行空白
+                match level {
+                    1 => {
+                        self.current_spans.push(StyledSpan {
+                            text: "═══════════════════════════".to_string(),
+                            style: Style::default().fg(self.theme.accent).add_modifier(Modifier::DIM),
+                        });
+                        self.flush_line(LineType::Normal);
+                    }
+                    2 => {
+                        self.current_spans.push(StyledSpan {
+                            text: "───────────────────────────".to_string(),
+                            style: Style::default().fg(self.theme.border).add_modifier(Modifier::DIM),
+                        });
+                        self.flush_line(LineType::Normal);
+                    }
+                    _ => {
+                        // H3+：无分隔线，仅空行分隔（避免视觉过重）
+                        self.push_empty_line();
+                    }
                 }
             }
             TagEnd::Emphasis => {
@@ -308,7 +373,8 @@ impl<'a> MdRenderer<'a> {
     fn handle_text(&mut self, text: &str) {
         // 表格单元格内容：缓冲到 current_cell_buf，等整行完成后统一排版
         if self.in_table {
-            self.current_cell_buf.push_str(text);
+            // 表格 cell 也要过滤控制序列（LLM 可能在 cell 里输出 ANSI 码）
+            self.current_cell_buf.push_str(&strip_ansi(text));
             return;
         }
 
@@ -351,8 +417,13 @@ impl<'a> MdRenderer<'a> {
 
         let style = self.compute_text_style();
 
+        // 普通文本过滤 ANSI/控制序列（等同 DOMPurify 对 HTML 的作用）
+        // LLM 有时会输出 \033[31m 等终端控制码，直接渲染会污染 TUI 显示
+        // 代码块内容不过滤（保留 ANSI 演示用途）
+        let sanitized = strip_ansi(text);
+
         // 按行分割（Markdown 文本可能含换行）
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = sanitized.lines().collect();
         if lines.is_empty() {
             return;
         }
