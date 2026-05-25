@@ -299,93 +299,145 @@ pub fn render_completion_popup(
     input_area: Rect,
     messages_area: Rect,
 ) {
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+    use crate::tui::util::{display_width, truncate_to_width, pad_to_width};
 
     let candidates = &state.completion_candidates;
     if candidates.is_empty() { return; }
 
+    let is_slash = candidates.first().map(|c| c.starts_with('/')).unwrap_or(false);
     let frame = f.area();
 
-    // ── 宽度：input_area.width × 65% ────────────────────────────
-    // saturating arith 防 u16 溢出；max(16) 防过窄到无法显示候选；min(frame.width) 防越界
-    let popup_w: u16 = (input_area.width as u32 * 65 / 100)
-        .max(16) as u16;
-    let popup_w = popup_w.min(frame.width);
+    // ── 宽度：input_area × 80%（稍宽一些给 2 列留空间）────────
+    let popup_w: u16 = (input_area.width as u32 * 80 / 100)
+        .max(24).min(frame.width as u32) as u16;
 
-    // ── 高度上限：messages_area.height × 45% ────────────────────
-    // 同时不能向上突破 input_area 顶部（即弹窗底边 = input_area.y - 1，可用空间 = input_area.y）
+    // ── 列数：内容宽 >= 52 用 2 列，否则 1 列 ──────────────────
+    let inner_w = popup_w.saturating_sub(2) as usize; // 减去左右边框
+    let ncols: usize = if is_slash && inner_w >= 52 { 2 } else { 1 };
+    let col_w: usize = if ncols == 2 { (inner_w - 1) / 2 } else { inner_w }; // -1 for │ separator
+
+    // 名字列宽：取所有候选最长名 + 1，但不超过 col_w × 45%
+    let max_name_w: usize = candidates.iter()
+        .map(|c| display_width(c.as_str()))
+        .max().unwrap_or(8)
+        .min(col_w * 45 / 100)
+        .max(6);
+    // 描述列宽：col_w - marker(2) - name(max_name_w) - gap(1)
+    let desc_w: usize = col_w.saturating_sub(max_name_w + 3);
+
+    // ── 高度：候选行数（grid 行数 = ceil(total / ncols)）+ 边框 ─
+    let total = candidates.len();
+    let nrows_total = total.div_ceil(ncols);
     let max_h_by_messages: u16 = (messages_area.height as u32 * 45 / 100).max(3) as u16;
     let max_h_by_above: u16 = input_area.y.saturating_sub(1).max(3);
     let max_h: u16 = max_h_by_messages.min(max_h_by_above);
+    let popup_h: u16 = ((nrows_total + 2) as u16).min(max_h).max(3);
 
-    // ── 实际高度：min(候选数 + 上下边框, max_h) ────────────────
-    let total_h: u16 = (candidates.len() as u16).saturating_add(2); // +2 for top/bottom border
-    let popup_h: u16 = total_h.min(max_h).max(3);
-
-    // ── 位置：贴 input_area 上方，左对齐到 input_area.x ────────
+    // ── 位置：贴 input 上方，左对齐 ────────────────────────────
     let popup_y: u16 = input_area.y.saturating_sub(popup_h);
     let popup_x: u16 = input_area.x.min(frame.width.saturating_sub(popup_w));
     let popup_area = Rect::new(popup_x, popup_y, popup_w, popup_h);
 
     f.render_widget(Clear, popup_area);
+
+    // 标题：简洁提示（不超出弹窗宽度）
+    let title = " ↑↓ Tab · Enter · Esc ";
     let block = Block::default()
-        .title(" 补全 (↑↓/Tab 选择 · Enter 确认 · Alt+1-9 直选 · Esc 取消) ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(state.theme.primary))
         .style(Style::default().bg(state.theme.elevated));
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    // ── 滚动：可见行数 = inner.height；选中项居中策略 ──────────
     let visible_rows: usize = inner.height as usize;
-    let total: usize = candidates.len();
-    let scroll_start: usize = if total <= visible_rows {
+    // 选中项所在行（grid row）
+    let selected_row = state.completion_index / ncols;
+    let scroll_start_row: usize = if nrows_total <= visible_rows {
         0
     } else {
-        // 选中项居中：(half 上 + half 下) 让 completion_index 大致在视图中央
         let half = visible_rows / 2;
-        state.completion_index.saturating_sub(half)
-            .min(total - visible_rows)
+        selected_row.saturating_sub(half).min(nrows_total - visible_rows)
     };
 
-    // V32 · 选中行高亮强化：选中前缀 ❯ + 数字快捷提示（前 9 项 1-9，对应 Alt+1..9）
-    // 非选中前缀用编号占位让对齐稳定，色弱用户也能凭数字识别选中项。
     let mut lines: Vec<Line> = Vec::new();
-    for (i, candidate) in candidates.iter()
-        .skip(scroll_start)
-        .take(visible_rows)
-        .enumerate()
-    {
-        let actual_idx = scroll_start + i;
-        let is_selected = actual_idx == state.completion_index;
-        // 数字快捷提示：actual_idx ∈ [0..9] → 显示 "1·".."9·"；之后用空白
-        let num_hint: String = if actual_idx < 9 {
-            format!("{}·", actual_idx + 1)
-        } else {
-            "  ".to_string()
-        };
-        let arrow = if is_selected { "❯" } else { " " };
-        let prefix = format!("{} {} ", arrow, num_hint);
-        let style = if is_selected {
-            // 强化选中样式：reverse + BOLD 对色弱友好
-            state.theme.semantic_style(SemanticIntent::Success, Strength::Strong)
-                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-        } else {
-            Style::default().fg(state.theme.muted)
-        };
-        // 滚动指示器：仅当列表确实溢出时显示
-        let scroll_indicator = if total > visible_rows {
-            if actual_idx == scroll_start && scroll_start > 0 { " ↑" }
-            else if actual_idx == scroll_start + visible_rows - 1
-                && scroll_start + visible_rows < total { " ↓" }
-            else { "" }
-        } else { "" };
-        lines.push(Line::from(Span::styled(
-            format!("{}{}{}", prefix, candidate, scroll_indicator),
-            style,
-        )));
+    for row_i in scroll_start_row..scroll_start_row + visible_rows {
+        if row_i >= nrows_total { break; }
+
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for col_i in 0..ncols {
+            let idx = row_i * ncols + col_i;
+
+            // 列分隔符
+            if col_i > 0 {
+                spans.push(Span::styled(
+                    "│",
+                    Style::default().fg(state.theme.border).add_modifier(Modifier::DIM),
+                ));
+            }
+
+            if idx >= total {
+                // 空白填充（最后一行可能列不满）
+                spans.push(Span::raw(" ".repeat(col_w)));
+                continue;
+            }
+
+            let candidate = &candidates[idx];
+            let is_selected = idx == state.completion_index;
+
+            // 描述（仅斜杠命令有）
+            let desc: String = if is_slash {
+                crate::tui::slash_commands::command_desc_by_name(candidate)
+                    .map(|d| {
+                        // 只取第一段（' - ' 前，或全部），截断到 desc_w
+                        let short = d.split(" - ").next().unwrap_or(d);
+                        truncate_to_width(short, desc_w)
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            // 名称截断 + 对齐
+            let name_trunc = truncate_to_width(candidate, max_name_w);
+            let name_padded = pad_to_width(&name_trunc, max_name_w);
+
+            let marker = if is_selected { "❯ " } else { "  " };
+            let marker_style = if is_selected {
+                Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let name_style = if is_selected {
+                Style::default().fg(state.theme.text).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(state.theme.text)
+            };
+            let desc_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+
+            spans.push(Span::styled(marker.to_string(), marker_style));
+            spans.push(Span::styled(name_padded, name_style));
+            if desc_w > 0 && !desc.is_empty() {
+                spans.push(Span::raw(" "));
+                // 滚动提示复用 desc 位置（最后一个可见行）
+                let scroll_hint = if nrows_total > visible_rows {
+                    if row_i == scroll_start_row && scroll_start_row > 0 { "↑" }
+                    else if row_i == scroll_start_row + visible_rows - 1
+                        && scroll_start_row + visible_rows < nrows_total { "↓" }
+                    else { "" }
+                } else { "" };
+                let display_desc = if !scroll_hint.is_empty() {
+                    format!("{} {}", scroll_hint, truncate_to_width(&desc, desc_w.saturating_sub(2)))
+                } else {
+                    desc
+                };
+                spans.push(Span::styled(display_desc, desc_style));
+            }
+        }
+        lines.push(Line::from(spans));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 三模式公共 overlay 渲染层（MD1+MD2 修复）

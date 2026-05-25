@@ -316,27 +316,20 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let show_placeholder = state.input.is_empty() && matches!(state.input_state, InputState::Ready);
     for (i, line) in visible_lines.iter().enumerate() {
         if show_placeholder && i == 0 {
+            // placeholder: 保留一个细条作为输入行视觉锚点
             input_lines.push(Line::from(vec![
-                Span::styled("▎", Style::default().fg(cursor_color)),
                 Span::styled(
-                    " Ask anything...",
+                    "Ask anything...",
                     Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
                 ),
             ]));
-        } else if i == cursor_visible_line {
-            let char_pos = state.cursor_col.min(line.chars().count());
-            let line_chars: Vec<char> = line.chars().collect();
-            let split_pos = char_pos.min(line_chars.len());
-            let left: String = line_chars[..split_pos].iter().collect();
-            let right: String = line_chars[split_pos..].iter().collect();
-            input_lines.push(Line::from(vec![
-                Span::styled(left, Style::default().fg(state.theme.text)),
-                Span::styled("▎", Style::default().fg(cursor_color)),
-                Span::styled(right, Style::default().fg(state.theme.text)),
-            ]));
         } else {
+            // 光标行和普通行都直接渲染原始文本
+            // 终端光标由 f.set_cursor_position() 定位，无需 ▎ 字符占位
+            // （▎ 会把光标后的文字右移 1 列，产生视觉偏移）
             input_lines.push(Line::styled(line.to_string(), Style::default().fg(state.theme.text)));
         }
+        let _ = cursor_color; // 光标颜色由终端控制，此变量不再用于渲染
     }
 
     // ── 底行：左侧 thinking_depth · 百分比 已用/上限，右侧 ⏎ Enter / Esc ──

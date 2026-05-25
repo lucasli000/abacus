@@ -162,6 +162,17 @@ pub fn all_command_names() -> Vec<&'static str> {
     registry().iter().flat_map(|e| e.names.iter().copied()).collect()
 }
 
+/// 按命令名（不含 /）查询 help 描述
+///
+/// 引用关系：render_completion_popup 用于多列弹窗中展示命令描述
+/// 生命周期：O(1) 查找，registry 是 OnceLock 静态数据
+pub fn command_desc_by_name(name: &str) -> Option<&'static str> {
+    let bare = name.trim_start_matches('/');
+    registry().iter()
+        .find(|e| e.names.iter().any(|n| *n == bare))
+        .map(|e| e.help)
+}
+
 /// Dispatch a slash command. Returns (consumed, result_text_for_display).
 pub fn dispatch(state: &mut AppState, text: &str) -> CmdResult {
     if !text.starts_with('/') { return CmdResult::NotFound(text.into()); }
