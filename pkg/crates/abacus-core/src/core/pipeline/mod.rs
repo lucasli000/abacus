@@ -1351,16 +1351,15 @@ impl<'a> TurnPipeline<'a> {
                         }
                         continue;
                     } else {
-                        // Final failure after 3 attempts: graceful end (not Err)
+                        // 强制终止条件 #3：超时/不可达（3 次重试失败 = 等效超时）
                         if let Some(ref stx) = self.stream_tx {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("Provider unavailable after 3 attempts: {}", e)
+                                format!("🛑 LLM 服务不可达（3 次重试失败）: {}", e)
                             ));
                         }
-                        ctx.final_response = format!(
-                            "[System] 无法连接 LLM 服务（{}）。请检查网络或 API key。", e
-                        );
-                        break;
+                        return Err(KernelError::Provider(format!(
+                            "Provider unavailable after 3 attempts: {}", e
+                        )));
                     }
                 }
             };
@@ -1921,7 +1920,22 @@ impl<'a> TurnPipeline<'a> {
                                 }.await;
                                 exec_result
                             } else {
-                                // 精简拒绝消息，减少 LLM 重试浪费的 token
+                                // 破坏性操作未授权 → 强制终止 pipeline（唯一非用户发起的终止条件）
+                                // 设计原则：除用户主动取消外，只有未授权的不可恢复破坏性操作才终止
+                                let is_destructive_denied = reason.contains("⚠")
+                                    || reason.contains("dangerous")
+                                    || reason.contains("system-dangerous");
+                                if is_destructive_denied {
+                                    if let Some(ref stx) = self.stream_tx {
+                                        let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                            format!("🛑 破坏性操作被拒绝，pipeline 强制终止: {}", reason)
+                                        ));
+                                    }
+                                    return Err(KernelError::Other(format!(
+                                        "Destructive operation denied without authorization: {}", reason
+                                    )));
+                                }
+                                // 非破坏性拒绝 → 返回错误让 LLM 换方案（不终止）
                                 Ok(ToolOutput {
                                     tool_id: tool_id.clone(),
                                     success: false,

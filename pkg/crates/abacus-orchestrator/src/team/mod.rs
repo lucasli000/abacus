@@ -325,6 +325,14 @@ impl TeamSession {
         }
     }
 
+    /// 获取全部任务实例的快照（用于进度展示）
+    ///
+    /// ## 引用关系
+    /// - 消费方: send_team_message (abacus-cli) 构建 TeamTaskInfo
+    pub async fn list_tasks(&self) -> Vec<TaskInstance> {
+        self.shared_ctx.read().await.task_board.clone()
+    }
+
     /// 所有任务是否完成
     pub async fn all_tasks_done(&self) -> bool {
         let ctx = self.shared_ctx.read().await;

@@ -843,9 +843,18 @@ pub async fn send_role_message(
 /// budget 比 chat 的 300s 更宽（600s）；超时触发后 UI 立即收到错误并解锁，
 /// plan 阶段用 cancellable 版本可真正中断 reqwest，execute_ready_tasks 由
 /// orchestrator 内部决定（外层 timeout 至少保证 UI 不卡）。
+/// 发送 Team 模式消息（Leader 分解 + SubAgent 并行执行）
+///
+/// ## 引用关系
+/// - 调用方: run.rs Team spawn
+/// - stream_tx: 进度通知推送到 TUI 更新 state.tasks 面板
+///
+/// ## 生命周期
+/// - stream_tx clone 自 run.rs 主 channel，send_team_message 结束后 clone drop
 pub async fn send_team_message(
     handle: &EngineHandle,
     message: &str,
+    stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
 ) -> ApiResult<EngineResponse> {
     let _permit = match handle.inflight_guard.try_acquire() {
         Ok(p) => p,
@@ -882,6 +891,12 @@ pub async fn send_team_message(
             }
             team.emit(TeamEvent::PlanningStarted { task_count: 0 });
 
+            // ── 进度通知: planning 阶段开始 ──
+            let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TeamProgress {
+                phase: "planning".into(),
+                tasks: vec![],
+            });
+
             // 使用 CoreLoop 让 Leader 分解目标
             let plan_prompt = format!(
                 "You are a team Leader. Decompose the following goal into 2-5 concrete subtasks.\n\
@@ -906,6 +921,30 @@ pub async fn send_team_message(
                         team.add_task(task.clone()).await;
                     }
                     team.emit(TeamEvent::PlanningStarted { task_count: tasks.len() });
+
+                    // ── TextDelta: 展示 Leader 分工结果 ──
+                    {
+                        let mut assign_text = String::from("已分解任务并指派：\n");
+                        for (i, task) in tasks.iter().enumerate() {
+                            assign_text.push_str(&format!(" → agent_{}: {}\n", i, task.description));
+                        }
+                        assign_text.push('\n');
+                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(assign_text));
+                    }
+
+                    // ── 进度通知: planning 完成，tasks 已入看板（全部 pending）──
+                    let task_infos: Vec<abacus_core::llm::stream::TeamTaskInfo> = tasks.iter().map(|t| {
+                        abacus_core::llm::stream::TeamTaskInfo {
+                            id: t.id.clone(),
+                            title: t.description.clone(),
+                            status: "pending".into(),
+                            output_preview: None,
+                        }
+                    }).collect();
+                    let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TeamProgress {
+                        phase: "executing".into(),
+                        tasks: task_infos,
+                    });
                 }
                 Err(e) => {
                     let _ = team.transition_to(TeamStatus::Failed {
@@ -916,18 +955,95 @@ pub async fn send_team_message(
             }
         }
 
-        // Phase 2: Execute ready tasks
+        // Phase 2: Execute ready tasks — 逐个执行并实时推送进度
         let _ = team.transition_to(TeamStatus::Executing {
             active_tasks: 0, completed_tasks: 0,
         }).await;
 
-        let results = match team.execute_ready_tasks(&handle.core).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = team.transition_to(TeamStatus::Failed { reason: e.to_string() }).await;
-                return ApiResult::Err(format!("任务执行失败: {}", e));
+        let ready_by_role = team.ready_tasks_by_role().await;
+        let mut results: Vec<(String, String)> = Vec::new();
+
+        for (role, tasks) in &ready_by_role {
+            for (idx, task) in tasks.iter().enumerate() {
+                // ── 进度通知: agent 开始执行 ──
+                let agent_label = format!("agent_{}", idx);
+                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+                    format!("⚙ {} 开始执行...\n", agent_label),
+                ));
+
+                // 推送 TeamProgress: 当前 task → running
+                {
+                    use abacus_orchestrator::team::TaskStatus as TTS;
+                    let all_tasks = team.list_tasks().await;
+                    let task_infos: Vec<abacus_core::llm::stream::TeamTaskInfo> = all_tasks.iter().map(|t| {
+                        let is_current = t.spec.id == task.id;
+                        let status_str = if is_current {
+                            "running"
+                        } else {
+                            match &t.status {
+                                TTS::Pending | TTS::Blocked { .. } => "pending",
+                                TTS::Assigned { .. } | TTS::Running { .. } => "running",
+                                TTS::Completed { .. } => "done",
+                                TTS::Failed { .. } => "failed",
+                            }
+                        };
+                        abacus_core::llm::stream::TeamTaskInfo {
+                            id: t.spec.id.clone(),
+                            title: t.spec.description.clone(),
+                            status: status_str.into(),
+                            output_preview: None,
+                        }
+                    }).collect();
+                    let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TeamProgress {
+                        phase: "executing".into(),
+                        tasks: task_infos,
+                    });
+                }
+
+                // 执行任务
+                match team.execute_task_with_core(&handle.core, task, role).await {
+                    Ok(r) => results.push((task.id.clone(), r)),
+                    Err(e) => {
+                        tracing::warn!("Task {} failed: {}", task.id, e);
+                    }
+                }
+
+                // ── 进度通知: task 完成后推送最新状态 ──
+                {
+                    use abacus_orchestrator::team::TaskStatus as TTS;
+                    let all_tasks = team.list_tasks().await;
+                    let task_infos: Vec<abacus_core::llm::stream::TeamTaskInfo> = all_tasks.iter().map(|t| {
+                        let status_str = match &t.status {
+                            TTS::Pending | TTS::Blocked { .. } => "pending",
+                            TTS::Assigned { .. } | TTS::Running { .. } => "running",
+                            TTS::Completed { .. } => "done",
+                            TTS::Failed { .. } => "failed",
+                        };
+                        let preview = if let TTS::Completed { result } = &t.status {
+                            let s = result.to_string();
+                            if s.len() > 100 { Some(format!("{}...", &s[..97])) } else { Some(s) }
+                        } else {
+                            None
+                        };
+                        abacus_core::llm::stream::TeamTaskInfo {
+                            id: t.spec.id.clone(),
+                            title: t.spec.description.clone(),
+                            status: status_str.into(),
+                            output_preview: preview,
+                        }
+                    }).collect();
+                    let phase = if all_tasks.iter().all(|t| matches!(t.status, TTS::Completed { .. } | TTS::Failed { .. })) {
+                        "completed"
+                    } else {
+                        "executing"
+                    };
+                    let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TeamProgress {
+                        phase: phase.into(),
+                        tasks: task_infos,
+                    });
+                }
             }
-        };
+        }
 
         // Phase 3: Check if all done
         // V28.7: 状态机合法转换路径——Executing → Reviewing → Completed

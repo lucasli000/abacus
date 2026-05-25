@@ -330,15 +330,19 @@ impl ToolRegistry {
                 // 引用关系：
                 // - tokio::spawn 隔离 executor panic（不崩溃调用方 task）
                 // - tokio::time::timeout 防止 executor 无限挂起
+                // - AbortHandle 确保超时后 spawned task 被终止（不泄漏）
                 //
                 // 生命周期：
-                // - spawned task 在 timeout 或完成后销毁
-                // - timeout 到期时 spawned task 被 abort（资源释放）
+                // - spawned task 在正常完成/panic 后自然销毁
+                // - 超时时通过 abort_handle.abort() 强制终止 spawned task
                 let tid = tool_id.clone();
                 let ctx_clone = ctx.clone();
                 let handle = tokio::spawn(async move {
                     exe.execute(&tid, params, &ctx_clone).await
                 });
+                // 保存 abort handle——timeout 后用于终止 spawned task
+                // 注意：drop JoinHandle 不会 abort task，必须显式调用
+                let abort_handle = handle.abort_handle();
 
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_secs),
@@ -378,9 +382,10 @@ impl ToolRegistry {
                             try_instead: Vec::new(),
                         })
                     }
-                    // 超时 — abort spawned task，释放资源
+                    // 超时 — 显式 abort spawned task 防止资源泄漏
                     Err(_elapsed) => {
-                        tracing::warn!("tool execution timeout: {tool_id} after {timeout_secs}s");
+                        abort_handle.abort();
+                        tracing::warn!("tool execution timeout: {tool_id} after {timeout_secs}s (task aborted)");
                         Ok(ToolOutput {
                             tool_id: tool_id.clone(),
                             success: false,

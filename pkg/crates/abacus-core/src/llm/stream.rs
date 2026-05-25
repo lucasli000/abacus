@@ -80,6 +80,32 @@ pub enum StreamChunk {
     /// - 生产者: TurnPipeline（从 complete() 的 retry 路径发出，未来可扩展）
     /// - 消费者: TUI run loop（显示 retry 进度）
     RetryProgress { attempt: u32, max_attempts: u32, reason: String },
+    /// Team 模式进度通知（SubAgent 执行过程中实时推送）
+    ///
+    /// ## 引用关系
+    /// - 生产者: send_team_message (abacus-cli/src/tui/api/mod.rs)
+    /// - 消费者: TUI run loop (更新 state.tasks 面板)
+    ///
+    /// ## 生命周期
+    /// - 创建: send_team_message 各阶段转换时
+    /// - 销毁: TUI 消费后立即释放
+    TeamProgress {
+        phase: String,              // "planning" / "executing" / "reviewing" / "completed"
+        tasks: Vec<TeamTaskInfo>,
+    },
     /// 错误（stream 中断）
     Error(String),
+}
+
+/// Team 模式任务进度信息（StreamChunk::TeamProgress 的载荷）
+///
+/// ## 引用关系
+/// - 生产者: send_team_message 从 TaskInstance 构建
+/// - 消费者: TUI run loop 映射为 state::TaskCard
+#[derive(Clone, Debug)]
+pub struct TeamTaskInfo {
+    pub id: String,
+    pub title: String,
+    pub status: String,             // "pending" / "running" / "done" / "failed"
+    pub output_preview: Option<String>,  // 前 100 字符结果预览
 }

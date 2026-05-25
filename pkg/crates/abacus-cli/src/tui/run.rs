@@ -1074,6 +1074,31 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.processing_phase = format!("重试 {}/{}: {}", attempt, max_attempts, reason);
                             state.rendered_lines_dirty.set(true);
                         }
+                        // ── Team 模式进度通知 → 更新 state.tasks 面板 ──
+                        StreamChunk::TeamProgress { phase, tasks } => {
+                            state.tasks = tasks.iter().map(|t| {
+                                crate::tui::state::TaskCard {
+                                    id: t.id.clone(),
+                                    title: t.title.clone(),
+                                    assignee: String::new(),
+                                    status: match t.status.as_str() {
+                                        "running" => crate::tui::state::TaskStatus::InProgress,
+                                        "done" => crate::tui::state::TaskStatus::Done,
+                                        "failed" => crate::tui::state::TaskStatus::Blocked,
+                                        _ => crate::tui::state::TaskStatus::Pending,
+                                    },
+                                    progress: match t.status.as_str() {
+                                        "done" => 100,
+                                        "running" => 50,
+                                        _ => 0,
+                                    },
+                                    deps: vec![],
+                                    description: t.output_preview.clone().unwrap_or_default(),
+                                }
+                            }).collect();
+                            state.processing_phase = format!("team/{}", phase);
+                            state.rendered_lines_dirty.set(true);
+                        }
                     }
                 }
 
@@ -1339,8 +1364,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             match current_mode {
                                 // ═══ Team 模式: Leader 分解 + SubAgent 并行执行 ═══
                                 AbacusMode::Team => {
+                                    let stx = stream_tx.clone();
                                     tokio::spawn(async move {
-                                        match send_team_message(&engine, &text).await {
+                                        match send_team_message(&engine, &text, stx).await {
                                             ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                             ApiResult::Err(e) => {
                                                 let _ = tx.send(EngineResponse {

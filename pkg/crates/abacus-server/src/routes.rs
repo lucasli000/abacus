@@ -654,6 +654,18 @@ async fn chat_stream_handler(
                     let data = serde_json::json!({"attempt": attempt, "max_attempts": max_attempts, "reason": reason}).to_string();
                     yield Ok(Event::default().event("retry_progress").data(data));
                 }
+                StreamChunk::TeamProgress { phase, tasks } => {
+                    let agents: Vec<serde_json::Value> = tasks.iter().map(|t| {
+                        serde_json::json!({
+                            "id": t.id,
+                            "title": t.title,
+                            "status": t.status,
+                            "output_preview": t.output_preview,
+                        })
+                    }).collect();
+                    let data = serde_json::json!({"phase": phase, "agents": agents}).to_string();
+                    yield Ok(Event::default().event("team_progress").data(data));
+                }
             }
         }
 
