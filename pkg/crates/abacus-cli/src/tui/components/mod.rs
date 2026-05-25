@@ -431,16 +431,29 @@ fn build_message_lines(
         // Breathing space
         lines.push(Line::raw(""));
 
-        // Header: ┃ 🤖 Abacus · now
+        // Header: ┃ 🤖 Abacus     输出中  · now
+        // stream_cursor > 0 意味着 TextDelta 已到达，状态固定为"输出中"
+        let badge_text = "🤖 Abacus";
         let badge = Span::styled(
-            "🤖 Abacus",
+            badge_text,
             Style::default().fg(theme.session).add_modifier(Modifier::BOLD),
         );
+        let status_badge = Span::styled("输出中", Style::default().fg(theme.success));
+        let time_text = " · now";
         let ts = Span::styled(
-            " · now",
+            time_text,
             theme.text_style(TextRole::Caption),
         );
-        lines.push(Line::from(vec![bar.clone(), Span::raw(" "), badge, ts]));
+        let badge_w = crate::tui::util::display_width(badge_text);
+        let status_w = crate::tui::util::display_width("输出中");
+        let time_w = crate::tui::util::display_width(time_text);
+        let hdr_content_w = (max_width as usize).saturating_sub(4);
+        let header_gap = hdr_content_w.saturating_sub(badge_w + status_w + time_w + 2);
+        lines.push(Line::from(vec![
+            bar.clone(), Span::raw(" "), badge,
+            Span::raw(" ".repeat(header_gap)),
+            status_badge, Span::raw("  "), ts,
+        ]));
 
         // Thinking block（如果有累积的 thinking 文本）
         // 注意：streaming_thinking 通过 state 传入——这里用 messages 数组的最后元素判断
@@ -996,15 +1009,54 @@ pub fn render_messages_in_card(
         //          在 stream_cursor==0（流式刚启动、TextDelta 尚未到达）时本函数必须自己补 header，
         //          否则 thinking/tools 直接挂在 user 消息下方，视觉上像 user 在 thinking。
         if state.stream_cursor == 0 {
+            // ── 状态 badge：header 右侧展示当前阶段 ──
+            // 引用关系：消费 streaming_tools / streaming_text_started / streaming_thinking
+            // 生命周期：仅 is_streaming=true 且 stream_cursor==0 时渲染
+            let status_badge: Span<'static> = {
+                use crate::tui::state::StreamingToolStatus;
+                if !state.streaming_tools.iter().any(|(_, s, _, _)| *s == StreamingToolStatus::Running)
+                    && state.streaming_text_started
+                {
+                    // TextDelta 输出中
+                    Span::styled("输出中", Style::default().fg(state.theme.success))
+                } else if state.streaming_tools.iter().any(|(_, s, _, _)| *s == StreamingToolStatus::Running) {
+                    // 工具执行中 — 显示最近运行的工具名
+                    let running_name = state.streaming_tools.iter().rev()
+                        .find(|(_, s, _, _)| *s == StreamingToolStatus::Running)
+                        .map(|(n, _, _, _)| n.as_str())
+                        .unwrap_or("tool");
+                    Span::styled(format!("⚙ {}", running_name), Style::default().fg(state.theme.gold))
+                } else if !state.streaming_thinking.is_empty() && !state.streaming_text_started {
+                    // Thinking 阶段
+                    Span::styled("💭 thinking", Style::default().fg(state.theme.accent))
+                } else {
+                    Span::raw("")
+                }
+            };
+
             lines.push(Line::raw(""));
+            // Header 构建：badge_text + gap + status_badge + "  · now"
+            let badge_text = "🤖 Abacus";
+            let badge_span = Span::styled(
+                badge_text,
+                Style::default().fg(state.theme.session).add_modifier(Modifier::BOLD),
+            );
+            let time_text = " · now";
+            let ts_span = Span::styled(time_text, state.theme.text_style(TextRole::Caption));
+            let badge_w = crate::tui::util::display_width(badge_text);
+            let status_text = status_badge.content.to_string();
+            let status_w = crate::tui::util::display_width(&status_text);
+            let time_w = crate::tui::util::display_width(time_text);
+            let content_w_hdr = (inner.width as usize).saturating_sub(4); // bar(1)+space(1)+margin
+            let header_gap = content_w_hdr.saturating_sub(badge_w + status_w + time_w + 2);
             lines.push(Line::from(vec![
                 bar.clone(),
                 Span::raw(" "),
-                Span::styled(
-                    "🤖 Abacus",
-                    Style::default().fg(state.theme.session).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" · now", state.theme.text_style(TextRole::Caption)),
+                badge_span,
+                Span::raw(" ".repeat(header_gap)),
+                status_badge,
+                Span::raw("  "),
+                ts_span,
             ]));
             // 占位光标行（thinking/tools/text 通过 saturating_sub(1) 插到此行之前）
             lines.push(Line::from(vec![bar.clone(), Span::raw(" ")]));
@@ -1017,49 +1069,118 @@ pub fn render_messages_in_card(
         let mut stream_offset: usize = 0;
         let content_w = inner.width.saturating_sub(5) as usize;
 
-        // ── Phase 1: Thinking — 流式期间不在消息区展示 ──
-        // 设计决策：输入栏 spinner 已指示 "Thinking..."，消息区不再重复展示 thinking 内容，
-        // 以降低视觉噪音，让文字回复保持主焦点。
-        // 原渲染逻辑保留注释供 /show-details 命令复活。
-        // if state.show_streaming_trace && !state.streaming_thinking.is_empty() { ... }
-
-        // ── Phase 2: Tools — 紧凑一行摘要，内联在文字流中 ──
-        // 设计决策：每个工具一行 "⚙ name → status (dur)"，muted+DIM 降低视觉权重，
-        // 不展开 diff/输出预览，让文字回复保持主焦点。
-        // 引用关系：消费 state.streaming_tools（由 run.rs ToolStart/ToolEnd 维护）
-        if !state.streaming_tools.is_empty() {
+        // ── Phase 1: Thinking — 按时序折叠策略 ──
+        // 设计决策：streaming 期间按 FIFO 时序展示内容，进入新阶段时前阶段自动折叠为摘要。
+        // 引用关系：消费 state.streaming_thinking / streaming_tools / streaming_text_started
+        // 生命周期：仅 is_streaming=true 时渲染，streaming 结束后由落档消息替代
+        if !state.streaming_thinking.is_empty() {
             use crate::tui::state::StreamingToolStatus;
-            for (name, status, duration_ms, _trace_id) in state.streaming_tools.iter() {
-                let (status_icon, status_style) = match status {
-                    StreamingToolStatus::Running => (
-                        "⏳",
-                        Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-                    ),
-                    StreamingToolStatus::Success => (
-                        "✓",
-                        Style::default().fg(state.theme.success).add_modifier(Modifier::DIM),
-                    ),
-                    StreamingToolStatus::Failed => (
-                        "✗",
-                        Style::default().fg(state.theme.error).add_modifier(Modifier::DIM),
-                    ),
-                };
-                let dur_text = match (status, duration_ms) {
-                    (StreamingToolStatus::Success, Some(d)) => format!(" ({:.1}s)", *d as f64 / 1000.0),
-                    _ => String::new(),
+            let thinking_lines = state.streaming_thinking.lines().count();
+
+            if state.streaming_text_started || !state.streaming_tools.is_empty() {
+                // 已进入后续阶段（tools 或 text）→ thinking 折叠为一行摘要
+                let tool_summary = if !state.streaming_tools.is_empty() {
+                    let done = state.streaming_tools.iter()
+                        .filter(|(_, s, _, _)| *s != StreamingToolStatus::Running).count();
+                    let total = state.streaming_tools.len();
+                    let dur: u64 = state.streaming_tools.iter()
+                        .filter_map(|(_, _, d, _)| *d)
+                        .sum();
+                    if state.streaming_text_started {
+                        // 全折叠：thinking + tools 合并为一行
+                        format!(" · ⚙ {}工具(✓{}) · {:.1}s", total, done, dur as f64 / 1000.0)
+                    } else {
+                        // 仅 thinking 折叠，tools 单独展示
+                        String::new()
+                    }
+                } else {
+                    String::new()
                 };
                 lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                     bar.clone(),
                     Span::raw(" "),
-                    Span::styled("⚙ ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                    Span::styled(name.clone(), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                    Span::styled(format!(" → {}{}", status_icon, dur_text), status_style),
+                    Span::styled(
+                        format!("▸ 💭 {}行思考{}", thinking_lines, tool_summary),
+                        Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+                    ),
+                ]));
+                stream_offset += 1;
+            } else {
+                // 当前就在 thinking 阶段 → 展示简短实时指示
+                lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                    bar.clone(),
+                    Span::raw(" "),
+                    Span::styled(
+                        "💭 正在推理...",
+                        Style::default().fg(state.theme.accent).add_modifier(Modifier::ITALIC),
+                    ),
                 ]));
                 stream_offset += 1;
             }
         }
 
-        // ── Phase 3: 分隔线（trace 有内容且 text 也有内容时插入）──
+        // ── Phase 2: Tools — 按时序折叠策略 ──
+        // 引用关系：消费 state.streaming_tools（由 run.rs ToolStart/ToolEnd 维护）
+        if !state.streaming_tools.is_empty() {
+            use crate::tui::state::StreamingToolStatus;
+
+            if state.streaming_text_started {
+                // 已进入 TextDelta → 工具也折叠
+                // 如果 thinking 为空但有 tools，单独展示工具折叠摘要
+                if state.streaming_thinking.is_empty() {
+                    let done = state.streaming_tools.iter()
+                        .filter(|(_, s, _, _)| *s != StreamingToolStatus::Running).count();
+                    let total = state.streaming_tools.len();
+                    let dur: u64 = state.streaming_tools.iter()
+                        .filter_map(|(_, _, d, _)| *d)
+                        .sum();
+                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                        bar.clone(),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("▸ ⚙ {}工具(✓{}) · {:.1}s", total, done, dur as f64 / 1000.0),
+                            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+                        ),
+                    ]));
+                    stream_offset += 1;
+                }
+                // else: thinking 非空时，工具已合并到 thinking 折叠摘要中（Phase 1）
+            } else {
+                // 当前在工具阶段 → 展示每个工具的实时状态
+                for (name, status, duration_ms, _trace_id) in state.streaming_tools.iter() {
+                    let (icon, style) = match status {
+                        StreamingToolStatus::Running => (
+                            "⏳",
+                            Style::default().fg(state.theme.gold),
+                        ),
+                        StreamingToolStatus::Success => (
+                            "✓",
+                            Style::default().fg(state.theme.success).add_modifier(Modifier::DIM),
+                        ),
+                        StreamingToolStatus::Failed => (
+                            "✗",
+                            Style::default().fg(state.theme.error).add_modifier(Modifier::DIM),
+                        ),
+                    };
+                    let dur_text = match (status, duration_ms) {
+                        (StreamingToolStatus::Success | StreamingToolStatus::Failed, Some(d)) =>
+                            format!(" ({:.1}s)", *d as f64 / 1000.0),
+                        _ => String::new(),
+                    };
+                    lines.insert(stream_insert_base + stream_offset, Line::from(vec![
+                        bar.clone(),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("⚙ {} → {}{}", name, icon, dur_text),
+                            style,
+                        ),
+                    ]));
+                    stream_offset += 1;
+                }
+            }
+        }
+
+        // ── Phase 3: 分隔线（前阶段有内容且 text 也有内容时插入）──
         if stream_offset > 0 && !state.streaming_text.is_empty() {
             lines.insert(stream_insert_base + stream_offset, Line::from(vec![
                 bar.clone(),

@@ -3109,11 +3109,17 @@ impl CoreLoop {
                 map.recent_tools(1).into_iter().next().map(|tid| tid.0)
             };
 
+            // Policy 感知：让 LLM 知道当前约束状态
+            let policy = &self.config.policy;
+            let guard_status = if policy.guard.entropy_guard.is_empty() { "off" } else { "on" };
+            let decl_status = if policy.guard.explicit_declaration.is_empty() { "off" } else { "on" };
+
             let block = format!(
                 "[Awareness]\n\
                  Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
                  Task: {} | Role: {} | Max output: {}tok\n\
-                 Capabilities: {} tools/turn, {} escalations available | scene_loading: {} | router: {}",
+                 Capabilities: {} tools/turn, {} escalations available | scene_loading: {} | router: {}\n\
+                 Policy: entropy_guard={} | explicit_decl={} | stop_threshold={}chars | confirm_timeout={}s",
                 current_turn, max_turns,
                 tool_calls_used,
                 model_name,
@@ -3125,6 +3131,10 @@ impl CoreLoop {
                 escalations_left,
                 if self.config.scene_tool_loading_enabled { "on" } else { "off" },
                 if self.config.silent_router_enabled { "on" } else { "off" },
+                guard_status,
+                decl_status,
+                policy.thresholds.premature_stop_chars,
+                policy.thresholds.confirm_timeout_secs,
             );
             (block, last_tool)
         };
