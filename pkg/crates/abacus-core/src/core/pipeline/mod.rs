@@ -1070,6 +1070,13 @@ impl<'a> TurnPipeline<'a> {
         const MAX_TOTAL_TOOL_CALLS: u32 = 200;
 
         for loop_iter in 0..self.core.config.max_turns_per_request {
+            // Fix 6: Cancel check at top of each loop iteration
+            if self.is_cancelled() {
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::Error("Turn cancelled".into()));
+                }
+                break;
+            }
             // V38: 迭代边界信号——TUI 收到后清空 streaming_thinking，避免跨迭代累积
             if let Some(ref stx) = self.stream_tx {
                 let _ = stx.send(crate::llm::stream::StreamChunk::IterationStart {
@@ -1241,10 +1248,22 @@ impl<'a> TurnPipeline<'a> {
                         };
                         ctx.provider.complete_cancellable(retry_req, self.cancel_token()).await?
                     } else {
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                format!("LLM API error (400): {}", body.chars().take(200).collect::<String>())
+                            ));
+                        }
                         return Err(KernelError::ApiError { status: 400, body: body.clone() });
                     }
                 }
-                Err(e) => return Err(e),
+                Err(ref e) => {
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                            format!("LLM provider error: {}", e)
+                        ));
+                    }
+                    return Err(provider_result.unwrap_err());
+                }
             };
 
             ctx.prompt_tokens += response.usage.prompt_tokens;

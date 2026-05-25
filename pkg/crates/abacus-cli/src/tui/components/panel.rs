@@ -987,23 +987,19 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         lines.push(Line::styled("    —", Style::default().fg(state.theme.muted)));
     }
 
-    // 📚 知识 (L1.5) — V33 现场版：仅一行小计（条数 + 总次数），层级树移到「量化」tab
-    // 口径：知识=knowledge_calls 实体条数；总次数=各实体 count 累加；与「量化」同源不同精度
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "   📚 知识",
-        state.theme.text_style(TextRole::BodyEmphasis),
-    ));
-    if state.knowledge_calls.is_empty() {
-        lines.push(Line::styled("    —", Style::default().fg(state.theme.muted)));
-    } else {
+    // 📚 知识 — 仅在有数据时展示（无数据不占空间）
+    if !state.knowledge_calls.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            "   📚 知识",
+            state.theme.text_style(TextRole::BodyEmphasis),
+        ));
         let total_calls: u32 = state.knowledge_calls.iter().map(|e| e.count).sum();
         lines.push(Line::from(vec![
             Span::styled("    实体 ", Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", state.knowledge_calls.len()), state.theme.text_style(TextRole::BodyEmphasis)),
             Span::styled("  调用 ", Style::default().fg(state.theme.muted)),
             Span::styled(format!("{} 次", total_calls), Style::default().fg(state.theme.text)),
-            Span::styled("  · 详情见「量化」", state.theme.text_style(TextRole::Caption)),
         ]));
     }
 
