@@ -136,6 +136,16 @@ impl PreflightChecker {
         classification: &crate::core::task_analyzer::TaskKind,
         complexity: Option<&abacus_types::progressive::ComplexityProfile>,
     ) -> PreflightReport {
+        Self::check_with_patterns(input, classification, complexity, None)
+    }
+
+    /// 带自定义破坏性模式的 preflight check（从 policy.toml 加载）
+    pub fn check_with_patterns(
+        input: &str,
+        classification: &crate::core::task_analyzer::TaskKind,
+        complexity: Option<&abacus_types::progressive::ComplexityProfile>,
+        custom_patterns: Option<&[String]>,
+    ) -> PreflightReport {
         let lower = input.to_lowercase();
 
         // 1. 意图确认
@@ -148,13 +158,15 @@ impl PreflightChecker {
                 dependencies.push("未指定文件路径".into());
             }
 
-        // 3. 风险识别（仅标记真正破坏性操作；edit/write/修改 是正常操作不标 risk）
-        // 原设计 "修改" 触发 risk → llm_self_review → 每次代码任务多 1-3s + 1024 tokens
-        // 收紧：只有不可逆删除/覆盖/清空才标记
+        // 3. 风险识别（从 policy.toml 加载模式，或用内置默认）
         let mut risks = Vec::new();
-        let destructive_patterns = ["delete all", "drop table", "truncate", "rm -rf", "format disk",
-            "覆盖全部", "清空", "删除所有"];
-        if destructive_patterns.iter().any(|p| lower.contains(p)) {
+        let default_patterns: Vec<String> = vec![
+            "delete all".into(), "drop table".into(), "truncate".into(),
+            "rm -rf".into(), "format disk".into(),
+            "覆盖全部".into(), "清空".into(), "删除所有".into(),
+        ];
+        let patterns = custom_patterns.unwrap_or(&default_patterns);
+        if patterns.iter().any(|p| lower.contains(p.as_str())) {
             risks.push("请求包含不可逆破坏性操作".into());
         }
 

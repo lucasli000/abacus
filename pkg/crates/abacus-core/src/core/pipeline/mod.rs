@@ -494,7 +494,10 @@ impl<'a> TurnPipeline<'a> {
         let preflight = if self.req_ctx.skip_preflight {
             PreflightReport::default()
         } else {
-            let rule_report = PreflightChecker::check(self.input, &classification.kind, Some(&complexity));
+            let rule_report = PreflightChecker::check_with_patterns(
+                self.input, &classification.kind, Some(&complexity),
+                Some(&self.core.config.policy.preflight.destructive_patterns),
+            );
             if rule_report.is_safe() {
                 rule_report
             } else {
