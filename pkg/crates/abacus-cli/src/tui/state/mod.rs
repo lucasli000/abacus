@@ -2543,15 +2543,16 @@ impl AppState {
     ///   - show_thinking_slider=true 渲染底部 thinking 行, ←→ 调整深度
     ///   - selected 跨分组用 items 索引(分组只是渲染形态, 不改 selected 语义)
     pub fn open_picker_model(&mut self) {
-        // V29.8: provider 分组数据(provider_label, model_id, model_label)
+        // V29.8: provider 分组数据(provider_label, model_id, model_desc)
+        //   label 格式："<model_id>  — <说明>"  让用户直接看到模型 ID
         //   将来可改为从 abacus-core 异步注入的 model registry, 当前用静态表
         const MODEL_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("DeepSeek", &[
-                ("deepseek-v4-pro",   "Pro    · 最强能力(deep reasoning)"),
-                ("deepseek-v4-flash", "Flash  · 最快响应(low latency)"),
+                ("deepseek-v4-pro",   "最强推理 (deep reasoning)"),
+                ("deepseek-v4-flash", "最快响应 (low latency)"),
             ]),
             ("Alibaba Qwen", &[
-                ("qwen-plus", "Plus   · 通用平衡"),
+                ("qwen-plus", "通用平衡"),
             ]),
         ];
 
@@ -2561,14 +2562,27 @@ impl AppState {
 
         for (provider, models) in MODEL_GROUPS {
             let start = items.len();
-            for (id, label) in *models {
+            for (id, desc) in *models {
                 items.push((*id).to_string());
-                labels.push((*label).to_string());
+                // 模型 ID 作为主显示内容，说明为辅
+                labels.push(format!("{:<22}  {}", id, desc));
             }
             let end = items.len();
             if end > start {
                 groups.push((provider.to_string(), start..end));
             }
+        }
+
+        // 当前配置的模型不在静态表中时自动插入到首位（避免找不到当前模型）
+        if !self.model_name.is_empty() && !items.contains(&self.model_name) {
+            items.insert(0, self.model_name.clone());
+            labels.insert(0, format!("{:<22}  (当前配置)", &self.model_name));
+            // 重计分组小标记：所有已有分组平移 1 位
+            for (_, range) in &mut groups {
+                *range = (range.start + 1)..(range.end + 1);
+            }
+            // 将自定义模型插入一个单独分组
+            groups.insert(0, ("自定义".to_string(), 0..1));
         }
 
         let current = items.iter().position(|m| m == &self.model_name);
