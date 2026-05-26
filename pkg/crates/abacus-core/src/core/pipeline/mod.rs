@@ -1609,6 +1609,7 @@ impl<'a> TurnPipeline<'a> {
                         continue; // 重试本轮
                     }
                 }
+                } // if ctx.tool_text_fallback_retries < 1
 
                 // V30: 检测 LLM 任务未完成即停止（premature stop）
                 // 条件：本轮有工具失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
