@@ -115,6 +115,10 @@ pub struct PickerState {
     ///   true = 渲染 "思考: ◀ {depth} ▶ · ←→ 调整" 行, ←→ 拦截路由到 thinking 调整
     ///   false = 默认 picker 行为
     pub show_thinking_slider: bool,
+    /// 防键重复保护：picker 打开时记录时刻，150ms 内 Enter 无效
+    /// 问题根因：accept_completion Enter → submit_message → open_picker → picker 开启
+    /// 同一物理 Enter 的「鍵重複」事件立即触发 apply_picker_selection → picker 瞬间关闭
+    pub opened_at: std::time::Instant,
 }
 
 /// 流式 tool 执行状态
@@ -2594,6 +2598,7 @@ impl AppState {
             labels,
             groups: Some(groups),
             show_thinking_slider: true,
+            opened_at: std::time::Instant::now(),
         });
         // picker 打开后立即触发重绘，避免 input_state=Ready 时 needs_draw=false 导致首帧不显示
         self.rendered_lines_dirty.set(true);
@@ -2613,6 +2618,7 @@ impl AppState {
             labels,
             groups: None,
             show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
         });
         self.rendered_lines_dirty.set(true);
     }
@@ -2639,6 +2645,7 @@ impl AppState {
             labels,
             groups: None,
             show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
         });
         self.rendered_lines_dirty.set(true);
     }

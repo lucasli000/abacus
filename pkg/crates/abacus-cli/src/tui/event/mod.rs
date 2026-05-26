@@ -980,7 +980,15 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 return;
             }
             KeyCode::Enter => {
-                apply_picker_selection(state);
+                // 防键重复：picker 打开 150ms 内 Enter 无效
+                // 根因：accept_completion Enter → submit_message → open_picker，同一物理 Enter
+                // 的鍵重複事件立即命中此处 → picker 瞬间关闭用户看不到
+                let debounce_ok = state.picker.as_ref()
+                    .map(|p| p.opened_at.elapsed().as_millis() >= 150)
+                    .unwrap_or(true);
+                if debounce_ok {
+                    apply_picker_selection(state);
+                }
                 return;
             }
             // Tab 循环（与 ↓ 等价，方便单手操作）
