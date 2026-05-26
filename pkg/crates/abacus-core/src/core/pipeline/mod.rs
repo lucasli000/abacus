@@ -1569,8 +1569,12 @@ impl<'a> TurnPipeline<'a> {
                 if ctx.tool_text_fallback_retries < 1 && !text.is_empty() && !ctx.tools_exhausted {
                     // 跳过描述性文本中的工具名提及（LLM 在解释计划而非调用）
                     let text_lower = text.to_lowercase();
+                    // 跳过描述性语境：精确短语避免过度匹配
+                    // “可以”过宽（中文回复几乎都含此词）——改用具体动词短语
                     let skip_patterns = ["i'll use", "i can use", "let me", "using ", "let's",
-                                         "you can use", "you could use", "我", "让我", "可以"];
+                                         "you can use", "you could use",
+                                         "我来使用", "让我使用", "可以使用", "我会使用",
+                                         "你可以使用", "我需要使用", "调用", "执行"];
                     if !skip_patterns.iter().any(|p| text_lower.contains(p)) {
                         let registered_names: Vec<String> = self.core.registry
                             .tool_names()

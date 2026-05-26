@@ -1229,7 +1229,9 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     if state.context_window > 0 {
         lines.push(dotted_sep.clone());
-        let used = state.session_tokens.total_tokens as usize;
+        // 口径对齐：与 InputBar context% 一致，用 latest_prompt_tokens（最新轮完整 context 大小）
+        // 而非 total_tokens（累加账单，随轮次增长会虚高到 100%+）
+        let used = state.session_tokens.latest_prompt_tokens as usize;
         let max_ctx = state.context_window;
         let pct = if max_ctx > 0 { (used * 100 / max_ctx).min(100) } else { 0 };
         let pct_color = if pct >= 80 { state.theme.error }

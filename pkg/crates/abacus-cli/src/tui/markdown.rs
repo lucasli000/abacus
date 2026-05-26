@@ -723,8 +723,8 @@ fn strip_ansi(text: &str) -> std::borrow::Cow<'_, str> {
             }
             i += 1; // skip terminator letter
         } else if bytes[i] == b'\x1b' {
-            // 其他 ESC 序列（\x1b + 单字符）
-            i += 2;
+            // 其他 ESC 序列（\x1b + 单字符）——若 ESC 是最后一个字节则仅跳过 1
+            i += if i + 1 < bytes.len() { 2 } else { 1 };
         } else if bytes[i] < 0x20 && bytes[i] != b'\n' && bytes[i] != b'\t' && bytes[i] != b'\r' {
             // 非打印 C0 控制字符（NUL、BEL、BS、FF 等）— 丢弃
             i += 1;

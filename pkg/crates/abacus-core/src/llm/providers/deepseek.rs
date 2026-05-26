@@ -774,6 +774,9 @@ impl LlmProvider for DeepSeekProvider {
         // 根因：SSE 只在第一个 chunk 携带 id，后续 chunk 仅有 index
         // 修复：建立 index→id 映射，后续 chunk 通过 index 查找 id，避免 arguments 丢失
         let mut tc_index_to_id: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        // ToolCallStart 去重守卫：避免少数代理/模型在多个 chunk 中重复下发 function.name
+        // 导致 TUI 出现重复的 Running 条目
+        let mut tc_index_started: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
@@ -846,10 +849,13 @@ impl LlmProvider for DeepSeekProvider {
                                             });
                                         if let Some(func) = tc.get("function") {
                                             if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                                let _ = tx.send(StreamEvent::ToolCallStart {
-                                                    id: id.clone(),
-                                                    name: name.to_string(),
-                                                });
+                                                // 展示并且每个 index 只发一次 ToolCallStart
+                                                if tc_index_started.insert(index) {
+                                                    let _ = tx.send(StreamEvent::ToolCallStart {
+                                                        id: id.clone(),
+                                                        name: name.to_string(),
+                                                    });
+                                                }
                                             }
                                             if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
                                                 if !args.is_empty() {
