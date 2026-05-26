@@ -723,6 +723,10 @@ async fn chat_stream_handler(
                     }).to_string();
                     yield Ok(Event::default().event("compress_end").data(data));
                 }
+                // CompressAutoResume: 压缩完成后 pipeline 自动续行信号
+                StreamChunk::CompressAutoResume => {
+                    yield Ok(Event::default().event("compress_auto_resume").data("{}"));
+                }
                 StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
                     let data = serde_json::json!({"attempt": attempt, "max_attempts": max_attempts, "reason": reason}).to_string();
                     yield Ok(Event::default().event("retry_progress").data(data));

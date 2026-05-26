@@ -49,10 +49,42 @@ pub fn apply_picker_selection(state: &mut AppState) {
     let Some(p) = state.picker.take() else { return; };
     let Some(value) = p.items.get(p.selected).cloned() else { return; };
     // V29.8: PickerKind::Thinking 走 "/model thinking <value>" (原 /thinking 已合并)
+    let review_strict = p.review_strict; // 取出 strict flag（picker 即将被 take）
     let cmd = match p.kind {
         PickerKind::Model    => format!("/model {}", value),
         PickerKind::Theme    => format!("/theme {}", value),
         PickerKind::Thinking => format!("/model thinking {}", value),
+        PickerKind::Mode     => format!("/{}", value),      // /clarify 或 /meeting
+        PickerKind::Review   => {
+            if review_strict {
+                format!("/review {} --strict", value)
+            } else {
+                format!("/review {}", value)
+            }
+        }
+        PickerKind::Resume   => format!("/resume {}", value),
+        PickerKind::Meeting  => {
+            // meeting    → /meeting （切换模式）
+            // expert     → /expert list
+            // meeting-list → /meeting-list
+            match value.as_str() {
+                "expert"       => "/expert list".to_string(),
+                "meeting-list" => "/meeting-list".to_string(),
+                _              => "/meeting".to_string(),  // default: switch mode
+            }
+        }
+        PickerKind::History  => {
+            // History 不走 slash dispatch，直接写入 input 并 submit
+            state.picker = None; // 已被 take，确保清空
+            state.input = value;
+            state.cursor_pos = state.input.len();
+            state.cursor_line = 0;
+            state.cursor_col = state.input.len();
+            state.input_state = crate::tui::state::InputState::Ready;
+            state.rendered_lines_dirty.set(true);
+            submit_message(state);
+            return;
+        }
     };
     // 复用 dispatch（已有 toast / state 副作用），不再走 picker 拦截分支
     let _ = crate::tui::slash_commands::dispatch(state, &cmd);
@@ -74,9 +106,14 @@ pub fn handle_slash_command(state: &mut AppState, text: &str) -> bool {
     let trimmed = text.trim();
     // 无参命令名 → 转 picker（用户体验：箭头选 + Enter 确认）
     match trimmed {
-        "/model" | "/m" => { state.open_picker_model(); return true; }
-        "/theme"        => { state.open_picker_theme(); return true; }
-        "/thinking" | "/think" | "/t" => { state.open_picker_thinking(); return true; }
+        "/model" | "/m"                => { state.open_picker_model();    return true; }
+        "/theme"                       => { state.open_picker_theme();    return true; }
+        "/thinking" | "/think" | "/t"  => { state.open_picker_thinking(); return true; }
+        "/mode"                        => { state.open_picker_mode();     return true; }
+        "/meeting" | "/meet"            => { state.open_picker_meeting();  return true; }
+        "/review"                      => { state.open_picker_review();   return true; }
+        "/resume"                      => { state.open_picker_resume();   return true; }
+        "/history"                     => { state.open_picker_history();  return true; }
         _ => {}
     }
     match slash_commands::dispatch(state, text) {
@@ -741,12 +778,11 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
         return true;
     }
 
-    // Ctrl+1/2/3: 模式切换 Clarify/Team/Meeting
+    // Ctrl+1/2: 模式切换 Clarify/Meeting（V34: Team/Plan 已降级为执行策略，无对应快捷键）
     if mods.contains(KeyModifiers::CONTROL) {
         match code {
             KeyCode::Char('1') => { switch_mode(state, AbacusMode::Clarify); return true; }
-            KeyCode::Char('2') => { switch_mode(state, AbacusMode::Team); return true; }
-            KeyCode::Char('3') => { switch_mode(state, AbacusMode::Meeting); return true; }
+            KeyCode::Char('2') => { switch_mode(state, AbacusMode::Meeting); return true; }
             _ => {}
         }
     }
@@ -972,10 +1008,18 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 state.rendered_lines_dirty.set(true);
                 return;
             }
+            KeyCode::Char(' ') => {
+                // Review picker：Space 切换 strict 模式
+                if let Some(p) = state.picker.as_mut() {
+                    if matches!(p.kind, crate::tui::state::PickerKind::Review) {
+                        p.review_strict = !p.review_strict;
+                        state.rendered_lines_dirty.set(true);
+                    }
+                }
+                return;
+            }
             KeyCode::Enter => {
                 // 防键重复：picker 打开 150ms 内 Enter 无效
-                // 根因：accept_completion Enter → submit_message → open_picker，同一物理 Enter
-                // 的鍵重複事件立即命中此处 → picker 瞬间关闭用户看不到
                 let debounce_ok = state.picker.as_ref()
                     .map(|p| p.opened_at.elapsed().as_millis() >= 150)
                     .unwrap_or(true);
@@ -1013,26 +1057,76 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
     // ## 引用关系
     // - 写入：此处通过 EngineHandle.session push
     // - 消费：abacus-core pipeline execute_loop 迭代间隙 drain
+    // 忙碌态下斜杠命令仍本地执行（/clear 等不需要引擎参与，不应被 mid-turn 拦截）
+    if is_busy && code == KeyCode::Enter && state.input.trim().starts_with('/') {
+        submit_message(state);
+        return;
+    }
+
+    // 授权弹窗激活时：支持输入框输入语义词确认/拒绝
+    // 语义词识别优先于按键快捷键，支持 IME 环境
+    if is_busy && code == KeyCode::Enter && state.confirm_dialog.is_some() {
+        let text = state.input.trim().to_lowercase();
+        if !text.is_empty() {
+            let is_yes = matches!(
+                text.as_str(),
+                "y" | "yes" | "ok" | "allow" | "是" | "好" | "好的" | "允许" | "确认" | "同意" | "授权" | "肯定"
+            );
+            let is_no = matches!(
+                text.as_str(),
+                "n" | "no" | "deny" | "reject" | "否" | "不" | "拒绝" | "取消" | "不允许" | "不同意"
+            );
+            if is_yes || is_no {
+                let dialog = state.confirm_dialog.take().unwrap();
+                let ts = chrono::Local::now().format("%H:%M").to_string();
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                if is_yes {
+                    state.add_event(&ts, "session", &format!("✓ 单次授权: {}", dialog.action), crate::tui::state::EventLevel::Notice);
+                    state.add_toast("✓ 已授权（本次）", std::time::Duration::from_secs(2));
+                    state.pending_confirmation_response = Some(true);
+                } else {
+                    state.add_event(&ts, "session", &format!("✗ 已拒绝: {}", dialog.action), crate::tui::state::EventLevel::Warning);
+                    state.add_toast("✗ 已拒绝", std::time::Duration::from_secs(2));
+                    state.pending_confirmation_response = Some(false);
+                }
+                return;
+            }
+        }
+    }
+
     if is_busy && code == KeyCode::Enter {
         if !state.input.trim().is_empty() {
-            let msg = state.input.clone();
-            // 注入 mid-turn signal 让 LLM 实时感知用户更新
-            if let Some(ref handle) = state.engine_handle {
-                let session = handle.session.clone();
-                let msg_clone = msg.clone();
-                tokio::spawn(async move {
-                    let s = session.read().await;
-                    s.mid_turn_signals.lock().await.push(msg_clone);
-                });
+            let msg = state.input.trim().to_string();
+
+            if state.input_state == InputState::Executing {
+                // ── 压缩阶段：暂存消息，等压缩完成后自动发送 ──
+                // 不走 mid-turn signal（压缩期间 turn 已结束，无 LLM 在接收）
+                state.pending_compress_input = Some(msg);
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.add_toast("⏳ 已暂存，压缩完成后自动发送", Duration::from_secs(3));
+            } else {
+                // ── Thinking/Outputting：注入 mid-turn signal 让 LLM 实时感知 ──
+                if let Some(ref handle) = state.engine_handle {
+                    let session = handle.session.clone();
+                    let msg_clone = msg.clone();
+                    tokio::spawn(async move {
+                        let s = session.read().await;
+                        s.mid_turn_signals.lock().await.push(msg_clone);
+                    });
+                }
+                state.input.clear();
+                // EV7 修复：input.clear 后必须同步重置 cursor 三件套
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.add_toast("已发送给 AI（工作中可感知）", Duration::from_secs(2));
             }
-            // 不再写入 pending_inputs — mid-turn signal 已注入，避免重复发送
-            state.input.clear();
-            // EV7 修复：input.clear 后必须同步重置 cursor 三件套，
-            // 否则 cursor_line/col 持有旧值，下一帧光标位置错位
-            state.cursor_pos = 0;
-            state.cursor_line = 0;
-            state.cursor_col = 0;
-            state.add_toast("已发送给 AI（工作中可感知）", Duration::from_secs(2));
         }
         return;
     }
@@ -1873,35 +1967,8 @@ pub fn submit_message(state: &mut AppState) {
         }
     }
 
-    // V28.7: 模式自适应——Clarify → Team/Meeting（自动切换 + 显著 toast；Plan 由 /done 显式触发，不走自动）
-    //
-    // 引用关系：
-    //   - 输入：text（用户当条消息）
-    //   - 检测：tui::modes::analyzer::suggest_mode（关键词驱动：审查/讨论 → Meeting；
-    //                                              全栈/多角色 → Team）
-    //   - 副作用：state.mode 变更；run loop 路由按新 mode 调度（chat/team/meeting）
-    //   - 看板：panel 渲染按新 mode 切到对应 tab 分组（"摘要/议程" 或 "摘要/任务"）
-    //
-    // 设计决策：
-    //   - 仅在 Chat → 其他模式触发，不会从 Meeting/Team 反向跳（保留用户显式选择）
-    //   - 自动切换后保留消息（switch_mode 不清 messages），Ctrl+1 可快速回 Clarify
-    //   - 仅在 engine 连接好时启用（演示模式不切，避免无果切换）
-    if state.engine_handle.is_some() && state.mode == AbacusMode::Clarify {
-        if let Some(recommended) = crate::tui::modes::analyzer::suggest_mode(&text) {
-            let mode_name = recommended.label();
-            switch_mode(state, recommended);
-            state.add_toast(
-                format!("🤖 已自动切换到 {} 模式（Ctrl+1 可切回 Clarify）", mode_name),
-                std::time::Duration::from_secs(5),
-            );
-            state.add_event(
-                chrono::Local::now().format("%H:%M").to_string(),
-                "session",
-                &format!("自适应切换 → {}", mode_name),
-                crate::tui::state::EventLevel::Notice,
-            );
-        }
-    }
+    // V33.1: 关闭关键词自动模式切换——误报率过高。
+    // 模式切换现在仅走显式命令 /clarify /plan /team /meeting + Ctrl+1/2/3
 
     state.input.clear();
     state.cursor_pos = 0;
@@ -1970,34 +2037,14 @@ pub fn switch_mode(state: &mut AppState, mode: AbacusMode) {
 
     state.set_mode(mode);
 
-    // V33: ModeArtifact 数据流转 — 进入新 mode 时取走上阶段产出
-    // 引用关系：mode_artifact 由上阶段（Clarify /done / Plan 输出 / Meeting 结论）写入
+    // V34: ModeArtifact 数据流转 — 进入新 mode 时取走上阶段产出
+    // 引用关系：mode_artifact 由上阶段（Clarify /done 携带 ClarifyBrief / Meeting 结论）写入
     // 消费：本处取 take()，根据新 mode 加载到对应 state 字段
-    // - PlanTasks → state.tasks（Team 入口加载）
-    // - ClarifyBrief → 暂存 toast 提示（Plan/Meeting 入口可读 state.session_summary）
-    // - MeetingConclusion → 同上（Team 入口可见）
+    // - ClarifyBrief → toast 提示（Meeting 入口可见）
+    // - MeetingConclusion → toast 提示（Clarify 入口可见）
+    // V34: PlanTasks 已删除（Plan 降级为执行策略，不通过 mode 切换传递 TaskSpec）
     if let Some(artifact) = state.mode_artifact.take() {
         let summary = artifact.summary();
-        // PlanTasks 直接灌入 state.tasks 让 Team 看板可见
-        // TaskSpec 结构（abacus-types/src/sandbox.rs）：goal + phases[PhaseSpec(id/description/steps)]
-        // 映射策略：每个 phase → 一个 TaskCard（粒度合理；steps 留给执行 agent 内部展开）
-        if let abacus_types::ModeArtifact::PlanTasks(tasks) = &artifact {
-            let mut cards: Vec<crate::tui::state::TaskCard> = Vec::new();
-            for ts in tasks {
-                for (i, phase) in ts.phases.iter().enumerate() {
-                    cards.push(crate::tui::state::TaskCard {
-                        id: phase.id.clone(),
-                        title: phase.description.clone(),
-                        assignee: format!("phase-{}", i + 1),
-                        status: crate::tui::state::TaskStatus::Pending,
-                        progress: 0,
-                        deps: vec![],
-                        description: ts.goal.clone(),
-                    });
-                }
-            }
-            state.tasks = cards;
-        }
         state.add_toast(
             format!("→ {} ({})", mode.display_zh(), summary),
             Duration::from_secs(4),

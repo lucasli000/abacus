@@ -28,126 +28,89 @@ fn registry() -> &'static [Entry] {
     REGISTRY.get_or_init(|| {
         let mut v = Vec::new();
 
-        // ── Core ──
-        v.push(Entry { names: &["help", "h"], handler: cmd_help, help: "显示所有命令" });
-        v.push(Entry { names: &["clear", "cls"], handler: cmd_clear, help: "清空屏幕" });
-        v.push(Entry { names: &["new", "reset"], handler: cmd_new, help: "新建会话" });
-        v.push(Entry { names: &["save"], handler: cmd_save, help: "保存当前会话" });
-        v.push(Entry { names: &["copy"], handler: cmd_copy, help: "复制最后回复到剪贴板" });
-        v.push(Entry { names: &["quit", "exit", "q"], handler: cmd_quit, help: "退出" });
+        // ════════════════════════════════════════════════════════════════
+        // 命令排布原则：按使用频次从高到低；/help 置最后（通常用于初次探索）
+        // ════════════════════════════════════════════════════════════════
 
-        // ── Model & Thinking ──
-        // V29.8: /model 收编 thinking + provider 子命令
-        //   /model <name>          切换模型
-        //   /model thinking [lvl]  原 /thinking
-        //   /model provider        原 /provider
-        v.push(Entry { names: &["model", "m"], handler: cmd_model, help: "模型设置 - /model [<name>|thinking|provider]" });
+        // ── 高频：日常会话操作 ──
+        v.push(Entry { names: &["clear", "cls"],    handler: cmd_clear,    help: "清空屏幕" });
+        v.push(Entry { names: &["new", "reset"],    handler: cmd_new,      help: "新建会话" });
+        v.push(Entry { names: &["model", "m"],      handler: cmd_model,    help: "模型设置 - /model [<name>|thinking|provider]" });
+        v.push(Entry { names: &["plan"],            handler: cmd_plan,     help: "/plan <任务> — 触发规划+执行策略" });
+        v.push(Entry { names: &["team"],            handler: cmd_team,     help: "/team <任务> — 触发多 agent 执行策略" });
+        v.push(Entry { names: &["mode"],            handler: cmd_mode,     help: "切换模式（picker）— Clarify / Meeting" });
+        v.push(Entry { names: &["clarify", "chat"], handler: cmd_clarify,  help: "切换到 澄清 模式" });
+        v.push(Entry { names: &["copy"],            handler: cmd_copy,     help: "复制最后回复到剪贴板" });
+        v.push(Entry { names: &["save"],            handler: cmd_save,     help: "保存当前会话" });
+        v.push(Entry { names: &["quit", "exit", "q"], handler: cmd_quit,   help: "退出" });
 
-        // ── Theme ──
-        v.push(Entry { names: &["theme"], handler: cmd_theme, help: "切换主题 (brand/light/dracula/...)" });
+        // ── 中高频：上下文与工具操作 ──
+        v.push(Entry { names: &["context", "ctx"],  handler: cmd_context,  help: "查询上下文使用状态" });
+        v.push(Entry { names: &["compress"],        handler: cmd_compress, help: "手动压缩上下文" });
+        v.push(Entry { names: &["search"],          handler: cmd_search,   help: "搜索消息 /search <query>" });
+        v.push(Entry { names: &["undo"],            handler: cmd_undo,     help: "撤销文件操作 /undo [seq <N>|turn <N>|history|timeline]" });
+        v.push(Entry { names: &["redo"],            handler: cmd_redo,     help: "重做最后一次撤销" });
+        v.push(Entry { names: &["diff"],            handler: cmd_diff,     help: "git diff - /diff [path]" });
+        v.push(Entry { names: &["export"],          handler: cmd_export,   help: "导出会话到 ~/abacus_session_<ts>.md" });
 
-        // ── Modes ──
-        // V33: 模式切换走 DAG 验证（cmd_xxx → try_switch_mode）
-        v.push(Entry { names: &["clarify", "chat"], handler: cmd_clarify, help: "切换到 澄清 模式" });
-        v.push(Entry { names: &["plan"], handler: cmd_plan, help: "切换到 规划 模式（Planner agent）" });
-        v.push(Entry { names: &["team"], handler: cmd_team, help: "切换到 执行 模式（多 agent 并行）" });
-        v.push(Entry { names: &["meeting"], handler: cmd_meeting, help: "切换到 会诊 模式（多专家会议）" });
-        v.push(Entry { names: &["done"], handler: cmd_done, help: "标记当前模式完成，自动推进下一阶段" });
+        // ── 中频：代码审查与角色 ──
+        // /review plan|diff|security [--strict] [content]
+        //   V39-2: --strict 让 verdict!=pass 时阻断 Plan→Team 切换
+        v.push(Entry { names: &["review"],          handler: cmd_review,        help: "审查 - /review <plan|diff|security> [--strict] [内容]" });
+        v.push(Entry { names: &["auto-review"],     handler: cmd_auto_review,   help: "自动 review 联动 - /auto-review <on|off|status>" });
+        // /role fix|summarize|test [content]（content 可省，自动用末尾 Session 消息）
+        v.push(Entry { names: &["role"],            handler: cmd_role,          help: "调用角色 - /role <fix|summarize|test> [内容]" });
 
-        // ── Info ──
-        v.push(Entry { names: &["status"], handler: cmd_status, help: "显示当前状态" });
-        v.push(Entry { names: &["tokens", "tok"], handler: cmd_tokens, help: "显示 token 统计" });
-        v.push(Entry { names: &["debug"], handler: cmd_debug, help: "显示调试信息" });
-        v.push(Entry { names: &["version", "v"], handler: cmd_version, help: "显示版本号" });
+        // ── 中频：配置与显示 ──
+        v.push(Entry { names: &["theme"],           handler: cmd_theme,    help: "切换主题 (brand/light/dracula/...)" });
+        v.push(Entry { names: &["tokens", "tok"],   handler: cmd_tokens,   help: "显示 token 统计" });
+        v.push(Entry { names: &["status"],          handler: cmd_status,   help: "显示当前状态" });
+        v.push(Entry { names: &["models"],          handler: cmd_models,   help: "列出可用模型" });
+        v.push(Entry { names: &["tools"],           handler: cmd_tools,    help: "列出已注册工具" });
+        v.push(Entry { names: &["inject"],          handler: cmd_inject,   help: "注入临时知识 /inject <text>" });
 
-        // ── Navigation ──
-        v.push(Entry { names: &["memory"], handler: cmd_memory, help: "打开 Memory 面板" });
-        v.push(Entry { names: &["plugins", "mcp"], handler: cmd_plugins, help: "打开 Components 面板" });
-        v.push(Entry { names: &["settings"], handler: cmd_settings, help: "打开设置面板" });
+        // ── 中频：会话管理 ──
+        v.push(Entry { names: &["rename"],          handler: cmd_rename,   help: "重命名会话 - /rename <alias>|clear" });
+        v.push(Entry { names: &["resume"],          handler: cmd_resume,   help: "恢复 session - /resume [<uuid prefix>]" });
+        v.push(Entry { names: &["branch", "fork"],  handler: cmd_branch,   help: "派生新会话 - /branch [alias]" });
+        v.push(Entry { names: &["history"],         handler: cmd_history,  help: "显示输入历史 /history [n]" });
 
-        // ── Backend Async (pending_slash_command) ──
-        v.push(Entry { names: &["context", "ctx"], handler: cmd_context, help: "查询上下文使用状态" });
-        v.push(Entry { names: &["compress"], handler: cmd_compress, help: "手动压缩上下文" });
-        v.push(Entry { names: &["inject"], handler: cmd_inject, help: "注入临时知识 /inject <text>" });
-        v.push(Entry { names: &["tools"], handler: cmd_tools, help: "列出已注册工具" });
+        // ── 中低频：会议模式 ──
+        v.push(Entry { names: &["meeting"],         handler: cmd_meeting,      help: "切换到 会诊 模式（多专家会议）" });
+        v.push(Entry { names: &["meeting-list", "ml"],   handler: cmd_meeting_list, help: "列出历史会议记录" });
+        v.push(Entry { names: &["meeting-load", "mload"], handler: cmd_meeting_load, help: "/meeting-load <id> — 注入历史会议结论" });
+        // V35: 专家角色配置
+        v.push(Entry { names: &["expert"], handler: cmd_expert, help: "/expert list|add <name> <domain> [--model <id>]|set <name> --model <id>|remove <name>|reset" });
+        v.push(Entry { names: &["done"],            handler: cmd_done,     help: "标记当前模式完成，推进下一阶段" });
+
+        // ── 低频：面板导航 ──
+        v.push(Entry { names: &["memory"],          handler: cmd_memory,   help: "打开 Memory 面板" });
+        v.push(Entry { names: &["plugins", "mcp"],  handler: cmd_plugins,  help: "打开 Components 面板" });
+        v.push(Entry { names: &["settings"],        handler: cmd_settings, help: "打开设置面板" });
+
+        // ── 低频：诊断与安全 ──
         v.push(Entry { names: &["tool-stats", "stats"], handler: cmd_tool_stats, help: "显示工具效能统计" });
-        v.push(Entry { names: &["safety"], handler: cmd_safety, help: "显示安全状态" });
-        v.push(Entry { names: &["models"], handler: cmd_models, help: "列出可用模型" });
-        v.push(Entry { names: &["info"], handler: cmd_info, help: "显示会话详情" });
-        // V29.8: /provider 已合并进 /model provider, 旧入口删除
+        v.push(Entry { names: &["allow"],           handler: cmd_allow,    help: "管理自动授权 - /allow [list|revoke <tool>|clear]" });
+        v.push(Entry { names: &["safety"],          handler: cmd_safety,   help: "显示安全状态" });
+        v.push(Entry { names: &["doctor"],          handler: cmd_doctor,   help: "系统健康检查" });
+        v.push(Entry { names: &["debug"],           handler: cmd_debug,    help: "显示调试信息" });
 
-        // ── Phase 4 file-undo ──
-        v.push(Entry { names: &["undo"], handler: cmd_undo, help: "撤销文件操作 /undo [seq <N>|turn <N>|history|timeline]" });
-        v.push(Entry { names: &["redo"], handler: cmd_redo, help: "重做最后一次撤销" });
-
-        // ── V37-3: Reviewer 角色 ──
-        // /review plan|diff|security [--strict] [content]  调用 Reviewer 角色审查
-        //   content 可省 → 自动用末尾 Session 消息（适合审 Planner 输出）
-        //   V39-2: --strict 标志让 verdict!=pass 时阻断 Plan→Team 切换（守门员模式）
-        v.push(Entry { names: &["review"], handler: cmd_review, help: "审查 - /review <plan|diff|security> [--strict] [内容]" });
-        // V39-2: /review-clear 清除 strict 阻断（逃生通道，防误判困住用户）
-        v.push(Entry { names: &["review-clear"], handler: cmd_review_clear, help: "清除 review 阻断" });
-        // V40-4: /auto-review on|off 切换 Plan→Team 自动 review 联动
-        v.push(Entry { names: &["auto-review"], handler: cmd_auto_review, help: "自动 review 联动 - /auto-review <on|off|status>" });
-        // V41-4: /review-history 显示最近 review 历史（verdict 演变）
-        v.push(Entry { names: &["review-history"], handler: cmd_review_history, help: "显示 review 历史 - 最近 20 条" });
-        // V41-2: /review-required on|off [<秒>] 强约束模式（必须有 fresh pass review 才能 Plan→Team）
-        v.push(Entry { names: &["review-required"], handler: cmd_review_required, help: "review 强约束 - /review-required <on|off|status> [<秒>]" });
-        // L-3/L-4/L-5: 通用角色调用
-        //   /role fix <代码 + 错误描述>     代码修复
-        //   /role summarize <文本>          文档摘要
-        //   /role test <函数签名/代码>      测试生成
-        //   content 可省 → 自动用末尾 Session 消息（与 /review 同款行为）
-        v.push(Entry { names: &["role"], handler: cmd_role, help: "调用角色 - /role <fix|summarize|test> [内容]" });
-
-        // ── V0.2: Local Commands ──
-        v.push(Entry { names: &["history"], handler: cmd_history, help: "显示输入历史 /history [n]" });
-        v.push(Entry { names: &["search"], handler: cmd_search, help: "搜索消息 /search <query>" });
-        v.push(Entry { names: &["feedback"], handler: cmd_feedback, help: "提交反馈 /feedback <text>" });
+        // ── 低频：其他工具 ──
+        v.push(Entry { names: &["turnkey", "tk"],   handler: cmd_turnkey,  help: "全托管目标 - /turnkey <goal>" });
         v.push(Entry { names: &["streaming", "stream"], handler: cmd_streaming, help: "切换流式输出模式" });
-        v.push(Entry { names: &["export"], handler: cmd_export, help: "导出会话到 ~/abacus_session_<ts>.md" });
+        v.push(Entry { names: &["info"],            handler: cmd_info,     help: "显示会话详情" });
+        v.push(Entry { names: &["feedback"],        handler: cmd_feedback, help: "提交反馈 /feedback <text>" });
+        v.push(Entry { names: &["version", "v"],    handler: cmd_version,  help: "显示版本号" });
 
-        // ── V29.9: Turnkey 全托管 ──
-        // /turnkey <goal>  设置会话目标(占位实现：仅写 session_goal，
-        //                  真实 sandbox.plan_from_nl + execute 接通在 C4 任务)
-        v.push(Entry { names: &["turnkey", "tk"], handler: cmd_turnkey, help: "全托管目标 - /turnkey <goal>" });
+        // ── 极低频：Review 辅助与废弃命令 ──
+        v.push(Entry { names: &["review-clear"],    handler: cmd_review_clear,    help: "清除 review 阻断" });
+        v.push(Entry { names: &["review-history"],  handler: cmd_review_history,  help: "显示 review 历史（最近 20 条）" });
+        v.push(Entry { names: &["review-required"], handler: cmd_review_required, help: "review 强约束 - /review-required <on|off|status> [<秒>]" });
+        // V34 废弃，保留入口避免"未知命令"错误
+        v.push(Entry { names: &["plan-prefix"],     handler: cmd_plan_prefix,     help: "（已废弃）改用 /plan <任务>" });
 
-        // ── V29.9: 会话别名 ──
-        // /rename <alias>  设置 session 别名（TopBar/StatusBar 显示）；
-        // /rename clear   清空(回到 session_id 截短显示)
-        v.push(Entry { names: &["rename"], handler: cmd_rename, help: "重命名会话 - /rename <alias>|clear" });
-
-        // ── V29.9: git diff 显示 ──
-        // /diff [path]   显示 cwd 下 git working tree 未提交变更
-        v.push(Entry { names: &["diff"], handler: cmd_diff, help: "git diff - /diff [path]" });
-
-        // ── V29.9: 会话分叉 ──
-        // /branch [alias]  在当前 session 基础上派生新 session(原 session 文件保留),
-        //                  当前 state 切到新 uuid + 可选 alias，下次 /save 写新文件
-        v.push(Entry { names: &["branch", "fork"], handler: cmd_branch, help: "派生新会话 - /branch [alias]" });
-
-        // ── V29.9 (C1): plan-mode 单次切换 ──
-        // /plan         切换 plan_mode=true, 下次发送 user message 前注入 plan-prefix,
-        //               一轮即清(再次 /plan 才能再启用)
-        // /plan off     主动关闭(尚未发送时取消)
-        // V33: 原 /plan（单次注入计划前缀）改名 /plan-prefix，避免与新 Plan AbacusMode 切换冲突
-        v.push(Entry { names: &["plan-prefix"], handler: cmd_plan_prefix, help: "Plan 前缀注入（单次） - /plan-prefix [off]" });
-
-        // ── V29.9 (C2): 按 uuid 恢复历史 session ──
-        // /resume <uuid>  从项目 sessions 目录加载特定 session(支持前缀匹配)
-        // /resume         无参 → 列出最近 session 列表(交互辅助)
-        v.push(Entry { names: &["resume"], handler: cmd_resume, help: "恢复 session - /resume [<uuid prefix>]" });
-
-        // ── V29.9 (C3): 系统健康检查 ──
-        // /doctor   复用 commands/doctor.rs 抽出的 build_doctor_report 纯函数,
-        //           输出渲染到消息区(info dialog)
-        v.push(Entry { names: &["doctor"], handler: cmd_doctor, help: "系统健康检查 - /doctor" });
-
-        // ── V29.11: always_allow 管理命令 ──
-        // /allow           查看已授权列表
-        // /allow revoke X  撤销特定工具的自动授权
-        // /allow clear     清空全部自动授权
-        v.push(Entry { names: &["allow"], handler: cmd_allow, help: "管理自动授权 - /allow [list|revoke <tool>|clear]" });
+        // ── /help 置最后：初次探索使用，不占补全首位 ──
+        v.push(Entry { names: &["help", "h"],       handler: cmd_help,     help: "显示所有命令" });
 
         v
     })
@@ -316,6 +279,30 @@ pub fn keyboard_cheatsheet() -> String {
 
 // ── Handlers ─────────────────────────────────────────────────
 
+/// /mode — 无参时由 handle_slash_command 拦截打开 picker；此处处理有参直接切换
+fn cmd_mode(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        // 有 picker 拦截兜底，此处理论上不到；但若直接 dispatch 则打开 picker
+        s.open_picker_mode();
+        return CmdResult::Consumed;
+    }
+    match args[0].to_ascii_lowercase().as_str() {
+        "clarify" | "chat" => {
+            try_switch_mode(s, crate::tui::state::AbacusMode::Clarify);
+        }
+        "meeting" => {
+            try_switch_mode(s, crate::tui::state::AbacusMode::Meeting);
+        }
+        other => {
+            s.add_toast(
+                format!("未知模式：{}（可选 clarify / meeting）", other),
+                std::time::Duration::from_secs(3),
+            );
+        }
+    }
+    CmdResult::Consumed
+}
+
 fn cmd_help(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     // V13 修复：help 走 show_info（已改为聊天区推送），与其它 status/tokens/debug 统一
     let cmds = help_text();
@@ -343,9 +330,17 @@ fn cmd_clear(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     // V29.16: 走 SSOT set_scroll, 内部已 mark dirty
     s.set_scroll(ScrollAction::ToBottom);
     // SC1a 修复：清屏改了消息影响渲染，必须失效缓存
-    // （与 S3/EV3 同根：mutate state without invalidating render cache）
     s.mark_dirty();
-    s.add_toast("屏幕已清屏", std::time::Duration::from_secs(2));
+    // 同步清除引擎侧对话历史，避免 LLM 在清屏后仍记得所有旧对话
+    if let Some(ref handle) = s.engine_handle {
+        let session = handle.session.clone();
+        tokio::spawn(async move {
+            let s = session.write().await;
+            s.messages.write().await.clear();
+            s.context_messages.write().await.clear();
+        });
+    }
+    s.add_toast("屏幕已清屏，对话历史已重置", std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
 
@@ -536,35 +531,12 @@ fn cmd_theme(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
 use crate::tui::state::AbacusMode;
 use crate::tui::event::switch_mode;
 
-// V34-2: Plan→Team 自动解析 JSON 代码块为 TaskSpec
-// V35-4: 返回 Result 区分失败原因（NoSession/NoCodeBlock/ParseError），便于上层区分提示
-// 引用关系：try_switch_mode (cur=Plan, target=Team) 调用；写入 state.mode_artifact 后由 switch_mode 消费
-// 设计意图：Planner agent 输出 ```json ... ``` 代码块，这里抽取并解析；解析失败 → 不阻断切换，但 UX 区分提示
-// 生命周期：仅在 Plan→Team 一次切换时调用；解析结果通过 ModeArtifact 临时驻留一帧即被消费
-
-/// V35-4: Plan→Team 解析失败原因分类
-/// V36-2: 增加 SchemaInvalid（业务级校验失败 — JSON 解析过但语义无效）
-#[derive(Debug)]
-enum PlanExtractError {
-    /// 没有任何 Session 角色消息（用户刚切到 Plan 模式还没发消息）
-    NoSession,
-    /// 找到 Session 消息但内容无 ```json 代码块（Planner 没按格式输出）
-    NoCodeBlock,
-    /// 找到代码块但 serde_json 解析失败（格式错）— 携带原始 body 用于诊断
-    ParseError { body_preview: String },
-    /// V36-2: serde 解析成功但 schema 校验不通过 — 携带具体原因（用户/Planner 可操作）
-    SchemaInvalid { reason: String },
-}
-
-/// V33: 提取最近 Session 消息的纯文本（Stream + Block.detail，不含 Trace）
+/// V34: 提取最近 Session 消息的纯文本（Stream + Block.detail，不含 Trace）
 ///
 /// 引用关系：
-/// - try_switch_mode 用此抽 ClarifyBrief（Clarify→Plan|Meeting）和 MeetingConclusion（Meeting→Team）
-/// - 与 extract_plan_tasks_from_messages 的扫描方式同源（保持口径一致）
+/// - try_switch_mode 用此抽 ClarifyBrief（Clarify→Meeting）和 MeetingConclusion（Meeting→Clarify）
 ///
 /// 返回 None 表示无任何 Session 消息（例如 mode 切换时还未对话）— 调用方应允许无 artifact 切换。
-/// 设计意图：Clarify/Meeting 产出本质是非结构化文本（澄清摘要 / 会议结论），不像 PlanTasks 需 JSON
-/// 解析；直接把整段 Session 文本作为 artifact 携带到下阶段即可。
 fn extract_last_session_text(messages: &std::collections::VecDeque<crate::tui::state::Message>) -> Option<String> {
     let last_session = messages
         .iter()
@@ -589,129 +561,51 @@ fn extract_last_session_text(messages: &std::collections::VecDeque<crate::tui::s
     }
 }
 
-fn extract_plan_tasks_from_messages(
-    messages: &std::collections::VecDeque<crate::tui::state::Message>,
-) -> Result<Vec<abacus_types::TaskSpec>, PlanExtractError> {
-    // 从尾向前找最后一条 Session 角色消息（Planner 的回复）
-    let last_session = messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, crate::tui::state::MsgRole::Session))
-        .ok_or(PlanExtractError::NoSession)?;
-
-    // 拼接 Stream 部分文本（Block.detail 也保留以兼容历史消息）
-    let mut buf = String::new();
-    for part in &last_session.parts {
-        match part {
-            crate::tui::state::MsgContent::Stream(s) => buf.push_str(s),
-            crate::tui::state::MsgContent::Block { detail, .. } => {
-                buf.push('\n');
-                buf.push_str(detail);
-            }
-            crate::tui::state::MsgContent::Trace { .. } => {} // 跳过 trace
-        }
-    }
-
-    // 提取首个 ```json ... ``` 代码块（容错：无 json 标记也接受首个 ``` 块）
-    let body = extract_json_code_block(&buf).ok_or(PlanExtractError::NoCodeBlock)?;
-
-    // 优先按 Vec<TaskSpec> 解析；失败则按单个 TaskSpec 包装
-    let tasks = if let Ok(v) = serde_json::from_str::<Vec<abacus_types::TaskSpec>>(body) {
-        v
-    } else if let Ok(t) = serde_json::from_str::<abacus_types::TaskSpec>(body) {
-        vec![t]
-    } else {
-        // V35-4: 两种解析路径都失败 — 返回带预览的 ParseError
-        let preview: String = body.chars().take(60).collect();
-        return Err(PlanExtractError::ParseError { body_preview: preview });
-    };
-
-    // V36-2: schema 业务校验
-    // 引用关系：解析后置 gate；不通过则走 SchemaInvalid 路径（与 ParseError 同样不阻断切换）
-    // 设计意图：serde 解析成功 ≠ 业务有效（如 []、空 goal、空 phases 均能解析过）
-    validate_plan_schema(&tasks)?;
-    Ok(tasks)
-}
-
-/// V36-2: TaskSpec 业务级 schema 校验
-///
-/// ## 校验维度
-/// - tasks 非空（Planner 至少出 1 个任务）
-/// - 每个 task.goal 非空（避免 Team 看板显示无意义任务）
-/// - 每个 task.phases 非空（最少要有 1 个 phase）
-/// - 每个 phase.id / phase.description 非空（看板渲染依赖）
-///
-/// ## 不校验维度（让 Planner 自由）
-/// - phase.steps 可空（Team 阶段可临时展开）
-/// - phase.id 唯一性（命名冲突由 Team 阶段处理）
-/// - 总数上限（让用户决定）
-///
-/// ## 错误格式
-/// 返回的 reason 字符串面向用户和 Planner，能直接用作"重新规划"的引导
-fn validate_plan_schema(tasks: &[abacus_types::TaskSpec]) -> Result<(), PlanExtractError> {
-    if tasks.is_empty() {
-        return Err(PlanExtractError::SchemaInvalid {
-            reason: "任务列表为空（至少需要 1 个任务）".into(),
-        });
-    }
-    for (ti, task) in tasks.iter().enumerate() {
-        if task.goal.trim().is_empty() {
-            return Err(PlanExtractError::SchemaInvalid {
-                reason: format!("task[{}] 缺 goal", ti),
-            });
-        }
-        if task.phases.is_empty() {
-            return Err(PlanExtractError::SchemaInvalid {
-                reason: format!("task[{}] phases 为空", ti),
-            });
-        }
-        for (pi, phase) in task.phases.iter().enumerate() {
-            if phase.id.trim().is_empty() {
-                return Err(PlanExtractError::SchemaInvalid {
-                    reason: format!("task[{}].phase[{}] 缺 id", ti, pi),
-                });
-            }
-            if phase.description.trim().is_empty() {
-                return Err(PlanExtractError::SchemaInvalid {
-                    reason: format!("task[{}].phase[{}] 缺 description", ti, pi),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 在文本中提取首个 markdown 代码块的 body（优先 ```json，回退 ```）
-/// 返回的 &str 是输入的子切片，无分配
-fn extract_json_code_block(text: &str) -> Option<&str> {
-    // 优先 ```json
-    let candidates = ["```json\n", "```JSON\n", "```\n"];
-    for marker in &candidates {
-        if let Some(start) = text.find(marker) {
-            let body_start = start + marker.len();
-            if let Some(end_off) = text[body_start..].find("```") {
-                let body = &text[body_start..body_start + end_off];
-                let trimmed = body.trim();
-                if trimmed.starts_with('[') || trimmed.starts_with('{') {
-                    return Some(trimmed);
-                }
-            }
-        }
-    }
-    None
-}
-
-// V33: 模式切换命令 — 走 try_switch_mode 验证 DAG 合法性
+// V34: 模式切换命令 — clarify/meeting 走 DAG 转移；plan/team 为执行策略不切换 mode
 fn cmd_clarify(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult { try_switch_mode(s, AbacusMode::Clarify); CmdResult::Consumed }
-fn cmd_plan(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult { try_switch_mode(s, AbacusMode::Plan); CmdResult::Consumed }
-fn cmd_team(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult { try_switch_mode(s, AbacusMode::Team); CmdResult::Consumed }
 fn cmd_meeting(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult { try_switch_mode(s, AbacusMode::Meeting); CmdResult::Consumed }
 
-/// V33: 模式 DAG 流转门控 — 验证转移合法性后调 switch_mode
+/// V34: /plan <任务> — 触发规划+执行策略，不切换 mode
 ///
-/// 引用关系：cmd_clarify/plan/team/meeting 入口；abacus_types::AbacusMode::can_transit_to 判定
+/// ## 引用关系
+/// - 设置：构造 SlashCommand::ExecuteWithPlan { task }，由 run.rs 主循环调 send_plan_and_execute_streaming
+/// - 消费：run.rs pending_slash_command 处理分支
+///
+/// ## 生命周期
+/// 一次性 dispatch；在当前 mode（Clarify）内部异步执行，不切换 state.mode
+fn cmd_plan(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        s.add_toast("/plan <任务描述> — 直接触发规划+执行策略", std::time::Duration::from_secs(4));
+        return CmdResult::Consumed;
+    }
+    let task = args.join(" ");
+    s.pending_slash_command = Some(crate::tui::state::SlashCommand::ExecuteWithPlan { task });
+    CmdResult::Consumed
+}
+
+/// V34: /team <任务> — 触发多 agent 执行策略，不切换 mode
+///
+/// ## 引用关系
+/// - 设置：构造 SlashCommand::ExecuteWithTeam { task }，由 run.rs 主循环调 send_team_message
+/// - 消费：run.rs pending_slash_command 处理分支
+///
+/// ## 生命周期
+/// 一次性 dispatch；在当前 mode（Clarify）内部异步执行，不切换 state.mode
+fn cmd_team(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        s.add_toast("/team <任务描述> — 直接触发多 agent 执行策略", std::time::Duration::from_secs(4));
+        return CmdResult::Consumed;
+    }
+    let task = args.join(" ");
+    s.pending_slash_command = Some(crate::tui::state::SlashCommand::ExecuteWithTeam { task });
+    CmdResult::Consumed
+}
+
+/// V34: 模式 DAG 流转门控 — 验证转移合法性后调 switch_mode
+///
+/// 引用关系：cmd_clarify/meeting 入口；abacus_types::AbacusMode::can_transit_to 判定
 /// 失败行为：toast 提示合法路径 + 不切换
-/// 设计意图：避免用户从 Clarify 直接跳 Team（必须经 Meeting 或 Plan）
+/// 设计意图：仅保留 Clarify ⇄ Meeting 双向转移（V34: Plan/Team 已降级为执行策略）
 fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
     if s.mode == target {
         s.add_toast(
@@ -734,192 +628,83 @@ fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
         return;
     }
 
-    // V39-2: strict review 阻断检查 — 仅 Plan→Team 路径生效
-    // 引用关系：s.last_review_strict + s.last_review.verdict（cmd_review --strict 写入 + run.rs 回填）
-    // 设计意图：让 review 从"参考"升级为"守门员"——非 pass 时阻止下游切换
-    // 逃生通道：用户可 /review-clear 主动解除阻断
-    if s.last_review_strict {
-        if let Some(ref report) = s.last_review {
-            if !report.verdict.is_pass() {
-                let issues_n = report.issues.len();
-                s.add_toast(
-                    format!(
-                        "🔒 strict 阻断：上次审查 {} ({} 项 issue)。/review-clear 解除 或重新 /review 通过",
-                        report.verdict.label(),
-                        issues_n,
-                    ),
-                    std::time::Duration::from_secs(8),
-                );
-                return;
-            }
-        }
-    }
-
-    // V33-续: Clarify → Plan|Meeting 自动注入 ClarifyBrief（非结构化文本摘要）
+    // V34: Clarify → Meeting 自动注入 ClarifyBrief（非结构化文本摘要）
     // 引用关系：写入 state.mode_artifact，switch_mode 内 take() → toast 显示 summary
-    // 设计意图：让澄清产出对下阶段可见，不需结构化解析；与 PlanTasks 的处理对称
-    // 失败行为：无 Session 消息时静默允许切换（不阻断 UX；用户可能就是想空切）
-    if s.mode == AbacusMode::Clarify
-        && (target == AbacusMode::Plan || target == AbacusMode::Meeting)
-        && s.mode_artifact.is_none()
-    {
+    // 失败行为：无 Session 消息时静默允许切换（不阻断 UX）
+    if s.mode == AbacusMode::Clarify && target == AbacusMode::Meeting && s.mode_artifact.is_none() {
         if let Some(text) = extract_last_session_text(&s.messages) {
             s.mode_artifact = Some(abacus_types::ModeArtifact::ClarifyBrief(text));
         }
-        // 无 Session 文本 → 不写 artifact、不阻断切换；下阶段照常进入空白 mode
     }
 
-    // V33-续: Meeting → Team 自动注入 MeetingConclusion（会议结论文本）
-    // 与 ClarifyBrief 同模式：取末尾 Session 消息为结论摘要
-    if s.mode == AbacusMode::Meeting && target == AbacusMode::Team && s.mode_artifact.is_none() {
+    // V34: Meeting → Clarify 自动注入 MeetingConclusion（会议结论文本）
+    // V35: 同时将结论持久化到 ~/.abacus/meetings/ 本地缓存
+    if s.mode == AbacusMode::Meeting && target == AbacusMode::Clarify && s.mode_artifact.is_none() {
         if let Some(text) = extract_last_session_text(&s.messages) {
+            // 本地缓存保存 — 错误不阻断 UX，仅 toast 提示
+            let specialists: Vec<String> = s.experts.iter().map(|e| e.name.clone()).collect();
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // topic: 优先取会议首条用户消息，退回到结论前 10 词
+            let topic = extract_meeting_topic(&s.messages)
+                .unwrap_or_else(|| text.split_whitespace().take(10).collect::<Vec<_>>().join(" "));
+            match crate::tui::meeting_cache::quick_save(&topic, &text, specialists, &cwd) {
+                Ok(path) => s.add_toast(
+                    format!("📋 会议记录已保存: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+                    std::time::Duration::from_secs(4),
+                ),
+                Err(e) => s.add_toast(
+                    format!("⚠ 会议记录保存失败: {}", e),
+                    std::time::Duration::from_secs(3),
+                ),
+            }
             s.mode_artifact = Some(abacus_types::ModeArtifact::MeetingConclusion(text));
         }
     }
 
-    // V34-2: Plan → Team 自动注入 mode_artifact（若 Planner 已输出 JSON）
-    // V35-4: 区分三种失败原因 — NoSession / NoCodeBlock / ParseError，UX 分级提示
-    // 引用关系：从 state.messages 末尾解析；写入 state.mode_artifact，switch_mode 内 take() 消费
-    // 仅在 mode_artifact 为空时尝试（避免覆盖用户/agent 显式注入）
-    if s.mode == AbacusMode::Plan && target == AbacusMode::Team && s.mode_artifact.is_none() {
-        match extract_plan_tasks_from_messages(&s.messages) {
-            Ok(tasks) => {
-                // V41-2: review-required 强约束 — 必须有 fresh pass review 才允许切换
-                // 引用关系：s.review_required + s.review_max_age_secs + s.last_review
-                // 设计意图：比 strict 更严的约束（无 review 也阻断），保证 Plan→Team 不无审切入
-                // 与 auto-review 的协作：required + auto-review on → 自动触发；否则显式 toast 引导用户
-                if s.review_required {
-                    let now = chrono::Utc::now();
-                    let fresh_pass = s.last_review.as_ref().and_then(|r| {
-                        if !r.verdict.is_pass() { return None; }
-                        let t = chrono::DateTime::parse_from_rfc3339(&r.time_rfc3339).ok()?;
-                        let age_secs = now.signed_duration_since(t.with_timezone(&chrono::Utc))
-                            .num_seconds().max(0) as u64;
-                        if age_secs <= s.review_max_age_secs { Some(()) } else { None }
-                    }).is_some();
-
-                    if !fresh_pass && !s.auto_review_plan {
-                        // 仅 required 启用 → 显式阻断 + 引导用户跑 review
-                        // (required + auto_review on 的情况由下方 V40-4 分支自动触发)
-                        s.add_toast(
-                            format!(
-                                "🔒 review-required：缺少 {}s 内的 pass review。请运行 /review plan --strict 后重试",
-                                s.review_max_age_secs
-                            ),
-                            std::time::Duration::from_secs(8),
-                        );
-                        return;
+    // V35: 过渡感知提示 — switch_mode 会 take() artifact，须在调用前捕获摘要
+    // 引用: bars::render_status_bar 读 state.transition_hint，5s 内展示，自然过期
+    let hint_text = match (s.mode, target) {
+        (AbacusMode::Clarify, AbacusMode::Meeting) => {
+            s.mode_artifact.as_ref().map(|a| {
+                let preview = match a {
+                    abacus_types::ModeArtifact::ClarifyBrief(t) => {
+                        let ch: String = t.chars().take(28).collect();
+                        if t.chars().count() > 28 { format!("{}…", ch) } else { ch }
                     }
-                }
-
-                // V40-4: 自动 review 联动 — schema 通过后串接 review_plan
-                // 引用关系：s.auto_review_plan（/auto-review on 启用）+ s.last_review.verdict
-                // 设计意图：让 Plan→Team 串联两层守门员（schema sync + LLM review async）
-                // 触发流程：schema 通过 + auto_review 启用 + last_review 缺失/非 pass → 拒绝切换 + 触发 review
-                //   review 抵达后 verdict pass → 用户再次 /done 才真正切换
-                if s.auto_review_plan {
-                    let need_review = s.last_review.as_ref()
-                        .map(|r| !r.verdict.is_pass())
-                        .unwrap_or(true);
-                    if need_review {
-                        s.add_toast(
-                            "🔁 auto-review：先审查任务规划，verdict=pass 后再 /done 进入执行",
-                            std::time::Duration::from_secs(6),
-                        );
-                        // 取末尾 Session 文本作为 review content（与 /review plan 同源）
-                        let content = extract_last_session_text(&s.messages)
-                            .unwrap_or_else(|| serde_json::to_string_pretty(&tasks).unwrap_or_default());
-                        s.pending_review_strict = true; // auto-review 默认 strict（确保 fail 阻断）
-                        s.pending_slash_command = Some(crate::tui::state::SlashCommand::ReviewRole {
-                            kind: crate::tui::api::ReviewKind::Plan,
-                            content,
-                        });
-                        return; // 暂不切换；review 完成 + 用户再次 /done 才进 Team
-                    }
-                }
-
-                let n = tasks.len();
-                s.mode_artifact = Some(abacus_types::ModeArtifact::PlanTasks(tasks));
-                s.add_toast(
-                    format!("✓ 已解析 {} 个任务计划", n),
-                    std::time::Duration::from_secs(2),
-                );
-            }
-            // V35-4: 用户刚进 Plan 还没让 Planner 出方案 — 引导先发起规划请求
-            Err(PlanExtractError::NoSession) => {
-                s.add_toast(
-                    "⚠ 还未进行规划。建议留在 规划 模式，先描述需求让 Planner 拆解任务",
-                    std::time::Duration::from_secs(6),
-                );
-            }
-            // V35-4: Planner 回复了但没有 ```json 块 — 提示重新规划
-            Err(PlanExtractError::NoCodeBlock) => {
-                s.add_toast(
-                    "⚠ 末尾消息未含 ```json 代码块。可继续追问让 Planner 输出 JSON 方案，或直接进入 执行 自由编排",
-                    std::time::Duration::from_secs(6),
-                );
-            }
-            // V35-4: 找到代码块但格式错 — 携带预览帮助用户诊断
-            Err(PlanExtractError::ParseError { body_preview }) => {
-                s.add_toast(
-                    format!("⚠ JSON 格式错（首段：{}…）。可让 Planner 重新规划，或直接进入 执行", body_preview),
-                    std::time::Duration::from_secs(8),
-                );
-            }
-            // V36-2: schema 业务校验失败 — 携带具体原因，Planner 可直接定位修正
-            // V37-1: 自动 nudge — 在 attempts ≤ 1 时把 reason 注入新 user message 触发 Planner 修正
-            Err(PlanExtractError::SchemaInvalid { reason }) => {
-                if s.planner_nudge_attempts < 1 {
-                    s.planner_nudge_attempts += 1;
-                    s.add_toast(
-                        format!("🔁 schema 不合规（{}），自动让 Planner 修正", reason),
-                        std::time::Duration::from_secs(5),
-                    );
-                    // 触发自动 nudge — 主循环 pending_slash_command 处理分支会走 Planner 路径
-                    s.pending_slash_command = Some(crate::tui::state::SlashCommand::PlannerNudge {
-                        reason: reason.clone(),
-                    });
-                    // 关键：取消本次切换（用户需手动再次 /done 等修正完成后重试）
-                    return;
-                } else {
-                    // attempts 已满 — 引导手动追问
-                    s.add_toast(
-                        format!("⚠ schema 修正后仍不合规：{}。请手动追问 Planner", reason),
-                        std::time::Duration::from_secs(8),
-                    );
-                }
-            }
+                    _ => a.summary(),
+                };
+                format!("会诊 · 携带: {}", preview)
+            })
         }
-    }
+        (AbacusMode::Meeting, AbacusMode::Clarify) => {
+            Some(s.mode_artifact.as_ref()
+                .map(|a| format!("澄清 · {}", a.summary()))
+                .unwrap_or_else(|| "澄清 · 会议已结束".to_string()))
+        }
+        _ => None,
+    };
 
     switch_mode(s, target);
+
+    if let Some(hint) = hint_text {
+        s.transition_hint = Some((hint, std::time::Instant::now()));
+    }
     s.add_toast(
         format!("✓ 已切换到 {}", target.display_zh()),
         std::time::Duration::from_secs(2),
     );
 }
 
-/// V33: /done 标记当前模式完成 — Clarify→自动转到 Plan / Meeting→自动转 Team / Plan→Team
+/// V34: /done 标记当前模式完成 — Clarify→Meeting / Meeting→Clarify（双向互转）
 /// 设计意图：用户主动声明"我准备好了"，避免 LLM 假阳性自判
-/// V34-5: Clarify→分叉提示（默认 Plan，附带 /meeting 替代路径提示）
 fn cmd_done(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
-    // 默认推进路径：Clarify→Plan / Meeting→Team / Plan→Team / Team→Clarify（开新循环）
+    // V34: 2 模式互转 — Clarify→Meeting / Meeting→Clarify
     let next = match s.mode {
-        AbacusMode::Clarify => AbacusMode::Plan, // 默认走 Plan；用户想走 Meeting 用 /meeting
-        AbacusMode::Meeting => AbacusMode::Team,
-        AbacusMode::Plan => AbacusMode::Team,
-        AbacusMode::Team => AbacusMode::Clarify,
+        AbacusMode::Clarify => AbacusMode::Meeting,
+        AbacusMode::Meeting => AbacusMode::Clarify,
     };
-
-    // V34-5: Clarify 是 DAG 中唯一的二叉分叉点（→Meeting | →Plan）
-    // 在切换前提示用户：当前默认走 Plan，可用 /meeting 替代
-    // 设计：5s toast，比普通 toast 更长——含操作引导信息需要时间消化
-    if s.mode == AbacusMode::Clarify {
-        s.add_toast(
-            "↗ 默认进入 规划。如需 多专家会诊，请用 /meeting",
-            std::time::Duration::from_secs(5),
-        );
-    }
 
     try_switch_mode(s, next);
     CmdResult::Consumed
@@ -938,10 +723,8 @@ fn cmd_done(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 /// - 取末尾 Session 失败（无任何消息）→ toast 提示"先发起对话再审查"
 fn cmd_review(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     if args.is_empty() {
-        s.add_toast(
-            "用法：/review <plan|diff|security> [--strict] [内容]",
-            std::time::Duration::from_secs(4),
-        );
+        // 无参 → picker 选类型（handle_slash_command 已拦截，此处作 fallback）
+        s.open_picker_review();
         return CmdResult::Consumed;
     }
     let kind = match args[0].to_ascii_lowercase().as_str() {
@@ -972,7 +755,6 @@ fn cmd_review(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     s.pending_review_kind = kind;
 
     // V37-3: content 取值 — 显式参数优先，缺省则取末尾 Session 消息
-    // 与 V34-2 extract_plan_tasks_from_messages 同款扫描方式（保持行为一致性）
     let content_explicit = rest_args.join(" ");
     let content = if !content_explicit.trim().is_empty() {
         content_explicit
@@ -1398,6 +1180,12 @@ fn engine_or(s: &mut AppState, cmd: SlashCommand) -> CmdResult {
 // ─── V0.2 Commands ──────────────────────────────────────────────────────────
 
 fn cmd_history(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        // 无参 → picker（选中后直接重发）
+        s.open_picker_history();
+        return CmdResult::Consumed;
+    }
+    // 带参 /history N → 文本列出（保留原行为）
     let n: usize = args.first().and_then(|a| a.parse().ok()).unwrap_or(10);
     let history = &s.input_history;
     let start = history.len().saturating_sub(n);
@@ -1407,7 +1195,6 @@ fn cmd_history(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     if lines.is_empty() {
         s.add_toast("暂无输入历史", std::time::Duration::from_secs(2));
     } else {
-        // V13: 改走聊天区显示
         s.show_info(format!("## 输入历史 (最近 {})\n\n{}", n, lines.join("\n")));
     }
     CmdResult::Consumed
@@ -1899,36 +1686,13 @@ fn cmd_branch(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     CmdResult::Consumed
 }
 
-// ─── V29.9 (C1): /plan plan-mode 单次切换 ─────────────────────
-//
-// 引用关系:
-//   - 写: AppState.plan_mode（bool flag）
-//   - 消费: run.rs `pending_text.take()` 后, 命中 plan_mode → wrap text + flag=false
-// 生命周期:
-//   - 创建: 用户 /plan
-//   - 销毁: 用户 /plan off | 下一次发送消息(单次自动清)
-// 设计取舍:
-//   - 单次而非常驻: 避免用户忘开关, plan-prefix 只在显式启用时进入
-//   - 不持久化: SessionExport 不存 plan_mode, 重启后复位
-//   - 文本注入而非 system_segments: 后端无须改动, 纯 TUI prompt 工程
-// V33: 重命名为 cmd_plan_prefix；新 cmd_plan 走 AbacusMode::Plan 切换路径
-fn cmd_plan_prefix(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
-    if args.len() == 1 && args[0].eq_ignore_ascii_case("off") {
-        if s.plan_mode {
-            s.plan_mode = false;
-            s.add_toast("Plan 模式已关闭", std::time::Duration::from_secs(2));
-        } else {
-            s.add_toast("Plan 模式当前未启用", std::time::Duration::from_secs(2));
-        }
-        return CmdResult::Consumed;
-    }
-    s.plan_mode = true;
-    s.show_info(
-        "Plan 模式 已启用（单次）\n\n下一次发送消息时会自动注入计划前缀，要求 LLM:\n\
-         1. 拆解需求\n2. 设计方案\n3. 拆分步骤\n4. 等待审批\n5. 分步执行 + 审查\n\n\
-         本轮对话结束后自动关闭，再次启用请重新输入 /plan\n\n用法:\n  \
-         /plan       启用单次 plan 模式\n  /plan off   立即关闭"
-            .to_string(),
+// ─── V34: /plan-prefix — 历史命令，plan_mode 字段已删除 ─────────
+// 原 plan-mode 单次前缀注入功能随 plan_mode 字段移除而废止。
+// 保留命令入口以避免"未知命令"错误；提示用户改用 /plan <task>。
+fn cmd_plan_prefix(s: &mut AppState, _: &str, _args: &[&str]) -> CmdResult {
+    s.add_toast(
+        "/plan-prefix 已废弃，请改用 /plan <任务描述> 直接触发规划策略",
+        std::time::Duration::from_secs(4),
     );
     CmdResult::Consumed
 }
@@ -2217,6 +1981,267 @@ mod undo_slash_tests {
 }
 
 // ════════════════════════════════════════════════════════════
+// ─── Meeting 辅助函数 ────────────────────────────────────────────────────────
+
+/// 提取 Meeting 议题：Meeting 模式首条用户消息前 20 词
+///
+/// 引用关系：try_switch_mode Meeting→Clarify 分支，为 quick_save 提供 topic
+fn extract_meeting_topic(
+    messages: &std::collections::VecDeque<crate::tui::state::Message>,
+) -> Option<String> {
+    // 找第一条 User 消息（即进入 Meeting 后用户的首条提问）
+    let first_user = messages
+        .iter()
+        .find(|m| matches!(m.role, crate::tui::state::MsgRole::User))?
+        ;
+    let mut buf = String::new();
+    for part in &first_user.parts {
+        if let crate::tui::state::MsgContent::Stream(s) = part {
+            buf.push_str(s);
+        }
+    }
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.split_whitespace().take(20).collect::<Vec<_>>().join(" "))
+}
+
+/// V35: /meeting-list [——project] — 列出历史会议记录
+///
+/// 引用关系：读 crate::tui::meeting_cache::list_records
+/// 输出：向 messages 追加一条 Session 消息展示列表
+fn cmd_meeting_list(s: &mut AppState, _raw: &str, args: &[&str]) -> CmdResult {
+    use crate::tui::meeting_cache;
+    // 可选 --project 参数：按当前 cwd 过滤
+    let cwd_filter = if args.contains(&"--project") {
+        std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .ok()
+    } else {
+        None
+    };
+    let records = meeting_cache::list_records(cwd_filter.as_deref());
+    if records.is_empty() {
+        s.add_toast("没有历史会议记录（~/.abacus/meetings/ 为空）", std::time::Duration::from_secs(3));
+        return CmdResult::Consumed;
+    }
+    // 构建列表文本，注入为一条 Session 消息展示
+    let mut lines = vec![
+        format!("📁 历史会议记录 ({} 条)：", records.len()),
+        String::new(),
+    ];
+    for (i, r) in records.iter().enumerate() {
+        lines.push(meeting_cache::format_list_entry(r, i));
+    }
+    lines.push(String::new());
+    lines.push("提示：使用 /meeting-load <id> 将结论注入当前 session".to_string());
+    let text = lines.join("\n");
+    s.add_message(crate::tui::state::Message {
+        role: crate::tui::state::MsgRole::Session,
+        parts: vec![crate::tui::state::MsgContent::Stream(text)],
+        time: chrono::Local::now().format("%H:%M").to_string(),
+    });
+    CmdResult::Consumed
+}
+
+/// V35: /meeting-load <id> — 将历史会议结论注入当前 session
+///
+/// 引用关系：读 crate::tui::meeting_cache::load_record
+/// 操作：将历史结论格式化后添加为 System 消息
+/// 当 LLM 下次回复时可引用这些内容
+fn cmd_meeting_load(s: &mut AppState, _raw: &str, args: &[&str]) -> CmdResult {
+    use crate::tui::meeting_cache;
+    let id = match args.first() {
+        Some(id) => *id,
+        None => {
+            s.add_toast("用法：/meeting-load <id>  （ID 可从 /meeting-list 获取）", std::time::Duration::from_secs(4));
+            return CmdResult::Consumed;
+        }
+    };
+    match meeting_cache::load_record(id) {
+        Some(record) => {
+            let injected = meeting_cache::format_for_injection(&record);
+            // 以 Expert("会议记录") 角色显示：视觉上区别于普通 Session 消息
+            // 注：TUI messages 为展示层，LLM context 由 abacus-core SessionState 管理
+            // 用户阅读后可在对话中主动引用，或结合 mode_artifact 注入机制
+            s.add_message(crate::tui::state::Message {
+                role: crate::tui::state::MsgRole::Expert("会议记录".to_string()),
+                parts: vec![crate::tui::state::MsgContent::Stream(injected)],
+                time: chrono::Local::now().format("%H:%M").to_string(),
+            });
+            s.add_toast(
+                format!("✔ 已加载会议记录: {}（可在对话中引用）", record.topic),
+                std::time::Duration::from_secs(4),
+            );
+        }
+        None => {
+            s.add_toast(
+                format!("✖ 找不到会议记录: {}", id),
+                std::time::Duration::from_secs(3),
+            );
+        }
+    }
+    CmdResult::Consumed
+}
+
+// ─── /expert 专家角色配置命令 ───────────────────────────────────────────────────────
+
+/// V35: /expert <subcommand> — Meeting 专家角色和模型配置
+///
+/// 子命令:
+///   list                       列出当前专家配置
+///   add <name> <domain>        添加专家（用主模型）
+///   add <name> <domain> --model <id>  添加专家并指定模型
+///   set <name> --model <id>    修改已有专家的模型
+///   remove <name>              删除专家
+///   reset                      恢复默认配置（3 个内置专家）
+fn cmd_expert(s: &mut AppState, _raw: &str, args: &[&str]) -> CmdResult {
+    use crate::tui::expert_config as ec;
+
+    let sub = args.first().copied().unwrap_or("list");
+    match sub {
+        "list" | "ls" => {
+            let experts = ec::load_experts();
+            if experts.is_empty() {
+                s.add_toast("没有专家配置，请用 /expert add 添加", std::time::Duration::from_secs(3));
+                return CmdResult::Consumed;
+            }
+            let mut lines = vec![
+                format!("🧠 Meeting 专家 ({} 位)：", experts.len()),
+                String::new(),
+            ];
+            for (i, e) in experts.iter().enumerate() {
+                lines.push(ec::format_expert_entry(e, i));
+            }
+            lines.push(String::new());
+            lines.push("提示: /expert add <名> <领域> [--model <模型号>] | set <名> --model <模型号> | remove <名> | reset".to_string());
+            s.add_message(crate::tui::state::Message {
+                role: crate::tui::state::MsgRole::Session,
+                parts: vec![crate::tui::state::MsgContent::Stream(lines.join("\n"))],
+                time: chrono::Local::now().format("%H:%M").to_string(),
+            });
+        }
+        "add" => {
+            // /expert add <name> <domain> [--model <id>]
+            let name = match args.get(1) {
+                Some(n) => n.to_string(),
+                None => {
+                    s.add_toast("用法: /expert add <名称> <领域> [--model <模型号>]", std::time::Duration::from_secs(4));
+                    return CmdResult::Consumed;
+                }
+            };
+            let domain = match args.get(2) {
+                Some(d) => d.to_string(),
+                None => {
+                    s.add_toast("用法: /expert add <名称> <领域> [--model <模型号>]", std::time::Duration::from_secs(4));
+                    return CmdResult::Consumed;
+                }
+            };
+            // 解析 --model <id>
+            let model = args.windows(2)
+                .find(|w| w[0] == "--model")
+                .map(|w| w[1].to_string());
+
+            let id = name.to_lowercase().replace(' ', "_");
+            let new_expert = ec::ExpertDef {
+                id: id.clone(),
+                name: name.clone(),
+                domain: domain.clone(),
+                model: model.clone(),
+                hint_tags: vec![domain.clone()],
+            };
+            let mut experts = ec::load_experts();
+            if experts.iter().any(|e| e.id == id) {
+                s.add_toast(format!("专家 {} 已存在，请用 /expert set 修改", name), std::time::Duration::from_secs(3));
+                return CmdResult::Consumed;
+            }
+            experts.push(new_expert);
+            match ec::save_experts(&experts) {
+                Ok(_) => s.add_toast(
+                    format!("✔ 已添加专家: {} ({}) {}",
+                        name, domain,
+                        model.as_deref().map(|m| format!("[模型: {}]", m)).unwrap_or_default()),
+                    std::time::Duration::from_secs(3),
+                ),
+                Err(e) => s.add_toast(format!("✖ 保存失败: {}", e), std::time::Duration::from_secs(3)),
+            }
+        }
+        "set" => {
+            // /expert set <name> --model <id>
+            let name = match args.get(1) {
+                Some(n) => n.to_string(),
+                None => {
+                    s.add_toast("用法: /expert set <名称> --model <模型号>", std::time::Duration::from_secs(4));
+                    return CmdResult::Consumed;
+                }
+            };
+            let model = args.windows(2)
+                .find(|w| w[0] == "--model")
+                .map(|w| w[1].to_string());
+            if model.is_none() {
+                s.add_toast("用法: /expert set <名称> --model <模型号>", std::time::Duration::from_secs(4));
+                return CmdResult::Consumed;
+            }
+            let mut experts = ec::load_experts();
+            let id = name.to_lowercase().replace(' ', "_");
+            // 借用拆分：先修改字段并取出 name，再 drop 可变借用，再调用 save_experts（需不可变借用）
+            let found_name = experts.iter_mut().find(|e| e.id == id || e.name == name)
+                .map(|e| { e.model = model.clone(); e.name.clone() });
+            match found_name {
+                Some(expert_name) => {
+                    match ec::save_experts(&experts) {
+                        Ok(_) => s.add_toast(
+                            format!("✔ {} 模型已更新为 {}", expert_name, model.unwrap_or_default()),
+                            std::time::Duration::from_secs(3),
+                        ),
+                        Err(e2) => s.add_toast(format!("✖ 保存失败: {}", e2), std::time::Duration::from_secs(3)),
+                    }
+                }
+                None => s.add_toast(format!("找不到专家: {}", name), std::time::Duration::from_secs(3)),
+            }
+        }
+        "remove" | "rm" => {
+            let name = match args.get(1) {
+                Some(n) => n.to_string(),
+                None => {
+                    s.add_toast("用法: /expert remove <名称>", std::time::Duration::from_secs(3));
+                    return CmdResult::Consumed;
+                }
+            };
+            let mut experts = ec::load_experts();
+            let before = experts.len();
+            let id = name.to_lowercase().replace(' ', "_");
+            experts.retain(|e| e.id != id && e.name != name);
+            if experts.len() == before {
+                s.add_toast(format!("找不到专家: {}", name), std::time::Duration::from_secs(3));
+            } else {
+                match ec::save_experts(&experts) {
+                    Ok(_) => s.add_toast(format!("✔ 已删除专家: {}", name), std::time::Duration::from_secs(3)),
+                    Err(e) => s.add_toast(format!("✖ 保存失败: {}", e), std::time::Duration::from_secs(3)),
+                }
+            }
+        }
+        "reset" => {
+            let defaults = ec::default_experts();
+            match ec::save_experts(&defaults) {
+                Ok(_) => s.add_toast(
+                    format!("✔ 已恢复默认专家配置 ({} 位内置专家)", defaults.len()),
+                    std::time::Duration::from_secs(3),
+                ),
+                Err(e) => s.add_toast(format!("✖ 保存失败: {}", e), std::time::Duration::from_secs(3)),
+            }
+        }
+        _ => {
+            s.add_toast(
+                "/expert list | add <名> <领域> [--model <号>] | set <名> --model <号> | remove <名> | reset",
+                std::time::Duration::from_secs(5),
+            );
+        }
+    }
+    CmdResult::Consumed
+}
+
 // V33-续 ModeArtifact 写入端单测
 //   引用关系：验证 try_switch_mode 在 Clarify→Plan/Meeting + Meeting→Team 三条路径
 //             正确写入 ModeArtifact::ClarifyBrief / MeetingConclusion
@@ -2272,19 +2297,8 @@ mod mode_artifact_tests {
     }
 
     #[test]
-    fn clarify_to_plan_writes_clarify_brief() {
-        let mut s = mk_state_with_session(AbacusMode::Clarify, "需求摘要文本");
-        try_switch_mode(&mut s, AbacusMode::Plan);
-        // mode_artifact 在 try_switch_mode → switch_mode 内部被 take() 消费，
-        // 但写入瞬间是真实发生的；这里验最终 mode 切换 + 切换前已写入的链路通过 toast 行为代证。
-        // 核心断言：mode 已转到 Plan（说明 try_switch_mode 走完了写入分支无 panic）
-        assert_eq!(s.mode, AbacusMode::Plan);
-        // mode_artifact 应已被 switch_mode 消费 → None
-        assert!(s.mode_artifact.is_none());
-    }
-
-    #[test]
     fn clarify_to_meeting_writes_clarify_brief() {
+        // V34: Clarify → Meeting 自动注入 ClarifyBrief
         let mut s = mk_state_with_session(AbacusMode::Clarify, "澄清后需求");
         try_switch_mode(&mut s, AbacusMode::Meeting);
         assert_eq!(s.mode, AbacusMode::Meeting);
@@ -2292,10 +2306,11 @@ mod mode_artifact_tests {
     }
 
     #[test]
-    fn meeting_to_team_writes_meeting_conclusion() {
+    fn meeting_to_clarify_writes_meeting_conclusion() {
+        // V34: Meeting → Clarify 自动注入 MeetingConclusion
         let mut s = mk_state_with_session(AbacusMode::Meeting, "会议结论：方案 A");
-        try_switch_mode(&mut s, AbacusMode::Team);
-        assert_eq!(s.mode, AbacusMode::Team);
+        try_switch_mode(&mut s, AbacusMode::Clarify);
+        assert_eq!(s.mode, AbacusMode::Clarify);
         assert!(s.mode_artifact.is_none()); // switch_mode 已消费
     }
 
@@ -2303,8 +2318,8 @@ mod mode_artifact_tests {
     fn clarify_without_session_still_switches_silently() {
         // 无 Session 消息 → 不写 artifact，但仍允许切换（不阻断 UX）
         let mut s = AppState::new(AbacusMode::Clarify);
-        try_switch_mode(&mut s, AbacusMode::Plan);
-        assert_eq!(s.mode, AbacusMode::Plan);
+        try_switch_mode(&mut s, AbacusMode::Meeting);
+        assert_eq!(s.mode, AbacusMode::Meeting);
     }
 
     #[test]
@@ -2312,9 +2327,9 @@ mod mode_artifact_tests {
         // 用户/agent 已显式注入 mode_artifact 时，try_switch_mode 不应覆盖
         let mut s = mk_state_with_session(AbacusMode::Clarify, "Session 文本");
         s.mode_artifact = Some(abacus_types::ModeArtifact::ClarifyBrief("已有摘要".to_string()));
-        try_switch_mode(&mut s, AbacusMode::Plan);
+        try_switch_mode(&mut s, AbacusMode::Meeting);
         // switch_mode take() 后 mode_artifact = None；但写入分支因 is_none() 守卫不会执行
         // 验证未 panic + 已切换即可
-        assert_eq!(s.mode, AbacusMode::Plan);
+        assert_eq!(s.mode, AbacusMode::Meeting);
     }
 }

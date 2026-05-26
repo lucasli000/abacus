@@ -80,8 +80,6 @@ fn build_tab_spans<'a>(labels: &'a [String], active: usize, theme: &crate::tui::
 /// 引用关系：被 modes/chat.rs、team.rs、meeting.rs 调用
 /// 生命周期：面板可见时每帧渲染
 pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    use crate::tui::state::AbacusMode;
-
     // K1 焦点反馈：focused → Thick + primary；非 focused → Rounded + border
     // V26: 焦点反馈从"整边框 Thick+primary"改为"上边框 primary, 其他三边保持 Rounded+border"
     //      旧设计副作用: ① Thick 切换让边框字符宽度跳变(╭─╮ → ┏━┓), 内容视觉位移
@@ -124,83 +122,17 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         f.render_widget(top_overlay, top_segment);
     }
 
-    match state.mode {
-        AbacusMode::Clarify => {
-            // V40: 双 Tab "现场 | 统计"（所有 mode 统一可达）
-            let labels: Vec<String> = vec![
-                label_with_count(t("panel.scene"), state.trace_events.len()),
-                t("panel.stats").to_string(),
-            ];
-            let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 1 } else { 0 };
-            let content = render_panel_header(f, state, inner, &labels, tab_idx);
-            match state.panel_tab {
-                PanelTab::Quant => render_tab_quant(f, state, content),
-                _ => render_panel_overview(f, state, content),
-            }
-        }
-        AbacusMode::Team => {
-            let labels: Vec<String> =
-                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
-                    .chain(std::iter::once(t("panel.stats").to_string()))
-                    .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
-                    .collect();
-            let tab_idx = match state.panel_tab {
-                PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
-                _ => 0,
-            };
-            let content = render_panel_header(f, state, inner, &labels, tab_idx);
-            match state.panel_tab {
-                PanelTab::Tasks => render_panel_team_board(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
-                PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
-                _ => render_panel_overview(f, state, content),
-            }
-        }
-        AbacusMode::Meeting => {
-            let labels: Vec<String> =
-                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count(t("panel.agenda"), state.experts.len())))
-                    .chain(std::iter::once(t("panel.stats").to_string()))
-                    .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
-                    .collect();
-            let tab_idx = match state.panel_tab {
-                PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
-                _ => 0,
-            };
-            let content = render_panel_header(f, state, inner, &labels, tab_idx);
-            match state.panel_tab {
-                PanelTab::Tasks => render_panel_meeting_agenda(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
-                PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
-                _ => render_panel_overview(f, state, content),
-            }
-        }
-        AbacusMode::Plan => {
-            let labels: Vec<String> =
-                std::iter::once(label_with_count(t("panel.scene"), state.trace_events.len()))
-                    .chain(std::iter::once(label_with_count(t("panel.tasks"), state.tasks.len())))
-                    .chain(std::iter::once(t("panel.stats").to_string()))
-                    .chain(state.custom_tabs.iter().map(|ct| ct.name.clone()))
-                    .collect();
-            let tab_idx = match state.panel_tab {
-                PanelTab::Tasks => 1,
-                PanelTab::Quant => 2,
-                PanelTab::Custom(i) => 3 + i,
-                _ => 0,
-            };
-            let content = render_panel_header(f, state, inner, &labels, tab_idx);
-            match state.panel_tab {
-                PanelTab::Tasks => render_panel_team_board(f, state, content),
-                PanelTab::Quant => render_tab_quant(f, state, content),
-                PanelTab::Custom(idx) => render_custom_tab(f, state, content, idx),
-                _ => render_panel_overview(f, state, content),
-            }
-        }
+    // V35: 统一两 Tab — 现场（Timeline+Focus+Stats）和 仓库（Memory+Skill+Tool）
+    // 两模式相同，Meeting 专家议程并入现场 Tab 的 Focus 区
+    let labels: Vec<String> = vec![
+        t("panel.scene").to_string(),
+        t("panel.stockroom").to_string(),
+    ];
+    let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 1 } else { 0 };
+    let content = render_panel_header(f, state, inner, &labels, tab_idx);
+    match state.panel_tab {
+        PanelTab::Quant => render_tab_stockroom(f, state, content),
+        _ => render_tab_scene(f, state, content),
     }
 }
 
@@ -209,7 +141,7 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 /// 四模式分支共享相同的 Layout(1+1+Min(2)) + build_tab_spans + separator 逻辑。
 /// 本函数统一渲染 tab + sep，返回 content area（已经过 render_card_bar）。
 ///
-/// 引用关系：被 render_panel 的 Clarify/Team/Meeting/Plan 四分支调用
+/// 引用关系：被 render_panel 的 Clarify/Meeting 两分支调用（V34: Team/Plan 已降级为执行策略）
 /// 生命周期：每帧渲染，纯函数
 fn render_panel_header(
     f: &mut ratatui::Frame,
@@ -244,6 +176,7 @@ fn render_panel_header(
 ///      此函数只负责内容区垂直布局: timeline / 细分隔 / memory
 /// 引用关系: 被三模式的 PanelTab::Overview 分支调用
 /// 生命周期: 每帧渲染; 不持有状态
+#[allow(dead_code)]
 fn render_panel_overview(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // 布局：时间线(55%) + 分隔 + 记忆(30%) + 分隔 + 简化统计(15%)
     let sections = ratatui::layout::Layout::default()
@@ -368,6 +301,7 @@ fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 }
 
 /// Team 模式专属：任务看板（专家状态 + Task Kanban）
+#[allow(dead_code)]
 fn render_panel_team_board(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -459,6 +393,7 @@ fn render_panel_team_board(f: &mut ratatui::Frame, state: &AppState, area: Rect)
 }
 
 /// Meeting 模式专属：议程看板（专家列表 + 决策记录）
+#[allow(dead_code)]
 fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
@@ -495,6 +430,31 @@ fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: R
             ]));
         }
     }
+
+    // V35: 会议阶段 — 从専家状态推导，无新 state 字段
+    // 发言中(Active>0) → 综合中(Done=All+streaming) → 结论(Done=All)
+    lines.push(dotted_sep.clone());
+    let total_e = state.experts.len();
+    let done_e  = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Done)).count();
+    let active_e= state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Active)).count();
+    let (phase_icon, phase_label, phase_color) = if total_e == 0 {
+        ("○", "等待开始", state.theme.muted)
+    } else if active_e > 0 {
+        ("●", "发言中", state.theme.success)
+    } else if done_e == total_e && state.is_streaming {
+        ("●", "综合中", state.theme.accent)
+    } else if done_e == total_e && done_e > 0 {
+        ("✓", "结论完成", state.theme.success)
+    } else {
+        ("○", "等待发言", state.theme.muted)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("会议阶段", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  {} {}", phase_icon, phase_label),
+            Style::default().fg(phase_color),
+        ),
+    ]));
 
     // ── 决策 ──
     lines.push(dotted_sep.clone());
@@ -1113,6 +1073,7 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 ///   - 滚动复用 state.knowledge_scroll_offset（与现场共享同一 scroll bus）
 ///
 /// 生命周期：每帧渲染；不持有状态
+#[allow(dead_code)]
 fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // V33 滚动支持：与现场 tab 共用 knowledge_scroll_offset
     let mut lines: Vec<Line> = Vec::new();
@@ -1678,3 +1639,354 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 // V33 注：旧 V34 占位 render_tab_quant（仅 token/cost 概要）也已删除——新版（render_tab_quant
 //   行 ~4133）口径与「现场」tab 同源对齐，含完整 📊 统计 + 知识宫殿层级树。
 
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// V35: 现场 Tab (render_tab_scene) + 仓库 Tab (render_tab_stockroom)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn resolve_phase(tool_name: &str) -> &'static str {
+    if tool_name.starts_with("mcp__octopus__") { return "浏览器操作"; }
+    if tool_name.starts_with("mcp__fetch__") || tool_name.starts_with("web_") { return "信息收集"; }
+    if tool_name.contains("_search") || tool_name.contains("_fetch")
+        || tool_name.contains("kb_query") || tool_name.contains("_read")
+        || tool_name.contains("_list") || tool_name.contains("glob")
+        || tool_name.contains("grep") { return "信息收集"; }
+    if tool_name.contains("_write") || tool_name.contains("_edit")
+        || tool_name.contains("_create") || tool_name.contains("_delete")
+        || tool_name.contains("_move") { return "代码修改"; }
+    if tool_name.contains("shell") || tool_name.contains("_run")
+        || tool_name.contains("_exec") || tool_name.contains("bash")
+        || tool_name.contains("_test") { return "执行验证"; }
+    if tool_name.contains("memory") || tool_name.contains("knowledge") { return "记忆操作"; }
+    if tool_name.starts_with("mcp__filengine__") { return "文件操作"; }
+    if tool_name.starts_with("mcp__") { return "工具调用"; }
+    "其他"
+}
+
+/// 计算 Timeline 分组（每帧按需计算，有界 30 组）
+fn compute_timeline_groups(state: &AppState) -> Vec<crate::tui::state::TimelineGroup> {
+    use crate::tui::state::{TraceKind, ToolStatus, TimelineGroup};
+    let mut groups: Vec<TimelineGroup> = Vec::new();
+    for evt in &state.trace_events {
+        match &evt.kind {
+            TraceKind::ToolCall { name, status, .. } => {
+                let label = resolve_phase(name).to_string();
+                let dur = evt.duration_ms.map(|ms| format!("  {:.1}s", ms as f64 / 1000.0)).unwrap_or_default();
+                let icon = match status { ToolStatus::Success => "✓", ToolStatus::Failed => "✗", ToolStatus::Running => "⟳" };
+                let sn: String = name.rsplitn(2, "__").next().unwrap_or(name).chars().take(18).collect();
+                let line = format!("  {} {}{}", icon, sn, dur);
+                let active = matches!(status, ToolStatus::Running);
+                if let Some(last) = groups.last_mut() {
+                    if last.label == label && last.lines.len() < 4 {
+                        last.lines.push(line); if active { last.is_active = true; } continue;
+                    }
+                }
+                groups.push(TimelineGroup { label, timestamp: evt.time.clone(), lines: vec![line], is_active: active });
+            }
+            TraceKind::Thinking { lines: n, .. } => {
+                let line = format!("  ✓ 思考  {} 行", n);
+                if let Some(last) = groups.last_mut() { if last.label == "推理分析" { last.lines.push(line); continue; } }
+                groups.push(TimelineGroup { label: "推理分析".to_string(), timestamp: evt.time.clone(), lines: vec![line], is_active: false });
+            }
+            _ => {}
+        }
+    }
+    if groups.len() > 30 { let d = groups.len() - 30; groups.drain(0..d); }
+    if !state.processing_phase.is_empty() && state.is_streaming {
+        if let Some(last) = groups.last_mut() { last.is_active = true; }
+    }
+    groups
+}
+
+fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::layout::{Layout, Constraint, Direction};
+    let sep = ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
+        " ╌╌╌╌╌╌╌╌",
+        ratatui::style::Style::default().fg(state.theme.muted).add_modifier(ratatui::style::Modifier::DIM),
+    ));
+    let secs = Layout::default().direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1), Constraint::Length(2)])
+        .split(area);
+    render_timeline_grouped(f, state, secs[0]);
+    f.render_widget(sep.clone(), secs[1]);
+    render_focus_area(f, state, secs[2]);
+    f.render_widget(sep, secs[3]);
+    render_scene_stats(f, state, secs[4]);
+}
+
+fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    let muted = Style::default().fg(state.theme.muted);
+    let mut lines: Vec<Line> = Vec::new();
+    let groups = compute_timeline_groups(state);
+    if groups.is_empty() {
+        lines.push(Line::styled("  ⏸ 等待输入", muted));
+    } else {
+        let mut all: Vec<Line> = Vec::new();
+        let gl = groups.len();
+        for (gi, g) in groups.iter().enumerate() {
+            let is_last = gi == gl - 1;
+            let tc = if g.is_active && is_last { state.theme.accent } else { state.theme.muted };
+            let ts = if g.timestamp.is_empty() { String::new() } else { format!(" {}", g.timestamp) };
+            all.push(Line::from(vec![
+                Span::styled(format!("─{} ", ts), Style::default().fg(tc)),
+                Span::styled(g.label.clone(), Style::default().fg(tc).add_modifier(Modifier::BOLD)),
+            ]));
+            for l in &g.lines { all.push(Line::styled(l.clone(), Style::default().fg(state.theme.text))); }
+        }
+        let vis = area.height as usize;
+        let tot = all.len();
+        let off = state.timeline_scroll_offset.min(tot.saturating_sub(vis));
+        if tot > vis && off == 0 {
+            lines.push(Line::styled(format!("  … 更早 {} 条", tot - vis), muted.add_modifier(Modifier::DIM)));
+            if tot > 1 { lines.extend(all[tot - vis + 1..].to_vec()); }
+        } else {
+            let end = tot.saturating_sub(off); let start = end.saturating_sub(vis);
+            lines.extend(all[start..end].to_vec());
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_focus_area(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use crate::tui::state::AbacusMode;
+    if state.processing_phase.starts_with("📋") { render_focus_plan(f, state, area); }
+    else if state.processing_phase.starts_with("🤖") { render_focus_team(f, state, area); }
+    else if state.mode == AbacusMode::Meeting { render_focus_meeting(f, state, area); }
+    else { render_focus_clarify(f, state, area); }
+}
+
+fn render_focus_clarify(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    let muted = Style::default().fg(state.theme.muted);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(vec![Span::styled("Focus", ab), Span::styled(" · 澄清", muted)])];
+    if state.session_summary.is_empty() {
+        lines.push(Line::styled("  开始对话后自动更新", muted));
+    } else {
+        for l in state.session_summary.lines().take(7) {
+            let t: String = l.chars().take(28).collect();
+            lines.push(Line::styled(format!("  {}", t), Style::default().fg(state.theme.text)));
+        }
+    }
+    if let Some((hint, at)) = &state.transition_hint {
+        if at.elapsed().as_secs() < 5 {
+            lines.push(Line::styled("  ─", muted));
+            let t: String = hint.chars().take(28).collect();
+            lines.push(Line::styled(format!("  {}", t), Style::default().fg(state.theme.accent)));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_focus_plan(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    let muted = Style::default().fg(state.theme.muted);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let mut lines = vec![
+        Line::from(vec![Span::styled("Focus", ab), Span::styled(" · 规划", muted)]),
+        Line::styled(format!("  ⟳ {}", state.processing_phase), Style::default().fg(state.theme.accent)),
+    ];
+    if !state.tasks.is_empty() {
+        lines.push(Line::styled(format!("  待确认 {} 项", state.tasks.len()), muted));
+        let nums = ["❶","❷","❸","❹","❺"];
+        for (i, task) in state.tasks.iter().take(5).enumerate() {
+            let t: String = task.title.chars().take(22).collect();
+            lines.push(Line::styled(format!("   {} {}", nums.get(i).copied().unwrap_or("·"), t), Style::default().fg(state.theme.text)));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_focus_team(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    use crate::tui::state::TaskStatus;
+    let muted = Style::default().fg(state.theme.muted);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let done = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
+    let total = state.tasks.len();
+    let mut lines = vec![Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 团队 {}/{}", done, total), muted)])];
+    for task in state.tasks.iter().take(6) {
+        let (icon, color) = match task.status {
+            TaskStatus::Done       => ("✓", state.theme.success),
+            TaskStatus::InProgress => ("⟳", state.theme.accent),
+            TaskStatus::Blocked    => ("⚠", state.theme.error),
+            TaskStatus::Pending    => ("○", state.theme.muted),
+        };
+        let t: String = task.title.chars().take(18).collect();
+        let extra = if !task.deps.is_empty() { format!(" 等待{}", task.deps.join(",")) } else { String::new() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+            Span::styled(t, Style::default().fg(state.theme.text)),
+            Span::styled(extra, muted),
+        ]));
+    }
+    if total > 0 {
+        lines.push(Line::styled("  ─", muted));
+        let bw = (area.width as usize).saturating_sub(6).min(12);
+        let filled = (done * bw / total.max(1)).min(bw);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("█".repeat(filled), Style::default().fg(state.theme.accent)),
+            Span::styled("░".repeat(bw - filled), muted),
+            Span::styled(format!("  {}/{}", done, total), muted),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_focus_meeting(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    use crate::tui::state::ExpertStatus;
+    let muted = Style::default().fg(state.theme.muted);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let mut lines = vec![Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 会诊 {}位", state.experts.len()), muted)])];
+    for e in &state.experts {
+        let (icon, color) = match e.status {
+            ExpertStatus::Active => ("🔊", state.theme.success),
+            ExpertStatus::Done   => ("✓ ", state.theme.success),
+            ExpertStatus::Idle   => ("○ ", state.theme.muted),
+        };
+        let nm: String = e.name.chars().take(14).collect();
+        let st = match e.status { ExpertStatus::Active => " 发言中...", ExpertStatus::Done => " 完成", ExpertStatus::Idle => " 等待" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {} ", icon), Style::default().fg(color)),
+            Span::styled(nm, Style::default().fg(state.theme.text)),
+            Span::styled(st, muted),
+        ]));
+    }
+    let te = state.experts.len();
+    let de = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Done)).count();
+    let ae = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Active)).count();
+    let phase = if te == 0 { "等待开始" } else if ae > 0 { "● 发言中" }
+        else if de == te && state.is_streaming { "● 综合中" }
+        else if de == te && de > 0 { "✓ 结论完成" } else { "○ 等待发言" };
+    lines.push(Line::styled("  ─", muted));
+    lines.push(Line::from(vec![Span::styled("  阶段  ", muted), Span::styled(phase, Style::default().fg(state.theme.accent))]));
+    if let Some((hint, _)) = &state.transition_hint {
+        let t: String = hint.chars().take(22).collect();
+        lines.push(Line::from(vec![Span::styled("  携带  ", muted), Span::styled(t, muted)]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_scene_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    let muted = Style::default().fg(state.theme.muted);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let uc = state.messages.iter().filter(|m| matches!(m.role, crate::tui::state::MsgRole::User)).count();
+    let ac = state.messages.iter().filter(|m| matches!(m.role, crate::tui::state::MsgRole::Session | crate::tui::state::MsgRole::Expert(_))).count();
+    let cost = state.session_tokens.cost_cny;
+    let cs = if cost > 0.001 { format!("  ¥{}", crate::tui::cost::format_cny(cost)) } else { String::new() };
+    f.render_widget(Paragraph::new(vec![
+        Line::from(Span::styled("统计", ab)),
+        Line::from(Span::styled(format!("  你{}·AI{}  事件 {}{}", uc, ac, state.trace_events.len(), cs), muted)),
+    ]), area);
+}
+
+fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    use crate::tui::state::ToolStatus;
+    let muted = Style::default().fg(state.theme.muted);
+    let dim  = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+    let ab   = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let txt  = Style::default().fg(state.theme.text);
+    let sep  = Line::styled(" ╌╌╌╌╌╌╌╌", dim);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // 📦 记忆宫殿
+    lines.push(Line::from(Span::styled("📦 记忆宫殿", ab)));
+    lines.push(Line::styled("  ─", muted));
+    let total_kc: u32 = state.knowledge_calls.iter().map(|e| e.count).sum();
+    if state.knowledge_calls.is_empty() {
+        lines.push(Line::styled("  本轮  —", muted));
+    } else {
+        let mut pm: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        for kc in &state.knowledge_calls { *pm.entry(kc.domain.as_str()).or_insert(0) += kc.count; }
+        let mut pv: Vec<_> = pm.into_iter().collect();
+        pv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (d, c) in pv.iter().take(3) { lines.push(Line::from(vec![Span::styled(format!("  {:<10}", d), muted), Span::styled(format!("{} 次", c), txt)])); }
+        lines.push(Line::from(vec![Span::styled("  本轮  读 ", muted), Span::styled(format!("{} 次", total_kc), txt)]));
+    }
+    if let Some(r) = state.knowledge_calls.last() {
+        let nm: String = r.domain.chars().take(18).collect();
+        lines.push(Line::from(vec![Span::styled("  常用  ", muted), Span::styled(nm, txt)]));
+    }
+    lines.push(sep.clone()); lines.push(Line::raw(""));
+
+    // ⚡ 技能引擎
+    lines.push(Line::from(Span::styled("⚡ 技能引擎", ab)));
+    lines.push(Line::styled("  ─", muted));
+    let skills: Vec<_> = state.tool_records.iter().filter(|r| !r.name.contains("__") && !r.name.starts_with("mcp_")).collect();
+    if skills.is_empty() {
+        lines.push(Line::styled("  本轮  —", muted));
+    } else {
+        lines.push(Line::from(vec![Span::styled("  本轮  调用 ", muted), Span::styled(format!("{} 次", skills.len()), txt)]));
+        let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        for r in &skills { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
+        let mut fv: Vec<_> = freq.into_iter().collect();
+        fv.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let top: Vec<String> = fv.iter().take(2).map(|(n, c)| format!("{} ({}次)", n, c)).collect();
+        if !top.is_empty() { lines.push(Line::from(vec![Span::styled("  常用  ", muted), Span::styled(top.join(" · "), txt)])); }
+    }
+    lines.push(sep.clone()); lines.push(Line::raw(""));
+
+    // 🔧 工具仓
+    lines.push(Line::from(Span::styled("🔧 工具仓", ab)));
+    lines.push(Line::styled("  ─", muted));
+    let hc = state.tool_health.len();
+    let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
+    let blocked: Vec<_> = state.tool_health.iter().filter(|(_, h)| h.blocked_by_env).collect();
+    if hc > 0 {
+        let pct = avail * 100 / hc;
+        lines.push(Line::from(vec![Span::styled("  可用  ", muted), Span::styled(format!("{}/{} 健康{}%", avail, hc, pct), txt)]));
+        let mut tiers: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for h in state.tool_health.values() { *tiers.entry(h.tier.as_str()).or_insert(0) += 1; }
+        let ts: String = ["S","A","B","C"].iter().filter_map(|t| tiers.get(t).map(|n| format!("{}●{} ", t, n))).collect();
+        if !ts.is_empty() { lines.push(Line::from(vec![Span::raw("  "), Span::styled(ts, muted)])); }
+    }
+    let tc = state.tool_records.len();
+    if tc > 0 {
+        let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
+        lines.push(Line::from(vec![Span::styled("  本轮  调 ", muted), Span::styled(format!("{} · ✓{} ✗{}", tc, sc, tc - sc), txt)]));
+        let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        for r in &state.tool_records { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
+        if let Some((tn, cnt)) = freq.iter().max_by_key(|(_, c)| *c) {
+            let t: String = tn.rsplitn(2, "__").next().unwrap_or(tn).chars().take(14).collect();
+            lines.push(Line::from(vec![Span::styled("  最用  ", muted), Span::styled(format!("{} ({}次)", t, cnt), txt)]));
+        }
+        if let Some(sl) = state.tool_records.iter().filter(|r| r.duration_ms > 0).max_by_key(|r| r.duration_ms) {
+            let t: String = sl.name.rsplitn(2, "__").next().unwrap_or(&sl.name).chars().take(12).collect();
+            lines.push(Line::from(vec![Span::styled("  最慢  ", muted), Span::styled(format!("{} ({:.1}s)", t, sl.duration_ms as f64 / 1000.0), txt)]));
+        }
+    }
+    if !blocked.is_empty() {
+        lines.push(Line::from(Span::styled(format!("  阻断 {} 个", blocked.len()), Style::default().fg(state.theme.error))));
+        for (nm, _) in blocked.iter().take(3) {
+            let t: String = nm.rsplitn(2, "__").next().unwrap_or(nm).chars().take(18).collect();
+            lines.push(Line::styled(format!("    {}", t), muted));
+        }
+    }
+    let vis = area.height as usize;
+    if lines.len() > vis {
+        let end = lines.len().saturating_sub(state.knowledge_scroll_offset);
+        let start = end.saturating_sub(vis);
+        lines = lines[start..end].to_vec();
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}

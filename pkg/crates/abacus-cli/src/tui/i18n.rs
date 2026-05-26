@@ -107,7 +107,10 @@ pub fn t(key: &'static str) -> &'static str {
         "event.denied" => if zh { "已拒绝" } else { "Denied" },
 
         // ── 面板标签 ──
-        "panel.scene" => if zh { "现场" } else { "Scene" },
+        "panel.scene"     => if zh { "现场" } else { "Scene" },
+        "panel.stockroom" => if zh { "仓库" } else { "Stockroom" },
+        "panel.focus"     => if zh { "焦点" } else { "Focus" },
+        "panel.agenda"    => if zh { "议程" } else { "Agenda" },
         "panel.tasks" => if zh { "任务" } else { "Tasks" },
         "panel.quant" => if zh { "统计" } else { "Quant" },
         "panel.custom" => if zh { "自定义" } else { "Custom" },
@@ -164,7 +167,6 @@ pub fn t(key: &'static str) -> &'static str {
         "stat.cache_hit" => if zh { "缓存" } else { "cache" },
         "timeline.thinking" => if zh { "推理" } else { "Reasoning" },
         "timeline.earlier" => if zh { "更早的步骤" } else { "earlier steps" },
-        "panel.agenda" => if zh { "议程" } else { "Agenda" },
         "panel.theme_preview" => if zh { " 主题预览 " } else { " Theme Preview " },
 
         // ── 面板统计字段 ──

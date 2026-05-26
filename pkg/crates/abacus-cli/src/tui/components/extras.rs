@@ -294,23 +294,31 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     let bar_w: usize = 16.min(area.width.saturating_sub(8) as usize);
     let filled = (pct * bar_w / 100).min(bar_w);
     let empty = bar_w - filled;
+    // V35: 进度条单行 — 右侧追加 ×轮次·总token|↑input↓output
+    // 引用: state.turn_count / prompt_tokens / completion_tokens
+    let prompt = state.session_tokens.prompt_tokens;
+    let completion = state.session_tokens.completion_tokens;
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled("▓".repeat(filled), Style::default().fg(bar_color)),
         Span::styled("░".repeat(empty), muted),
         Span::styled(format!(" {}%", pct), Style::default().fg(bar_color).add_modifier(pct_mod)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(format!("{} / {}", format_ctx(total), format_ctx(max_ctx)), muted),
+        Span::styled(
+            format!("  ×{}·{}|↑{}↓{}",
+                state.turn_count,
+                format_ctx(total),
+                format_ctx(prompt as usize),
+                format_ctx(completion as usize),
+            ),
+            muted,
+        ),
     ]));
     lines.push(Line::raw(""));
 
     // 指标列表
     let cost = state.session_tokens.cost_cny;
-    let prompt = state.session_tokens.prompt_tokens;
     let cached = state.session_tokens.cached_tokens;
-    let completion = state.session_tokens.completion_tokens;
+    // completion / prompt 已在上方声明，此处不重复 let
     let kv_pct = if prompt > 0 { (cached * 100 / prompt).min(100) } else { 0 };
     let kv_color = match kv_pct {
         70..=100 => state.theme.success,

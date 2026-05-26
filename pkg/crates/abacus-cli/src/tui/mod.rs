@@ -17,6 +17,8 @@ pub mod event;
 pub mod layout;
 pub mod markdown;
 pub mod md_stream;
+pub mod expert_config;
+pub mod meeting_cache;
 pub mod modes;
 pub mod run;
 pub mod setup;

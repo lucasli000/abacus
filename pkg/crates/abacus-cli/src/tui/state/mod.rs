@@ -81,16 +81,27 @@ pub enum MsgRole {
 }
 
 /// 命令参数 Picker 类型
-/// V13: 输入 `/model`/`/theme`/`/thinking` 等参数化命令时弹出 picker 让用户选择
-/// 多模式交互状态机（输入框/补全/思考/执行 等）
+///
+/// 引用关系：PickerState.kind 驱动 render_picker_popup 渲染分支 + apply_picker_selection 分发
+/// 生命周期：state.picker = Some 时弹出；Enter/Esc 关闭
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind {
-    /// 模型选择（KNOWN_MODELS）
+    /// 模型选择（带 thinking slider）
     Model,
-    /// 主题选择（Theme::all_names）
+    /// 主题选择（带色板预览）
     Theme,
-    /// 思考深度（off/low/medium/high）
+    /// 思考深度（off/low/medium/high/max）
     Thinking,
+    /// 模式切换（Clarify / Meeting）
+    Mode,
+    /// 审查类型（plan / diff / security）+ strict toggle
+    Review,
+    /// 历史 session 恢复
+    Resume,
+    /// 输入历史重发
+    History,
+    /// Meeting 操作菜单（进入会诊 / 专家配置 / 历史记录）
+    Meeting,
 }
 
 /// Picker 状态
@@ -119,9 +130,11 @@ pub struct PickerState {
     ///   false = 默认 picker 行为
     pub show_thinking_slider: bool,
     /// 防键重复保护：picker 打开时记录时刻，150ms 内 Enter 无效
-    /// 问题根因：accept_completion Enter → submit_message → open_picker → picker 开启
-    /// 同一物理 Enter 的「鍵重複」事件立即触发 apply_picker_selection → picker 瞬间关闭
     pub opened_at: std::time::Instant,
+    /// Review picker 专用：Space 切换 strict 模式（verdict≠pass 阻断后续执行）
+    /// 引用：render_picker_popup 渲染 toggle 行；apply_picker_selection 读取并传给 /review
+    /// 生命周期：picker 打开时初始化为 false；picker 关闭时随 PickerState take 消耗
+    pub review_strict: bool,
 }
 
 /// 流式 tool 执行状态
@@ -333,6 +346,24 @@ pub enum PanelTab {
     Custom(usize), // index into AppState.custom_tabs
 }
 
+/// V35: Timeline 分组缓存条目 — 按语义阶段分组的工具事件
+///
+/// 引用关系:
+///   生产者: panel::rebuild_timeline_groups (render_tab_scene 内按需调用)
+///   消费者: panel::render_tab_scene Timeline 区渲染
+///   生命周期: AppState.timeline_groups_cache 持有，trace_events 变化时整体重建
+#[derive(Debug, Clone)]
+pub struct TimelineGroup {
+    /// 阶段标签（信息收集 / 代码修改 / 执行验证 / ...）
+    pub label: String,
+    /// 时间戳字符串（"09:23"）
+    pub timestamp: String,
+    /// 已格式化的子事件行（直接渲染）
+    pub lines: Vec<String>,
+    /// 是否为最后一组（最后一组可能仍在进行）
+    pub is_active: bool,
+}
+
 /// V40: 仪表盘 Tab（右下区域）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DashboardTab {
@@ -362,36 +393,25 @@ impl PanelTab {
     pub fn label(&self) -> &'static str {
         match self {
             PanelTab::Timeline => "现场",
-            PanelTab::Tasks => "任务",
-            PanelTab::Quant => "量化",
+            PanelTab::Tasks => "任务",   // 保留 variant，panel dispatch 不再使用
+            PanelTab::Quant => "仓库",   // V35: 量化 → 仓库
             PanelTab::Custom(_) => "自定义",
         }
     }
 
-    /// 获取当前模式可用的所有 Tab（含自定义 Tab）
-    /// V33: 4 个 mode 统一加 Quant tab（量化复盘视角）
-    /// 引用关系: render_panel 用此序列校验 panel_tab 合法性 + cycle_focus 过滤
-    pub fn all_with_custom(mode: AbacusMode, custom_count: usize) -> Vec<PanelTab> {
-        let mut tabs = match mode {
-            // Team/Meeting/Plan 都有任务/议程维度可看，给 Tasks tab
-            AbacusMode::Team | AbacusMode::Meeting | AbacusMode::Plan =>
-                vec![PanelTab::Timeline, PanelTab::Tasks, PanelTab::Quant],
-            AbacusMode::Clarify => vec![PanelTab::Timeline, PanelTab::Quant],
-        };
-        // 追加用户自定义 Tab
+    /// V35: 两模式统一两 Tab — 现场(Timeline) + 仓库(Quant)
+    /// Meeting 专家议程并入现场 Tab 的 Focus 区，不再单独 Tasks Tab
+    pub fn all_with_custom(_mode: AbacusMode, custom_count: usize) -> Vec<PanelTab> {
+        let mut tabs = vec![PanelTab::Timeline, PanelTab::Quant];
         for i in 0..custom_count {
             tabs.push(PanelTab::Custom(i));
         }
         tabs
     }
 
-    /// 获取静态 Tab（不含自定义，用于不需要 custom 的场景）
-    pub fn all(mode: AbacusMode) -> &'static [PanelTab] {
-        match mode {
-            AbacusMode::Team | AbacusMode::Meeting | AbacusMode::Plan =>
-                &[PanelTab::Timeline, PanelTab::Tasks, PanelTab::Quant],
-            AbacusMode::Clarify => &[PanelTab::Timeline, PanelTab::Quant],
-        }
+    /// 静态 Tab 列表（两模式统一）
+    pub fn all(_mode: AbacusMode) -> &'static [PanelTab] {
+        &[PanelTab::Timeline, PanelTab::Quant]
     }
 
     pub fn next(&self, mode: AbacusMode) -> PanelTab {
@@ -620,21 +640,29 @@ pub enum SlashCommand {
         content: String,
     },
 
-    // ─── V37-1: Planner schema 失败自动 nudge ─────────────────
-    /// 触发 Planner 修正调用 — 把 schema 校验 reason 注入 user message 重新规划
+    // ─── V34: 执行策略 slash commands ─────────────────────────
+    /// 触发规划+执行策略 — /plan <task> 直接发起，不切换 mode
     ///
     /// ## 引用关系
-    /// - 设置：try_switch_mode 检测 SchemaInvalid 时构造（消耗 planner_nudge_attempts 配额）
-    /// - 消费：run.rs pending_slash_command 处理分支走 send_planner_message_streaming
-    ///
-    /// ## 死循环防御
-    /// - try_switch_mode 内部有 attempts 上限（≤1，单次 Plan→Team 内仅一次）
-    /// - 用户重新进入 Plan 模式时 planner_nudge_attempts 重置为 0
+    /// - 设置：slash_commands.rs::cmd_plan 解析 `/plan <task>` 后构造
+    /// - 消费：run.rs 主循环检测 pending_slash_command，调 send_plan_and_execute_streaming
     ///
     /// ## 生命周期
-    /// 一次性 dispatch；Planner 修正后用户需再次 /done 触发 try_switch_mode 重新校验
-    PlannerNudge {
-        reason: String,
+    /// 一次性 dispatch；在当前 Clarify mode 内部执行，不切换 mode
+    ExecuteWithPlan {
+        task: String,
+    },
+
+    /// 触发多 agent 执行策略 — /team <task> 直接发起，不切换 mode
+    ///
+    /// ## 引用关系
+    /// - 设置：slash_commands.rs::cmd_team 解析 `/team <task>` 后构造
+    /// - 消费：run.rs 主循环检测 pending_slash_command，调 send_team_message
+    ///
+    /// ## 生命周期
+    /// 一次性 dispatch；在当前 Clarify mode 内部执行，不切换 mode
+    ExecuteWithTeam {
+        task: String,
     },
 }
 
@@ -646,13 +674,12 @@ pub struct AppState {
     pub theme: Theme,
     /// 上次渲染的主题名（仅首帧或主题切换时重刷全屏背景）
     pub mode: AbacusMode,
-    /// V33: 模式间携带数据 — 上阶段产出，下阶段消费
+    /// V34: 模式间携带数据 — 上阶段产出，下阶段消费（V34: 仅 ClarifyBrief/MeetingConclusion）
     ///
     /// ## 引用关系
-    /// - 写：mode 完成时（Clarify /done 携带 ClarifyBrief / Plan 输出 PlanTasks /
-    ///       Meeting 结论 MeetingConclusion）
-    /// - 读：进入新 mode 时取走（take()），加载到 messages preamble 或 state.tasks
-    /// - 来源 SSoT：abacus_types::ModeArtifact（含 ClarifyBrief / MeetingConclusion / PlanTasks）
+    /// - 写：mode 完成时（Clarify /done 携带 ClarifyBrief / Meeting 结论 MeetingConclusion）
+    /// - 读：进入新 mode 时取走（take()），加载到 messages preamble
+    /// - 来源 SSoT：abacus_types::ModeArtifact（含 ClarifyBrief / MeetingConclusion）
     ///
     /// ## 生命周期
     /// - mode 切换时若有则 take 给新 mode，旧 mode 不再持有
@@ -765,20 +792,6 @@ pub struct AppState {
     /// false（保持现有行为，只有用户显式启用才生效）
     pub auto_review_plan: bool,
 
-    /// V37-1: Planner schema 失败自动 nudge 计数器
-    ///
-    /// ## 引用关系
-    /// - 写：try_switch_mode 检测 SchemaInvalid 触发 nudge 时 +1
-    /// - 写：set_mode 进入 Plan 时重置为 0（新一轮规划）
-    /// - 读：try_switch_mode 检查上限（≤1）防死循环
-    ///
-    /// ## 死循环防御
-    /// - 单次 Plan 阶段最多 1 次 auto-nudge
-    /// - Planner 修正后用户需手动 /done 触发新一次校验（不自动循环）
-    ///
-    /// ## 生命周期
-    /// 进入 Plan 模式 → 计数 0；nudge 触发后 → 1；离开 Plan 后归零
-    pub planner_nudge_attempts: u8,
     /// Session UUID。启动时 Uuid::new_v4() 生成；load_last_session 恢复时覆盖。
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
     pub session_id: String,
@@ -791,6 +804,13 @@ pub struct AppState {
     pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
     pub context_window: usize,  // tokens (e.g. 1_000_000)
+    /// 实时上下文 token 估算（流式期间每 500ms 更新；Complete 后换为真实值）
+    /// 引用：bars.rs inputbar 进度条；0 = 无数据
+    /// 生命周期：/new 不清（保留上轮最终值直到新轮覆盖）
+    pub ctx_live_tokens: u64,
+    /// 上次 ctx_live_tokens 估算时刻（用于 500ms 门控）
+    /// 生命周期：TextDelta 期间更新，Complete 后清空
+    pub ctx_estimate_at: Option<std::time::Instant>,
     pub session_summary: String,
     pub turn_count: u32,
     /// V29.9: 会话可读别名(rename 命令设置), None = 显示 session_id
@@ -810,11 +830,6 @@ pub struct AppState {
     ///   - 销毁: /turnkey execute(执行后清) | /turnkey clear | /new
     /// 持久化: 不进 SessionExport(plan 是会话期间的临时审阅状态, 重启清空)
     pub pending_turnkey_plan: Option<abacus_types::sandbox::TaskSpec>,
-    /// V29.9: 规划模式 — true 时下一条用户消息应该被 LLM 当 "plan first" 处理
-    /// 引用关系: send_chat_message 时附加 system prompt 提示, 输出后自动清回 false
-    /// 单次用 — 一轮对话后就退出, 用户要再次进入需重新 /plan
-    pub plan_mode: bool,
-
     pub messages: VecDeque<Message>,
     pub scroll: usize,
     /// V28.6 (PR12-5): 模式切换时保留各自的 scroll 位置, 切回不归零
@@ -851,6 +866,13 @@ pub struct AppState {
     /// 压缩前的 input_state 快照（CompressEnd 时恢复）
     /// 生命周期：CompressStart 设置 → CompressEnd 消费（take）
     pub pre_compress_input_state: Option<InputState>,
+    /// 压缩期间用户输入的暂存消息（InputState::Executing 时用户提交的文本）
+    ///
+    /// 引用关系：
+    ///   - 写入：event/mod.rs Enter 键处理（Executing 态且非 slash 命令时）
+    ///   - 读取：run.rs CompressEnd / CompressAutoResume 处理后自动发送
+    /// 生命周期：CompressEnd 或 CompressAutoResume 消费（take）后清空
+    pub pending_compress_input: Option<String>,
     pub cursor_pos: usize,
     /// 缓存光标所在行号（避免每帧 O(n²) 计算）
     pub(crate) cursor_line: usize,
@@ -1007,6 +1029,12 @@ pub struct AppState {
     pub settings_input: String,
     /// 会话 Token 统计（含压缩历史：compress_count / compress_tokens_saved）
     pub session_tokens: SessionTokenStats,
+    /// V35: 模式过渡感知提示 — 切换模式后 5s 内展示携带内容摘要
+    /// 引用关系:
+    ///   写: slash_commands::try_switch_mode 切换后立即写入
+    ///   读: bars::render_status_bar 按 elapsed 决定是否展示
+    /// 生命周期: 写入后 5s 自然过期（render 时检查 elapsed），不需要显式清除
+    pub transition_hint: Option<(String, std::time::Instant)>,
     /// 当前处理阶段描述（减少等待焦虑）
     pub processing_phase: String,
     /// 当前处理阶段序号 (1-based)
@@ -1132,6 +1160,11 @@ pub struct AppState {
     // ─── V0.5 Panel Scroll ──────────────────────────────────────────
     /// 时间线滚动偏移（0 = auto-scroll to bottom，>0 = 手动向上偏移行数）
     pub timeline_scroll_offset: usize,
+    /// V35: Timeline 分组缓存 — 防止每帧重分组（trace_events.len() 变化时失效重建）
+    /// 生命周期: render_tab_scene 按需重建，进程内有效
+    pub timeline_groups_cache: Vec<TimelineGroup>,
+    /// 上次缓存时 trace_events.len()，用于失效检测
+    pub timeline_cache_len: usize,
     /// 知识宫殿滚动偏移（0 = auto-scroll to bottom，>0 = 手动向上偏移行数）
     pub knowledge_scroll_offset: usize,
     /// 面板当前滚动焦点区块（用于 ↑↓ 操作哪个区块）
@@ -1348,12 +1381,19 @@ pub struct ConfirmDialog {
     /// 与 interaction_paused 区别: 后者是"D 键硬冻结"(单向不可逆),
     ///                            本字段是"软重置"(每次活动都向前推, 无活动自然耗尽)
     pub last_active_at: Instant,
+    /// 系统+LLM 对本次授权的建议动作（由引擎 pipeline 计算，携带在 McipConfirmRequest 中）
+    ///   Some(true)  → 系统评估安全，3s 后自动放行
+    ///   Some(false) → 系统评估危险，标准 8s 超时后拒绝
+    ///   None        → 系统无法判断，标准 10s 等待用户
+    pub suggested_action: Option<bool>,
 }
 
 impl ConfirmDialog {
-    /// V27/V29 (P2)：差异化超时：
-    ///   - High（破坏性）：8s 无操作 → auto-reject（V29: 5s→8s, 给 D 展开后阅读 8 行 details 留缓冲）
-    ///   - Medium/Low（非破坏性）：10s 无操作 → auto-always-allow（自动加入 always_allow）
+    /// 差异化超时：原始设计不变
+    ///   High（破坏性）→ 8s 无操作 → auto-reject
+    ///   Medium/Low    → 10s 无操作 → 单次允许
+    ///
+    /// suggested_action 仅作信息展示（标题提示），不参与超时逻辑——两者职责不重叠。
     pub fn timeout_secs(&self) -> u64 {
         match self.risk {
             ConfirmRisk::High => 8,
@@ -1363,10 +1403,7 @@ impl ConfirmDialog {
 
     /// 超时后的默认行为：High=拒绝, 其他=单次允许
     pub fn timeout_action(&self) -> bool {
-        match self.risk {
-            ConfirmRisk::High => false,  // auto-reject
-            _ => true,                    // auto-allow
-        }
+        !matches!(self.risk, ConfirmRisk::High)
     }
 
     /// V29.1 (P1+P4): 用户 idle 时长(扣除 D 冻结 + 终端失焦时间)
@@ -1494,6 +1531,7 @@ impl ConfirmDialog {
             paused_total: std::time::Duration::ZERO,
             focus_lost_at: None,
             last_active_at: Instant::now(),
+            suggested_action: None,
         }
     }
 
@@ -1528,6 +1566,7 @@ impl ConfirmDialog {
             paused_total: std::time::Duration::ZERO,
             focus_lost_at: None,
             last_active_at: Instant::now(),
+            suggested_action: None,
         }
     }
 
@@ -1550,6 +1589,7 @@ impl ConfirmDialog {
             paused_total: std::time::Duration::ZERO,
             focus_lost_at: None,
             last_active_at: Instant::now(),
+            suggested_action: Some(false), // 文件删除始终建议拒绝
         }
     }
 
@@ -1579,6 +1619,7 @@ impl ConfirmDialog {
             paused_total: std::time::Duration::ZERO,
             focus_lost_at: None,
             last_active_at: Instant::now(),
+            suggested_action: None,
         }
     }
 }
@@ -1848,12 +1889,12 @@ mod per_mode_query_tests {
     fn make_stats() -> SessionTokenStats {
         let mut s = SessionTokenStats::default();
         // 使用 mode.label() 返回的实际值作 key（小写）— 与 run.rs 累加同源
-        s.per_mode.insert(AbacusMode::Plan.label().to_string(), ModelTokenStats {
+        s.per_mode.insert(AbacusMode::Clarify.label().to_string(), ModelTokenStats {
             cost_cny: 3.0,
             turns: 2,
             ..Default::default()
         });
-        s.per_mode.insert(AbacusMode::Team.label().to_string(), ModelTokenStats {
+        s.per_mode.insert(AbacusMode::Meeting.label().to_string(), ModelTokenStats {
             cost_cny: 7.0,
             turns: 5,
             ..Default::default()
@@ -1864,15 +1905,16 @@ mod per_mode_query_tests {
     #[test]
     fn mode_stats_finds_existing() {
         let s = make_stats();
-        assert_eq!(s.mode_stats(AbacusMode::Plan).map(|x| x.cost_cny), Some(3.0));
-        assert_eq!(s.mode_stats(AbacusMode::Team).map(|x| x.turns), Some(5));
+        assert_eq!(s.mode_stats(AbacusMode::Clarify).map(|x| x.cost_cny), Some(3.0));
+        assert_eq!(s.mode_stats(AbacusMode::Meeting).map(|x| x.turns), Some(5));
     }
 
     #[test]
     fn mode_stats_returns_none_when_absent() {
         let s = make_stats();
-        // Clarify 未在 per_mode 中
-        assert!(s.mode_stats(AbacusMode::Clarify).is_none());
+        // Clarify 已插入，Meeting 已插入；测试空 stats
+        let s2 = SessionTokenStats::default();
+        assert!(s2.mode_stats(AbacusMode::Clarify).is_none());
     }
 
     #[test]
@@ -1884,20 +1926,20 @@ mod per_mode_query_tests {
     #[test]
     fn mode_cost_ratio_correct() {
         let s = make_stats();
-        assert!((s.mode_cost_ratio(AbacusMode::Plan) - 0.30).abs() < 1e-9);
-        assert!((s.mode_cost_ratio(AbacusMode::Team) - 0.70).abs() < 1e-9);
+        assert!((s.mode_cost_ratio(AbacusMode::Clarify) - 0.30).abs() < 1e-9);
+        assert!((s.mode_cost_ratio(AbacusMode::Meeting) - 0.70).abs() < 1e-9);
     }
 
     #[test]
     fn mode_cost_ratio_zero_when_absent() {
-        let s = make_stats();
+        let s = SessionTokenStats::default();
         assert_eq!(s.mode_cost_ratio(AbacusMode::Clarify), 0.0);
     }
 
     #[test]
     fn mode_cost_ratio_zero_when_total_zero() {
         let s = SessionTokenStats::default();
-        assert_eq!(s.mode_cost_ratio(AbacusMode::Plan), 0.0);
+        assert_eq!(s.mode_cost_ratio(AbacusMode::Meeting), 0.0);
     }
 }
 
@@ -2109,8 +2151,8 @@ pub struct TextSelection {
     pub end_char_idx: usize,
 }
 
-/// 消息列表上限 — 防止长会话 OOM
-const MAX_MESSAGES: usize = 1000;
+/// 消息显示窗口上限 — 只保留最近 N 条消息（超出时裁剪最旧的，先剥离 Trace 内容节省内存）
+const MAX_MESSAGES: usize = 200;
 /// 事件列表上限
 const MAX_EVENTS: usize = 500;
 
@@ -2123,7 +2165,6 @@ impl AppState {
             theme,
             mode,
             mode_artifact: None, // V33: 初始无产出
-            planner_nudge_attempts: 0, // V37-1: 初始无 nudge 计数
             last_review: None, // V39-1: 初始无 review 结果
             last_review_strict: false, // V39-2: 初始非 strict
             pending_review_parses: 0, // V39-1: 初始无待解析 review
@@ -2140,12 +2181,13 @@ impl AppState {
             pending_model_fetch: false,
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
+            ctx_live_tokens: 0,
+            ctx_estimate_at: None,
             session_summary: String::new(),
             turn_count: 0,
             session_alias: None,
             session_goal: None,
             pending_turnkey_plan: None,
-            plan_mode: false,
             messages: VecDeque::new(),
             scroll: 0,
             scroll_by_mode: std::collections::HashMap::new(),
@@ -2160,6 +2202,7 @@ impl AppState {
             input: String::new(),
             input_state: InputState::Ready,
             pre_compress_input_state: None,
+            pending_compress_input: None,
             cursor_pos: 0,
             cursor_line: 0,
             cursor_col: 0,
@@ -2220,6 +2263,7 @@ impl AppState {
             settings_focus: 0,
             settings_input: String::new(),
             session_tokens: SessionTokenStats::default(),
+            transition_hint: None,
             processing_phase: String::new(),
             processing_step: 0,
             processing_total_steps: 0,
@@ -2257,6 +2301,8 @@ impl AppState {
             always_allow: std::collections::HashSet::new(),
             pending_mcip_confirmations: Vec::new(),
             timeline_scroll_offset: 0,
+            timeline_groups_cache: Vec::new(),
+            timeline_cache_len: 0,
             knowledge_scroll_offset: 0,
             panel_scroll_section: PanelSection::Timeline,
             knowledge_calls: Vec::new(),
@@ -2383,12 +2429,6 @@ impl AppState {
             let restored = self.scroll_by_mode.get(&mode).copied().unwrap_or(0);
             self.set_scroll(ScrollAction::Restore(restored));
 
-            // V37-1: 进入 Plan 时重置 nudge 计数器（新一轮规划，attempts 配额刷新）
-            // 引用关系：try_switch_mode 检查 planner_nudge_attempts ≤ 1 触发 nudge
-            // 设计意图：每次新规划独立配额，避免历史 nudge 影响当前规划
-            if mode == AbacusMode::Plan {
-                self.planner_nudge_attempts = 0;
-            }
         }
         self.mode = mode;
         self.theme.set_mode_color(mode.label());
@@ -2651,6 +2691,7 @@ impl AppState {
             groups: Some(groups),
             show_thinking_slider: true,
             opened_at: std::time::Instant::now(),
+            review_strict: false,
         });
         // picker 打开后立即触发重绘，避免 input_state=Ready 时 needs_draw=false 导致首帧不显示
         self.rendered_lines_dirty.set(true);
@@ -2671,6 +2712,7 @@ impl AppState {
             groups: None,
             show_thinking_slider: false,
             opened_at: std::time::Instant::now(),
+            review_strict: false,
         });
         self.rendered_lines_dirty.set(true);
     }
@@ -2698,6 +2740,202 @@ impl AppState {
             groups: None,
             show_thinking_slider: false,
             opened_at: std::time::Instant::now(),
+            review_strict: false,
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 打开模式切换 picker（Clarify / Meeting）
+    ///
+    /// 引用关系：handle_slash_command "/mode" 拦截 → 此处打开
+    /// 生命周期：picker 关闭后 apply_picker_selection 发送 /clarify 或 /meeting
+    pub fn open_picker_mode(&mut self) {
+        let items = vec!["clarify".to_string(), "meeting".to_string()];
+        let labels = vec![
+            "Clarify   需求澄清与方案对齐".to_string(),
+            "Meeting   多专家会诊审议".to_string(),
+        ];
+        let current_mode = match self.mode {
+            AbacusMode::Clarify  => Some(0usize),
+            AbacusMode::Meeting  => Some(1usize),
+        };
+        self.picker = Some(PickerState {
+            kind: PickerKind::Mode,
+            selected: current_mode.unwrap_or(0),
+            current: current_mode,
+            items,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false,
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 打开审查类型 picker（plan / diff / security）
+    ///
+    /// 引用关系：handle_slash_command "/review"（无参）拦截 → 此处打开
+    /// 生命周期：picker 关闭后 apply_picker_selection 发送 /review <type> [--strict]
+    pub fn open_picker_review(&mut self) {
+        let items = vec![
+            "plan".to_string(),
+            "diff".to_string(),
+            "security".to_string(),
+        ];
+        let labels = vec![
+            "plan       审查规划方案与任务分解".to_string(),
+            "diff       审查代码变更（git diff 风格）".to_string(),
+            "security   安全审计（OWASP + 权限检查）".to_string(),
+        ];
+        self.picker = Some(PickerState {
+            kind: PickerKind::Review,
+            selected: 0,
+            current: None,
+            items,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false, // Space 键切换
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// V35: 打开 Meeting 操作 picker
+    ///
+    /// 匹配内容：进入会诊 / 专家配置 / 历史记录
+    /// 引用关系：handle_slash_command "/meeting"（无参）拦截 → 此处打开
+    /// 生命周期：picker 关闭后 apply_picker_selection 路由到对应 slash 命令
+    pub fn open_picker_meeting(&mut self) {
+        // 动态加载专家数量（确保 /expert set 后 picker 立即反映最新配置）
+        let expert_count = crate::tui::expert_config::load_experts().len();
+        let items = vec![
+            "meeting".to_string(),
+            "expert".to_string(),
+            "meeting-list".to_string(),
+        ];
+        let labels = vec![
+            format!("进入会诊       召集专家开始多角色会议"),
+            format!("专家配置 ({}位)  /expert list | add | set | remove", expert_count),
+            format!("历史记录       浏览历史会议结论"),
+        ];
+        self.picker = Some(PickerState {
+            kind: PickerKind::Meeting,
+            selected: 0,
+            current: if self.mode == crate::tui::state::AbacusMode::Meeting { Some(0) } else { None },
+            items,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false,
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 打开历史 session 恢复 picker
+    ///
+    /// 引用关系：handle_slash_command "/resume"（无参）拦截 → 此处打开
+    /// 生命周期：picker 关闭后 apply_picker_selection 发送 /resume <uuid>
+    pub fn open_picker_resume(&mut self) {
+        let dir = abacus_core::paths::current_sessions_dir();
+        let mut entries: Vec<(String, std::time::SystemTime)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let is_session = p.extension().and_then(|x| x.to_str()) == Some("json")
+                    && !p.file_name().and_then(|x| x.to_str())
+                        .map(|n| n.starts_with('.')).unwrap_or(false);
+                if !is_session { continue; }
+                let stem = p.file_stem().and_then(|x| x.to_str()).unwrap_or("").to_string();
+                if let Ok(mt) = e.metadata().and_then(|m| m.modified()) {
+                    entries.push((stem, mt));
+                }
+            }
+        }
+        entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+        entries.truncate(10);
+
+        if entries.is_empty() {
+            self.add_toast("暂无历史 session", std::time::Duration::from_secs(3));
+            return;
+        }
+
+        let current_id = self.session_id.clone();
+        let mut items = Vec::new();
+        let mut labels = Vec::new();
+        let mut current_idx = None;
+
+        for (i, (uuid, mt)) in entries.iter().enumerate() {
+            let dt: chrono::DateTime<chrono::Local> = (*mt).into();
+            let now = chrono::Local::now();
+            let time_str = if dt.date_naive() == now.date_naive() {
+                dt.format("今天 %H:%M").to_string()
+            } else if (now.date_naive() - dt.date_naive()).num_days() == 1 {
+                dt.format("昨天 %H:%M").to_string()
+            } else {
+                dt.format("%m/%d %H:%M").to_string()
+            };
+            // 别名：取 session_summary（此处无法访问，用 UUID 前 8 位）
+            let short_id: String = uuid.chars().take(8).collect();
+            let alias = if uuid == &current_id {
+                format!("▶ {} （当前）", &short_id)
+            } else {
+                format!("  {}", &short_id)
+            };
+            let label = format!("{}  {}  {}", alias, time_str, uuid);
+            items.push(uuid.clone());
+            labels.push(label);
+            if uuid == &current_id {
+                current_idx = Some(i);
+            }
+        }
+
+        self.picker = Some(PickerState {
+            kind: PickerKind::Resume,
+            selected: current_idx.unwrap_or(0),
+            current: current_idx,
+            items,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false,
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 打开输入历史 picker（最近 20 条，选中重发）
+    ///
+    /// 引用关系：handle_slash_command "/history"（无参）拦截 → 此处打开
+    /// 生命周期：picker 关闭后 apply_picker_selection 把选中文本写入 input 并 submit
+    pub fn open_picker_history(&mut self) {
+        if self.input_history.is_empty() {
+            self.add_toast("暂无输入历史", std::time::Duration::from_secs(2));
+            return;
+        }
+        // 最新的在前（逆序）
+        let recent: Vec<String> = self.input_history.iter().rev().take(20).cloned().collect();
+        let labels: Vec<String> = recent.iter().map(|h| {
+            let truncated: String = h.chars().take(60).collect();
+            if h.chars().count() > 60 {
+                format!("{}…", truncated)
+            } else {
+                truncated
+            }
+        }).collect();
+
+        self.picker = Some(PickerState {
+            kind: PickerKind::History,
+            selected: 0,
+            current: None,
+            items: recent,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false,
         });
         self.rendered_lines_dirty.set(true);
     }
@@ -2789,14 +3027,52 @@ impl AppState {
         if let MsgRole::Expert(ref name) = msg.role {
             self.expert_names_cache.insert(name.clone());
         }
+        // 超出上限时从最旧消息开始裁剪。
+        // 先剥离最旧消息的 Trace 部分（Thinking/Tool 记录，内容大但历史价值低），
+        // 保留 Stream 文本；若消息仅含 Trace 则整条删除。
+        // 当裁剪积累到 COMPRESS_BATCH 条时，在消息列表头插入一行占位摘要。
+        const COMPRESS_BATCH: usize = 20;
         if self.messages.len() >= MAX_MESSAGES {
-            self.messages.pop_front();
+            let mut stripped = 0usize;
+            // 先把最前面的消息 Trace 部分剥离，尽量保留 Stream 文本
+            for msg in self.messages.iter_mut().take(COMPRESS_BATCH) {
+                let had_trace = msg.parts.iter().any(|p| matches!(p, MsgContent::Trace { .. }));
+                if had_trace {
+                    msg.parts.retain(|p| !matches!(p, MsgContent::Trace { .. }));
+                    stripped += 1;
+                }
+            }
+            // 删除已无内容（全为空 parts）的消息
+            let before = self.messages.len();
+            self.messages.retain(|m| !m.parts.is_empty());
+            let removed = before - self.messages.len();
+            // 若仍超限，直接从头 pop
+            while self.messages.len() >= MAX_MESSAGES {
+                self.messages.pop_front();
+            }
+            // 在列表头插入压缩占位行（替代被删消息，让用户知道有历史被裁剪）
+            if removed > 0 || stripped > 0 {
+                let compressed_count = removed.max(stripped);
+                let placeholder = Message {
+                    role: MsgRole::Session,
+                    parts: vec![MsgContent::Stream(
+                        format!("[ 已压缩 {} 条历史消息 ]", compressed_count)
+                    )],
+                    time: String::new(),
+                };
+                self.messages.push_front(placeholder);
+            }
         }
         // 焦点跟随：非 User 消息（agent/system/tool）抵达 → 试图磁吸到 Panel/Timeline。
         // User 消息是用户自己刚发的，焦点不动避免与用户后续输入抢；try_magnet_focus
         // 内部有 2s 抑制窗保护连续输入场景，不会真正打断用户。
         let from_agent = !matches!(msg.role, MsgRole::User);
         self.messages.push_back(msg);
+        // V40 修复：新消息加入时必须失效 base 渲染缓存
+        // 引用关系：components/mod.rs V40 分区渲染路径依赖 cached_base_msg_count 判断缓存新鲜度
+        // 漏清导致非 streaming 消息（slash command / system note）被"吞"——渲染层用旧缓存不包含新行
+        self.cached_base_lines.borrow_mut().clear();
+        self.cached_base_msg_count.set(0);
         if from_agent {
             self.try_magnet_focus(Focus::Panel, PanelSection::Timeline);
         }
@@ -3114,8 +3390,8 @@ mod tests {
     // ════════════════════════════════════════════════════════════
     #[test]
     fn panel_tab_all_includes_quant_for_every_mode() {
-        // 4 个 mode 的静态 tab 序列必须包含 Quant 作为末位（Custom 之前）
-        for mode in [AbacusMode::Clarify, AbacusMode::Team, AbacusMode::Meeting, AbacusMode::Plan] {
+        // V34: 2 个 mode 的静态 tab 序列必须包含 Quant 作为末位（Custom 之前）
+        for mode in [AbacusMode::Clarify, AbacusMode::Meeting] {
             let tabs = PanelTab::all(mode);
             assert!(tabs.contains(&PanelTab::Quant),
                 "mode={:?} 必须含 Quant tab", mode);
@@ -3131,8 +3407,8 @@ mod tests {
         assert_eq!(PanelTab::Timeline.next(mode), PanelTab::Quant);
         assert_eq!(PanelTab::Quant.next(mode), PanelTab::Timeline);
 
-        // Team: Timeline → Tasks → Quant → Timeline (循环)
-        let mode = AbacusMode::Team;
+        // Meeting: Timeline → Tasks → Quant → Timeline (循环)
+        let mode = AbacusMode::Meeting;
         assert_eq!(PanelTab::Timeline.next(mode), PanelTab::Tasks);
         assert_eq!(PanelTab::Tasks.next(mode), PanelTab::Quant);
         assert_eq!(PanelTab::Quant.next(mode), PanelTab::Timeline);
@@ -3140,22 +3416,22 @@ mod tests {
 
     #[test]
     fn set_mode_preserves_quant_across_modes() {
-        // 在 Team 切到 Quant tab，然后切到 Clarify mode；Quant 在两者 allowed 列表都在 → 应保留
-        let mut s = AppState::new(AbacusMode::Team);
+        // 在 Meeting 切到 Quant tab，然后切到 Clarify mode；Quant 在两者 allowed 列表都在 → 应保留
+        let mut s = AppState::new(AbacusMode::Meeting);
         s.panel_tab = PanelTab::Quant;
         s.set_mode(AbacusMode::Clarify);
         assert_eq!(s.panel_tab, PanelTab::Quant,
-            "Quant 在 4 个 mode 都合法，跨 mode 切换应保留");
+            "Quant 在两个 mode 都合法，跨 mode 切换应保留");
 
-        // 反向：Clarify → Plan，Quant 仍合法保留
-        s.set_mode(AbacusMode::Plan);
+        // 反向：Clarify → Meeting，Quant 仍合法保留
+        s.set_mode(AbacusMode::Meeting);
         assert_eq!(s.panel_tab, PanelTab::Quant);
     }
 
     #[test]
     fn set_mode_demotes_orphan_tab_to_timeline() {
         // Tasks 在 Clarify 不合法 → 切到 Clarify 应被兜底回 Timeline
-        let mut s = AppState::new(AbacusMode::Team);
+        let mut s = AppState::new(AbacusMode::Meeting);
         s.panel_tab = PanelTab::Tasks;
         s.set_mode(AbacusMode::Clarify);
         assert_eq!(s.panel_tab, PanelTab::Timeline,
