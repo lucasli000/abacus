@@ -1309,15 +1309,27 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
 
         // V32 · Slash 自动补全：用户在输入栏首位敲 `/` 起头的命令时自动弹候选
         //
-        // 触发条件：
-        //   1. input 以 `/` 起头（必要前置 — 避免正文 "abc/def" 误触发）
-        //   2. 光标在末尾（避免用户在已有文本中间插入字符时打扰）
-        //   3. 已有任意字符（input.len() ≥ 1，由 starts_with 保证）
-        //
-        // 行为：trigger_completion 内部探测候选，有则切到 Completing 状态弹出弹窗；
-        // 无候选则保持 Typing 状态不打扰用户。后续每次字符输入会进 Completing 分支
-        // （line 1066）继续按 prefix 过滤，与原 Tab 触发链路自然衔接。
+        // 特殊路径：Picker 命令直接执行，跳过补全弹窗中间步骤
+        // - /model / /m → 直接打开模型选择器（用户不需要再按一次 Enter）
+        // - /theme       → 直接打开主题选择器
+        // - /thinking /think → 直接打开思考深度选择器
+        // 以上命令输入完成后即可开起 picker，无需经过补全候选列表确认。
         if state.input.starts_with('/') && state.cursor_pos == state.input.len() {
+            let trimmed = state.input.trim().to_string(); // to_string() 释放借用，避免后续可变借用冲突
+            let is_direct_picker = matches!(trimmed.as_str(),
+                "/model" | "/m" | "/theme" | "/thinking" | "/think"
+            );
+            if is_direct_picker {
+                // 直接执行，跳过补全弹窗
+                if handle_slash_command(state, &trimmed) {
+                    state.input.clear();
+                    state.cursor_pos = 0;
+                    state.cursor_line = 0;
+                    state.cursor_col = 0;
+                    state.input_state = InputState::Ready;
+                }
+                return;
+            }
             let _ = trigger_completion(state);
         }
     }

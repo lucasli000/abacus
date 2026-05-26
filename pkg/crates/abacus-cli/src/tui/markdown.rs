@@ -83,11 +83,12 @@ struct MdRenderer<'a> {
     // ── 表格状态 ────────────────────────────────────────────────
     in_table: bool,
     /// 所有已完成的行（索引 0 = 表头行）
-    table_rows: Vec<Vec<String>>,
+    /// 每个 cell 存储 Vec<StyledSpan> 保留 inline 格式（粗体/斜体/行内代码等）
+    table_rows: Vec<Vec<Vec<StyledSpan>>>,
     /// 当前正在构建的行（逐格填充）
-    current_table_row: Vec<String>,
-    /// 当前单元格文本缓冲
-    current_cell_buf: String,
+    current_table_row: Vec<Vec<StyledSpan>>,
+    /// 当前单元格的 styled span 缓冲（替代旧 String，保留 inline 格式）
+    current_cell_spans: Vec<StyledSpan>,
     /// T2: 表格列对齐方式（pulldown-cmark Tag::Table 自带）
     /// 生命周期：Tag::Table 开始时设置，TagEnd::Table 后清空
     /// 引用关系：render_table() 用于单元格左/居中/右对齐
@@ -115,7 +116,7 @@ impl<'a> MdRenderer<'a> {
             in_table: false,
             table_rows: Vec::new(),
             current_table_row: Vec::new(),
-            current_cell_buf: String::new(),
+            current_cell_spans: Vec::new(),
             table_alignments: Vec::new(),
         }
     }
@@ -134,7 +135,14 @@ impl<'a> MdRenderer<'a> {
                 // HardBreak（两个空格+换行 或 \）→ 真实换行
                 // 旧行为两者都换行，导致段内文本被碎裂成多行
                 Event::SoftBreak => {
-                    if self.in_code_block {
+                    if self.in_table {
+                        // 表内换行 → 空格（同一 cell 继续）
+                        let style = self.compute_text_style();
+                        self.current_cell_spans.push(StyledSpan {
+                            text: " ".to_string(),
+                            style,
+                        });
+                    } else if self.in_code_block {
                         self.flush_line(LineType::Normal);
                     } else {
                         self.current_spans.push(StyledSpan {
@@ -143,7 +151,18 @@ impl<'a> MdRenderer<'a> {
                         });
                     }
                 }
-                Event::HardBreak => self.flush_line(LineType::Normal),
+                Event::HardBreak => {
+                    if self.in_table {
+                        // 表内硬换行 → 空格（cell 内不支持多行，折成空格）
+                        let style = self.compute_text_style();
+                        self.current_cell_spans.push(StyledSpan {
+                            text: " ".to_string(),
+                            style,
+                        });
+                    } else {
+                        self.flush_line(LineType::Normal);
+                    }
+                }
                 Event::Rule => {
                     self.flush_line(LineType::Normal);
                     self.current_spans.push(StyledSpan {
@@ -259,7 +278,7 @@ impl<'a> MdRenderer<'a> {
                 self.current_table_row = Vec::new();
             }
             Tag::TableCell => {
-                self.current_cell_buf = String::new();
+                self.current_cell_spans = Vec::new();
             }
             _ => {}
         }
@@ -346,7 +365,7 @@ impl<'a> MdRenderer<'a> {
             }
             // ── 表格结束事件 ────────────────────────────────────────────
             TagEnd::TableCell => {
-                self.current_table_row.push(std::mem::take(&mut self.current_cell_buf));
+                self.current_table_row.push(std::mem::take(&mut self.current_cell_spans));
             }
             TagEnd::TableRow => {
                 if !self.current_table_row.is_empty() {
@@ -364,10 +383,16 @@ impl<'a> MdRenderer<'a> {
     }
 
     fn handle_text(&mut self, text: &str) {
-        // 表格单元格内容：缓冲到 current_cell_buf，等整行完成后统一排版
+        // 表格单元格内容：缓冲 styled spans，保留 inline 格式（粗体/斜体/代码等）
         if self.in_table {
-            // 表格 cell 也要过滤控制序列（LLM 可能在 cell 里输出 ANSI 码）
-            self.current_cell_buf.push_str(&strip_ansi(text));
+            let style = self.compute_text_style();
+            let sanitized = strip_ansi(text);
+            if !sanitized.is_empty() {
+                self.current_cell_spans.push(StyledSpan {
+                    text: sanitized.into_owned(),
+                    style,
+                });
+            }
             return;
         }
 
@@ -464,109 +489,170 @@ impl<'a> MdRenderer<'a> {
     }
 
     fn handle_inline_code(&mut self, code: &str) {
-        // F2：去掉源码反引号；gold + DIM 样式仍提供视觉区分
-        self.current_spans.push(StyledSpan {
+        let code_span = StyledSpan {
             text: code.to_string(),
             style: self.theme.text_style(TextRole::InlineCode),
-        });
+        };
+        if self.in_table {
+            self.current_cell_spans.push(code_span);
+        } else {
+            // F2：去掉源码反引号；gold + DIM 样式仍提供视觉区分
+            self.current_spans.push(code_span);
+        }
     }
 
-    /// 表格渲染：收集完所有行后一次性绘制 box-drawing 边框
+    /// 表格渲染：收集完所有行后一次性绘制 box-drawing 边框。
     ///
     /// 引用关系：由 handle_end(TagEnd::Table) 调用
-    /// 第 0 行为表头（accent + BOLD），其余行为数据行（text 色）。
-    /// 列宽根据所有行内容的最大字符数动态计算（最小 3）。
+    /// 第 0 行为表头（accent + BOLD），后续行交替斑马色。
+    /// 列宽根据所有 cell 的 styled spans 显示宽度动态计算（最小 3）。
+    /// Cell 超宽时从右侧截断 styled spans，保留省略号。
     fn render_table(&mut self) {
         if self.table_rows.is_empty() { return; }
         let col_count = self.table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
         if col_count == 0 { return; }
 
-        // 动态列宽（至少 3 列）——按显示列宽（CJK 全角=2 列）
-        // 统一走 tui::util::display_width，避免再次落入 chars().count() 陷阱
-        use crate::tui::util::{display_width, pad_to_width, truncate_to_width};
+        use crate::tui::util::{display_width, truncate_to_width};
+
+        // ── 动态列宽（按 display_width 计算）──
         let mut col_widths: Vec<usize> = vec![3; col_count];
         for row in &self.table_rows {
-            for (i, cell) in row.iter().enumerate() {
-                col_widths[i] = col_widths[i].max(display_width(cell.as_str()));
+            for (i, cell_spans) in row.iter().enumerate() {
+                let cell_w: usize = cell_spans.iter()
+                    .map(|s| display_width(&s.text))
+                    .sum();
+                col_widths[i] = col_widths[i].max(cell_w);
             }
         }
 
-        // V27: 列宽收缩 — 总宽超过 max_width 时按比例缩小
-        // 边框开销：每列 "│ ... " (1 + 1 + w + 1) + 末尾 │ = col_count*3 + 1
+        // ── V27: 列宽收缩 — 总宽超过 max_width 时 fair-share 分配 ──
+        // 边框开销：│ + sp + content(w) + sp = w+2 per cell，+│ at end → col_count*3+1
         let overhead = col_count.saturating_mul(3).saturating_add(1);
         let total_content: usize = col_widths.iter().sum();
         if total_content + overhead > self.max_width && self.max_width > overhead {
             let avail = self.max_width.saturating_sub(overhead);
-            // 按比例缩放（保底每列 3）
-            let mut scaled: Vec<usize> = col_widths
-                .iter()
-                .map(|w| {
-                    let v = (*w as u64 * avail as u64 / total_content.max(1) as u64) as usize;
-                    v.max(3)
-                })
+            // Fair-share: 每列先给 min(w, floor(avail/col_count))，剩余按比例分
+            let baseline = avail.checked_div(col_count).unwrap_or(0).max(3);
+            let mut allocated: Vec<usize> = col_widths.iter()
+                .map(|&w| w.min(baseline))
                 .collect();
-            // T3: .max(3) 可能使 sum > avail（小列被提升），从最宽列逐一裁剪回 avail
-            let mut sum: usize = scaled.iter().sum();
-            while sum > avail {
-                let max_idx = scaled.iter().enumerate()
-                    .max_by_key(|(_, &w)| w)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                if scaled[max_idx] <= 3 { break; } // 无法再缩小
-                scaled[max_idx] -= 1;
-                sum -= 1;
+            let mut used: usize = allocated.iter().sum();
+            // 剩余空间按原始比例分配给还有富余的列
+            let mut surplus: Vec<usize> = col_widths.iter().enumerate()
+                .map(|(i, &w)| if w > allocated[i] { w - allocated[i] } else { 0 })
+                .collect();
+            let total_surplus: usize = surplus.iter().sum();
+            if total_surplus > 0 && used < avail {
+                let extra = avail - used;
+                for (i, s) in surplus.iter_mut().enumerate() {
+                    if *s == 0 { continue; }
+                    let add = (*s as u64 * extra as u64 / total_surplus as u64) as usize;
+                    allocated[i] += add;
+                }
+                // 微调溢出（整数除法可能多 1~2）
+                let mut sum: usize = allocated.iter().sum();
+                while sum > avail {
+                    let max_idx = allocated.iter().enumerate()
+                        .filter(|(i, _)| allocated[*i] > 3)
+                        .max_by_key(|(_, &w)| w)
+                        .map(|(i, _)| i);
+                    if let Some(idx) = max_idx {
+                        allocated[idx] -= 1;
+                        sum -= 1;
+                    } else { break; }
+                }
             }
-            col_widths = scaled;
+            col_widths = allocated;
         }
 
         let border_style = Style::default().fg(self.theme.border);
         let header_style = self.theme.text_style(TextRole::H2);
         let cell_style   = self.theme.text_style(TextRole::Body);
+        let alt_style    = cell_style.add_modifier(Modifier::DIM); // 斑马条纹
 
         // ┌──────┬──────┐
         let top = table_border_row(&col_widths, '┌', '┬', '┐', '─');
         self.current_spans.push(StyledSpan { text: top, style: border_style });
         self.flush_line(LineType::Table);
 
-        // 借走 table_rows 以避免迭代时 &self 借用阻塞 self.flush_line(&mut self)
+        // 借走 table_rows 以避免迭代时 &self 借用阻塞 self.flush_line
         let rows = std::mem::take(&mut self.table_rows);
         let total_rows = rows.len();
         for (row_idx, row) in rows.iter().enumerate() {
-            // V29.11 修复: │ 竖线用 border_style, cell 内容用 header/cell style
-            // 之前整行一个 span → │ 也染了文本色, 视觉上左右边框"有颜色"
-            let text_style = if row_idx == 0 { header_style } else { cell_style };
-            self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
-        for (i, w) in col_widths.iter().enumerate() {
-            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            // V27: cell 超过列宽 → 截断 + 省略号
-            let cell_owned = if display_width(cell) > *w {
-                let target = w.saturating_sub(1).max(1);
-                let mut t = truncate_to_width(cell, target);
-                t.push('…');
-                t
+            let row_style = if row_idx == 0 {
+                header_style
+            } else if row_idx % 2 == 0 {
+                cell_style
             } else {
-                cell.to_string()
+                alt_style
             };
-            // T2: 按列对齐方式填充单元格（左对齐是默认/未指定）
-            let align = self.table_alignments.get(i).copied().unwrap_or(Alignment::None);
-            let padded = match align {
-                Alignment::Right => {
-                    let cw = display_width(&cell_owned);
-                    let pad = w.saturating_sub(cw);
-                    format!(" {}{} ", " ".repeat(pad), cell_owned)
-                }
-                Alignment::Center => {
-                    let cw = display_width(&cell_owned);
-                    let total_pad = w.saturating_sub(cw);
-                    let lpad = total_pad / 2;
-                    let rpad = total_pad - lpad;
-                    format!(" {}{}{} ", " ".repeat(lpad), cell_owned, " ".repeat(rpad))
-                }
-                _ => format!(" {} ", pad_to_width(&cell_owned, *w)), // Left / None
-            };
-            self.current_spans.push(StyledSpan { text: padded, style: text_style });
+
+            // │ cell0 │ cell1 │ ...
             self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
-        }
+
+            for (i, w) in col_widths.iter().enumerate() {
+                let cell_spans: &[StyledSpan] = row.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                let cell_w: usize = cell_spans.iter()
+                    .map(|s| display_width(&s.text))
+                    .sum();
+                let align = self.table_alignments.get(i).copied().unwrap_or(Alignment::None);
+
+                // 左间距（border 色）
+                self.current_spans.push(StyledSpan { text: " ".to_string(), style: border_style });
+
+                if cell_w > *w {
+                    // ── 截断：从右往左裁切 spans ──
+                    let limit = w.saturating_sub(1); // 留 1 列给 …
+                    let mut remaining = limit;
+                    let mut truncated = Vec::new();
+                    for span in cell_spans {
+                        let sw = display_width(&span.text);
+                        if sw <= remaining {
+                            truncated.push(StyledSpan {
+                                text: span.text.clone(),
+                                style: span.style,
+                            });
+                            remaining -= sw;
+                        } else if remaining > 0 {
+                            let t = truncate_to_width(&span.text, remaining);
+                            truncated.push(StyledSpan {
+                                text: format!("{}…", t),
+                                style: span.style,
+                            });
+                            remaining = 0;
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    for s in &truncated {
+                        self.current_spans.push(s.clone());
+                    }
+                } else {
+                    // ── 对齐填充 ──
+                    let pad = w - cell_w;
+                    let (lpad, rpad) = match align {
+                        Alignment::Right  => (pad, 0),
+                        Alignment::Center => (pad / 2, pad - pad / 2),
+                        _                 => (0, pad), // Left / None
+                    };
+                    for _ in 0..lpad {
+                        self.current_spans.push(StyledSpan { text: " ".to_string(), style: row_style });
+                    }
+                    for s in cell_spans {
+                        self.current_spans.push(s.clone());
+                    }
+                    for _ in 0..rpad {
+                        self.current_spans.push(StyledSpan { text: " ".to_string(), style: row_style });
+                    }
+                }
+
+                // 右间距（border 色）
+                self.current_spans.push(StyledSpan { text: " ".to_string(), style: border_style });
+                // 列分隔线
+                self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
+            }
+
             self.flush_line(LineType::Table);
 
             // ├──────┼──────┤ 表头分隔线
@@ -818,5 +904,99 @@ mod st5_streaming_tests {
         let (code, fence, _) = count_line_types(&lines);
         assert!(fence >= 1, "未闭合 fence 应仍输出至少 1 个 CodeFence 标记");
         assert!(code >= 1, "代码内容应被识别为 Code 行");
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    //! T6: 表格渲染回归测试
+    //!
+    //! 覆盖：基础表格、inline 格式保留、CJK 对齐、列宽收缩、斑马条纹
+
+    use super::*;
+
+    /// 提取所有 Table 行类型的 span 文本用于断言
+    fn extract_table_texts(lines: &[StyledLine]) -> Vec<String> {
+        lines.iter()
+            .filter(|l| l.line_type == LineType::Table)
+            .map(|l| l.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn basic_table_structure() {
+        let theme = Theme::init();
+        let md = "| A | B |\n| - | - |\n| 1 | 2 |\n";
+        let lines = render_markdown(md, &theme, false);
+        let texts = extract_table_texts(&lines);
+        // 应有：┌ top, │ header, ├ sep, │ data, └ bottom
+        assert!(texts.len() >= 4, "表格至少 4 行（top/header/sep/data/bottom）");
+        assert!(texts[0].contains('┌'), "第一行是上边框");
+        assert!(texts[1].contains("│ A │"), "表头含 A");
+        assert!(texts[1].contains("│ B │"), "表头含 B");
+        assert!(texts[texts.len() - 1].contains('└'), "最后一行是下边框");
+    }
+
+    #[test]
+    fn inline_format_preserved_in_cell() {
+        // 核心断言：**bold** 和 `code` 在表内应有样式区分
+        let theme = Theme::init();
+        let md = "| X |\n| - |\n| **bold** `code` |\n";
+        let lines = render_markdown(md, &theme, false);
+        // 找到数据行（第 3 行 Table 类型，前面是 top/header/sep）
+        let table_lines: Vec<&StyledLine> = lines.iter()
+            .filter(|l| l.line_type == LineType::Table)
+            .collect();
+        assert!(table_lines.len() >= 4);
+        let data_line = table_lines[3]; // 0=top, 1=header, 2=sep, 3=data
+        // 数据行应包含不同样式的 span
+        assert!(data_line.spans.len() > 3,
+            "应包含多种 span（│ + sp + bold + normal + code + sp + │），实际 {} spans",
+            data_line.spans.len());
+    }
+
+    #[test]
+    fn cjk_cell_width_accounted() {
+        let theme = Theme::init();
+        let md = "| Col |\n| --- |\n| 中文 |\n";
+        let lines = render_markdown(md, &theme, false);
+        let texts = extract_table_texts(&lines);
+        // "中文" 显示宽 4，列宽应 ≥ 4
+        let data_row = &texts[3]; // 0=top, 1=header, 2=sep, 3=data
+        // 验证没有截断（列宽够大）
+        assert!(data_row.contains("中文"), "CJK 文本不应被截断: {}", data_row);
+    }
+
+    #[test]
+    fn narrow_table_scales_columns() {
+        let theme = Theme::init();
+        // 6 列，总宽 > 40，给 max_width=40
+        let md = "| AAAA | BBBB | CCCC | DDDD | EEEE | FFFF |\n| ---- | ---- | ---- | ---- | ---- | ---- |\n| 1 | 2 | 3 | 4 | 5 | 6 |\n";
+        let lines = render_markdown_bounded(md, &theme, false, 40);
+        let texts = extract_table_texts(&lines);
+        let header = &texts[1];
+        // 总宽度应 ≤ 40（允许一些 border 开销后的容忍度）
+        let hw = crate::tui::util::display_width(header);
+        assert!(hw <= 42, "header 总宽应 ≤ 42（max_width=40+容忍），实际 {}", hw);
+    }
+
+    #[test]
+    fn single_row_table_no_separator() {
+        let theme = Theme::init();
+        let md = "| Key | Value |\n| --- | ----- |\n";
+        let lines = render_markdown(md, &theme, false);
+        let texts = extract_table_texts(&lines);
+        // 应只有 top / header / bottom，无 ├ 分隔线（单行不需要）
+        assert!(!texts.iter().any(|t| t.contains('├')),
+            "单行表格不应有表头分隔线");
+    }
+
+    #[test]
+    fn empty_table_no_crash() {
+        let theme = Theme::init();
+        let md = "";
+        let lines = render_markdown(md, &theme, false);
+        let table_count = lines.iter().filter(|l| l.line_type == LineType::Table).count();
+        assert_eq!(table_count, 0, "空文本不产生表格行");
     }
 }

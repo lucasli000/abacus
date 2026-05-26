@@ -206,7 +206,7 @@ impl MeetingEngineAdapter {
                     needs_clarify: false,
                 })
             }
-            RoutingDecision::NoMatch { input: user_input, suggestion } => {
+            RoutingDecision::NoMatch { input: _user_input, suggestion } => {
                 // 需求不清晰/无匹配专家 → 返回澄清提示，附带模式切换建议
                 // 调用方可据此切换到 Clarify 模式
                 let clarify_output = format!(

@@ -1533,7 +1533,7 @@ impl CoreLoop {
         // memory_palace 在 with_memory() 才注入；register_executors 此时调用一次绑 store；
         // 若后续启用 palace，可重新注册覆盖 executor 槽位）
         let result_store: crate::tool::builtin::result::ResultStore =
-            Arc::new(RwLock::new(HashMap::new()));
+            Arc::new(RwLock::new(crate::tool::builtin::result::BoundedResultStore::new()));
         crate::tool::builtin::result::register_executors(&registry, result_store.clone(), None).await;
 
         // W2 (Task #100)：按 config 决定是否实例化 dedup 池
@@ -3277,7 +3277,7 @@ impl CoreLoop {
 
             // 能力感知
             let max_turns = self.config.max_turns_per_request;
-            let max_tool_calls = self.config.max_tool_calls_per_turn;
+            let _max_tool_calls = self.config.max_tool_calls_per_turn;
             let max_tokens = self.config.default_max_tokens;
             let escalations_left = self.config.max_escalations;
 

@@ -1834,11 +1834,16 @@ impl ContextManager {
 
         *messages = new_messages;
 
-        self.tiers
-            .compressed_messages
-            .write()
-            .await
-            .extend(compressed_records.clone());
+        {
+            let mut v = self.tiers.compressed_messages.write().await;
+            v.extend(compressed_records.clone());
+            // FIFO 上限：防止超长 session 无限积累摘要记录（每条 ~200B，500 条 ≈ 100KB）
+            const MAX_COMPRESSED_MESSAGES: usize = 500;
+            if v.len() > MAX_COMPRESSED_MESSAGES {
+                let overflow = v.len() - MAX_COMPRESSED_MESSAGES;
+                v.drain(0..overflow);
+            }
+        }
 
         // Phase Z2：把 archive_writes 写入 message_archive（BoundedFifo LRU evict）
         if !archive_writes.is_empty() {

@@ -525,8 +525,12 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("core.default_model".into(), ConfigValue::String("deepseek-v4-flash".into()));
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
     defaults.insert("core.max_tokens".into(), ConfigValue::Number(64000.0));
-    defaults.insert("core.thinking_enabled".into(), ConfigValue::Bool(false));   // [DEPRECATED] Phase 5 移除
-    defaults.insert("core.thinking_effort".into(), ConfigValue::String("medium".into())); // [DEPRECATED] Phase 5 移除
+    // [DEPRECATED] 旧版思考配置 key，保留默认值供兼容层 get_bool/get_str 调用使用。
+    // 迁移路径：用户若在配置文件中显式设置这两个 key，get_thinking_intent() 会自动
+    // 转译为新 key 语义并打 warning 提示迁移到 core.thinking。
+    // 当确认不再有用户使用旧 key 时可安全删除这两行及 get_thinking_intent() 中的兼容分支。
+    defaults.insert("core.thinking_enabled".into(), ConfigValue::Bool(false));
+    defaults.insert("core.thinking_effort".into(), ConfigValue::String("medium".into()));
     // Phase 3 新 key（PRIMARY）：单字段表达 thinking 意图
     //   off | adaptive | minimal | low | medium | high | max | xhigh | <整数 budget>
     defaults.insert("core.thinking".into(), ConfigValue::String("off".into()));

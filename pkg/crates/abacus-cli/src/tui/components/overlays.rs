@@ -476,16 +476,16 @@ pub fn render_overlays(
 ///           可视化选择器，箭头选 + Enter 确认
 pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area: Rect) {
     use crate::tui::state::PickerKind;
-    use crate::tui::util::display_width;
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
     let Some(p) = state.picker.as_ref() else { return; };
     if p.items.is_empty() { return; }
 
+    // 标题带数量，让用户知道列表长度
     let title = match p.kind {
-        PickerKind::Model    => t("overlay.model_picker"),
-        PickerKind::Theme    => t("overlay.theme_picker"),
-        PickerKind::Thinking => t("overlay.thinking_picker"),
+        PickerKind::Model    => format!("{} ({})", t("overlay.model_picker"), p.items.len()),
+        PickerKind::Theme    => format!("{} ({})", t("overlay.theme_picker"), p.items.len()),
+        PickerKind::Thinking => t("overlay.thinking_picker").to_string(),
     };
     let frame = f.area();
 

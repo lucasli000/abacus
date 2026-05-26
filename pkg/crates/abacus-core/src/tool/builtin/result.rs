@@ -36,7 +36,73 @@ use crate::tool::{ExecutionContext, ToolExecutor, ToolRegistry};
 /// 第二字段 source_tool_id 让 result.expand 反查源工具 → 反馈到 palace 统计
 /// "expanded" 比率，让 pipeline 决定该 tool 下次截断阈值是否翻倍。
 pub type ResultStoreEntry = (Value, String);
-pub type ResultStore = Arc<RwLock<HashMap<String, ResultStoreEntry>>>;
+
+/// result_store 单 session 最大条目数。
+/// 每条存储完整大工具输出（≥64KB），200 条约 ≤ 12MB 峰值。
+const MAX_RESULT_STORE_ENTRIES: usize = 200;
+
+/// 容量有界的 result store：HashMap 存数据 + VecDeque 追踪插入顺序实现 FIFO eviction。
+///
+/// ## 生命周期
+/// - 创建：CoreLoop::new() 初始化空 store
+/// - 写入：pipeline 在工具输出 > RESULT_TRUNCATE_THRESHOLD 时存入
+/// - 读取：result.expand 按 result_id 取回
+/// - 销毁：随 CoreLoop drop（不持久化）
+///
+/// ## 容量策略
+/// 超过 MAX_RESULT_STORE_ENTRIES 时 FIFO 淘汰最旧条目。
+/// 被淘汰 id 调用 result.expand 返回 "not found" 错误（错误文案已说明可能被 evicted）。
+pub struct BoundedResultStore {
+    map: HashMap<String, ResultStoreEntry>,
+    /// 插入顺序追踪（FIFO eviction 依赖此队列）
+    order: std::collections::VecDeque<String>,
+}
+
+impl BoundedResultStore {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// 插入条目。同 id 重复写入幂等更新值但不改顺序；新 id 超容则 FIFO 淘汰最旧。
+    pub fn insert(&mut self, key: String, value: ResultStoreEntry) {
+        if self.map.contains_key(&key) {
+            self.map.insert(key, value);
+            return;
+        }
+        if self.map.len() >= MAX_RESULT_STORE_ENTRIES {
+            if let Some(old_key) = self.order.pop_front() {
+                self.map.remove(&old_key);
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, value);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&ResultStoreEntry> {
+        self.map.get(key)
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &ResultStoreEntry> {
+        self.map.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl Default for BoundedResultStore {
+    fn default() -> Self { Self::new() }
+}
+
+pub type ResultStore = Arc<RwLock<BoundedResultStore>>;
 
 /// 大结果阈值（字节数）。超过则截断 + 存 store。
 /// V38: 从 8KB 提升到 64KB——8KB 对文件读取场景过小，
@@ -233,7 +299,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_returns_stored_value() {
-        let store: ResultStore = Arc::new(RwLock::new(HashMap::new()));
+        let store: ResultStore = Arc::new(RwLock::new(BoundedResultStore::new()));
         store.write().await.insert("rs_test".into(), (json!({"big": "content"}), "filengine_fs_read".to_string()));
         let exec = ResultExpandExecutor::new(store);
         let ctx = crate::tool::ExecutionContext::noop("test");
@@ -248,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_executor_errors_on_missing_id() {
-        let store: ResultStore = Arc::new(RwLock::new(HashMap::new()));
+        let store: ResultStore = Arc::new(RwLock::new(BoundedResultStore::new()));
         let exec = ResultExpandExecutor::new(store);
         let ctx = crate::tool::ExecutionContext::noop("test");
         let res = exec.execute(
@@ -262,7 +328,7 @@ mod tests {
     /// Phase γ-Palace-D：expand 时反馈到 palace
     #[tokio::test]
     async fn test_executor_records_to_palace_on_expand() {
-        let store: ResultStore = Arc::new(RwLock::new(HashMap::new()));
+        let store: ResultStore = Arc::new(RwLock::new(BoundedResultStore::new()));
         store.write().await.insert("rs_x".into(), (json!({}), "filengine_fs_read".to_string()));
         let palace = Arc::new(RwLock::new(DualPalaceMemory::new()));
         let exec = ResultExpandExecutor::new(store).with_palace(palace.clone());

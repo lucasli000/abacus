@@ -4,13 +4,16 @@
 //!
 //! 管理模式: 集中式 AppState，所有 UI 组件共享引用。
 //!
-//! ## ⚠ 代码审查 @2025-01-23 (中等)
-//! AppState 使用 `RefCell` 进行内部可变性。在 crossterm 单线程事件循环中安全，
-//! 但 run.rs 中存在 tokio 异步 engine 回调路径（engine_rx.recv() + 事件处理）。
-//! 需要审查所有 `borrow_mut()` 调用点是否跨越 `.await` 边界——
-//! 若 engine 回调中持有 RefMut 跨越 await，将 panic。
-//! 建议：对所有 borrow_mut 调用点加 `debug_assert!(!RefCell::borrow_mut())` 守卫，
-//! 或迁移到 `std::cell::Cell` / 拆分 async-safe 字段到独立 Mutex。
+//! ## RefCell 安全性说明 @2025-01-23（已验证）
+//! AppState 使用 `RefCell` 进行内部可变性，在 crossterm 单线程事件循环中安全。
+//!
+//! **已审查的 borrow_mut 调用点（run.rs）：**
+//! - `state.streaming_md.borrow_mut()`（run.rs ~782）：在有界 `{ }` scope 内，
+//!   scope 结束即释放 RefMut，scope 内无任何 `.await`，**安全**。
+//!
+//! **维护规则：** 新增 `borrow_mut()` 调用时，必须确保持有 RefMut 的 scope 内
+//! 不含任何 `.await` 表达式。如需跨越 await 边界，改用 `Mutex<T>` 或在 await
+//! 前 `drop(refmut_guard)` 显式释放。
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};

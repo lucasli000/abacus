@@ -1060,7 +1060,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             });
                             let is_readonly = is_kb_or_memory
                                 || (has_readonly_verb && !tool_lower.contains("write") && !tool_lower.contains("delete") && !tool_lower.contains("remove"));
-                            let is_destructive_cmd = if tool_lower.contains("bash") {
+                            let _is_destructive_cmd = if tool_lower.contains("bash") {
                                 // 检查 bash 命令参数是否含破坏性关键词
                                 let params_str = req.params_preview.as_deref().unwrap_or("");
                                 let params_lower = params_str.to_lowercase();

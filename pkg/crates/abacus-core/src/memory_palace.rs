@@ -185,6 +185,8 @@ pub struct KnowledgePalace {
 }
 
 const MAX_KNOWLEDGE_ENTRIES: usize = 5000;
+/// MemoryBridge 关系链容量上限（FIFO 淘汰最旧关系）
+const MAX_RELATIONS: usize = 30_000;
 
 impl KnowledgePalace {
     pub fn new() -> Self {
@@ -437,17 +439,19 @@ pub struct MemoryRelation {
 
 /// 关系链
 pub struct MemoryBridge {
-    relations: RwLock<Vec<MemoryRelation>>,
+    relations: RwLock<std::collections::VecDeque<MemoryRelation>>,
 }
 
 impl MemoryBridge {
     pub fn new() -> Self {
         Self {
-            relations: RwLock::new(Vec::new()),
+            relations: RwLock::new(std::collections::VecDeque::new()),
         }
     }
 
     /// 添加关系（自动去重：相同 from + to + type 不重复添加）
+    ///
+    /// 容量超过 MAX_RELATIONS 时 FIFO 淘汰最旧关系，防止无限增长。
     pub async fn add_relation(&self, relation: MemoryRelation) {
         let mut relations = self.relations.write().await;
         let exists = relations.iter().any(|r| {
@@ -455,7 +459,10 @@ impl MemoryBridge {
                 && r.relation_type == relation.relation_type
         });
         if !exists {
-            relations.push(relation);
+            if relations.len() >= MAX_RELATIONS {
+                relations.pop_front(); // FIFO 淘汰最旧关系
+            }
+            relations.push_back(relation);
         }
     }
 
@@ -594,8 +601,21 @@ impl DualPalaceMemory {
         self.behavior.record_interaction(pattern, tags).await;
     }
 
+    /// 单条知识内容最大字节数（防止单条暴涨应对最坏 5000×unbounded 场景）
+    const MAX_CONTENT_BYTES: usize = 8_192;
+
     /// Store knowledge entry with dedup + cross-domain linking + write-through
-    pub async fn store_knowledge(&self, entry: KnowledgeEntry) -> bool {
+    pub async fn store_knowledge(&self, mut entry: KnowledgeEntry) -> bool {
+        // 超长内容截断（UTF-8 安全边界）
+        if entry.content.len() > Self::MAX_CONTENT_BYTES {
+            let cut = entry.content
+                .char_indices()
+                .take_while(|(i, _)| *i < Self::MAX_CONTENT_BYTES)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(Self::MAX_CONTENT_BYTES);
+            entry.content.truncate(cut);
+        }
         let quota = self.write_quota.load(std::sync::atomic::Ordering::Relaxed);
         if quota >= Self::MAX_WRITES_PER_SESSION {
             tracing::debug!("write_quota exceeded, skipping knowledge store");
@@ -665,16 +685,23 @@ impl DualPalaceMemory {
             }
         };
 
-        let entries = self.knowledge.entries.read().await;
-        let mut scored: Vec<(KnowledgeEntry, f64)> = Vec::new();
+        // 快照必要字段后立即释放读锁，避免 async embed 期间长持锁阻塞并发写入
+        let entry_snapshots: Vec<(String, String, String)> = {
+            let entries = self.knowledge.entries.read().await;
+            entries.values()
+                .map(|e| (e.id.clone(), e.title.clone(), e.content.clone()))
+                .collect()
+        };
 
-        for entry in entries.values() {
-            // 对每个条目的 title + content 计算 embedding
-            let text = format!("{} {}", entry.title, entry.content);
+        let mut scored: Vec<(KnowledgeEntry, f64)> = Vec::new();
+        for (id, title, content) in entry_snapshots {
+            let text = format!("{} {}", title, content);
             if let Ok(entry_vec) = embedder.embed_text(&text).await {
                 let sim = cosine_similarity(&query_vec, &entry_vec);
                 if sim > 0.3 {
-                    scored.push((entry.clone(), sim));
+                    if let Some(entry) = self.knowledge.get(&id).await {
+                        scored.push((entry, sim));
+                    }
                 }
             }
         }
@@ -1097,7 +1124,9 @@ impl SqlitePalaceStore {
             let mut stmt = conn.prepare(
                 "SELECT id, title, content, domain, sm2_ease, sm2_interval_days,
                         sm2_repetitions, last_reviewed, next_review, tags
-                 FROM knowledge_entries"
+                 FROM knowledge_entries
+                 ORDER BY last_reviewed DESC
+                 LIMIT 5000"
             ).map_err(|e| e.to_string())?;
 
             let entries: Vec<KnowledgeEntry> = stmt.query_map([], |row| {
@@ -1132,7 +1161,9 @@ impl SqlitePalaceStore {
         {
             let mut stmt = conn.prepare(
                 "SELECT id, pattern, frequency, last_seen, confidence, tags, created_at
-                 FROM behavior_memories"
+                 FROM behavior_memories
+                 ORDER BY last_seen DESC
+                 LIMIT 2000"
             ).map_err(|e| e.to_string())?;
 
             let memories: Vec<BehaviorMemory> = stmt.query_map([], |row| {
@@ -1163,7 +1194,10 @@ impl SqlitePalaceStore {
         // 加载 relations
         {
             let mut stmt = conn.prepare(
-                "SELECT from_id, to_id, relation_type, strength FROM memory_relations"
+                "SELECT from_id, to_id, relation_type, strength
+                 FROM memory_relations
+                 ORDER BY id DESC
+                 LIMIT 20000"
             ).map_err(|e| e.to_string())?;
 
             let rels: Vec<MemoryRelation> = stmt.query_map([], |row| {
@@ -1199,7 +1233,7 @@ impl SqlitePalaceStore {
 
             let mut bridge = palace.bridge.relations.write().await;
             for r in rels {
-                bridge.push(r);
+                bridge.push_back(r);
             }
         }
 
