@@ -2466,27 +2466,22 @@ impl AppState {
         });
     }
 
-    /// 命令信息展示：写入右侧 info_panel，不污染对话消息流。
-    ///
-    /// 设计变更（V13→当前）：
-    ///   V13 曾改为走聊天区，理由是"用户期望在对话上下文看到"。
-    ///   现在改回 info_panel：命令输出（/help/status/tokens/models 等）是工具信息，
-    ///   不应混入 AI 对话历史——弹窗/panel 是更合适的展示位置。
-    ///   用户可按 Ctrl+I 切换 panel 可见性，或直接在右侧 panel 查看。
-    ///
-    /// 引用关系：cmd_status / cmd_tokens / cmd_debug / cmd_help / cmd_models 等
-    /// 生命周期：写入 info_panel_text（每次覆盖）；panel 保留直到下次 show_info 或 /clear
-    /// 保护：streaming 中改为 toast 提示，等完成后用户可再次执行命令
+    /// 命令信息展示：走聊天区（Session message），与 AI 回复风格一致。
+    /// 引用关系：cmd_status / cmd_tokens / cmd_debug / cmd_help 等
+    /// 保护：streaming 中延迟为 toast，避免打断流式渲染
     pub fn show_info(&mut self, text: impl Into<String>) {
         let s = text.into();
         if self.is_streaming {
-            // streaming 中不写 panel（避免抢夺焦点），仅 toast 提示
-            self.add_toast("命令已收到，流式结束后执行可查看详情", std::time::Duration::from_secs(2));
+            self.add_toast("命令已收到，请等流式结束后查看", std::time::Duration::from_secs(2));
+            self.info_panel_text = s;
+            self.info_panel_auto_open = true;
             return;
         }
-        // 写入 info_panel 并自动展开
-        self.info_panel_text = s;
-        self.info_panel_auto_open = true;
+        let ts = chrono::Local::now().format("%H:%M").to_string();
+        self.add_message(Message::new_session(
+            vec![MsgContent::Stream(s)],
+            &ts,
+        ));
         self.rendered_lines_dirty.set(true);
     }
 
