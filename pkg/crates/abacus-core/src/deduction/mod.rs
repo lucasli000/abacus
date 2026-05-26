@@ -701,7 +701,7 @@ mod tests {
 
         for i in 0..8 {
             let mut stats = HashMap::new();
-            stats.insert(ToolId("filengine_web_fetch".into()), make_stats(0.9, 0.4, 300.0, 10));
+            stats.insert(ToolId("web_fetch".into()), make_stats(0.9, 0.4, 300.0, 10));
             engine.collect_post_turn(
                 i, "s1", &stats, 50.0, 128_000, 64_000,
                 false, 6, 14, 0x1234, false,

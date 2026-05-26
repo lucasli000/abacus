@@ -489,18 +489,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     };
     let frame = f.area();
 
-    // 计算尺寸：列宽取最长 label，也考虑分组标题
-    let widest: usize = p.labels.iter().map(|s| display_width(s.as_str())).max().unwrap_or(20);
-    let widest = if let Some(ref groups) = p.groups {
-        let g_widest = groups.iter().map(|(name, _)| display_width(name) + 4).max().unwrap_or(0);
-        widest.max(g_widest)
-    } else { widest };
-    // 主题色块预览额外宽度（3色块 × 2字符 + 3间距 = 9）
-    let extra = if matches!(p.kind, PickerKind::Theme) { 9usize } else { 0 };
-    // Fix: widest 实际用于 popup_w 计算（之前只计算未使用）
-    // 前缀4 + 内容widest + extra + 边框2 + 内边距2 = widest+extra+8
-    let min_content_w = (widest + extra + 8) as u16;
-    let popup_w = min_content_w.max(input_area.width * 6 / 8).max(36).min(frame.width);
+    // 宽度：固定为输入框的 6/8，内容在此宽度内自动排版
+    // 下限 36，上限 frame.width
+    let popup_w = (input_area.width * 6 / 8).max(36).min(frame.width);
     let group_overhead = p.groups.as_ref().map(|g| g.len()).unwrap_or(0);
     let slider_overhead = if p.show_thinking_slider { 2 } else { 0 };
     let content_lines = p.items.len() + group_overhead + slider_overhead;

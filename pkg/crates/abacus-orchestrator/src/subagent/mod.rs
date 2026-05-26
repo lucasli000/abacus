@@ -835,7 +835,7 @@ mod tests {
         };
 
         assert!(boundary.is_tool_allowed(&ToolId("filengine_fs_read".into())));
-        assert!(!boundary.is_tool_allowed(&ToolId("filengine_web_search".into()))); // not in allowed
+        assert!(!boundary.is_tool_allowed(&ToolId("web_search".into()))); // not in allowed
         assert!(!boundary.is_tool_allowed(&ToolId("filengine_bash_exec".into()))); // explicitly forbidden
     }
 
@@ -848,7 +848,7 @@ mod tests {
         };
 
         assert!(boundary.is_tool_allowed(&ToolId("filengine_fs_read".into())));
-        assert!(boundary.is_tool_allowed(&ToolId("filengine_web_search".into())));
+        assert!(boundary.is_tool_allowed(&ToolId("web_search".into())));
         assert!(!boundary.is_tool_allowed(&ToolId("filengine_bash_exec".into()))); // still forbidden
     }
 

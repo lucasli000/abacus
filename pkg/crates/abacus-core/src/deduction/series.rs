@@ -480,7 +480,7 @@ mod tests {
                 opportunities: 10, invocations: 8, successes: 7, avg_latency_ms: 10.0,
             },
             ToolMetricPoint {
-                tool_id: ToolId("filengine_web_fetch".into()), turn_number: 1, session_id: "s1".into(),
+                tool_id: ToolId("web_fetch".into()), turn_number: 1, session_id: "s1".into(),
                 timestamp_ms: 1000, adoption_rate: 0.3, success_rate: 0.6, trend: -0.1,
                 composite_score: 0.4, visibility_tier: "B".into(),
                 opportunities: 10, invocations: 3, successes: 2, avg_latency_ms: 500.0,

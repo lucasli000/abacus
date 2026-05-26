@@ -583,9 +583,9 @@ mod tests {
             make_metric("filengine_fs_read", 1, 0.8, 0.9, 0.7),
             make_metric("filengine_fs_read", 2, 0.8, 0.9, 0.7),
             make_metric("filengine_fs_read", 3, 0.8, 0.9, 0.7),
-            make_metric("filengine_web_fetch", 1, 0.9, 0.5, 0.6),
-            make_metric("filengine_web_fetch", 2, 0.9, 0.4, 0.6),
-            make_metric("filengine_web_fetch", 3, 0.9, 0.5, 0.6),
+            make_metric("web_fetch", 1, 0.9, 0.5, 0.6),
+            make_metric("web_fetch", 2, 0.9, 0.4, 0.6),
+            make_metric("web_fetch", 3, 0.9, 0.5, 0.6),
         ];
         let patterns = extract_cross_session_patterns(&all);
         // Should detect systematic contamination (web.fetch adoption >> success)

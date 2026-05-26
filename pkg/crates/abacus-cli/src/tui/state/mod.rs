@@ -780,10 +780,12 @@ pub struct AppState {
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
     pub session_id: String,
     pub model_name: String,
-    /// 从 engine 动态拉取的可用模型列表（engine 连接后填充）
+    /// 从 engine 动态拉取的可用模型列表（首次打开 /model picker 时延迟拉取）
     /// 引用：open_picker_model 优先使用此列表，空时退回静态 MODEL_GROUPS
-    /// 生命周期：engine 连接 → 拉取 → 填充；/new 不清（模型列表不随会话变）
+    /// 生命周期：pending_model_fetch 触发 → 拉取 → 填充；/new 不清（模型列表不随会话变）
     pub available_models: Vec<String>,
+    /// 标记需要在下一次 interval tick 拉取模型列表（engine 连接后设 true）
+    pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
     pub context_window: usize,  // tokens (e.g. 1_000_000)
     pub session_summary: String,
@@ -2112,6 +2114,7 @@ impl AppState {
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
             available_models: Vec::new(),
+            pending_model_fetch: false,
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
             session_summary: String::new(),

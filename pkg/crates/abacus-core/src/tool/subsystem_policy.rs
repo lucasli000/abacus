@@ -58,9 +58,9 @@ pub fn builtin_subsystems() -> Vec<SubsystemDecl> {
             description: "filesystem ops (read/write/grep/etc.) — core capability",
         },
         SubsystemDecl {
-            name: "filengine.web",
+            name: "web",
             mode: RegistrationMode::Always,
-            tool_prefix: "filengine_web_",
+            tool_prefix: "web_",
             description: "web fetch/search — core capability",
         },
         SubsystemDecl {

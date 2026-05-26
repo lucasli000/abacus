@@ -222,7 +222,8 @@ impl McipHmac {
 /// 前缀匹配 ToolId.0 开头。
 const BUILTIN_EXEMPT_PREFIXES: &[&str] = &[
     // —— 单一命名约定：所有工具 ToolId 用下划线分隔形态 ——
-    "filengine_",    // filengine_fs_read / filengine_web_fetch / filengine_bash_exec
+    "filengine_",    // filengine_fs_read / filengine_bash_exec
+    "web_",          // web_fetch / web_search (独立子系统，不含 filengine_ 前缀)
     "env_",          // env_status
     "deduction_",    // deduction_status / deduction_analyze
     "context_",      // context_declare / context_keep / context_compress

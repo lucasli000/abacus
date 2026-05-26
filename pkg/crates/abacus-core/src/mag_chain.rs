@@ -697,7 +697,7 @@ impl DecayRouter {
     /// 根据衰减层级返回应提升的工具 ID
     pub fn tools_to_promote(tier: DecayTier) -> Vec<&'static str> {
         match tier {
-            DecayTier::Fast => vec!["filengine_web_search", "filengine_web_fetch"],
+            DecayTier::Fast => vec!["web_search", "web_fetch"],
             DecayTier::Medium => vec![], // 正常排序
             DecayTier::Slow => vec![],   // weight-first，无需提升工具
         }
@@ -766,10 +766,10 @@ impl EpistemicPostCheck {
 
         // 检查 2: 快衰问题未调用 web
         if decay_tier == DecayTier::Fast {
-            // 严格匹配 filengine.web.* —— substring contains 模式留下未来命名误伤隐患
-            // (mcp/server-web.search 等会被误判为 web 调用)
+            // 严格相等匹配 web_search / web_fetch —— starts_with("web_") 会误伤
+            // mcp/server-web.search 等以 web_ 开头的外部工具
             let has_web_call = tools_called.iter()
-                .any(|t| t == "filengine_web_search" || t == "filengine_web_fetch");
+                .any(|t| t == "web_search" || t == "web_fetch");
             if !has_web_call && has_factual_claims(llm_output) {
                 violations.push(EpistemicViolation::FastDecayNoWebSearch);
             }
@@ -779,7 +779,7 @@ impl EpistemicPostCheck {
         if has_signal_words(llm_output)
             && !llm_output.contains("[training_snapshot]")
             && !llm_output.contains("[来源")
-            && !tools_called.iter().any(|t| t.starts_with("filengine_web_") || t.starts_with("kb_") || t.starts_with("filengine_fs_"))
+            && !tools_called.iter().any(|t| t.starts_with("web_") || t.starts_with("kb_") || t.starts_with("filengine_fs_"))
         {
             violations.push(EpistemicViolation::UnmarkedFactualClaim);
         }
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn test_decay_router_promote() {
         let fast_tools = DecayRouter::tools_to_promote(DecayTier::Fast);
-        assert!(fast_tools.contains(&"filengine_web_search"));
+        assert!(fast_tools.contains(&"web_search"));
 
         let slow_tools = DecayRouter::tools_to_promote(DecayTier::Slow);
         assert!(slow_tools.is_empty());

@@ -674,7 +674,7 @@ mod tests {
     #[test]
     fn test_low_success_downgrades() {
         let mut tracker = EffectivenessTracker::new();
-        let tid = ToolId("filengine_web_fetch".into());
+        let tid = ToolId("web_fetch".into());
         for _ in 0..15 {
             tracker.record_opportunity(&tid);
             tracker.record_invocation(&tid, false, 3000);

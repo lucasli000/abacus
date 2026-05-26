@@ -1179,6 +1179,7 @@ impl ToolExecutor for FilengineToolExecutor {
         // 命名约定：ToolId 形如 "filengine_fs_read"，schema.name / LLM 视图 / dispatch
         // 同源（无 sanitize 链路）。strip_prefix 兼容外部传入的 ToolId.0：
         //   "filengine_fs_read" → "fs_read" → 内部 trait dispatch
+        // web_* 工具无 filengine_ 前缀；fs_*/bash_* 工具有前缀，strip 后取内部名
         let tool_name = tool_id.0.strip_prefix("filengine_").unwrap_or(&tool_id.0);
 
         // Phase 2 undo 注入：写工具前 snapshot/record，成功后 commit
@@ -1349,10 +1350,13 @@ pub async fn register(registry: &ToolRegistry) {
     // - resolve_sanitized_id 反查链路（O(N) 遍历）整个删除 → dispatch 直接 ToolId(llm_name)
     //
     // ## 子系统分组
-    // - subsystem_policy 用前缀 `filengine_fs_` / `filengine_web_` / `filengine_bash_` 分组
-    // - sandbox / mag_chain 等下游引用同样用 `filengine_xxx_yyy` 字面量
+    // - subsystem_policy 用前缀 `filengine_fs_` / `filengine_bash_` 分组；web 子系统单独用 `web_` 前缀
+    // - sandbox / mag_chain 等下游引用同样用对应字面量（web_fetch / web_search）
     for mut s in schemas() {
-        s.name = format!("filengine_{}", s.name);
+        // web_* 工具不加 filengine_ 前缀（它们是通用 web 工具，不属于文件引擎范畴）
+        // fs_*/bash_*/db_*/lsp_* 等仍使用 filengine_ 前缀以保持子系统分组
+        let is_web = s.name.starts_with("web_");
+        s.name = if is_web { s.name.clone() } else { format!("filengine_{}", s.name) };
         let id = ToolId(s.name.clone());
         registry.register(ToolHandle {
             id,
@@ -1365,15 +1369,16 @@ pub async fn register(registry: &ToolRegistry) {
 }
 
 /// Register filengine tool executors (must be called after register).
-///
-/// ## 变更（post ExecutionContext 重构）
-/// 不再接受 `session` 参数。executor 已改为无状态实现，
-/// session 在每次工具调用时通过 `ExecutionContext` 动态注入。
 pub async fn register_executors(registry: &ToolRegistry) {
     let executor = Arc::new(FilengineToolExecutor::new());
     for s in schemas() {
-        // ToolId 与 register() 同步：均为 "filengine_{raw}"（下划线）
-        registry.register_executor(ToolId(format!("filengine_{}", s.name)), executor.clone()).await;
+        let is_web = s.name.starts_with("web_");
+        let id = if is_web {
+            ToolId(s.name.clone())
+        } else {
+            ToolId(format!("filengine_{}", s.name))
+        };
+        registry.register_executor(id, executor.clone()).await;
     }
 }
 

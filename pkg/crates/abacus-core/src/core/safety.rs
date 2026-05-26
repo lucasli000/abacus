@@ -40,7 +40,7 @@ impl SafetyGuard {
                 "filengine_fs_move".into(),
                 "filengine_fs_mkdir".into(),
                 "filengine_bash_exec".into(),
-                "filengine_web_fetch".into(),
+                "web_fetch".into(),
             ],
         }
     }

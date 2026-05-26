@@ -248,10 +248,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             if let Some(ref spec) = e.core.config().model_spec {
                 state.context_window = spec.context_window;
             }
-            // 拉取可用模型列表，填充 /model picker 动态选项
-            // 引用：state.available_models → open_picker_model 优先消费
-            // 生命周期：一次性拉取，engine 连接后不再重复（除非用户运行 /models）
-            state.available_models = e.core.list_models().await;
+            // 可用模型列表延迟到首次打开 /model picker 时通过 pending_model_fetch 触发
+            // 避免启动时同步阻塞（虽然 list_models 是内存操作，但避免任何潜在 lock 争用）
+            state.pending_model_fetch = true;
             e
         }
         Ok(Err(e)) => {
@@ -336,6 +335,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.rendered_lines_dirty.set(true);
                         }
                     }
+                }
+                // 延迟拉取可用模型列表（避免启动时同步阻塞）
+                if state.pending_model_fetch {
+                    if let Some(ref engine) = state.engine_handle {
+                        state.available_models = engine.core.list_models().await;
+                    }
+                    state.pending_model_fetch = false;
                 }
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {
@@ -2345,8 +2351,8 @@ const DEFAULT_ALLOW: &[&str] = &[
     // ─── 文件编辑 (精确替换, confirm=false) ───
     "filengine_fs_edit",
     // ─── 网络 (只读) ───
-    "filengine_web_fetch",
-    "filengine_web_search",
+    "web_fetch",
+    "web_search",
     // ─── Shell (最常用, Medium 级 — 默认允许避免每条命令弹窗) ───
     "filengine_bash_exec",
     // ─── 文件写入/移动 (有副作用, 但高频且非破坏性) ───
