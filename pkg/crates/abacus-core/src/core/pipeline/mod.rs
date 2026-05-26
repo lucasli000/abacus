@@ -1596,11 +1596,12 @@ impl<'a> TurnPipeline<'a> {
                         {
                             let s = self.session.read().await;
                             let mut msgs = s.messages.write().await;
+                            // Abacus 内部指令：System 角色避免 LLM 文字确认回复
                             msgs.push(Message {
-                                role: MessageRole::User,
+                                role: MessageRole::System,
                                 content: Some(MessageContent::Text(
                                     format!(
-                                        "[System] 你在文本中提到了工具名 \"{}\"，但没有通过 function calling 调用它。\
+                                        "[Abacus] 你在文本中提到了工具名 \"{}\"，但没有通过 function calling 调用它。\
                                          \n如果你确实要调用此工具，请使用结构化 tool_call（不要写在文本里）。\
                                          \n如果你只是正常推理中提到了工具名（并非要调用），请忽略此提示，继续你的回答。",
                                         tool_name
@@ -1672,8 +1673,9 @@ impl<'a> TurnPipeline<'a> {
                             {
                                 let s = self.session.read().await;
                                 let mut msgs = s.messages.write().await;
+                                // Abacus 内部指令：System 角色避免 LLM 文字确认回复
                                 msgs.push(Message {
-                                    role: MessageRole::User,
+                                    role: MessageRole::System,
                                     content: Some(MessageContent::Text(hint_msg)),
                                     name: None, tool_calls: None, tool_call_id: None,
                                     reasoning_content: None, prefix: false,
@@ -1700,9 +1702,10 @@ impl<'a> TurnPipeline<'a> {
                     {
                         let s = self.session.read().await;
                         let mut msgs = s.messages.write().await;
+                        // Abacus 内部续写指令：System 角色
                         msgs.push(Message {
-                            role: MessageRole::User,
-                            content: Some(MessageContent::Text("Continue from where you left off. Do not repeat what you already said.".into())),
+                            role: MessageRole::System,
+                            content: Some(MessageContent::Text("[Abacus] Output was truncated. Continue directly from where you left off without any preamble.".into())),
                             name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, prefix: false,
                         });
                     }
@@ -1761,11 +1764,10 @@ impl<'a> TurnPipeline<'a> {
                 let s = self.session.read().await;
                 let mut msgs = s.messages.write().await;
                 msgs.push(Message {
-                    role: MessageRole::User,
+                    role: MessageRole::System,
                     content: Some(MessageContent::Text(format!(
-                        "[System Hint] Tool usage: {}/{} this turn (75%). You have {} calls remaining. \
-                         Continue working — prioritize the most impactful actions. \
-                         Consider batching related operations and skipping non-essential checks.",
+                        "[Abacus] Tool usage: {}/{} (75%). {} calls remaining. \
+                         Prioritize impactful actions; batch related operations.",
                         ctx.total_tool_calls, tool_limit, tool_limit - ctx.total_tool_calls
                     ))),
                     name: None, tool_calls: None, tool_call_id: None,
@@ -1798,11 +1800,10 @@ impl<'a> TurnPipeline<'a> {
                     let s = self.session.read().await;
                     let mut msgs = s.messages.write().await;
                     msgs.push(Message {
-                        role: MessageRole::User,
+                        role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[System] Tool budget at 95% ({}/{}). Context has been compressed to free memory. \
-                             Prioritize completing your current task with remaining budget. \
-                             Early conversation details are now summarized — rely on recent context.",
+                            "[Abacus] Tool budget at 95% ({}/{}). Context compressed. \
+                             Complete current task with remaining budget.",
                             ctx.total_tool_calls, tool_limit
                         ))),
                         name: None, tool_calls: None, tool_call_id: None,
@@ -1834,11 +1835,10 @@ impl<'a> TurnPipeline<'a> {
                     let s = self.session.read().await;
                     let mut msgs = s.messages.write().await;
                     msgs.push(Message {
-                        role: MessageRole::User,
+                        role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[System] Tool budget fully exhausted ({} calls). \
-                             Tool calling is now disabled. \
-                             Output your progress summary now. The user can continue in the next message.",
+                            "[Abacus] Tool budget exhausted ({} calls). Tool calling disabled. \
+                             Output your final summary now.",
                             ctx.total_tool_calls
                         ))),
                         name: None, tool_calls: None, tool_call_id: None,
