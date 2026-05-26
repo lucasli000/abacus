@@ -1342,7 +1342,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     || !state.toasts.is_empty()
                     || state.confirm_dialog.is_some()
                     || state.frame_dirty.get()
-                    || state.picker.is_some(); // picker 打开后必须持续渲染（thinking slider 动画 + 选中高亮）
+                    || state.picker.is_some()        // picker 打开后持续渲染
+                    || state.show_settings           // 设置模态框
+                    || state.theme_preview_open;     // 主题色板预览面板
                 if needs_draw {
                     state.frame_dirty.set(false);
                     if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {

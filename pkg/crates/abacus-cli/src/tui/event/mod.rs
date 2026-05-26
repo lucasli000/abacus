@@ -186,6 +186,7 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
     match action {
         EscAction::CloseSettings => {
             state.show_settings = false;
+            state.rendered_lines_dirty.set(true);
         }
         EscAction::ClosePicker => {
             state.picker = None;
@@ -193,6 +194,7 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
         }
         EscAction::CloseThemePreview => {
             state.theme_preview_open = false;
+            state.rendered_lines_dirty.set(true);
         }
         EscAction::ExitCompletion => {
             cancel_completion(state);
