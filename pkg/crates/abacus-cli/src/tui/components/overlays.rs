@@ -489,19 +489,18 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     };
     let frame = f.area();
 
-    // 计算尺寸：列宽取最长 label + 2(▶/●) + 12(主题色块预览) + 边框
+    // 计算尺寸：列宽取最长 label，也考虑分组标题
     let widest: usize = p.labels.iter().map(|s| display_width(s.as_str())).max().unwrap_or(20);
-    // 也考虑分组标题宽度
     let widest = if let Some(ref groups) = p.groups {
         let g_widest = groups.iter().map(|(name, _)| display_width(name) + 4).max().unwrap_or(0);
         widest.max(g_widest)
     } else { widest };
-    let _extra = if matches!(p.kind, PickerKind::Theme) { 14 } else { 4 };
-    // V40: 弹窗布局规范 — 靠左，宽度为输入框 6/8，高度不超过消息框 1/3
-    //   宽度：input_area.width * 6 / 8
-    //   高度：内容自适应，上限 = 消息区高度 / 3（消息区 ≈ input_area.y）
-    //   位置：左对齐 input_area.x，垂直方向向上弹出（输入框正上方）
-    let popup_w = (input_area.width * 6 / 8).max(36).min(frame.width);
+    // 主题色块预览额外宽度（3色块 × 2字符 + 3间距 = 9）
+    let extra = if matches!(p.kind, PickerKind::Theme) { 9usize } else { 0 };
+    // Fix: widest 实际用于 popup_w 计算（之前只计算未使用）
+    // 前缀4 + 内容widest + extra + 边框2 + 内边距2 = widest+extra+8
+    let min_content_w = (widest + extra + 8) as u16;
+    let popup_w = min_content_w.max(input_area.width * 6 / 8).max(36).min(frame.width);
     let group_overhead = p.groups.as_ref().map(|g| g.len()).unwrap_or(0);
     let slider_overhead = if p.show_thinking_slider { 2 } else { 0 };
     let content_lines = p.items.len() + group_overhead + slider_overhead;
@@ -530,19 +529,15 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    // V29.8: 分组模式下不做滚动(假设 model 列表短), 简单全部显示
-    //   未来若 model 多到需滚动, 可加 scroll_start 计算
     let mut lines: Vec<Line> = Vec::new();
 
-    // V40: 渲染项闭包 — 紧凑排版，固定 3 字符前缀（marker），无冗余 padding
-    // 格式: " ▶● label" 或 "    label"（3 字符对齐前缀 + 1 空格）
+    // 渲染项闭包 — 固定 4 字符前缀（marker+空格），无冗余 padding
     let render_item = |idx: usize, lines: &mut Vec<Line>| {
         let label = &p.labels[idx];
         let id = &p.items[idx];
         let is_sel = idx == p.selected;
         let is_cur = p.current == Some(idx);
-        // 固定 3 字符宽前缀：确保所有行文本起始位置对齐
-        let marker = if is_sel && is_cur { "▶●" }  // 2 宽（全角类）
+        let marker = if is_sel && is_cur { "▶●" }
             else if is_sel { " ▶" }
             else if is_cur { " ●" }
             else { "  " };
@@ -555,9 +550,7 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         };
         let mut spans: Vec<Span> = Vec::new();
         spans.push(Span::styled(format!(" {} ", marker), row_style));
-        // 直接输出 label（不做 pad_to_width，避免多余空格浪费弹窗宽度）
         spans.push(Span::styled(label.clone(), row_style));
-
         if matches!(p.kind, PickerKind::Theme) {
             let t = crate::tui::theme::from_name(id);
             spans.push(Span::raw(" "));
@@ -568,35 +561,54 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         lines.push(Line::from(spans));
     };
 
-    // V40: 分组渲染 — 紧凑组标题 + 子项
+    // 分组渲染（含滚动）— 先建全量行列表，追踪选中行视觉位置，再截取可见窗口
+    // Fix: 之前分组不滚动，模型多时超出高度部分不可见
+    let item_max_visible = if p.show_thinking_slider {
+        max_visible.saturating_sub(2) // 为底部 thinking slider 留 2 行
+    } else {
+        max_visible
+    };
+
     if let Some(ref groups) = p.groups {
+        let mut selected_visual: usize = 0;
+        let mut visual_line: usize = 0;
         for (provider, range) in groups {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" ─ {}", provider),
-                    Style::default().fg(state.theme.muted),
-                ),
+                Span::styled(format!(" ─ {}", provider), Style::default().fg(state.theme.muted)),
             ]));
+            visual_line += 1;
             for idx in range.clone() {
+                if idx == p.selected { selected_visual = visual_line; }
                 render_item(idx, &mut lines);
+                visual_line += 1;
             }
         }
-    } else {
-        // 默认(Theme/Thinking): 简单滚动窗口
-        let scroll_start = if p.items.len() <= max_visible {
+        // 计算滚动偏移：选中行尽量居中，不超出边界
+        let scroll_start = if lines.len() <= item_max_visible {
             0
         } else {
-            p.selected.saturating_sub(2).min(p.items.len() - max_visible)
+            selected_visual.saturating_sub(item_max_visible / 2)
+                .min(lines.len().saturating_sub(item_max_visible))
         };
-        for idx in scroll_start..(scroll_start + max_visible).min(p.items.len()) {
+        lines.drain(0..scroll_start);
+        lines.truncate(item_max_visible);
+    } else {
+        // Theme / Thinking：简单滚动窗口
+        let scroll_start = if p.items.len() <= item_max_visible {
+            0
+        } else {
+            p.selected.saturating_sub(2).min(p.items.len().saturating_sub(item_max_visible))
+        };
+        for idx in scroll_start..(scroll_start + item_max_visible).min(p.items.len()) {
             render_item(idx, &mut lines);
         }
     }
 
-    // V29.8: 底部 thinking 调节器 (Model picker 专属)
+    // 底部 thinking 调节器 (Model picker 专属)
+    // Fix: 使用 THINKING_SLIDER_DEPTHS 单一真相（含 max），之前硬编码 4 档漏掉 max
     if p.show_thinking_slider {
         lines.push(Line::raw("")); // 空行分隔
-        let depths = ["off", "low", "medium", "high"];
+        let depths = crate::tui::state::AppState::THINKING_SLIDER_DEPTHS;
         let cur_depth = state.thinking_depth.as_str();
         let mut slider_spans: Vec<Span> = Vec::new();
         slider_spans.push(Span::styled(
