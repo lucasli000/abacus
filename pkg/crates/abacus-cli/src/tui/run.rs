@@ -1750,6 +1750,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
                                 state.is_streaming = true;
+                                // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
+                                state.input_state = InputState::Outputting;
+                                state.processing_phase = format!("🔍 审查{}...", kind.label());
+                                state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
                                 state.pending_review_parses = state.pending_review_parses.saturating_add(1);
                                 tokio::spawn(async move {
@@ -1787,6 +1791,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 );
                                 state.reset_streaming();
                                 state.is_streaming = true;
+                                state.input_state = InputState::Thinking;
+                                state.processing_phase = "📋 Planner 修正中...".into();
+                                state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     use crate::tui::api::send_planner_message_streaming;
                                     let req_ctx = abacus_core::core::RequestContext::default();
@@ -1818,6 +1825,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
                                 state.is_streaming = true;
+                                state.input_state = InputState::Outputting;
+                                state.processing_phase = format!("🤖 {} 处理中...", role.label());
+                                state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     use crate::tui::api::send_role_message_streaming;
                                     let req_ctx = abacus_core::core::RequestContext::default();
