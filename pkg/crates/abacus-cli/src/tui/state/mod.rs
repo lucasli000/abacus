@@ -2581,6 +2581,8 @@ impl AppState {
             groups: Some(groups),
             show_thinking_slider: true,
         });
+        // picker 打开后立即触发重绘，避免 input_state=Ready 时 needs_draw=false 导致首帧不显示
+        self.rendered_lines_dirty.set(true);
     }
 
     /// 打开主题 picker — 列出 Theme::all_names，selected 设为当前主题位置
@@ -2598,6 +2600,7 @@ impl AppState {
             groups: None,
             show_thinking_slider: false,
         });
+        self.rendered_lines_dirty.set(true);
     }
 
     /// 打开思考深度 picker — off/low/medium/high/max
@@ -2623,6 +2626,7 @@ impl AppState {
             groups: None,
             show_thinking_slider: false,
         });
+        self.rendered_lines_dirty.set(true);
     }
 
     pub fn cleanup_toasts(&mut self) {
