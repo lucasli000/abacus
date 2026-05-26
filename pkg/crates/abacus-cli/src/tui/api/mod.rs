@@ -1100,7 +1100,24 @@ pub async fn send_team_message(
         ));
 
         let combined_text = if results.is_empty() {
-            "所有任务已在之前完成。发送新指令可添加后续任务。".to_string()
+            // 没有新 agent 结果：可能是对话性跟进问题，或 team 任务已全部提前完成。
+            // 用 LLM 直接响应而非固定文本，避免循环输出同一句话。
+            let fallback_prompt = format!(
+                "You are the Abacus team Leader. The user sent: '{}'\
+                 \nAll team tasks have already been completed. \
+                 If this is a follow-up question about the completed work, answer it directly. \
+                 If this is a new task request, acknowledge it and suggest using /team to start a new session. \
+                 Be concise and natural.",
+                message
+            );
+            let fb_session = abacus_core::core::SessionState::new("_team_followup");
+            let fb_session = tokio::sync::RwLock::new(fb_session);
+            match handle.core.process_turn_streaming(
+                &fallback_prompt, &fb_session, stream_tx.clone()
+            ).await {
+                Ok(r) => r.response,
+                Err(_) => "所有任务已完成。可发送新指令继续。".to_string(),
+            }
         } else {
             // 构建汇总 prompt：让 Leader 综合各 agent 结果
             let mut agent_outputs = String::new();
