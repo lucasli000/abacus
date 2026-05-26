@@ -783,6 +783,10 @@ async fn chat_stream_handler(
                     let data = serde_json::json!({"signals": signals, "recommendation": recommendation}).to_string();
                     yield Ok(Event::default().event("inertia_detected").data(data));
                 }
+                StreamChunk::AuthResult { tool, approved } => {
+                    let data = serde_json::json!({"tool": tool, "approved": approved}).to_string();
+                    yield Ok(Event::default().event("auth_result").data(data));
+                }
             }
         }
 
