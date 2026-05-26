@@ -1485,19 +1485,36 @@ impl<'a> TurnPipeline<'a> {
             }
             let tool_calls = response.message.tool_calls.clone().unwrap_or_default();
 
-            // 兜底：解析 content 中的 XML 格式工具调用（DeepSeek 某些版本的回退行为）
-            // 当 API 未通过 structured tool_calls 返回、而是在 content 输出 <tool_calls> XML 时触发
-            // 引用关系：依赖 crate::llm::ToolCall / ToolFunction；消费方为下方 tool execution 逻辑
+            // V40: 多格式文本工具调用解析（XML / JSON / Markdown fenced）
+            // 引用：crate::llm::text_tool_parser — 支持 function_calls XML、裸 JSON、代码块
+            // 降级：text_tool_parser 未命中时再用旧 try_parse_xml_tool_calls（向后兼容）
+            // clean_text: 去除 XML 标记后的纯文本，写入 session 历史防止消息中断
+            let mut clean_text = String::new(); // 当文本工具调用解析成功时赋値
             let tool_calls = if tool_calls.is_empty() {
-                Self::try_parse_xml_tool_calls(&response.message)
+                let raw_text = super::extract_text(&response.message);
+                let (parsed_clean, text_parsed) =
+                    crate::llm::text_tool_parser::extract_text_tool_calls(&raw_text);
+                if !text_parsed.is_empty() {
+                    clean_text = parsed_clean;
+                    text_parsed
+                } else {
+                    Self::try_parse_xml_tool_calls(&response.message)
+                }
             } else {
                 tool_calls
             };
 
+            // session 历史写入：文本工具调用时用 clean_text，防止 XML 标记残留
             {
                 let s = self.session.read().await;
                 let mut msgs = s.messages.write().await;
-                msgs.push(response.message.clone());
+                let mut msg_to_push = response.message.clone();
+                if !tool_calls.is_empty() && !clean_text.is_empty() {
+                    msg_to_push.content =
+                        Some(crate::llm::provider::MessageContent::Text(clean_text.clone()));
+                    msg_to_push.tool_calls = Some(tool_calls.clone());
+                }
+                msgs.push(msg_to_push);
             }
 
             if tool_calls.is_empty() {
@@ -1507,7 +1524,8 @@ impl<'a> TurnPipeline<'a> {
                 // DeepSeek 等模型偶尔会在文本中写出工具名/命令而非发起 structured tool_call。
                 // 检测条件：response text 包含已注册工具名 + tool_calls 为空 + 重试 < 1
                 // 机制：注入纠正提示，让 LLM 用 function calling 而非文本输出来调工具。
-                if ctx.tool_text_fallback_retries < 1 && !text.is_empty() {
+                // tools_exhausted=true 时跳过：LLM 已知晓工具耗尽，注入纠错只会加剧混乱
+                if ctx.tool_text_fallback_retries < 3 && !text.is_empty() && !ctx.tools_exhausted {
                     let text_lower = text.to_lowercase();
                     let registered_names: Vec<String> = self.core.registry
                         .tool_names()
@@ -1751,6 +1769,14 @@ impl<'a> TurnPipeline<'a> {
                     ));
                 }
                 ctx.tools_exhausted = true;
+                // 系统提示覆盖：明确告知 LLM 工具通道已关，防止其继续尝试调用工具而导致混乱
+                // 注入到 enriched_system 末尾，确保下次 LlmRequest 就带这个信息
+                ctx.enriched_system.push_str(
+                    "\n\n[SYSTEM OVERRIDE] Tool calling is now DISABLED. \
+                     The function calling channel is closed. \
+                     Do NOT attempt any tool calls or write tool names in text. \
+                     Provide your final answer in plain text only."
+                );
                 {
                     let s = self.session.read().await;
                     let mut msgs = s.messages.write().await;
@@ -1758,6 +1784,7 @@ impl<'a> TurnPipeline<'a> {
                         role: MessageRole::User,
                         content: Some(MessageContent::Text(format!(
                             "[System] Tool budget fully exhausted ({} calls). \
+                             Tool calling is now disabled. \
                              Output your progress summary now. The user can continue in the next message.",
                             ctx.total_tool_calls
                         ))),

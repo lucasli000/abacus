@@ -110,7 +110,7 @@ fn default_thresholds() -> ThresholdConfig {
 }
 
 fn default_premature_stop_chars() -> usize { 200 }
-fn default_premature_stop_max_retries() -> u32 { 3 }
+fn default_premature_stop_max_retries() -> u32 { u32::MAX }
 fn default_confirm_timeout_secs() -> u64 { 15 }
 fn default_bash_timeout() -> u64 { 30 }
 fn default_bash_max_timeout() -> u64 { 120 }

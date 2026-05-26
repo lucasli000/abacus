@@ -194,15 +194,17 @@ pub fn dispatch(state: &mut AppState, text: &str) -> CmdResult {
 
 /// Generate help text
 pub fn help_text() -> String {
+    use unicode_width::UnicodeWidthStr;
     let mut lines: Vec<String> = Vec::new();
     let mut max_name = 0usize;
     for entry in registry() {
         let display = entry.names.join("/");
-        max_name = max_name.max(display.len());
+        max_name = max_name.max(UnicodeWidthStr::width(display.as_str()));
     }
     for entry in registry() {
         let display = entry.names.join("/");
-        let padding = " ".repeat(max_name.saturating_sub(display.len()) + 2);
+        let w = UnicodeWidthStr::width(display.as_str());
+        let padding = " ".repeat(max_name.saturating_sub(w) + 2);
         lines.push(format!("/{} {}— {}", display, padding, entry.help));
     }
     lines.join("\n")
@@ -301,9 +303,11 @@ pub fn keyboard_cheatsheet() -> String {
     for (title, rows) in sections {
         out.push_str(&format!("\n## {}\n\n", title));
         // 计算列宽对齐
-        let max_key = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+        use unicode_width::UnicodeWidthStr;
+        let max_key = rows.iter().map(|(k, _)| UnicodeWidthStr::width(*k)).max().unwrap_or(0);
         for (key, desc) in *rows {
-            let pad = " ".repeat(max_key.saturating_sub(key.chars().count()) + 2);
+            let w = UnicodeWidthStr::width(*key);
+            let pad = " ".repeat(max_key.saturating_sub(w) + 2);
             out.push_str(&format!("- `{}`{}— {}\n", key, pad, desc));
         }
     }

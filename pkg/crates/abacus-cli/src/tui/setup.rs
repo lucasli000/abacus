@@ -520,6 +520,55 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         mn_inner,
     );
 
+    // ── 模型下拉列表（Model 字段聚焦 + 有候选模型时显示）──
+    // 在 model_block 下方绘制浮层：最多 5 条，超出显示省略
+    // 引用关系：fetched_models / model_select_idx / model_block 位置
+    // 生命周期：焦点离开 ModelName 时下拉消失
+    if state.focus == FocusField::ModelName && !state.fetched_models.is_empty() {
+        use ratatui::widgets::Clear;
+        let max_visible: usize = 5;
+        let list_h = (state.fetched_models.len().min(max_visible) as u16) + 2; // 边框
+        let model_rect = parts[8];
+        // 下拉放在 model_block 正下方（绝对坐标）
+        let drop_y = model_rect.y + model_rect.height;
+        let drop_x = model_rect.x;
+        let drop_w = model_rect.width.min(card.width);
+        // 防止超出 card 底部
+        let drop_y = drop_y.min(card.y + card.height - list_h);
+        if drop_y + list_h <= area.height {
+            let drop_area = Rect::new(drop_x, drop_y, drop_w, list_h);
+            f.render_widget(Clear, drop_area);
+            let drop_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.primary));
+            let drop_inner = drop_block.inner(drop_area);
+            f.render_widget(drop_block, drop_area);
+
+            let scroll_start = if state.fetched_models.len() <= max_visible { 0 }
+                else { state.model_select_idx.saturating_sub(1).min(state.fetched_models.len() - max_visible) };
+            let mut model_list_lines: Vec<Line> = Vec::new();
+            for (i, name) in state.fetched_models
+                .iter()
+                .enumerate()
+                .skip(scroll_start)
+                .take(max_visible)
+            {
+                let is_sel = i == state.model_select_idx;
+                let marker = if is_sel { "> " } else { "  " };
+                let style = if is_sel {
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                model_list_lines.push(Line::from(Span::styled(
+                    format!("{}{}", marker, name),
+                    style,
+                )));
+            }
+            f.render_widget(Paragraph::new(model_list_lines), drop_inner);
+        }
+    }
+
     // ── 底部提示 ──
     f.render_widget(
         Paragraph::new(vec![
