@@ -497,7 +497,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     let content_lines = p.items.len() + group_overhead + slider_overhead;
     // 高度上限：消息区（input_area.y 近似消息框高度）的 1/3
     let msg_area_h = input_area.y as usize;
-    let max_h = (msg_area_h / 3).max(6);
+    // picker 弹窗高度上限：取消息区 1/2，至少 10
+    // 原来 1/3.max(6) 在 24 行终端下上限=7，去掉 border+slider 只剩 2 行，模型名称几乎看不到
+    let max_h = (msg_area_h / 2).max(10);
     let popup_h = ((content_lines + 2) as u16) // +2 border
         .min(max_h as u16)
         .min(frame.height);

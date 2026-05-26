@@ -2552,15 +2552,15 @@ impl AppState {
     pub fn open_picker_model(&mut self) {
         // 静态兜底表（engine 未连接 / 未拉取时使用）
         // 包含所有已知常见 DeepSeek + Qwen 模型
+        // 静态兼容表：仅列出已知内置支持的 DeepSeek 模型
+        // 其他供应商（Qwen 等）用户未配置时不应展示，避免误导
+        // 引用：available_models 为空时由 list_models() 自动填充取代
         const STATIC_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("DeepSeek", &[
                 ("deepseek-chat",     "通用对话"),
                 ("deepseek-reasoner", "推理增强"),
                 ("deepseek-v4-flash", "最快响应 (low latency)"),
                 ("deepseek-v4-pro",   "最强推理 (deep reasoning)"),
-            ]),
-            ("Alibaba Qwen", &[
-                ("qwen-plus", "通用平衡"),
             ]),
         ];
 
@@ -2570,10 +2570,25 @@ impl AppState {
 
         if !self.available_models.is_empty() {
             // 动态列表：engine 已拉取，显示全部可用模型（单组"可用模型"）
+            // 已知模型描述表（与静态兜底保持一致）
+            const KNOWN_DESCS: &[(&str, &str)] = &[
+                ("deepseek-chat",     "通用对话"),
+                ("deepseek-reasoner", "推理增强"),
+                ("deepseek-v4-flash", "最快响应"),
+                ("deepseek-v4-pro",   "最强推理"),
+            ];
             let start = 0;
             for id in &self.available_models {
                 items.push(id.clone());
-                labels.push(format!("{}", id));
+                let desc = KNOWN_DESCS.iter()
+                    .find(|(k, _)| *k == id.as_str())
+                    .map(|(_, d)| *d)
+                    .unwrap_or("");
+                labels.push(if desc.is_empty() {
+                    id.clone()
+                } else {
+                    format!("{:<22}  {}", id, desc)
+                });
             }
             groups.push(("可用模型".to_string(), start..items.len()));
         } else {
