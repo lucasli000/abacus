@@ -756,6 +756,10 @@ impl LlmProvider for DeepSeekProvider {
         // V30：thinking 模式下 reasoning_tokens（completion 子集）
         let mut thinking_tokens_stream = 0u64;
         let mut completion_tokens = 0u64;
+        // OpenAI/DeepSeek SSE tool call ID 映射：index → id
+        // 根因：SSE 只在第一个 chunk 携带 id，后续 chunk 仅有 index
+        // 修复：建立 index→id 映射，后续 chunk 通过 index 查找 id，避免 arguments 丢失
+        let mut tc_index_to_id: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
 
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
@@ -806,11 +810,27 @@ impl LlmProvider for DeepSeekProvider {
                                     }
                                 }
 
-                                // Tool calls (start)
+                                // Tool calls (start/delta)
+                                // OpenAI/DeepSeek SSE 协议：id 只在 index 首次出现的 chunk 携带；
+                                // 后续 argument delta chunk 仅有 index，需通过映射表还原 id。
                                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                     for tc in tool_calls {
+                                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+                                        // 首次出现时（携带 id）存入映射表
+                                        if let Some(id_str) = tc.get("id").and_then(|i| i.as_str()) {
+                                            if !id_str.is_empty() {
+                                                tc_index_to_id.insert(index, id_str.to_string());
+                                            }
+                                        }
+                                        // 从映射表获取 id（后续 chunk 无 id 时通过 index 查找）
+                                        let id = tc_index_to_id.get(&index)
+                                            .cloned()
+                                            .unwrap_or_else(|| {
+                                                tc.get("id").and_then(|i| i.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string()
+                                            });
                                         if let Some(func) = tc.get("function") {
-                                            let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                                             if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
                                                 let _ = tx.send(StreamEvent::ToolCallStart {
                                                     id: id.clone(),
@@ -818,10 +838,12 @@ impl LlmProvider for DeepSeekProvider {
                                                 });
                                             }
                                             if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                                let _ = tx.send(StreamEvent::ToolCallArgDelta {
-                                                    id,
-                                                    delta: args.to_string(),
-                                                });
+                                                if !args.is_empty() {
+                                                    let _ = tx.send(StreamEvent::ToolCallArgDelta {
+                                                        id,
+                                                        delta: args.to_string(),
+                                                    });
+                                                }
                                             }
                                         }
                                     }
