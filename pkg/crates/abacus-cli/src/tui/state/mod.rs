@@ -780,6 +780,10 @@ pub struct AppState {
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
     pub session_id: String,
     pub model_name: String,
+    /// 从 engine 动态拉取的可用模型列表（engine 连接后填充）
+    /// 引用：open_picker_model 优先使用此列表，空时退回静态 MODEL_GROUPS
+    /// 生命周期：engine 连接 → 拉取 → 填充；/new 不清（模型列表不随会话变）
+    pub available_models: Vec<String>,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
     pub context_window: usize,  // tokens (e.g. 1_000_000)
     pub session_summary: String,
@@ -2107,6 +2111,7 @@ impl AppState {
             // Session UUID 启动生成；恢复 session 时由 apply_session_export 覆盖。
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
+            available_models: Vec::new(),
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
             session_summary: String::new(),
@@ -2461,27 +2466,27 @@ impl AppState {
         });
     }
 
-    /// V13 修复：信息展示统一走聊天区（在对话流中以 Session message 出现），
-    /// 不再漂移到右侧 info_panel——用户期望"对话上下文里看到 status/tokens/debug 等"。
-    /// 引用关系：cmd_status / cmd_tokens / cmd_debug / cmd_help 等
-    /// 生命周期：作为聊天历史一部分，参与 mark_dirty 重渲；不写入 info_panel_text
-    /// 保护：streaming 中延迟为 toast 提示——避免 add_message 重置 stream_cursor
-    ///       导致打字机视觉跳回开头、流式渲染错乱
+    /// 命令信息展示：写入右侧 info_panel，不污染对话消息流。
+    ///
+    /// 设计变更（V13→当前）：
+    ///   V13 曾改为走聊天区，理由是"用户期望在对话上下文看到"。
+    ///   现在改回 info_panel：命令输出（/help/status/tokens/models 等）是工具信息，
+    ///   不应混入 AI 对话历史——弹窗/panel 是更合适的展示位置。
+    ///   用户可按 Ctrl+I 切换 panel 可见性，或直接在右侧 panel 查看。
+    ///
+    /// 引用关系：cmd_status / cmd_tokens / cmd_debug / cmd_help / cmd_models 等
+    /// 生命周期：写入 info_panel_text（每次覆盖）；panel 保留直到下次 show_info 或 /clear
+    /// 保护：streaming 中改为 toast 提示，等完成后用户可再次执行命令
     pub fn show_info(&mut self, text: impl Into<String>) {
         let s = text.into();
         if self.is_streaming {
-            // streaming 中只显示提示，命令完整结果暂不插入历史（避免打断流式输出）
-            self.add_toast("命令已收到，请等流式结束后查看", std::time::Duration::from_secs(2));
-            // 仍写一份到 info_panel 兜底（用户可手动切右侧 panel 看）
-            self.info_panel_text = s;
-            self.info_panel_auto_open = true;
+            // streaming 中不写 panel（避免抢夺焦点），仅 toast 提示
+            self.add_toast("命令已收到，流式结束后执行可查看详情", std::time::Duration::from_secs(2));
             return;
         }
-        let ts = chrono::Local::now().format("%H:%M").to_string();
-        self.add_message(Message::new_session(
-            vec![MsgContent::Stream(s)],
-            &ts,
-        ));
+        // 写入 info_panel 并自动展开
+        self.info_panel_text = s;
+        self.info_panel_auto_open = true;
         self.rendered_lines_dirty.set(true);
     }
 
@@ -2547,13 +2552,14 @@ impl AppState {
     ///   - show_thinking_slider=true 渲染底部 thinking 行, ←→ 调整深度
     ///   - selected 跨分组用 items 索引(分组只是渲染形态, 不改 selected 语义)
     pub fn open_picker_model(&mut self) {
-        // V29.8: provider 分组数据(provider_label, model_id, model_desc)
-        //   label 格式："<model_id>  — <说明>"  让用户直接看到模型 ID
-        //   将来可改为从 abacus-core 异步注入的 model registry, 当前用静态表
-        const MODEL_GROUPS: &[(&str, &[(&str, &str)])] = &[
+        // 静态兜底表（engine 未连接 / 未拉取时使用）
+        // 包含所有已知常见 DeepSeek + Qwen 模型
+        const STATIC_GROUPS: &[(&str, &[(&str, &str)])] = &[
             ("DeepSeek", &[
-                ("deepseek-v4-pro",   "最强推理 (deep reasoning)"),
+                ("deepseek-chat",     "通用对话"),
+                ("deepseek-reasoner", "推理增强"),
                 ("deepseek-v4-flash", "最快响应 (low latency)"),
+                ("deepseek-v4-pro",   "最强推理 (deep reasoning)"),
             ]),
             ("Alibaba Qwen", &[
                 ("qwen-plus", "通用平衡"),
@@ -2564,28 +2570,36 @@ impl AppState {
         let mut labels: Vec<String> = Vec::new();
         let mut groups: Vec<(String, std::ops::Range<usize>)> = Vec::new();
 
-        for (provider, models) in MODEL_GROUPS {
-            let start = items.len();
-            for (id, desc) in *models {
-                items.push((*id).to_string());
-                // 模型 ID 作为主显示内容，说明为辅
-                labels.push(format!("{:<22}  {}", id, desc));
+        if !self.available_models.is_empty() {
+            // 动态列表：engine 已拉取，显示全部可用模型（单组"可用模型"）
+            let start = 0;
+            for id in &self.available_models {
+                items.push(id.clone());
+                labels.push(format!("{}", id));
             }
-            let end = items.len();
-            if end > start {
-                groups.push((provider.to_string(), start..end));
+            groups.push(("可用模型".to_string(), start..items.len()));
+        } else {
+            // 静态兜底
+            for (provider, models) in STATIC_GROUPS {
+                let start = items.len();
+                for (id, desc) in *models {
+                    items.push((*id).to_string());
+                    labels.push(format!("{:<22}  {}", id, desc));
+                }
+                let end = items.len();
+                if end > start {
+                    groups.push((provider.to_string(), start..end));
+                }
             }
         }
 
-        // 当前配置的模型不在静态表中时自动插入到首位（避免找不到当前模型）
+        // 当前配置的模型不在列表中时自动插入到首位
         if !self.model_name.is_empty() && !items.contains(&self.model_name) {
             items.insert(0, self.model_name.clone());
             labels.insert(0, format!("{:<22}  (当前配置)", &self.model_name));
-            // 重计分组小标记：所有已有分组平移 1 位
             for (_, range) in &mut groups {
                 *range = (range.start + 1)..(range.end + 1);
             }
-            // 将自定义模型插入一个单独分组
             groups.insert(0, ("自定义".to_string(), 0..1));
         }
 

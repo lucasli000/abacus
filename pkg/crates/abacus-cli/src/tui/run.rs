@@ -248,6 +248,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             if let Some(ref spec) = e.core.config().model_spec {
                 state.context_window = spec.context_window;
             }
+            // 拉取可用模型列表，填充 /model picker 动态选项
+            // 引用：state.available_models → open_picker_model 优先消费
+            // 生命周期：一次性拉取，engine 连接后不再重复（除非用户运行 /models）
+            state.available_models = e.core.list_models().await;
             e
         }
         Ok(Err(e)) => {
