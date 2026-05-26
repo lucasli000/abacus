@@ -470,6 +470,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.session_tokens.cached_tokens += stats.cached_tokens;
                             // V30：思考 tokens 累加（completion 子集，仅信息透明）
                             state.session_tokens.thinking_tokens += stats.thinking_tokens;
+                            // latest_prompt_tokens：set 语义（非累加）——记录最新轮完整 context 大小
+                            // 用途：InputBar context % 显示真实 context 窗口占用，不是累计账单 token
+                            state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
 
                             // 费用累加：按当轮 model_id 查 pricing 估算 USD
                             // 引用关系：cost::estimate_turn_cost_usd(本地 pricing 表)
@@ -1072,10 +1075,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                             let auto_allow = if is_readonly {
                                 true // 只读：永久放行
-                            } else if is_destructive_cmd {
-                                false // 破坏性：绝不自动放行
                             } else {
-                                // 编辑类：检查 always_allow（首次弹窗后 session 内放行）
+                                // B12: 所有工具（含破坏性）都查 always_allow
                                 state.always_allow.contains(&req.tool_id)
                             };
 

@@ -334,7 +334,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
 
     // ── 底行：左侧 thinking_depth · 百分比 已用/上限，右侧 ⏎ Enter / Esc ──
     // 性能修复：直接使用 session_tokens（引擎返回的真实值），不再每帧遍历全部消息估算
-    let real_tokens = state.session_tokens.total_tokens as usize;
+    let real_tokens = state.session_tokens.latest_prompt_tokens as usize;
     let (pct, used_str, max_str) = if state.context_window > 0 && real_tokens > 0 {
         let pct = (real_tokens * 100 / state.context_window).min(99);
         (pct, format_ctx(real_tokens), format_ctx(state.context_window))

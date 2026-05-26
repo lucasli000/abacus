@@ -835,6 +835,14 @@ pub struct AppState {
     /// 生命周期: 启动时 0（锚定逻辑见 0 时退化为 80, 安全 fallback）
     pub(crate) last_content_width: std::cell::Cell<usize>,
 
+    /// B11: 每条消息的实际渲染行数缓存（由 render_messages_in_card 每次 L2 重建时写入）
+    /// 用于 screen_row_to_msg_idx / screen_pos_to_msg_char 的热路径，避免每帧/每次点击
+    /// 重新调用 estimate_msg_rows（含 serde_json::from_str 和 wrap math）。
+    /// 
+    /// 缓存有效性: cached_msg_rows.len() == messages.len() 时有效，否则回退 estimate_msg_rows。
+    /// 生命周期: 启动时空 Vec；每次 L2 渲染后刷新；messages 数量变化时自动失效。
+    pub(crate) cached_msg_rows: std::cell::RefCell<Vec<usize>>,
+
     pub input: String,
     pub input_state: InputState,
     /// 压缩前的 input_state 快照（CompressEnd 时恢复）
@@ -1991,6 +1999,18 @@ pub struct SessionTokenStats {
     /// 来源：TurnStats.thinking_tokens；引用 components::render_tab_memory 单独显示一行
     #[serde(default)]
     pub thinking_tokens: u64,
+    /// 最新一轮的 prompt_tokens（set 语义，非累加）
+    ///
+    /// ## 设计意图
+    /// total_tokens 是所有轮次的累计账单 token，不反映当前 context 窗口占用。
+    /// prompt_tokens 是当轮发送给 LLM 的完整 context（含历史），才是真正的
+    /// "context window 使用量"。InputBar 百分比用此字段，避免虚高。
+    ///
+    /// ## 引用关系
+    /// - 写：run.rs 每轮 stats 到达时 set（不 +=）
+    /// - 读：bars.rs InputBar context % 计算
+    #[serde(default)]
+    pub latest_prompt_tokens: u64,
     /// V31: 累计费用（CNY canonical）—— 按每轮 stats.model_id 查 model_registry 即时计算
     /// 引用关系：cost::estimate_turn_cost_cny → abacus_types::lookup_model_or_default
     /// 数据源真相：CNY（DeepSeek 官方计费货币），USD 经 fx_rate 现算
@@ -2132,6 +2152,8 @@ impl AppState {
             last_timeline_visible: std::cell::Cell::new(0),
             // V29.11: 启动时未渲染, 错赋 0; Space 锁定逻辑看到 0 时退化为 80
             last_content_width: std::cell::Cell::new(0),
+            // B11: 启动时空缓存，第一次 L2 渲染后填充
+            cached_msg_rows: std::cell::RefCell::new(Vec::new()),
             input: String::new(),
             input_state: InputState::Ready,
             pre_compress_input_state: None,

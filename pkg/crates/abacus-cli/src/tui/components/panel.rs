@@ -292,7 +292,7 @@ fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let completion = state.session_tokens.completion_tokens;
     let cached = state.session_tokens.cached_tokens;
     let total = state.session_tokens.total_tokens;
-    let cost = state.session_tokens.cost_usd;
+    let cost_cny = state.session_tokens.cost_cny;
 
     let user_count = state.messages.iter()
         .filter(|m| matches!(m.role, crate::tui::state::MsgRole::User))
@@ -328,7 +328,7 @@ fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let cache_pct = if prompt > 0 { cached * 100 / prompt } else { 0 };
         let narrow = area.width < 24;
         let (in_label, out_label, cache_label, cost_label) = if narrow {
-            ("  in ", " · out ", "  ♻", " · $")
+            ("  in ", " · out ", "  ♻", " · ¥")
         } else {
             ("   input ", "  ·  output ", "   cache ", "  ·  cost ")
         };
@@ -343,9 +343,12 @@ fn render_compact_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Span::styled(cache_label, muted),
             Span::styled(format!("{}%", cache_pct), Style::default().fg(state.theme.success)),
         ];
-        if cost > 0.001 {
+        if cost_cny > 0.001 {
             cache_cost_spans.push(Span::styled(cost_label, muted));
-            cache_cost_spans.push(Span::styled(format!("${:.4}", cost), Style::default().fg(state.theme.gold)));
+            cache_cost_spans.push(Span::styled(
+                crate::tui::cost::format_cny(cost_cny),
+                Style::default().fg(state.theme.gold),
+            ));
         }
         lines.push(Line::from(cache_cost_spans));
 
@@ -939,7 +942,10 @@ fn render_tab_memory(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         // 用空 bar（info panel 无色条侧边栏）调用 styled_line_to_ratatui，
         // 复用消息区一致的标题加粗 / 列表缩进 / 代码行样式
         let empty_bar = Span::raw("");
-        let styled = markdown::render_markdown(&state.info_panel_text, &state.theme, false);
+        // T1修复：用 bounded 版传入实际宽度，避免固定 80 宽导致溢出/资源浪费
+        // area.width 减 2：empty_bar(0) + 表格缩进"  "(2) 的开销
+        let panel_md_width = (area.width as usize).saturating_sub(2).max(20);
+        let styled = markdown::render_markdown_bounded(&state.info_panel_text, &state.theme, false, panel_md_width);
         let md_lines: Vec<Line> = styled
             .iter()
             .map(|s| markdown::styled_line_to_ratatui(s, &empty_bar, &state.theme))

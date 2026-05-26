@@ -23,8 +23,8 @@ use crate::tui::theme::{TextRole, Theme};
 ///
 /// 引用关系：被 build_message_lines 内 Block 展开分支调用
 /// 生命周期：单次展开渲染，无持久缓存（detail 已固化在 message.parts）
-pub(super) fn render_block_detail<'a>(detail: &str, kind: &BlockKind, theme: &Theme) -> Vec<Line<'a>> {
-    render_block_detail_with_limit(detail, kind, theme, 0)
+pub(super) fn render_block_detail<'a>(detail: &str, kind: &BlockKind, theme: &Theme, max_width: usize) -> Vec<Line<'a>> {
+    render_block_detail_with_limit(detail, kind, theme, 0, max_width)
 }
 
 /// V29.11: bash_exec 工具的 args 渲染为 shell 命令视图
@@ -130,6 +130,7 @@ pub(super) fn render_single_trace_event<'a>(
     theme: &Theme,
     max_lines_think: usize,
     max_lines_tool: usize,
+    max_width: usize,
     lines: &mut Vec<Line<'a>>,
 ) {
     match &ev.kind {
@@ -145,8 +146,9 @@ pub(super) fn render_single_trace_event<'a>(
                     theme.text_style(TextRole::Caption),
                 ),
             ]));
+            // bar(1)+"  "(2)=3 chars overhead; max_width 已由调用方减去容器宽度开销
             let detail_lines = render_block_detail_with_limit(
-                text, &BlockKind::Think, theme, max_lines_think,
+                text, &BlockKind::Think, theme, max_lines_think, max_width.saturating_sub(3),
             );
             for dl in detail_lines {
                 let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
@@ -179,7 +181,7 @@ pub(super) fn render_single_trace_event<'a>(
                 ).or_else(|| try_render_bash_exec(
                     name, args, theme, max_lines_tool,
                 )).unwrap_or_else(|| render_block_detail_with_limit(
-                    args, &BlockKind::ToolCall, theme, max_lines_tool,
+                    args, &BlockKind::ToolCall, theme, max_lines_tool, max_width.saturating_sub(3),
                 ));
                 for dl in arg_lines {
                     let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
@@ -195,7 +197,7 @@ pub(super) fn render_single_trace_event<'a>(
                         Span::styled("→", theme.text_style(TextRole::Caption)),
                     ]));
                     let out_lines = render_block_detail_with_limit(
-                        out, &BlockKind::ToolCall, theme, max_lines_tool,
+                        out, &BlockKind::ToolCall, theme, max_lines_tool, max_width.saturating_sub(3),
                     );
                     for dl in out_lines {
                         let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
@@ -254,6 +256,7 @@ pub(super) fn render_merged_tool_run<'a>(
     theme: &Theme,
     code_blocks_expanded: bool,
     expanded_event_ids: &std::collections::HashSet<u64>,
+    max_width: usize,
     lines: &mut Vec<Line<'a>>,
 ) {
     // 收集本组 events（部分可能已被 FIFO 裁剪）
@@ -390,7 +393,7 @@ pub(super) fn render_merged_tool_run<'a>(
                             Span::styled("→", theme.text_style(TextRole::Caption)),
                         ]));
                         let out_lines = render_block_detail_with_limit(
-                            out, &BlockKind::ToolCall, theme, max_lines_tool,
+                            out, &BlockKind::ToolCall, theme, max_lines_tool, max_width.saturating_sub(3),
                         );
                         for dl in out_lines {
                             let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
@@ -718,12 +721,15 @@ fn render_simple_diff(
 /// 调用方决定 max_lines:Trace 中 thinking=30, tool=20;Block 直接展开传 0。
 ///
 /// 引用关系: 被 render_block_detail (传 0) 和 build_message_lines Trace 分支(传 30/20) 调用
-pub(super) fn render_block_detail_with_limit<'a>(detail: &str, kind: &BlockKind, theme: &Theme, max_lines: usize) -> Vec<Line<'a>> {
+pub(super) fn render_block_detail_with_limit<'a>(detail: &str, kind: &BlockKind, theme: &Theme, max_lines: usize, max_width: usize) -> Vec<Line<'a>> {
     let lines: Vec<Line<'a>> = match kind {
         BlockKind::Think => {
             // 走 markdown 渲染——空 bar，让思考块按结构化文本展示
+            // T1修复：传入实际宽度，避免固定 80 宽导致表格溢出
+            // max_width 已由调用方减去 bar+内嵌缩进开销
             let empty_bar = Span::raw("");
-            let styled_lines = markdown::render_markdown(detail, theme, false);
+            let md_width = max_width.max(20);
+            let styled_lines = markdown::render_markdown_bounded(detail, theme, false, md_width);
             styled_lines.iter()
                 .map(|s| markdown::styled_line_to_ratatui(s, &empty_bar, theme))
                 .collect()

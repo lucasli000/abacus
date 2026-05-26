@@ -278,7 +278,8 @@ fn build_message_lines(
                         //   Think     → markdown 渲染（思考链常含列表/加粗/代码引用）
                         //   ToolCall  → JSON pretty-print + InlineCode 染色（args 实为 output JSON）
                         //   Checklist → Caption（清单结构简单，保留旧行为）
-                        let detail_lines = render_block_detail(detail, kind, theme);
+                        // max_width 减去：bar(1) + 5空格(5) = 6 对 Think 内嵌表格的开销
+                        let detail_lines = render_block_detail(detail, kind, theme, content_width.saturating_sub(5));
                         for dl in detail_lines {
                             // 每行加 bar 前缀和缩进，保持视觉一致
                             let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("     ")];
@@ -376,6 +377,7 @@ fn build_message_lines(
                                         let max_lines_tool = if fully_expanded { 0 } else { 20 };
                                         render_single_trace_event(
                                             ev, &bar, theme, max_lines_think, max_lines_tool,
+                                            content_width,
                                             &mut lines,
                                         );
                                     }
@@ -385,6 +387,7 @@ fn build_message_lines(
                                 render_merged_tool_run(
                                     run, trace_events, trace_event_index, &bar, theme,
                                     code_blocks_expanded, expanded_event_ids,
+                                    content_width,
                                     &mut lines,
                                 );
                             }
@@ -571,12 +574,16 @@ pub(crate) fn estimate_msg_rows(msg: &crate::tui::state::Message, content_width:
 }
 
 /// 将屏幕行号转换为消息索引（按实际渲染行数映射）
+///
+/// B11: cached_msg_rows 缓存热路径 — 非空且长度匹配时直接使用，
+/// 跳过 estimate_msg_rows（含 serde_json::from_str 和 wrap math）。
 pub(crate) fn screen_row_to_msg_idx(
     row: u16,
     terminal_rows: u16,
     scroll: usize,
     messages: &std::collections::VecDeque<crate::tui::state::Message>,
     chat_width: u16,
+    cached_msg_rows: &[usize],
 ) -> Option<usize> {
     let msg_area_start = 1u16; // after top bar
     let msg_area_end = terminal_rows.saturating_sub(7); // before input + status
@@ -586,9 +593,10 @@ pub(crate) fn screen_row_to_msg_idx(
     let screen_row = (row - msg_area_start) as usize;
 
     let content_width = (chat_width as usize).saturating_sub(5).max(20);
+    let use_cache = !cached_msg_rows.is_empty() && cached_msg_rows.len() == messages.len();
     let mut acc = 0usize;
     for (idx, msg) in messages.iter().enumerate().skip(scroll) {
-        let h = estimate_msg_rows(msg, content_width);
+        let h = if use_cache { cached_msg_rows[idx] } else { estimate_msg_rows(msg, content_width) };
         if screen_row < acc + h {
             return Some(idx);
         }
@@ -623,19 +631,21 @@ pub(crate) fn screen_pos_to_msg_char(
     scroll: usize,
     messages: &std::collections::VecDeque<crate::tui::state::Message>,
     chat_width: u16,
+    cached_msg_rows: &[usize],
 ) -> Option<(usize, usize)> {
     use crate::tui::state::MsgContent;
-    let msg_idx = screen_row_to_msg_idx(row, terminal_rows, scroll, messages, chat_width)?;
+    let msg_idx = screen_row_to_msg_idx(row, terminal_rows, scroll, messages, chat_width, cached_msg_rows)?;
     let msg = messages.get(msg_idx)?;
 
     // 定位 msg 起始屏幕行
     let msg_area_start = 1u16;
     let screen_row = (row.saturating_sub(msg_area_start)) as usize;
     let content_width = (chat_width as usize).saturating_sub(5).max(20);
+    let use_cache = !cached_msg_rows.is_empty() && cached_msg_rows.len() == messages.len();
     let mut acc = 0usize;
     for (idx, m) in messages.iter().enumerate().skip(scroll) {
         if idx == msg_idx { break; }
-        acc += estimate_msg_rows(m, content_width);
+        acc += if use_cache { cached_msg_rows[idx] } else { estimate_msg_rows(m, content_width) };
     }
     let row_in_msg = screen_row.saturating_sub(acc);
 
@@ -1326,6 +1336,17 @@ pub fn render_messages_in_card(
     state.last_visible_h.set(visible_h);
     state.last_total_lines.set(total_before_slice);
     state.last_content_width.set((inner.width as usize).saturating_sub(5));
+    // B11: 刷新每消息行数缓存（用于 screen_row_to_msg_idx / screen_pos_to_msg_char 热路径）
+    // 使用 last_content_width 的相同值以保证一致性
+    {
+        let content_width = (inner.width as usize).saturating_sub(5);
+        let mut cache = state.cached_msg_rows.borrow_mut();
+        cache.clear();
+        cache.reserve(state.messages.len());
+        for msg in &state.messages {
+            cache.push(crate::tui::components::estimate_msg_rows(msg, content_width));
+        }
+    }
 
     // V28.3: trace_part_positions → screen row map
     let mut row_map = state.message_trace_row_map.borrow_mut();

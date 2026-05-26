@@ -1566,16 +1566,18 @@ impl<'a> TurnPipeline<'a> {
                 // 检测条件：response text 包含已注册工具名 + tool_calls 为空 + 重试 < 1
                 // 机制：注入纠正提示，让 LLM 用 function calling 而非文本输出来调工具。
                 // tools_exhausted=true 时跳过：LLM 已知晓工具耗尽，注入纠错只会加剧混乱
-                if ctx.tool_text_fallback_retries < 3 && !text.is_empty() && !ctx.tools_exhausted {
+                if ctx.tool_text_fallback_retries < 1 && !text.is_empty() && !ctx.tools_exhausted {
+                    // 跳过描述性文本中的工具名提及（LLM 在解释计划而非调用）
                     let text_lower = text.to_lowercase();
-                    let registered_names: Vec<String> = self.core.registry
-                        .tool_names()
-                        .await;
-                    let found_tool = registered_names.iter().find(|name| {
-                        // 只检测长度 >= 4 的工具名（避免 "ls" 等短串误判）
-                        name.len() >= 4 && text_lower.contains(name.as_str())
-                    });
-                    if let Some(tool_name) = found_tool {
+                    let skip_patterns = ["i'll use", "i can use", "let me", "using ", "let's",
+                                         "you can use", "you could use", "我", "让我", "可以"];
+                    if !skip_patterns.iter().any(|p| text_lower.contains(p)) {
+                        let registered_names: Vec<String> = self.core.registry
+                            .tool_names()
+                            .await;
+                        if let Some(tool_name) = registered_names.iter().find(|name| {
+                            name.len() >= 4 && text_lower.contains(name.as_str())
+                        }) {
                         ctx.tool_text_fallback_retries += 1;
                         tracing::warn!(
                             tool = %tool_name,
@@ -1593,10 +1595,12 @@ impl<'a> TurnPipeline<'a> {
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(
-                                    "You wrote a tool name in your text response instead of calling it. \
-                                     Do NOT write tool names or commands in text. \
-                                     Use the function calling mechanism to invoke tools with JSON parameters. \
-                                     Now call the tool properly.".into()
+                                    format!(
+                                        "[System] 你在文本中提到了工具名 \"{}\"，但没有通过 function calling 调用它。\
+                                         \n如果你确实要调用此工具，请使用结构化 tool_call（不要写在文本里）。\
+                                         \n如果你只是正常推理中提到了工具名（并非要调用），请忽略此提示，继续你的回答。",
+                                        tool_name
+                                    ).into()
                                 )),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, prefix: false,

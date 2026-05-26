@@ -411,14 +411,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                 return true;
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                // 总是允许——但 High 风险操作禁止此选项
-                let is_high = state.confirm_dialog.as_ref()
-                    .map(|d| d.risk == crate::tui::state::ConfirmRisk::High)
-                    .unwrap_or(false);
-                if is_high {
-                    state.add_toast("⚠ 破坏性操作不支持[总是允许]", Duration::from_secs(2));
-                    return true;
-                }
+                // B12: 放开所有风险等级的"总是允许"——用户可对高频安全命令授权
                 let dialog = state.confirm_dialog.take().unwrap();
                 state.add_event(&ts, "session", &format!("✓ 总是授权: {}", dialog.action), crate::tui::state::EventLevel::Notice);
                 state.add_toast("✓ 已授权（总是允许同类操作）", Duration::from_secs(3));
@@ -1470,8 +1463,10 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
             // 引用关系：screen_pos_to_msg_char 定义于 components/mod.rs。
             // 生命周期：selection 状态清除走 Up 分支（复制后 take()）或 Esc 取消
             if event.modifiers.contains(KeyModifiers::SHIFT) {
+                let cached_rows = state.cached_msg_rows.borrow();
                 if let Some((msg_idx, char_idx)) = crate::tui::components::screen_pos_to_msg_char(
                     event.row, event.column, terminal_rows, state.scroll, &state.messages, chat_cols,
+                    cached_rows.as_slice(),
                 ) {
                     state.text_selection = Some(TextSelection {
                         start_msg_idx: msg_idx,
@@ -1650,8 +1645,10 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                 if state.text_selection.is_some() {
                     let pw = if state.panel_visible { terminal_cols * crate::tui::layout::panel_pct_for_width(terminal_cols) / 100 } else { 0 };
                     let chat_cols = terminal_cols.saturating_sub(pw).max(40);
+                    let cached_rows = state.cached_msg_rows.borrow();
                     if let Some((msg_idx, char_idx)) = crate::tui::components::screen_pos_to_msg_char(
                         event.row, event.column, terminal_rows, state.scroll, &state.messages, chat_cols,
+                        cached_rows.as_slice(),
                     ) {
                         if let Some(ref mut sel) = state.text_selection {
                             sel.end_msg_idx = msg_idx;

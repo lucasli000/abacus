@@ -490,6 +490,8 @@ impl LlmProvider for OpenAICompatibleProvider {
         );
 
         // V18 wire trace（openai-compatible 路径）
+        // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
+        #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
             let _ = std::fs::write("/tmp/abacus_wire_last.json",
                 format!("// PROVIDER: openai-compatible\n// BASE_URL: {}\n{}", self.base_url, json));
@@ -562,9 +564,14 @@ impl LlmProvider for OpenAICompatibleProvider {
             let summary = body.messages.iter().enumerate()
                 .map(|(i, m)| format!("  [{}] role={}", i, m.role))
                 .collect::<Vec<_>>().join("\n");
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            } else {
+                String::new()
+            };
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18 openai-compat) ---\nbase_url={}\nmessages:\n{}\n(完整 JSON 见 /tmp/abacus_wire_last.json)",
-                body_text, self.base_url, summary
+                "{}\n--- REQ DUMP (V18 openai-compat) ---\nbase_url={}\nmessages:\n{}{}",
+                body_text, self.base_url, summary, wire_hint
             );
             return Err(KernelError::ApiError {
                 status: status.as_u16(),
@@ -622,6 +629,8 @@ impl LlmProvider for OpenAICompatibleProvider {
         body.stream = true;
 
         // V18 wire trace（openai-compatible streaming 路径）
+        // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
+        #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
             let _ = std::fs::write("/tmp/abacus_wire_last.json",
                 format!("// PROVIDER: openai-compatible (streaming)\n// BASE_URL: {}\n{}", self.base_url, json));
@@ -649,9 +658,14 @@ impl LlmProvider for OpenAICompatibleProvider {
             let summary = body.messages.iter().enumerate()
                 .map(|(i, m)| format!("  [{}] role={}", i, m.role))
                 .collect::<Vec<_>>().join("\n");
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            } else {
+                String::new()
+            };
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18 openai-compat stream) ---\nbase_url={}\nmessages:\n{}\n(完整 JSON 见 /tmp/abacus_wire_last.json)",
-                body_text, self.base_url, summary
+                "{}\n--- REQ DUMP (V18 openai-compat stream) ---\nbase_url={}\nmessages:\n{}{}",
+                body_text, self.base_url, summary, wire_hint
             );
             return Err(KernelError::ApiError { status: status.as_u16(), body: enriched });
         }

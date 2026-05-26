@@ -6,7 +6,7 @@
 //! 引用关系：被 components/mod.rs 的 build_message_lines 调用
 //! 生命周期：每次消息渲染时调用（通过缓存减少重复解析）
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, CodeBlockKind};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd, CodeBlockKind};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -88,6 +88,10 @@ struct MdRenderer<'a> {
     current_table_row: Vec<String>,
     /// 当前单元格文本缓冲
     current_cell_buf: String,
+    /// T2: 表格列对齐方式（pulldown-cmark Tag::Table 自带）
+    /// 生命周期：Tag::Table 开始时设置，TagEnd::Table 后清空
+    /// 引用关系：render_table() 用于单元格左/居中/右对齐
+    table_alignments: Vec<Alignment>,
 }
 
 impl<'a> MdRenderer<'a> {
@@ -112,6 +116,7 @@ impl<'a> MdRenderer<'a> {
             table_rows: Vec::new(),
             current_table_row: Vec::new(),
             current_cell_buf: String::new(),
+            table_alignments: Vec::new(),
         }
     }
 
@@ -242,10 +247,12 @@ impl<'a> MdRenderer<'a> {
             // 历史此处曾打算"段间补空行"，最终未实现，删除空逻辑壳。
             Tag::Paragraph => {}
             // ── 表格：开始收集行，等 End(Table) 时统一绘制 ──────────────
-            Tag::Table(_) => {
+            // T2：捕获对齐信息，render_table() 用于单元格对齐
+            Tag::Table(alignments) => {
                 self.flush_line(LineType::Normal);
                 self.in_table = true;
                 self.table_rows = Vec::new();
+                self.table_alignments = alignments.to_vec();
             }
             // TableHead 是 thead 容器，实际行由内部 TableRow 负责
             Tag::TableRow => {
@@ -350,6 +357,7 @@ impl<'a> MdRenderer<'a> {
                 self.render_table();
                 self.in_table = false;
                 self.table_rows = Vec::new();
+                self.table_alignments = Vec::new(); // T2: 清空，下一张表格重新捕获
             }
             _ => {}
         }
@@ -490,13 +498,24 @@ impl<'a> MdRenderer<'a> {
         if total_content + overhead > self.max_width && self.max_width > overhead {
             let avail = self.max_width.saturating_sub(overhead);
             // 按比例缩放（保底每列 3）
-            let scaled: Vec<usize> = col_widths
+            let mut scaled: Vec<usize> = col_widths
                 .iter()
                 .map(|w| {
                     let v = (*w as u64 * avail as u64 / total_content.max(1) as u64) as usize;
                     v.max(3)
                 })
                 .collect();
+            // T3: .max(3) 可能使 sum > avail（小列被提升），从最宽列逐一裁剪回 avail
+            let mut sum: usize = scaled.iter().sum();
+            while sum > avail {
+                let max_idx = scaled.iter().enumerate()
+                    .max_by_key(|(_, &w)| w)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                if scaled[max_idx] <= 3 { break; } // 无法再缩小
+                scaled[max_idx] -= 1;
+                sum -= 1;
+            }
             col_widths = scaled;
         }
 
@@ -517,21 +536,37 @@ impl<'a> MdRenderer<'a> {
             // 之前整行一个 span → │ 也染了文本色, 视觉上左右边框"有颜色"
             let text_style = if row_idx == 0 { header_style } else { cell_style };
             self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
-            for (i, w) in col_widths.iter().enumerate() {
-                let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-                // V27: cell 超过列宽 → 截断 + 省略号
-                let cell_owned = if display_width(cell) > *w {
-                    let target = w.saturating_sub(1).max(1);
-                    let mut t = truncate_to_width(cell, target);
-                    t.push('…');
-                    t
-                } else {
-                    cell.to_string()
-                };
-                let padded = format!(" {} ", pad_to_width(&cell_owned, *w));
-                self.current_spans.push(StyledSpan { text: padded, style: text_style });
-                self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
-            }
+        for (i, w) in col_widths.iter().enumerate() {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            // V27: cell 超过列宽 → 截断 + 省略号
+            let cell_owned = if display_width(cell) > *w {
+                let target = w.saturating_sub(1).max(1);
+                let mut t = truncate_to_width(cell, target);
+                t.push('…');
+                t
+            } else {
+                cell.to_string()
+            };
+            // T2: 按列对齐方式填充单元格（左对齐是默认/未指定）
+            let align = self.table_alignments.get(i).copied().unwrap_or(Alignment::None);
+            let padded = match align {
+                Alignment::Right => {
+                    let cw = display_width(&cell_owned);
+                    let pad = w.saturating_sub(cw);
+                    format!(" {}{} ", " ".repeat(pad), cell_owned)
+                }
+                Alignment::Center => {
+                    let cw = display_width(&cell_owned);
+                    let total_pad = w.saturating_sub(cw);
+                    let lpad = total_pad / 2;
+                    let rpad = total_pad - lpad;
+                    format!(" {}{}{} ", " ".repeat(lpad), cell_owned, " ".repeat(rpad))
+                }
+                _ => format!(" {} ", pad_to_width(&cell_owned, *w)), // Left / None
+            };
+            self.current_spans.push(StyledSpan { text: padded, style: text_style });
+            self.current_spans.push(StyledSpan { text: "│".to_string(), style: border_style });
+        }
             self.flush_line(LineType::Table);
 
             // ├──────┼──────┤ 表头分隔线
@@ -641,7 +676,8 @@ pub fn styled_line_to_ratatui(
             }
             LineType::ListItem => "  ".to_string(),     // 2sp
             LineType::Normal | LineType::Empty => "  ".to_string(), // 2sp
-            LineType::Table    => String::new(),         // 表格自带布局
+            // T5: 表格缩进与正文对齐（bar(1)+"  "(2)+table = bar+indent+content_width = max_width 允许）
+            LineType::Table    => "  ".to_string(),
         };
         (s, Style::default())
     };
@@ -784,4 +820,3 @@ mod st5_streaming_tests {
         assert!(code >= 1, "代码内容应被识别为 Code 行");
     }
 }
-

@@ -585,6 +585,8 @@ impl LlmProvider for DeepSeekProvider {
         );
 
         // V18 wire trace: 把请求 body 写到 /tmp/abacus_wire_last.json，方便 400 时事后 diff
+        // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
+        #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
             let _ = std::fs::write("/tmp/abacus_wire_last.json", &json);
         }
@@ -663,9 +665,14 @@ impl LlmProvider for DeepSeekProvider {
                 })
                 .collect::<Vec<_>>().join("\n");
             let thinking_state = if body.thinking.is_some() { "ON" } else { "OFF" };
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            } else {
+                String::new()
+            };
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18 complete) ---\nthinking={}\nmessages:\n{}\n(完整 JSON 见 /tmp/abacus_wire_last.json)",
-                body_text, thinking_state, summary
+                "{}\n--- REQ DUMP (V18 complete) ---\nthinking={}\nmessages:\n{}{}",
+                body_text, thinking_state, summary, wire_hint
             );
             return Err(KernelError::ApiError {
                 status: status.as_u16(),
@@ -704,6 +711,8 @@ impl LlmProvider for DeepSeekProvider {
         body.stream = true;
 
         // V18 wire trace: 把请求 body 写到 /tmp/abacus_wire_last.json
+        // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
+        #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
             let _ = std::fs::write("/tmp/abacus_wire_last.json", &json);
         }
@@ -737,9 +746,14 @@ impl LlmProvider for DeepSeekProvider {
                 })
                 .collect::<Vec<_>>().join("\n");
             let thinking_state = if body.thinking.is_some() { "ON" } else { "OFF" };
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            } else {
+                String::new()
+            };
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18) ---\nthinking={}\nmessages:\n{}\n(完整 JSON 见 /tmp/abacus_wire_last.json)",
-                body_text, thinking_state, summary
+                "{}\n--- REQ DUMP (V18) ---\nthinking={}\nmessages:\n{}{}",
+                body_text, thinking_state, summary, wire_hint
             );
             return Err(KernelError::ApiError { status: status.as_u16(), body: enriched });
         }
