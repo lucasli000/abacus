@@ -367,7 +367,10 @@ impl<'a> TurnPipeline<'a> {
         let start_time = std::time::Instant::now();
 
         // V35-1: continue_gated 路径同步注入 prefix message（与 execute_loop 对齐）
-        let cg_model = self.core.config.default_model.clone();
+        // 优先级与 execute_loop 一致：req_ctx.model > model_override > default
+        let cg_model = self.req_ctx.model.clone()
+            .or(self.core.get_model_override().await)
+            .unwrap_or_else(|| self.core.config.default_model.clone());
         maybe_inject_prefix_message(
             &mut messages,
             &cg_model.0,
@@ -1162,7 +1165,12 @@ impl<'a> TurnPipeline<'a> {
             // 引用关系：escalated_model 在 handle_model_escalation 升级成功后写入；
             // 后续所有 turn 优先用此 model 直到 session 结束——避免 cache 池来回切换
             let escalated = self.session.read().await.escalated_model.read().await.clone();
+            // 用户 /model 命令设置的运行时覆盖（应高于 escalated 优先级）
+            // 不把 model_override 放进 req_ctx.model（那是 per-request），而是作为 session 级默认
+            // 优先级：req_ctx.model（显式单请求覆盖）> model_override（用户 /model 设置）> escalated > default
+            let model_override = self.core.get_model_override().await;
             let effective_model = self.req_ctx.model.clone()
+                .or(model_override)
                 .or(escalated)
                 .unwrap_or_else(|| self.core.config.default_model.clone());
             let effective_temperature = self.req_ctx.temperature
@@ -1239,6 +1247,14 @@ impl<'a> TurnPipeline<'a> {
                 });
 
                 // 转发 StreamEvent → StreamChunk（实时推送到 TUI）
+                // 同时在本线累积 structured tool_calls（id → (name, args_buf)）
+                // stream_complete 返回的 LlmResponse.tool_calls 可能为 None（流式路径不组装）
+                // 此处拦截 ToolCallArgDelta 并在 Done 后注入到最终 response
+                let mut stream_tool_buf: std::collections::HashMap<
+                    String, // call id
+                    (String, String), // (name, accumulated_args)
+                > = std::collections::HashMap::new();
+
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         crate::llm::stream::StreamEvent::TextDelta(t) => {
@@ -1247,19 +1263,44 @@ impl<'a> TurnPipeline<'a> {
                         crate::llm::stream::StreamEvent::ThinkingDelta(t) => {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Thinking(t));
                         }
-                        crate::llm::stream::StreamEvent::ToolCallStart { name, .. } => {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart { name });
+                        crate::llm::stream::StreamEvent::ToolCallStart { id, name } => {
+                            // 展示给 TUI + 同时开始累积 args
+                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart { name: name.clone() });
+                            stream_tool_buf.insert(id, (name, String::new()));
+                        }
+                        crate::llm::stream::StreamEvent::ToolCallArgDelta { id, delta } => {
+                            // 累积 args（不向 TUI 推送，等 Done 后注入到 response）
+                            if let Some((_name, args)) = stream_tool_buf.get_mut(&id) {
+                                args.push_str(&delta);
+                            }
                         }
                         crate::llm::stream::StreamEvent::Error(msg) => {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(msg));
                         }
                         crate::llm::stream::StreamEvent::Done => break,
-                        _ => {} // ArgDelta/Usage handled via final response
+                        _ => {} // Usage etc handled via final response
                     }
                 }
 
-                handle.await
-                    .map_err(|e| KernelError::Other(format!("stream task panicked: {e}")))?
+                let mut response = handle.await
+                    .map_err(|e| KernelError::Other(format!("stream task panicked: {e}")))
+                    .and_then(|r| r)?;
+
+                // 如果 streaming 收集到了 structured tool_calls 且 response 中为空，注入组装结果
+                if !stream_tool_buf.is_empty() && response.message.tool_calls.as_ref().map_or(true, |v| v.is_empty()) {
+                    let assembled: Vec<crate::llm::provider::ToolCall> = stream_tool_buf
+                        .into_iter()
+                        .map(|(id, (name, arguments))| crate::llm::provider::ToolCall {
+                            id,
+                            type_: "function".into(),
+                            function: crate::llm::provider::ToolFunction { name, arguments },
+                        })
+                        .collect();
+                    tracing::debug!(n = assembled.len(), "streaming: assembled tool_calls from SSE deltas");
+                    response.message.tool_calls = Some(assembled);
+                }
+
+                Ok(response)
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
                 // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
@@ -1360,7 +1401,7 @@ impl<'a> TurnPipeline<'a> {
                             Ok(resp) => resp,
                             Err(retry_err) => {
                                 // Error-recovery: 400 repair retry also failed
-                                let err_desc = format!("{}", retry_err);
+                                let err_desc = sanitize_provider_error(&retry_err);
                                 if let Some(ref stx) = self.stream_tx {
                                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
                                         format!("LLM retry after repair also failed: {}", err_desc)
@@ -1436,8 +1477,8 @@ impl<'a> TurnPipeline<'a> {
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(format!(
-                                    "[System] LLM request failed: {}. This is attempt {}/3. I will retry.",
-                                    e, ctx.provider_retries
+                                        "[System] LLM request failed: {}. This is attempt {}/3. I will retry.",
+                                        sanitize_provider_error(&e), ctx.provider_retries
                                 ))),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, prefix: false,
@@ -1540,15 +1581,10 @@ impl<'a> TurnPipeline<'a> {
                             tool = %tool_name,
                             "LLM wrote tool name in text without function call — injecting correction"
                         );
+                        // 修复：不再发假工具 ToolStart/ToolEnd，改用 processing_phase 更新显示纠正状态
                         if let Some(ref stx) = self.stream_tx {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart {
-                                name: "auto_repair".into(),
-                            });
-                            let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
-                                name: "auto_repair".into(),
-                                success: true,
-                                duration_ms: 0,
-                                failure_kind: None,
+                            let _ = stx.send(crate::llm::stream::StreamChunk::IterationStart {
+                                iteration: ctx.tool_text_fallback_retries,
                             });
                         }
                         {
@@ -1573,12 +1609,12 @@ impl<'a> TurnPipeline<'a> {
                 // V30: 检测 LLM 任务未完成即停止（premature stop）
                 // 条件：本轮有工具失败 + LLM 输出了短文本（< 200 chars）+ 之前已有工具调用
                 // 机制：注入续写提示，让 LLM 继续尝试或显式声明阻塞
-                // 限制：每 session 最多触发 3 次，避免无限循环
-                if ctx.total_tool_calls > 0 && loop_iter > 0 {
-                    let has_recent_failures = ctx.all_tool_outputs.iter()
-                        .rev()
-                        .take(5)
-                        .any(|o| !o.success);
+                // 修复1：tools_exhausted=true 时跳过（工具已关，LLM 第一次输出文本就是正常总结）
+                // 修复2：只检查最近 1 次工具调用结果，而非最近 5 次（历史失败不应影响当前判断）
+                if ctx.total_tool_calls > 0 && loop_iter > 0 && !ctx.tools_exhausted {
+                    let has_recent_failures = ctx.all_tool_outputs.last()
+                        .map(|o| !o.success)
+                        .unwrap_or(false);
 
                     if has_recent_failures {
                         // 检查 LLM 是否显式声明了状态（遵守 [Explicit Declaration]）
@@ -1599,29 +1635,37 @@ impl<'a> TurnPipeline<'a> {
                                 text_len = text.len(),
                                 "LLM stopped without explicit declaration after tool failures"
                             );
-                            // 用户感知：通知 TUI policy 拦截生效
+                            // 用户感知：通知 TUI policy 拦截生效（IterationStart，不产生虚假工具条目）
                             if let Some(ref stx) = self.stream_tx {
-                                let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart {
-                                    name: format!("⚡ policy: retry {}/{} (silent stop detected)", retry_count + 1, max_retries),
-                                });
-                                let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
-                                    name: format!("⚡ policy: retry {}/{} (silent stop detected)", retry_count + 1, max_retries),
-                                    success: true,
-                                    duration_ms: 0,
-                                    failure_kind: None,
+                                let _ = stx.send(crate::llm::stream::StreamChunk::IterationStart {
+                                    iteration: retry_count + 1,
                                 });
                             }
+                            // 构建携带失败上下文的续写提示
+                            // has_recent_failures=true → last() 一定存在且 success=false
+                            let hint_msg = {
+                                let last = ctx.all_tool_outputs.last().unwrap();
+                                let failed_tool = &last.tool_id.0;
+                                let fk = last.failure_kind.as_deref().unwrap_or("Unknown");
+                                let err_text = last.output.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("(no detail)");
+                                // 安全截断（避免 multi-byte 边界 panic）
+                                let err_short: String = err_text.chars().take(200).collect();
+                                format!(
+                                    "Tool `{failed_tool}` failed ({fk}): {err_short}\n\
+                                     You MUST either:\n\
+                                     1. Try alternative approaches to complete the task, OR\n\
+                                     2. Explicitly state what happened using [Blocked], [Stuck], [Need Input], or [Partial] prefix.\n\
+                                     Do not stop silently."
+                                )
+                            };
                             {
                                 let s = self.session.read().await;
                                 let mut msgs = s.messages.write().await;
                                 msgs.push(Message {
                                     role: MessageRole::User,
-                                    content: Some(MessageContent::Text(
-                                        "Some tools failed. You MUST either:\n\
-                                         1. Try alternative approaches to complete the task, OR\n\
-                                         2. Explicitly state what happened using [Blocked], [Stuck], [Need Input], or [Partial] prefix.\n\
-                                         Do not stop silently.".into()
-                                    )),
+                                    content: Some(MessageContent::Text(hint_msg)),
                                     name: None, tool_calls: None, tool_call_id: None,
                                     reasoning_content: None, prefix: false,
                                 });
@@ -2014,12 +2058,27 @@ impl<'a> TurnPipeline<'a> {
                                     tracing::warn!(
                                         tool = %tool_id.0,
                                         dangerous = is_dangerous,
-                                        "confirm timeout (15s) — pipeline-side fallback"
+                                        "confirm timeout (60s) — pipeline-side fallback"
                                     );
+                                    // 超时备注：向 TUI 发送 AuthResult toast，让用户知道弹窗已超时自动处理
+                                    if let Some(ref stx) = self.stream_tx {
+                                        let _ = stx.send(crate::llm::stream::StreamChunk::AuthResult {
+                                            tool: format!("超时自动:{}", &tool_id.0),
+                                            approved: !is_dangerous,
+                                        });
+                                    }
                                     !is_dangerous
                                 }
                             };
                             if approved {
+                                // 继续性增强：授权后向 TUI 发送 Toast，让用户知道 pipeline 继续执行
+                                // 不用假工具 ToolStart（会卡在 Running 状态）
+                                if let Some(ref stx) = self.stream_tx {
+                                    let _ = stx.send(crate::llm::stream::StreamChunk::AuthResult {
+                                        tool: tool_id.0.clone(),
+                                        approved: true,
+                                    });
+                                }
                                 // V30: bash 命令级 session grant——同类命令本 session 不再弹窗
                                 // 格式 "bash:{cmd} {subcmd}"，如 "bash:git push"
                                 if tool_id.0.as_str() == "filengine_bash_exec" {
@@ -2053,27 +2112,36 @@ impl<'a> TurnPipeline<'a> {
                                 }.await;
                                 exec_result
                             } else {
-                                // 破坏性操作未授权 → 强制终止 pipeline（唯一非用户发起的终止条件）
-                                // 设计原则：除用户主动取消外，只有未授权的不可恢复破坏性操作才终止
+                                // 破坏性操作被拒绝
+                                // 修复：不再强制终止 pipeline，而是返回失败结果 + 让 LLM 知道操作被拒绝
+                                // 设计原则：任务连续性 > 强制中断；LLM 应有机会换根安全方案或向用户说明原因
                                 let is_destructive_denied = reason.contains("⚠")
                                     || reason.contains("dangerous")
                                     || reason.contains("system-dangerous");
                                 if is_destructive_denied {
                                     if let Some(ref stx) = self.stream_tx {
-                                        let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                            format!("🛑 破坏性操作被拒绝，pipeline 强制终止: {}", reason)
-                                        ));
+                                        let _ = stx.send(crate::llm::stream::StreamChunk::AuthResult {
+                                            tool: tool_id.0.clone(),
+                                            approved: false,
+                                        });
                                     }
-                                    return Err(KernelError::Other(format!(
-                                        "Destructive operation denied without authorization: {}", reason
-                                    )));
+                                    tracing::warn!(
+                                        tool = %tool_id.0,
+                                        reason = %reason,
+                                        "destructive op denied — returning failure to LLM for recovery"
+                                    );
+                                    // 返回失败 ToolOutput，LLM 会看到拒绝原因并换方案
                                 }
                                 // 非破坏性拒绝 → 返回错误让 LLM 换方案（不终止）
                                 Ok(ToolOutput {
                                     tool_id: tool_id.clone(),
                                     success: false,
                                     output: serde_json::json!({
-                                        "error": "denied",
+                                        "error": if is_destructive_denied {
+                                            format!("Operation '{}' was DENIED by user as unsafe. Do NOT retry this operation. Explain to the user why this cannot be done safely, or suggest a safer alternative.", tool_id.0)
+                                        } else {
+                                            "denied".to_string()
+                                        },
                                         "do_not_retry": true,
                                     }),
                                     latency_ms: 0,
@@ -2147,28 +2215,31 @@ impl<'a> TurnPipeline<'a> {
                         }
                     }
                 };
+                // tool_end_sent 标记：应对 Err 路径在内部已发 ToolEnd 的情况，避免行 2249 次发
+                let mut tool_end_sent = false;
                 let mut output = match output_result {
                     Ok(o) => o,
                     Err(e) => {
                         // Error-recovery: tool dispatch failure → synthesize failed ToolOutput
                         // instead of terminating. LLM sees the error via Tool message and adapts.
+                        let fk = "DispatchError".to_string();
                         if let Some(ref stx) = self.stream_tx {
                             let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
                                 name: tc.function.name.clone(),
                                 success: false,
                                 duration_ms: 0,
-                                failure_kind: Some("MCIPBlocked".into()),
+                                failure_kind: Some(fk.clone()),
                             });
-                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("Tool dispatch failed: {}", e)
-                            ));
+                            // 不发 StreamChunk::Error（会中断 streaming 和设置 Ready）
+                            // TUI 通过 ToolBlocked 和 failure_kind 感知错误
                         }
+                        tool_end_sent = true;
                         // Synthesize a failed output so the tool loop continues
                         ToolOutput {
                             tool_id: tool_id.clone(),
                             success: false,
                             output: serde_json::json!({
-                                "error": format!("Tool dispatch error: {}", e),
+                                "error": format!("Tool dispatch error: {}", sanitize_provider_error(&e)),
                                 "recoverable": true
                             }),
                             latency_ms: 0,
@@ -2193,6 +2264,8 @@ impl<'a> TurnPipeline<'a> {
                 //   并更新 trace_events 状态(Running → Success/Failed).
                 //   注: 用 tc.function.name(LLM-sanitized) 而非 tool_id.0(resolved real),
                 //   保持与 ToolStart 同键, 避免 UI 端反查 mismatch.
+                //   tool_end_sent: Err 路径已在行 2211 发送 ToolEnd，此处跳过避免重复
+                if !tool_end_sent {
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::ToolEnd {
                         name: tc.function.name.clone(),
@@ -2212,6 +2285,7 @@ impl<'a> TurnPipeline<'a> {
                         }
                     }
                 }
+                } // if !tool_end_sent
                 ctx.all_tool_outputs.push(output.clone());
                 // W2 (Task #100)：写入 dedup 池——仅在 idempotent && success && 非缓存命中时
                 //
@@ -2808,6 +2882,36 @@ fn task_temperature(
 // ## 不在本期范围
 // `setup` / `execute_loop` / `handle_model_escalation` / `persist_and_build_result`
 // 依赖 CoreLoop + LlmProvider + 数据库，需要专项 mock 框架，留给后续。
+
+// ─── 错误信息净化 ────────────────────────────────────────────────────────────
+//
+// 目的：provider 错误注入 LLM history 前移除 URL 和潜在凭证
+// 引用关系：execute_loop 各错误注入点调用
+// 生命周期：无状态，每次调用独立执行（LazyLock regex 编译一次）
+
+/// provider/dispatch 错误信息中可能含 URL 端点
+static SANITIZE_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"https?://\S+").expect("valid regex")
+});
+
+/// 常见 auth 凭证模式（Bearer token, api-key, Authorization header）
+static SANITIZE_AUTH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)(bearer\s+\S+|api[-_]?key\s*[:=]\s*\S+|token\s*[:=]\s*\S+|authorization\s*:\s*\S+)"
+    ).expect("valid regex")
+});
+
+/// provider/dispatch 错误信息净化：移除 URL、凭证，截断到 200 字符。
+///
+/// 防止 provider API 错误体（含端点 URL、request token 等）泄漏至 LLM context history。
+/// 纯函数，无副作用。
+fn sanitize_provider_error(raw: impl std::fmt::Display) -> String {
+    let s = raw.to_string();
+    let no_url = SANITIZE_URL_RE.replace_all(&s, "[url]");
+    let no_auth = SANITIZE_AUTH_RE.replace_all(&no_url, "[redacted]");
+    no_auth.chars().take(200).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -170,9 +170,10 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
     } else {
         format!("{}s 后自动允许", remaining)
     };
-    let countdown_color = if remaining <= 3 {
+    // 倒计时颜色阈値为 60s 重新校准：最后 5s 红色警示，最后 15s 金色提示
+    let countdown_color = if remaining <= 5 {
         state.theme.error
-    } else if remaining <= 5 {
+    } else if remaining <= 15 {
         state.theme.gold
     } else {
         state.theme.muted

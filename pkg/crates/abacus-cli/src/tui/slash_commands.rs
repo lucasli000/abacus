@@ -358,9 +358,16 @@ fn cmd_new(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 
 fn cmd_save(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     if s.engine_handle.is_some() {
-        let ts = chrono::Local::now().format("%H:%M").to_string();
-        s.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
-        s.add_toast("会话已保存", std::time::Duration::from_secs(2));
+        match crate::tui::run::save_session(s) {
+            Ok(()) => {
+                let ts = chrono::Local::now().format("%H:%M").to_string();
+                s.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
+                s.add_toast("会话已保存", std::time::Duration::from_secs(2));
+            }
+            Err(e) => {
+                s.add_toast(format!("保存失败: {}", e), std::time::Duration::from_secs(4));
+            }
+        }
     } else {
         s.add_toast("演示模式 — 会话仅在内存中", std::time::Duration::from_secs(2));
     }

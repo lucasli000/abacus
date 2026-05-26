@@ -106,6 +106,14 @@ pub enum StreamChunk {
     /// 轻量：只传本轮工具的 tier + blocked_by_env，不传全量 200+ 工具
     /// TUI 用于：工具名称旁标注 tier badge、blocked 工具灰色警示
     ToolHealth(Vec<ToolHealthEntry>),
+    /// 授权结果通知（工具授权通过或拒绝后发出）
+    ///
+    /// - 生产者: pipeline execute_loop MCIP 确认路径
+    /// - 消费者: TUI 显示 toast 通知，不产生假工具 trace
+    AuthResult {
+        tool: String,
+        approved: bool,
+    },
     /// 错误（非致命，pipeline 继续；致命错误通过 channel drop 信号）
     Error(String),
 

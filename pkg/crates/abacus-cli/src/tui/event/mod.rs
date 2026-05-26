@@ -101,9 +101,16 @@ fn reset_session_state(state: &mut AppState, toast: &str) {
 
 fn handle_save_session(state: &mut AppState) {
     if state.engine_handle.is_some() {
-        let ts = chrono::Local::now().format("%H:%M").to_string();
-        state.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
-        state.add_toast("会话已保存", Duration::from_secs(2));
+        match crate::tui::run::save_session(state) {
+            Ok(()) => {
+                let ts = chrono::Local::now().format("%H:%M").to_string();
+                state.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
+                state.add_toast("会话已保存", Duration::from_secs(2));
+            }
+            Err(e) => {
+                state.add_toast(format!("保存失败: {}", e), Duration::from_secs(4));
+            }
+        }
     } else {
         state.add_toast("演示模式 — 会话仅在内存中", Duration::from_secs(2));
     }
@@ -831,19 +838,31 @@ pub fn trigger_completion(state: &mut AppState) -> bool {
 }
 
 /// 接受当前选中的补全候选。
+///
+/// 旗杆命令逻辑：
+/// - 候选以 '/' 开头 且 completion_prefix 为空（根级命令，不是路径补全的参数部分）
+///   → 填充完后直接调 submit_message（一次 Enter 即执行）
+///   符合 VS Code / fish / zsh 用户直觉（命令面板 Enter = 执行）
+/// - 其他候选（文件路径、带参数的命令）→ 仅填充输入框，用户继续编辑
 fn accept_completion(state: &mut AppState) {
     if state.completion_index >= state.completion_candidates.len() {
         cancel_completion(state);
         return;
     }
-    let chosen = &state.completion_candidates[state.completion_index];
+    let chosen = state.completion_candidates[state.completion_index].clone();
     // L3-17: 仅斜杠命令后加空格，文件路径不加
     let suffix = if chosen.starts_with('/') { " " } else { "" };
+    // cancel_completion 会清 completion_prefix，必须在此先捕获判断结果
+    let is_slash_root_cmd = chosen.starts_with('/') && state.completion_prefix.is_empty();
     state.input = format!("{}{}{}", state.completion_prefix, chosen, suffix);
     state.cursor_pos = state.input.len();
     state.recalculate_cursor();
     cancel_completion(state);
     state.input_state = InputState::Typing;
+    // 斜杠命令一次 Enter 即执行（不需要第二次 Enter 确认）
+    if is_slash_root_cmd {
+        submit_message(state);
+    }
 }
 
 /// 取消补全，清除候选列表。

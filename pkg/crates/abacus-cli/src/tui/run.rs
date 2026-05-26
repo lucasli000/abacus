@@ -1207,14 +1207,29 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 只有 EngineResponse 到达才真正设 Ready。
                             // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
                             state.input_state = InputState::Executing;
-                            state.processing_phase = "· processing...".into();
+                            state.processing_phase = "· 收尾中...".into();
                             state.rendered_lines_dirty.set(true);
                             // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
                             // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
                         }
+                        StreamChunk::AuthResult { tool, approved } => {
+                            // 授权结果通知：显示 toast，不产生假工具 trace
+                            let msg = if approved {
+                                format!("✓ 已授权 {}", tool)
+                            } else {
+                                format!("✗ 已拒绝 {} （不安全操作）", tool)
+                            };
+                            let dur = if approved {
+                                Duration::from_secs(2)
+                            } else {
+                                Duration::from_secs(4)
+                            };
+                            state.add_toast(msg, dur);
+                            state.rendered_lines_dirty.set(true);
+                        }
                         StreamChunk::Error(e) => {
                             state.reset_streaming();
-                            // V30: Error 到达即释放输入（与 Complete 一致）
+                            // V30: Error 到达即释放输入（不 Complete 一致）
                             state.input_state = InputState::Ready;
                             state.op_started_at = None;
                             state.accumulated_elapsed = Duration::ZERO;

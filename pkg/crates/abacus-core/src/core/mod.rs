@@ -2785,6 +2785,14 @@ impl CoreLoop {
         *self.model_override.blocking_write() = None;
     }
 
+    /// 读取当前运行时模型覆盖（pipeline execute_loop 内用）
+    ///
+    /// 引用关系：pipeline/mod.rs execute_loop effective_model 优先级链
+    /// 生命周期：set_model_override 设入 → 本函数读出 → clear_model_override 清空
+    pub(crate) async fn get_model_override(&self) -> Option<ModelId> {
+        self.model_override.read().await.clone()
+    }
+
     /// 获取沙箱引擎引用（CLI turnkey 命令使用）
     pub fn sandbox_engine(&self) -> &Arc<SandboxOrchestrator> { &self.sandbox_engine }
 
@@ -4096,6 +4104,11 @@ Output JSON:
         // - 消费方：下游 Phase γ-I 和段 K3 接收过滤后的 tools Vec
         let tools: Vec<_> = if self.config.scene_tool_loading_enabled && task_kind_label.is_some() {
             let prefixes = scene_active_prefixes(task_kind_label.unwrap());
+            // 修复：未列举的任务类型（general_chat 等）前缀为空列表→过滤掉所有工具→tools=0
+            // 修复：前缀为空时跳过过滤，全部工具透传
+            if prefixes.is_empty() {
+                tools
+            } else {
             let last = self.tool_last_invoked.read().await;
             let cur = current_turn.unwrap_or(0);
             tools.into_iter().filter(|t| {
@@ -4117,6 +4130,7 @@ Output JSON:
                 }
                 false
             }).collect()
+            } // else (prefixes non-empty)
         } else {
             tools
         };
