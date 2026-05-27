@@ -44,15 +44,7 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     };
     left.push(Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)));
 
-    // [PLAN] 指示（临时态）
-    if state.plan_mode {
-        left.push(Span::styled(
-            "[PLAN] ",
-            Style::default()
-                .fg(state.theme.semantic_fg(SemanticIntent::Warning))
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    // V34: plan_mode 字段已删除（/plan-prefix 功能已随 plan_mode 字段移除）
 
     // ABACUS logo
     left.push(Span::styled(
@@ -85,14 +77,27 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mode_label = match state.mode {
         crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
         crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
-        crate::tui::state::AbacusMode::Plan => t("mode.plan"),
-        crate::tui::state::AbacusMode::Team => t("mode.team"),
     };
     left.push(Span::styled(" · ", Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)));
     left.push(Span::styled(
         mode_label,
         Style::default().fg(state.theme.accent),
     ));
+
+    // V35: 策略执行徽章 — Plan/Team 策略运行时显示在模式标签旁
+    // 检测依据: processing_phase 前缀（run.rs 写入时已加前缀 📋/🤖）
+    // 引用关系: run.rs 设置 state.processing_phase → 此处读取
+    if state.processing_phase.starts_with("📋") {
+        left.push(Span::styled(
+            " [📋 规划]",
+            Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD),
+        ));
+    } else if state.processing_phase.starts_with("🤖") {
+        left.push(Span::styled(
+            " [🤖 团队]",
+            Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // ── 右侧: model_name ──
     let right = Span::styled(
@@ -133,22 +138,50 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mode_label = match state.mode {
         crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
         crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
-        crate::tui::state::AbacusMode::Plan => t("mode.plan"),
-        crate::tui::state::AbacusMode::Team => t("mode.team"),
     };
     let mode_color = state.theme.mode;
-    let status_icon = if state.paused { "⏸" } else { "●" };
-    let status_color = if state.paused { state.theme.semantic_fg(SemanticIntent::Warning) } else { state.theme.success };
+    let status_icon = if state.connection_error { "⚠" }
+        else if state.paused { "⏸" }
+        else { "●" };
+    let status_color = if state.connection_error { state.theme.error }
+        else if state.paused { state.theme.semantic_fg(SemanticIntent::Warning) }
+        else { state.theme.success };
     let mut left = vec![
         Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
         Span::styled(mode_label, Style::default().fg(mode_color).add_modifier(Modifier::BOLD)),
     ];
-
-    // ── 中间：processing_phase（活跃时）──
-    if !state.processing_phase.is_empty() {
+    // 网络异常时在 mode 后追加红色提示
+    if state.connection_error {
         left.push(Span::styled(
-            format!(" · {}",  state.processing_phase),
-            muted_dim,
+            " · 网络异常",
+            Style::default().fg(state.theme.error).add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // ── 中间：过渡提示（5s）> 策略阶段（着色）> 普通 phase ──
+    // V35: 优先级: transition_hint(5s) > strategy phase(accent) > normal(muted)
+    let phase_shown = if let Some((hint, at)) = &state.transition_hint {
+        if at.elapsed().as_secs() < 5 {
+            // 过渡提示 5s 内展示，accent 色区分
+            left.push(Span::styled(
+                format!(" · {}", hint),
+                Style::default().fg(state.theme.accent),
+            ));
+            true
+        } else { false }
+    } else { false };
+
+    if !phase_shown && !state.processing_phase.is_empty() {
+        // 策略运行时用 accent 色，普通状态用 muted
+        let phase_style = if state.processing_phase.starts_with("📋")
+            || state.processing_phase.starts_with("🤖") {
+            Style::default().fg(state.theme.accent)
+        } else {
+            muted_dim
+        };
+        left.push(Span::styled(
+            format!(" · {}", state.processing_phase),
+            phase_style,
         ));
     }
 
@@ -279,8 +312,6 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let mode_label = match state.mode {
         crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
         crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
-        crate::tui::state::AbacusMode::Plan => t("mode.plan"),
-        crate::tui::state::AbacusMode::Team => t("mode.team"),
     };
     let (status_text, status_color) = match state.input_state {
         InputState::Thinking => (format!("{} {} {} {}{}", spinner(), t("event.thinking"), mode_label, phase, elapsed), state.theme.accent),
@@ -333,13 +364,17 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     }
 
     // ── 底行：左侧 thinking_depth · 百分比 已用/上限，右侧 ⏎ Enter / Esc ──
-    // 性能修复：直接使用 session_tokens（引擎返回的真实值），不再每帧遍历全部消息估算
-    let real_tokens = state.session_tokens.latest_prompt_tokens as usize;
+    // ctx_live_tokens: 流式期间每 500ms 估算一次，Complete 后换为 prompt+completion 真实值
+    // 居优先于 legacy latest_prompt_tokens（仅 prompt，精度较低）
+    let real_tokens = if state.ctx_live_tokens > 0 {
+        state.ctx_live_tokens as usize
+    } else {
+        state.session_tokens.latest_prompt_tokens as usize
+    };
     let (pct, used_str, max_str) = if state.context_window > 0 && real_tokens > 0 {
         let pct = (real_tokens * 100 / state.context_window).min(99);
         (pct, format_ctx(real_tokens), format_ctx(state.context_window))
     } else if state.context_window > 0 {
-        // 引擎未返回 token 数时显示 0%（不遍历消息估算）
         (0, "0".to_string(), format_ctx(state.context_window))
     } else {
         (0, "?".to_string(), "?".to_string())

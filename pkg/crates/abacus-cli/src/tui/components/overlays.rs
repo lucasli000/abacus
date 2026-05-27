@@ -75,7 +75,9 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
     let visible_count = dialog.details.len().min(max_visible);
     let has_more = dialog.details.len() > max_visible;
     let detail_lines = visible_count + if has_more { 1 } else { 0 };
-    let content_h = (6 + detail_lines) as u16;
+    // suggested_action 行：Some 时额外占 1 行
+    let suggestion_line = if dialog.suggested_action.is_some() { 1 } else { 0 };
+    let content_h = (6 + detail_lines + suggestion_line) as u16;
     let frame_size = f.area();
     // 宽度：输入框 6/8
     let popup_w: u16 = (input_area.width * 6 / 8).max(40).min(frame_size.width);
@@ -163,27 +165,63 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
 
     lines.push(Line::raw(""));
 
-    // 倒计时 + 超时行为提示
+    // 系统建议行：带颜色 badge，让用户直观看到引擎对此请求的判断
+    match dialog.suggested_action {
+        Some(true) => {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    " ✓ 系统建议允许 ",
+                    Style::default()
+                        .fg(crate::tui::effects::auto_contrast_fg(state.theme.success))
+                        .bg(state.theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" 工具属安全范围", Style::default().fg(state.theme.muted)),
+            ]));
+        }
+        Some(false) => {
+            lines.push(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    " ⚠ 系统建议拒绝 ",
+                    Style::default()
+                        .fg(crate::tui::effects::auto_contrast_fg(state.theme.error))
+                        .bg(state.theme.error)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" 检测到潜在风险", Style::default().fg(state.theme.muted)),
+            ]));
+        }
+        None => {} // 系统无法判断，不加辅助行，保持简洁
+    }
+
+    // 倒计时行：剩余秒数 + 超时后的默认动作（颜色与动作语义一致）
     let remaining = dialog.remaining_secs();
-    let timeout_hint = if dialog.risk == ConfirmRisk::High {
-        format!("{}s 后自动拒绝", remaining)
+    let (timeout_label, timeout_color) = if dialog.risk == ConfirmRisk::High {
+        ("自动拒绝", state.theme.error)
     } else {
-        format!("{}s 后自动允许", remaining)
+        ("自动允许", state.theme.success)
     };
-    // 倒计时颜色阈値为 60s 重新校准：最后 5s 红色警示，最后 15s 金色提示
-    let countdown_color = if remaining <= 5 {
+    let countdown_color = if remaining <= 3 {
         state.theme.error
-    } else if remaining <= 15 {
+    } else if remaining <= 6 {
         state.theme.gold
     } else {
         state.theme.muted
     };
     lines.push(Line::from(vec![
         Span::raw(" "),
-        Span::styled(format!("⏱ {}", timeout_hint), Style::default().fg(countdown_color).add_modifier(Modifier::BOLD)),
+        Span::styled("⏱ ", Style::default().fg(countdown_color)),
+        Span::styled(
+            format!("{}s", remaining),
+            Style::default().fg(countdown_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" 后 ", Style::default().fg(countdown_color)),
+        Span::styled(timeout_label, Style::default().fg(timeout_color).add_modifier(Modifier::BOLD)),
     ]));
 
-    // V25：动态从 dialog.options 渲染按钮，selected 项加箭头标识 + REVERSED
+    // 按键按钮行：selected 项加箭头 + UNDERLINED
     //   中文 IME 用户用 ↑↓/Tab 切换 selected，看箭头知道 Enter 会触发哪个
     let mut btn_spans: Vec<Span> = vec![Span::raw(" ")];
     for (idx, opt) in dialog.options.iter().enumerate() {
@@ -310,8 +348,9 @@ pub fn render_completion_popup(
     let frame = f.area();
 
     // ── 宽度：input_area × 80%（稍宽一些给 2 列留空间）────────
+    // P2 修复：最小宽 30 （> render_min_terminal_warning 的 20 保护阈値）
     let popup_w: u16 = (input_area.width as u32 * 80 / 100)
-        .max(24).min(frame.width as u32) as u16;
+        .max(30).min(frame.width as u32) as u16;
 
     // ── 列数：内容宽 >= 52 用 2 列，否则 1 列 ──────────────────
     let inner_w = popup_w.saturating_sub(2) as usize; // 减去左右边框
@@ -342,10 +381,11 @@ pub fn render_completion_popup(
 
     f.render_widget(Clear, popup_area);
 
-    // 标题：简洁提示（不超出弹窗宽度）
-    let title = " ↑↓ Tab · Enter · Esc ";
+    // P7 修复：标题按弹窗宽度截断，防止窄终端超出
+    let title_full = " ↑↓ Tab · Enter · Esc ";
+    let title: String = crate::tui::util::truncate_to_width(title_full, popup_w.saturating_sub(4) as usize);
     let block = Block::default()
-        .title(title)
+        .title(title.clone())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(state.theme.primary))
         .style(Style::default().bg(state.theme.elevated));
@@ -410,30 +450,36 @@ pub fn render_completion_popup(
             } else {
                 Style::default()
             };
+            // P5 修复：选中项用显式 accent 背景色而非 REVERSED，避免浅色主题下对比度不足
             let name_style = if is_selected {
-                Style::default().fg(state.theme.text).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                Style::default()
+                    .fg(crate::tui::effects::auto_contrast_fg(state.theme.accent))
+                    .bg(state.theme.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(state.theme.text)
             };
             let desc_style = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
 
+            // P3 修复：滚动指示符独立于 desc，无描述时也能显示
+            let scroll_hint = if nrows_total > visible_rows && col_i == 0 {
+                if row_i == scroll_start_row && scroll_start_row > 0 { "↑ " }
+                else if row_i == scroll_start_row + visible_rows - 1
+                    && scroll_start_row + visible_rows < nrows_total { "↓ " }
+                else { "" }
+            } else { "" };
+
             spans.push(Span::styled(marker.to_string(), marker_style));
             spans.push(Span::styled(name_padded, name_style));
+            if !scroll_hint.is_empty() {
+                // 将滚动指示符附加在行尾（占用 2 字符）
+                spans.push(Span::styled(scroll_hint.to_string(),
+                    Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)));
+            }
             if desc_w > 0 && !desc.is_empty() {
                 spans.push(Span::raw(" "));
-                // 滚动提示复用 desc 位置（最后一个可见行）
-                let scroll_hint = if nrows_total > visible_rows {
-                    if row_i == scroll_start_row && scroll_start_row > 0 { "↑" }
-                    else if row_i == scroll_start_row + visible_rows - 1
-                        && scroll_start_row + visible_rows < nrows_total { "↓" }
-                    else { "" }
-                } else { "" };
-                let display_desc = if !scroll_hint.is_empty() {
-                    format!("{} {}", scroll_hint, truncate_to_width(&desc, desc_w.saturating_sub(2)))
-                } else {
-                    desc
-                };
-                spans.push(Span::styled(display_desc, desc_style));
+                let avail_desc = if scroll_hint.is_empty() { desc_w } else { desc_w.saturating_sub(2) };
+                spans.push(Span::styled(truncate_to_width(&desc, avail_desc), desc_style));
             }
         }
         lines.push(Line::from(spans));
@@ -457,14 +503,17 @@ pub fn render_overlays(
 ) {
     render_toasts(f, state);
     render_confirm_dialog(f, state, input_area);
-    if state.input_state == crate::tui::state::InputState::Completing
-        && !state.completion_candidates.is_empty()
-    {
-        render_completion_popup(f, state, input_area, messages_area);
-    }
-    // V13: 命令参数 picker（/model /theme /thinking）— 在输入框上方弹出
-    if state.picker.is_some() {
-        render_picker_popup(f, state, input_area);
+    // P1 z-order 修复：confirm_dialog 存在时不渲染其他弹窗，避免遇策弹窗被遗漏覆盖
+    if state.confirm_dialog.is_none() {
+        if state.input_state == crate::tui::state::InputState::Completing
+            && !state.completion_candidates.is_empty()
+        {
+            render_completion_popup(f, state, input_area, messages_area);
+        }
+        // V13: 命令参数 picker（/model /theme /thinking）— 在输入框上方弹出
+        if state.picker.is_some() {
+            render_picker_popup(f, state, input_area);
+        }
     }
 }
 
@@ -481,11 +530,16 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     let Some(p) = state.picker.as_ref() else { return; };
     if p.items.is_empty() { return; }
 
-    // 标题带数量，让用户知道列表长度
+    // 标题 — 各 picker 语义化
     let title = match p.kind {
         PickerKind::Model    => format!("{} ({})", t("overlay.model_picker"), p.items.len()),
         PickerKind::Theme    => format!("{} ({})", t("overlay.theme_picker"), p.items.len()),
         PickerKind::Thinking => t("overlay.thinking_picker").to_string(),
+        PickerKind::Mode     => " 切换模式 ".to_string(),
+        PickerKind::Review   => " 审查类型 ".to_string(),
+        PickerKind::Resume   => format!(" 恢复会话 ({}) ", p.items.len()),
+        PickerKind::History  => format!(" 输入历史 ({}) ", p.items.len()),
+        PickerKind::Meeting  => " 🧠 Meeting 会诊 ".to_string(),
     };
     let frame = f.area();
 
@@ -494,7 +548,10 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
     let popup_w = (input_area.width * 6 / 8).max(36).min(frame.width);
     let group_overhead = p.groups.as_ref().map(|g| g.len()).unwrap_or(0);
     let slider_overhead = if p.show_thinking_slider { 2 } else { 0 };
-    let content_lines = p.items.len() + group_overhead + slider_overhead;
+    // 底部键位提示行（所有 picker 都有）+ Review picker 的 strict toggle 行
+    let hint_overhead = 1;
+    let strict_overhead = if matches!(p.kind, PickerKind::Review) { 1 } else { 0 };
+    let content_lines = p.items.len() + group_overhead + slider_overhead + hint_overhead + strict_overhead;
     // 高度上限：消息区（input_area.y 近似消息框高度）的 1/3
     let msg_area_h = input_area.y as usize;
     // picker 弹窗高度上限：取消息区 1/2，至少 10
@@ -556,11 +613,11 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
 
     // 分组渲染（含滚动）— 先建全量行列表，追踪选中行视觉位置，再截取可见窗口
     // Fix: 之前分组不滚动，模型多时超出高度部分不可见
-    let item_max_visible = if p.show_thinking_slider {
-        max_visible.saturating_sub(2) // 为底部 thinking slider 留 2 行
-    } else {
-        max_visible
-    };
+    // 底部保留行：thinking slider(2) + hint(1) + strict toggle(1)
+    let bottom_reserved = if p.show_thinking_slider { 2 } else { 0 }
+        + 1  // hint 行
+        + if matches!(p.kind, PickerKind::Review) { 1 } else { 0 };
+    let item_max_visible = max_visible.saturating_sub(bottom_reserved);
 
     if let Some(ref groups) = p.groups {
         let mut selected_visual: usize = 0;
@@ -576,13 +633,23 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
                 visual_line += 1;
             }
         }
+        // P6 修复：滚动时保留分组标题行。
         // 计算滚动偏移：选中行尽量居中，不超出边界
-        let scroll_start = if lines.len() <= item_max_visible {
+        let mut scroll_start = if lines.len() <= item_max_visible {
             0
         } else {
             selected_visual.saturating_sub(item_max_visible / 2)
                 .min(lines.len().saturating_sub(item_max_visible))
         };
+        // 如果 scroll_start 指向分组第一个项（scroll_start-1 是组标题），往上展一行包含标题
+        if scroll_start > 0 {
+            // 组标题行形式为 " ─ provider"，以单行加组名识别
+            let prev_line_text: String = lines[scroll_start - 1]
+                .spans.iter().map(|s| s.content.as_ref()).collect();
+            if prev_line_text.trim_start().starts_with('─') {
+                scroll_start -= 1; // 包含该组标题
+            }
+        }
         lines.drain(0..scroll_start);
         lines.truncate(item_max_visible);
     } else {
@@ -632,6 +699,42 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         ));
         lines.push(Line::from(slider_spans));
     }
+
+    // Review picker：strict toggle 行
+    if matches!(p.kind, PickerKind::Review) {
+        let (box_char, box_style) = if p.review_strict {
+            ("■", Style::default().fg(state.theme.error).add_modifier(Modifier::BOLD))
+        } else {
+            ("□", Style::default().fg(state.theme.muted))
+        };
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(box_char, box_style),
+            Span::styled(
+                " --strict  verdict≠pass 时阻断执行",
+                if p.review_strict {
+                    Style::default().fg(state.theme.error)
+                } else {
+                    Style::default().fg(state.theme.muted)
+                },
+            ),
+        ]));
+    }
+
+    // 底部键位提示行（所有 picker）— 让用户发现隐藏操作
+    let hint = match p.kind {
+        PickerKind::Model    => " ↑↓ 选模型 · ←→ 调思考深度 · Enter 应用 · Esc 取消",
+        PickerKind::Theme    => " ↑↓ 选主题 · Enter 应用 · Esc 取消",
+        PickerKind::Thinking => " ↑↓ / ←→ 选深度 · Enter 应用 · Esc 取消",
+        PickerKind::Mode     => " ↑↓ 选模式 · Enter 切换 · Esc 取消",
+        PickerKind::Review   => " ↑↓ 选类型 · Space 切换 strict · Enter 执行",
+        PickerKind::Resume   => " ↑↓ 选会话 · Enter 恢复 · Esc 取消",
+        PickerKind::History  => " ↑↓ 选记录 · Enter 重发 · Esc 取消",
+        PickerKind::Meeting  => " ↑↓ 选操作 · Enter 执行 · Esc 取消",
+    };
+    lines.push(Line::from(vec![
+        Span::styled(hint, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+    ]));
 
     f.render_widget(Paragraph::new(lines), inner);
 }

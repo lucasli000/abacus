@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -804,6 +804,8 @@ pub struct AppState {
     pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
     pub context_window: usize,  // tokens (e.g. 1_000_000)
+    /// 配置文件 mtime 快照，用于热加载检测
+    pub config_mtime: Option<SystemTime>,
     /// 实时上下文 token 估算（流式期间每 500ms 更新；Complete 后换为真实值）
     /// 引用：bars.rs inputbar 进度条；0 = 无数据
     /// 生命周期：/new 不清（保留上轮最终值直到新轮覆盖）
@@ -873,6 +875,9 @@ pub struct AppState {
     ///   - 读取：run.rs CompressEnd / CompressAutoResume 处理后自动发送
     /// 生命周期：CompressEnd 或 CompressAutoResume 消费（take）后清空
     pub pending_compress_input: Option<String>,
+    /// 网络连接异常标记 — status bar 显示 ⚠ 网络异常
+    /// 引用：run.rs NETWORK_ERROR 前缀时置 true；成功响应后清 false
+    pub connection_error: bool,
     pub cursor_pos: usize,
     /// 缓存光标所在行号（避免每帧 O(n²) 计算）
     pub(crate) cursor_line: usize,
@@ -2153,8 +2158,8 @@ pub struct TextSelection {
 
 /// 消息显示窗口上限 — 只保留最近 N 条消息（超出时裁剪最旧的，先剥离 Trace 内容节省内存）
 const MAX_MESSAGES: usize = 200;
-/// 事件列表上限
-const MAX_EVENTS: usize = 500;
+/// 事件列表上限（参考 Claude Code 控制 RAM，FIFO 淘汰最旧，UI 始终展示最新）
+const MAX_EVENTS: usize = 300;
 
 impl AppState {
     pub fn new(mode: AbacusMode) -> Self {
@@ -2181,6 +2186,7 @@ impl AppState {
             pending_model_fetch: false,
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
+            config_mtime: None,
             ctx_live_tokens: 0,
             ctx_estimate_at: None,
             session_summary: String::new(),
@@ -2203,6 +2209,7 @@ impl AppState {
             input_state: InputState::Ready,
             pre_compress_input_state: None,
             pending_compress_input: None,
+            connection_error: false,
             cursor_pos: 0,
             cursor_line: 0,
             cursor_col: 0,

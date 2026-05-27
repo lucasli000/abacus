@@ -352,6 +352,21 @@ impl PromptAssembly {
             - When output exceeds 50 lines: use structured sections with clear headers.\n\
             - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
 
+        // Layer 188: 任务完成摘要规则——稳定前缀的一部分（不随 task_kind 变化）
+        // 当 LLM 确认交付完成时，在回复末尾附上单行摘要，供 checkpoint 记录
+        // 格式固定，便于 pipeline 解析提取
+        layers.entry(188).or_default().push(
+            "## Task Completion\n\
+            When you have fully delivered what the user requested (task complete, not mid-task), \
+            append at the very end of your response:\n\
+            ---\n\
+            ✓ [one-sentence summary: what was done / what was delivered, ≤80 chars, same language as user]\n\n\
+            Rules:\n\
+            - Only output this when the task is truly complete — not when asking questions, not mid-execution.\n\
+            - The summary line must start exactly with `✓ ` (checkmark + space).\n\
+            - Keep it factual and specific: \"✓ 重构认证模块，JWT 替代 session token，cargo check 通过\"".into()
+        );
+
         // Layer 185: 任务相关子场景——动态内容，放在 Constraints(190) 之后
         // 任务切换时只影响该层和后续动态层，对稳定前缀 607 token 无影响
         let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind);

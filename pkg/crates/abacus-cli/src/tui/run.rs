@@ -4,6 +4,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::SystemTime;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, supports_keyboard_enhancement};
@@ -31,6 +32,7 @@ use crate::tui::modes;
 use crate::tui::setup;
 // V28 (T4): BlockKind 不再被 run.rs 写入(thinking/tool 走 TraceKind);保留 enum 给 Checklist + 旧 session 兼容
 use crate::tui::state::{AppState, InputState, Message, MsgContent, AbacusMode, SlashCommand, ToolStatus};
+use crate::tui::components::format_ctx;
 
 /// RAII guard: 确保 panic 或提前退出时终端状态恢复
 /// V14：尝试启用 kitty 键盘协议（DISAMBIGUATE）以区分 Ctrl+I 与 Tab；不支持则降级
@@ -169,11 +171,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
+    // V34: Plan/Team 已降级为执行策略；--team 参数改为默认 Meeting，--chat 保留 Clarify
     let mode = if chat {
         AbacusMode::Clarify
-    } else if team {
-        AbacusMode::Team
     } else {
+        // team 参数不再对应 AbacusMode::Team；保留 CLI 参数向后兼容，但统一进入 Meeting
+        let _ = team; // 抑制 unused variable 警告
         AbacusMode::Meeting
     };
 
@@ -203,8 +206,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         }
     }
 
-    // 初始化引擎
-    state.add_toast("正在连接引擎...", Duration::from_secs(10));
+    // 初始化引擎（连接状态在 loading 画面已有展示，不再重复 toast）
     let _ = terminal.draw(|f| {
         let area = f.area();
         let block = Block::default()
@@ -237,10 +239,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             // V30 复制修复：首次连接提示选中复制路径。
             // 生命周期：仅首次连接出现（随引擎启动一次性提醒）；重连会重发，不频繁。
             // 引用关系：/help 有完整复制节，用户可查体。
-            state.add_toast(
-                "提示：Shift + 拖动鼠标选中文本，释放自动复制 · /help 查看更多",
-                Duration::from_secs(6),
-            );
+            // 复制提示已在 /help 中有完整说明，不在连接时打扰用户
             let actual_model = e.core.config().default_model.0.clone();
             state.model_name = actual_model.clone();
             state.theme.apply_model_brand(&actual_model);
@@ -271,9 +270,22 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     };
     state.engine_handle = Some(engine.clone());
 
+    // 启动 AutoEngine Runner——将 AutoHealth 快照推送到自动化 Tab
+    // 生命周期：_auto_runner_handle drop 后 runner task 退出；与 TUI 同生命周期
+    // 引用关系：health_rx 在 interval tick 分支被 try_recv；state.auto_health 消费
+    let auto_engine = std::sync::Arc::new(abacus_core::auto::AutoEngine::new());
+    let auto_runner = abacus_core::auto::runner::JobRunner::new(
+        auto_engine,
+        abacus_core::auto::runner::RunnerConfig::default(),
+    );
+    let (_auto_runner_handle, mut auto_health_rx) = auto_runner.spawn();
+
     // 初始化 channel
     let (res_tx, mut res_rx) = mpsc::unbounded_channel::<EngineResponse>();
     let (comp_tx, mut comp_rx) = mpsc::unbounded_channel::<(Vec<String>, String)>();
+    // T-2 fix: 独立 channel 传递 discover_all_models 结果，防止占用 comp_rx
+    // 生命周期：model_list_tx 在 spawn 内发送一次后 drop；model_list_rx 在 tick 分支拥收
+    let (model_list_tx, mut model_list_rx) = mpsc::unbounded_channel::<Vec<String>>();
     // V0.2: Streaming chunk channel
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<abacus_core::llm::stream::StreamChunk>();
     state.engine_tx = Some(res_tx.clone());
@@ -303,6 +315,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (mut cols, mut rows) = (80u16, 24u16);
+    let mut config_recheck_ticks = 0u8;
 
     while state.running {
         tokio::select! {
@@ -336,13 +349,76 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                     }
                 }
-                // 延迟拉取可用模型列表（避免启动时同步阻塞）
-                if state.pending_model_fetch {
-                    if let Some(ref engine) = state.engine_handle {
-                        state.available_models = engine.core.list_models().await;
-                    }
-                    state.pending_model_fetch = false;
+                // 延迟拉取可用模型列表：通过 /v1/models 动态发现，失败时 provider 内部自动 fallback 静态列表
+                // 消费方：state.available_models → open_picker_model 优先使用
+                // 生命周期：engine 连接后设 pending_model_fetch=true → 首次 tick 触发 → 拉取完毕后 false
+                // 压缩暂存消息自动发送（Communication 阶段：没有 CompressAutoResume）
+                // 条件：有暂存消息 + 不在 busy 状态（压缩完成、input_state 已恢复）
+                if state.pending_compress_input.is_some()
+                    && !matches!(state.input_state,
+                        crate::tui::state::InputState::Thinking
+                        | crate::tui::state::InputState::Executing
+                        | crate::tui::state::InputState::Outputting)
+                {
+                    let pending = state.pending_compress_input.take().unwrap();
+                    state.add_toast(
+                        format!("压缩完成，发送: {}", pending.chars().take(20).collect::<String>()),
+                        Duration::from_secs(2),
+                    );
+                    state.input = pending;
+                    crate::tui::event::submit_message(&mut state);
                 }
+
+                // T-2 fix: discover_all_models 是网络调用，不能在主循环 tick 里直接 .await
+                // 改为 spawn 异步，结果通过独立的 model_list_rx channel 回传
+                while let Ok(models) = model_list_rx.try_recv() {
+                    state.available_models = models;
+                }
+                if state.pending_model_fetch {
+                    state.pending_model_fetch = false;
+                    if let Some(ref engine) = state.engine_handle {
+                        let engine_clone = engine.clone();
+                        let tx = model_list_tx.clone();
+                        tokio::spawn(async move {
+                            let discovered = engine_clone.core.discover_all_models().await;
+                            let flat: Vec<String> = discovered.into_values().flatten().collect();
+                            let models = if flat.is_empty() {
+                                engine_clone.core.list_models().await
+                            } else {
+                                flat
+                            };
+                            let _ = tx.send(models);
+                        });
+                    }
+                }
+                // ── 热加载：检测 config.yaml 变化，实时更新 context_window ──
+                config_recheck_ticks = config_recheck_ticks.wrapping_add(1);
+                if config_recheck_ticks >= 20 {
+                    config_recheck_ticks = 0;
+                    let config_path = abacus_core::paths::config_yaml();
+                    if let Ok(meta) = std::fs::metadata(&config_path) {
+                        if let Ok(mtime) = meta.modified() {
+                            if state.config_mtime.map_or(true, |t| mtime != t) {
+                                state.config_mtime = Some(mtime);
+                                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                                    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                                        if let Some(cw) = yaml["core"]["context_window"].as_u64() {
+                                            let new_val = cw as usize;
+                                            if new_val != state.context_window {
+                                                state.context_window = new_val;
+                                                state.add_toast(
+                                                    format!("上下文窗口已热加载: {}", format_ctx(new_val)),
+                                                    std::time::Duration::from_secs(3),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {
                     while let Ok(response) = res_rx.try_recv() {
@@ -535,17 +611,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 );
                             }
                         }
-                        // Progressive Gate state
-                        if let Some(ref ps) = response.progressive_state {
-                            let label = match ps {
-                                abacus_types::progressive::ProgressiveState::AwaitingConfirmation { .. } =>
-                                    "⏳ Awaiting your confirmation",
-                                abacus_types::progressive::ProgressiveState::Generating { .. } =>
-                                    "✍️ Generating...",
-                                _ => "⚙️ Processing",
-                            };
-                            state.add_toast(label.to_string(), Duration::from_secs(10));
-                        }
+                        // Progressive Gate state — 状态在 status bar 已有显示，无需 toast
                         // Inertia warning
                         if let Some(ref w) = response.inertia_warning {
                             state.add_toast(format!("⚠️ {w}"), Duration::from_secs(8));
@@ -684,11 +750,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     allow_always: !is_destructive,
                                     created_at: std::time::Instant::now(),
                                     details_expanded: false,
-                                    selected: 0, // V25：默认聚焦第一个选项（"允许"）
+                                    selected: 0,
                                     interaction_paused: false,
                                     paused_total: std::time::Duration::ZERO,
                                     focus_lost_at: None,
                                     last_active_at: std::time::Instant::now(),
+                                    suggested_action: first.suggested_action,
                                 });
                                 let event_msg = crate::tui::i18n::tf("event.wait_auth_tool", &[&first.tool_id]);
                                 state.pending_mcip_confirmations = confirmations;
@@ -751,6 +818,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             had_streaming_update = true;
                         }
                         StreamChunk::TextDelta(t) => {
+                            // 500ms 门控：实时估算 ctx_live_tokens
+                            // 估算 = latest_prompt_tokens（上轮真实值）+ 本轮已生成字符 / 4
+                            let now = std::time::Instant::now();
+                            let should_refresh = state.ctx_estimate_at
+                                .map(|t| now.duration_since(t).as_millis() >= 500)
+                                .unwrap_or(true);
+                            if should_refresh {
+                                let gen_est = (state.streaming_text.len() / 4) as u64;
+                                state.ctx_live_tokens = state.session_tokens.latest_prompt_tokens
+                                    .saturating_add(gen_est);
+                                state.ctx_estimate_at = Some(now);
+                            }
                             if !t.is_empty() && !state.streaming_text_started {
                                 state.streaming_text_started = true;
                                 // V38: 切换状态指示到 Outputting
@@ -797,11 +876,16 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
                                 // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
-                                let first_line = t.lines().next().unwrap_or("").to_string();
-                                let summary = if first_line.chars().count() > 40 {
-                                    format!("{}…", first_line.chars().take(37).collect::<String>())
-                                } else {
-                                    first_line
+                                // 存最近 2 行非空内容（\n 分隔），渲染层展示 2 行 live preview
+                                let summary = {
+                                    let lines: Vec<String> = t.lines()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .take(2)
+                                        .map(|l| if l.chars().count() > 50 {
+                                            format!("{}…", l.chars().take(47).collect::<String>())
+                                        } else { l.to_string() })
+                                        .collect();
+                                    lines.join("\n")
                                 };
                                 state.streaming_timeline.push(
                                     crate::tui::state::TimelineEntry::Thinking { summary }
@@ -812,15 +896,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     state.streaming_timeline.iter_mut().rev()
                                         .find(|e| matches!(e, crate::tui::state::TimelineEntry::Thinking { .. }))
                                 {
-                                    // 取 thinking 全文的最后非空行作为 live preview
+                                    // 取 thinking 全文最近 2 行非空行作为 live preview（\n 分隔）
                                     let full = &state.streaming_thinking;
                                     let combined = format!("{}{}", full, t);
-                                    if let Some(last_line) = combined.lines().rev().find(|l| !l.trim().is_empty()) {
-                                        *summary = if last_line.chars().count() > 50 {
-                                            format!("{}…", last_line.chars().take(47).collect::<String>())
-                                        } else {
-                                            last_line.to_string()
-                                        };
+                                    let last2: Vec<String> = combined.lines()
+                                        .filter(|l| !l.trim().is_empty())
+                                        .collect::<Vec<_>>()
+                                        .into_iter().rev().take(2).rev()
+                                        .map(|l| if l.chars().count() > 50 {
+                                            format!("{}…", l.chars().take(47).collect::<String>())
+                                        } else { l.to_string() })
+                                        .collect();
+                                    if !last2.is_empty() {
+                                        *summary = last2.join("\n");
                                     }
                                 }
                             }
@@ -842,6 +930,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 None,
                             );
                             state.streaming_trace_ids.push(trace_id);
+                            // streaming_tools Vec 上限 100（防止长 turn 积累过多条目）
+                            if state.streaming_tools.len() >= 100 {
+                                state.streaming_tools.remove(0); // FIFO 淘汰最旧
+                            }
                             state.streaming_tools.push((
                                 name.clone(),
                                 crate::tui::state::StreamingToolStatus::Running,
@@ -867,14 +959,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // V29.11: 工具输入参数 — 回填 trace event 的 args 字段
                         //   触发 try_render_edit_diff: args 含 old_string/new_string → 走 diff 视图
                         StreamChunk::ToolArgs { name, args_json } => {
-                            // 反查最近一个同名 Running 状态的 trace event
+                            // T-1 fix: 用 trace_event_index O(1) 查找，替代原来 O(n) iter().find()
                             if let Some(tool) = state.streaming_tools.iter().rev()
                                 .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
                             {
                                 let tid = tool.3;
-                                if let Some(ev) = state.trace_events.iter_mut().find(|e| e.id == tid) {
-                                    if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
-                                        *args = args_json.clone();
+                                // O(1) index 查找，再通过 index 知道数组下标
+                                if let Some(&idx) = state.trace_event_index.get(&tid) {
+                                    if let Some(ev) = state.trace_events.get_mut(idx) {
+                                        if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
+                                            *args = args_json.clone();
+                                        }
                                     }
                                 }
                             }
@@ -941,14 +1036,16 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     );
                                 }
                             }
-                            // 回填 trace event output（move，不 clone）
+                            // T-1 fix: O(1) index 查找回填 trace event output
                             if let Some(tool) = state.streaming_tools.iter().rev()
                                 .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
                             {
                                 let tid = tool.3;
-                                if let Some(ev) = state.trace_events.iter_mut().find(|e| e.id == tid) {
-                                    if let crate::tui::state::TraceKind::ToolCall { output, .. } = &mut ev.kind {
-                                        *output = Some(output_json);
+                                if let Some(&idx) = state.trace_event_index.get(&tid) {
+                                    if let Some(ev) = state.trace_events.get_mut(idx) {
+                                        if let crate::tui::state::TraceKind::ToolCall { output, .. } = &mut ev.kind {
+                                            *output = Some(output_json);
+                                        }
                                     }
                                 }
                             }
@@ -977,18 +1074,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 引用关系：trace_event 在 ToolStart 时建立, args 已写入。
                             // 触发条件：仅当 path 命中知识库/记忆宫殿语义路径时才追踪
                             // (避免任意文件读写都被算作知识调用)
+                            // T-1 fix: ToolEnd 中两处 iter().find() 改为 O(1) index 查找
                             if success {
                                 if let Some(tid) = updated_trace_id {
-                                    if let Some(ev) = state.trace_events.iter().find(|e| e.id == tid) {
-                                        if let crate::tui::state::TraceKind::ToolCall { args, .. } = &ev.kind {
-                                            if !args.is_empty() {
-                                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
-                                                    let path_opt = json.get("path")
-                                                        .or_else(|| json.get("file_path"))
-                                                        .and_then(|v| v.as_str());
-                                                    if let Some(p) = path_opt {
-                                                        // V40: 所有文件路径都追踪，palace 由路径自动推断
-                                                        state.track_knowledge_call(p);
+                                    if let Some(&idx) = state.trace_event_index.get(&tid) {
+                                        if let Some(ev) = state.trace_events.get(idx) {
+                                            if let crate::tui::state::TraceKind::ToolCall { args, .. } = &ev.kind {
+                                                if !args.is_empty() {
+                                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
+                                                        let path_opt = json.get("path")
+                                                            .or_else(|| json.get("file_path"))
+                                                            .and_then(|v| v.as_str());
+                                                        if let Some(p) = path_opt {
+                                                            state.track_knowledge_call(p);
+                                                        }
                                                     }
                                                 }
                                             }
@@ -997,19 +1096,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 }
                             }
                             if let Some(tid) = updated_trace_id {
-                                if let Some(ev) = state.trace_events.iter_mut().find(|e| e.id == tid) {
-                                    ev.duration_ms = Some(duration_ms);
-                                    ev.level = if success {
-                                        crate::tui::state::EventLevel::Notice
-                                    } else {
-                                        crate::tui::state::EventLevel::Warning
-                                    };
-                                    if let crate::tui::state::TraceKind::ToolCall { status, .. } = &mut ev.kind {
-                                        *status = if success {
-                                            crate::tui::state::ToolStatus::Success
+                                if let Some(&idx) = state.trace_event_index.get(&tid) {
+                                    if let Some(ev) = state.trace_events.get_mut(idx) {
+                                        ev.duration_ms = Some(duration_ms);
+                                        ev.level = if success {
+                                            crate::tui::state::EventLevel::Notice
                                         } else {
-                                            crate::tui::state::ToolStatus::Failed
+                                            crate::tui::state::EventLevel::Warning
                                         };
+                                        if let crate::tui::state::TraceKind::ToolCall { status, .. } = &mut ev.kind {
+                                            *status = if success {
+                                                crate::tui::state::ToolStatus::Success
+                                            } else {
+                                                crate::tui::state::ToolStatus::Failed
+                                            };
+                                        }
                                     }
                                 }
                             }
@@ -1038,47 +1139,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk, ConfirmOption};
                             use abacus_core::mcip::McipConfirmKind;
 
-                            // V38: 分级权限策略——根据工具类型决定是否自动放行
-                            // - 只读工具（read/search/ls/tree/grep/info）：永久放行
-                            // - 编辑工具（edit/write/move/mkdir）+ 非破坏性 bash：session 内放行
-                            // - 破坏性操作（rm/format/drop/kill/reset/force）：每次确认
-                            let tool_lower = req.tool_id.to_lowercase();
-                            // 知识库/记忆工具：kb_*, cross_session_*, session_resume_* 默认放行
-                            let is_kb_or_memory = tool_lower.starts_with("kb_")
-                                || tool_lower.starts_with("cross_session")
-                                || tool_lower.starts_with("session_resume")
-                                || tool_lower.contains("palace")
-                                || tool_lower.contains("memory");
-                            // Phase1-1.3: 词边界安全匹配，防止 "create" 误中 "read"
-                            // 匹配规则: 完全匹配 / 前缀 "read_xxx" / 后缀 "xxx_read" / 中间 "xxx_read_xxx"
-                            let readonly_keywords = ["read", "search", "ls", "tree", "grep", "info", "list", "get"];
-                            let has_readonly_verb = readonly_keywords.iter().any(|k| {
-                                tool_lower == *k
-                                    || tool_lower.starts_with(&format!("{}_", k))
-                                    || tool_lower.ends_with(&format!("_{}", k))
-                                    || tool_lower.contains(&format!("_{}_", k))
-                            });
-                            let is_readonly = is_kb_or_memory
-                                || (has_readonly_verb && !tool_lower.contains("write") && !tool_lower.contains("delete") && !tool_lower.contains("remove"));
-                            let _is_destructive_cmd = if tool_lower.contains("bash") {
-                                // 检查 bash 命令参数是否含破坏性关键词
-                                let params_str = req.params_preview.as_deref().unwrap_or("");
-                                let params_lower = params_str.to_lowercase();
-                                ["rm ", "rm\t", "rmdir", "format", "mkfs", "dd ", "kill -9",
-                                 "drop ", "truncate", "reset --hard", "push --force", "clean -f",
-                                 "> /dev/", "shred", "wipefs"]
-                                    .iter().any(|k| params_lower.contains(k))
-                            } else {
-                                ["delete", "remove", "drop", "destroy", "purge"]
-                                    .iter().any(|k| tool_lower.contains(k))
-                            };
-
-                            let auto_allow = if is_readonly {
-                                true // 只读：永久放行
-                            } else {
-                                // B12: 所有工具（含破坏性）都查 always_allow
-                                state.always_allow.contains(&req.tool_id)
-                            };
+                            // 授权决策：只有用户主动永久授权的工具直接放行
+                            // 工具语义判断已移至引擎层（pipeline 计算 suggested_action）
+                            // TUI 不再做关键词匹配，始终弹窗展示系统建议，由系统+用户共同决策
+                            let auto_allow = state.always_allow.contains(&req.tool_id);
 
                             if auto_allow {
                                 let nonce = req.nonce.clone();
@@ -1141,6 +1205,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     paused_total: std::time::Duration::ZERO,
                                     focus_lost_at: None,
                                     last_active_at: std::time::Instant::now(),
+                                    suggested_action: req.suggested_action,
                                 });
                                 state.pending_mcip_confirmations = vec![req.clone()];
                                 state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.wait_auth_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Warning);
@@ -1184,6 +1249,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 );
                             }
                             state.processing_phase.clear();
+                            // pending_compress_input 保留：
+                            //   Execution 阶段 → CompressAutoResume 来了会消费它
+                            //   Communication 阶段 → interval tick 检测到非 busy 时消费（见下方）
+                            state.rendered_lines_dirty.set(true);
+                            state.frame_dirty.set(true);
+                        }
+                        StreamChunk::CompressAutoResume => {
+                            // Execution 阶段压缩完成，自动续行
+                            // 优先使用用户暂存消息；无暂存则发送续行提示
+                            let msg = state.pending_compress_input.take()
+                                .unwrap_or_else(|| "继续当前任务".to_string());
+                            // 压缩完成 toast 已由 CompressEnd 发出，AutoResume 不再重复
+                            state.input = msg;
+                            crate::tui::event::submit_message(&mut state);
                             state.rendered_lines_dirty.set(true);
                             state.frame_dirty.set(true);
                         }
@@ -1195,6 +1274,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                         }
                         StreamChunk::Complete(stats) => {
+                            // 成功完成：清除网络异常标记
+                            state.connection_error = false;
+                            // Complete: 用真实 prompt+completion 更新 ctx_live_tokens，清除估算状态
+                            state.ctx_live_tokens = stats.prompt_tokens.saturating_add(stats.completion_tokens);
+                            state.ctx_estimate_at = None;
                             // V40: 实时更新 token 统计（面板每帧可见最新数据）
                             state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
                                 .max(stats.prompt_tokens);
@@ -1239,14 +1323,42 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.rendered_lines_dirty.set(true);
                         }
                         StreamChunk::Error(e) => {
+                            let is_net = e.starts_with("NETWORK_ERROR:");
+                            let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
+
                             state.reset_streaming();
-                            // V30: Error 到达即释放输入（不 Complete 一致）
                             state.input_state = InputState::Ready;
                             state.op_started_at = None;
                             state.accumulated_elapsed = Duration::ZERO;
                             state.rendered_lines_dirty.set(true);
-                            state.add_event(&ts, "llm", &format!("错误: {}", e), crate::tui::state::EventLevel::Warning);
-                            state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
+
+                            if is_net {
+                                // 网络错误：标记状态 + 专属提示
+                                state.connection_error = true;
+                                let msg = if is_fatal_net {
+                                    "网络连接失败，请检查网络后重试".to_string()
+                                } else {
+                                    // 重试中：不弹 toast，只更新 processing_phase
+                                    let phase_msg = e.trim_start_matches("NETWORK_ERROR:")
+                                        .trim_start_matches("retrying ")
+                                        .to_string();
+                                    state.processing_phase = format!("⚠ {}", phase_msg);
+                                    state.add_event(&ts, "network", "网络连接失败，重试中...", crate::tui::state::EventLevel::Warning);
+                                    while stream_rx.try_recv().is_ok() {}
+                                    // 继续处理下一个 chunk（等待重试结果），不 break
+                                    continue;
+                                };
+                                state.add_event(&ts, "network", &msg, crate::tui::state::EventLevel::Warning);
+                                state.add_toast(
+                                    format!("⚠ {}", msg),
+                                    Duration::from_secs(8),
+                                );
+                                state.push_system_note(&format!("--- 网络异常 ---\n{}", msg));
+                            } else {
+                                // API / 其他错误
+                                state.add_event(&ts, "llm", &format!("错误: {}", e), crate::tui::state::EventLevel::Warning);
+                                state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
+                            }
                             while stream_rx.try_recv().is_ok() {}
                             break;
                         }
@@ -1342,6 +1454,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
+                // AutoHealth 快照更新：自动化 Tab 实时显示 Runner 状态
+                // 生命周期：Runner 每 tick 可能推送新快照；大字符不益(只取最新一条)
+                while let Ok(health) = auto_health_rx.try_recv() {
+                    state.auto_health = health;
+                    state.rendered_lines_dirty.set(true);
+                }
+
                 // P1 优化：条件渲染
                 // - streaming 期间：每帧渲染（内容持续变化 + 光标动画）
                 // - 非 streaming：仅在有状态变化时渲染（事件/响应/resize/toast）
@@ -1370,7 +1489,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 //   非破坏性（Medium/Low）：超时 → session 内允许（不写入永久 always_allow）
                 if let Some(ref dialog) = state.confirm_dialog {
                     if dialog.is_expired() {
-                        let tool_id = dialog.tool_id.clone();
+                        let _tool_id = dialog.tool_id.clone();
                         let action = dialog.action.clone();
                         let is_destructive = dialog.risk == crate::tui::state::ConfirmRisk::High;
                         state.confirm_dialog = None;
@@ -1381,13 +1500,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.add_event(&ts, "session", &crate::tui::i18n::tf("event.timeout_reject", &[&action]), crate::tui::state::EventLevel::Warning);
                             state.add_toast(crate::tui::i18n::t("toast.timeout_reject"), Duration::from_secs(3));
                         } else {
-                            // 非破坏性：超时 → session 内允许（加入 session grants，不持久化）
+                            // 非破坏性：超时 → 仅此次单次放行，不写入 always_allow
+                            // Bug fix: 原来会把工具永久加入 session always_allow，导致
+                            // 后续所有该工具调用全部静默放行不弹窗。
+                            // 改为仅放行当前次请求，不改变 always_allow 状态。
                             state.pending_confirmation_response = Some(true);
-                            // 加入 session 级 grants（不写 always_allow.json，session 结束后失效）
-                            if !state.always_allow.contains(&tool_id) {
-                                state.always_allow.insert(tool_id.clone());
-                                // 注意：不调用 save_always_allow——仅 session 内有效
-                            }
                             state.add_event(&ts, "session", &crate::tui::i18n::tf("event.timeout_allow", &[&action]), crate::tui::state::EventLevel::Info);
                             state.add_toast(crate::tui::i18n::t("toast.timeout_allow"), Duration::from_secs(3));
                         }
@@ -1525,31 +1642,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                         }
                         handle_input_key(&mut state, key.code, key.modifiers);
-                        if let Some(mut text) = state.pending_text.take() {
-                            // V29.9 (C1): /plan 单次模式 — 在 user message 前注入 plan-mode 前缀,
-                            //   要求 LLM 先研究、出方案、等审批、分步执行、每步复盘。一轮即清。
-                            // 引用: state.plan_mode 由 cmd_plan 设 true; 命中后追加事件 + 翻 false
-                            // 销毁: 一轮对话后 plan_mode=false; 用户重新 /plan 才再次启用
-                            if state.plan_mode {
-                                text = format!(
-                                    "[plan-mode 已启用]\n\n请按以下步骤回答用户:\n\
-                                     1. 拆解需求 — 识别核心目标与隐含约束\n\
-                                     2. 设计方案 — 列出 1~2 个备选方案 + 取舍说明\n\
-                                     3. 拆分步骤 — 编号小步骤, 每步标注预期产物 + 验证方式\n\
-                                     4. 等待审批 — 输出后明确暂停, 不直接动手\n\
-                                     5. 分步执行 + 审查 — 用户批准后逐步执行, 每步完成后复盘\n\n\
-                                     用户输入:\n{}",
-                                    text
-                                );
-                                state.plan_mode = false;
-                                let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-                                state.add_event(
-                                    &ts,
-                                    "session",
-                                    "plan-mode 已注入到本轮请求(单次)",
-                                    crate::tui::state::EventLevel::Info,
-                                );
-                            }
+                        if let Some(text) = state.pending_text.take() {
+                            // V34: plan_mode 字段已删除（/plan-prefix 功能废弃），此处直接发送用户文本
                             let engine = engine.clone();
                             let tx = res_tx.clone();
                             let current_mode = state.mode;
@@ -1581,8 +1675,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                      Key Commands: /plan, /meeting, /team (mode switch), /compress (context), /streaming (toggle){}\n\
                                      Tool Discovery: call tool_compass with intent description if unsure which tool fits.\n\
                                      You have full access to file system tools, shell execution, web search, and knowledge retrieval.\n\
-                                     Choose the most efficient tool for each step — prefer direct action over asking.",
-                                    current_mode.display_zh(), current_mode.label(), transitions, skills_str
+                                     Choose the most efficient tool for each step — prefer direct action over asking.{}",
+                                    current_mode.display_zh(), current_mode.label(), transitions, skills_str,
+                                    // V35: 模式过渡上下文注入 — 携带上阶段产物摘要给 LLM
+                                    // 引用: state.transition_hint 由 try_switch_mode 写入
+                                    // 生命周期: hint 存在即注入，不限制次数（LLM 自然理解前置语境）
+                                    state.transition_hint.as_ref()
+                                        .map(|(hint, _)| format!("\n\n[Mode Context]\n{}", hint))
+                                        .unwrap_or_default()
                                 )
                             };
                             let chat_req_ctx = abacus_core::core::RequestContext {
@@ -1592,30 +1692,6 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             };
 
                             match current_mode {
-                                // ═══ Team 模式: Leader 分解 + SubAgent 并行执行 ═══
-                                AbacusMode::Team => {
-                                    let stx = stream_tx.clone();
-                                    tokio::spawn(async move {
-                                        match send_team_message(&engine, &text, stx).await {
-                                            ApiResult::Ok(resp) => { let _ = tx.send(resp); }
-                                            ApiResult::Err(e) => {
-                                                let _ = tx.send(EngineResponse {
-                                                    text: format!("⚠️ [Team] {}", e),
-                                                    thinking: None,
-                                                    tool_records: vec![],
-                                                    stats: None,
-                                                    progressive_state: None,
-                                                    inertia_warning: None,
-                                                    pending_confirmations: vec![],
-                                                    meeting_experts: None,
-                                                    auto_fallback_chat: None,
-                                                    turnkey_plan: None,
-                                                });
-                                            }
-                                            _ => { let _ = tx.send(EngineResponse::default()); }
-                                        }
-                                    });
-                                }
                                 // ═══ Meeting 模式: 多专家会诊 + Host 综合（流式连续流程） ═══
                                 AbacusMode::Meeting => {
                                     let stx = stream_tx.clone();
@@ -1693,37 +1769,6 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         });
                                     }
                                 }
-                                // ═══ V33 Plan 模式: PlannerAgent 路径 ═══
-                                // 引用关系：send_planner_message_streaming 在 cli/api/mod.rs
-                                //   - 注入 Planner system prompt
-                                //   - 限制只读 tool whitelist (read/glob/grep/kb_query)
-                                //   - 用户进入 Team 模式时才执行写操作
-                                // ═══ Plan 模式: 规划 + 自动执行 + 汇总（流式连续流程） ═══
-                                AbacusMode::Plan => {
-                                    let stx = stream_tx.clone();
-                                    state.reset_streaming();
-                                    state.is_streaming = true;
-                                    tokio::spawn(async move {
-                                        match send_plan_and_execute_streaming(&engine, &text, stx, chat_req_ctx).await {
-                                            ApiResult::Ok(resp) => { let _ = tx.send(resp); }
-                                            ApiResult::Err(e) => {
-                                                let _ = tx.send(EngineResponse {
-                                                    text: format!("⚠️ [Plan] {}", e),
-                                                    thinking: None,
-                                                    tool_records: vec![],
-                                                    stats: None,
-                                                    progressive_state: None,
-                                                    inertia_warning: None,
-                                                    pending_confirmations: vec![],
-                                                    meeting_experts: None,
-                                                    auto_fallback_chat: None,
-                                                    turnkey_plan: None,
-                                                });
-                                            }
-                                            _ => { let _ = tx.send(EngineResponse::default()); }
-                                        }
-                                    });
-                                }
                             }
                         }
                         if let Some(prefix) = state.pending_file_completion.take() {
@@ -1789,30 +1834,29 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         _ => {}
                                     }
                                 });
-                            } else if let crate::tui::state::SlashCommand::PlannerNudge { reason } = cmd {
-                                // V37-1: schema 失败自动 nudge — 走 Plan 路径，把 reason 注入新 user message
-                                // 引用关系：cmd 由 try_switch_mode 检测 SchemaInvalid 时构造（计数器已 +1）
-                                // 设计意图：让 Planner 看到具体校验错误（如 "task[0].phase[1] 缺 description"）后修正
+                            } else if let crate::tui::state::SlashCommand::ExecuteWithPlan { task } = cmd {
+                                // V34: /plan <task> 执行策略 — 调 send_plan_and_execute_streaming，不切换 mode
+                                // 引用关系：cmd 由 slash_commands.rs::cmd_plan 构造
+                                // 设计意图：Plan 降级为策略，在 Clarify mode 内部异步执行
                                 let engine = engine.clone();
                                 let tx = res_tx.clone();
                                 let stx = stream_tx.clone();
-                                let nudge_msg = format!(
-                                    "上一次输出的 JSON 不通过 schema 校验：{}\n\n请按 system prompt 中的格式约束重新输出完整的任务规划。",
-                                    reason
-                                );
+                                // 构造独立 RequestContext（slash cmd 处理域，无法复用 message 路径的 chat_req_ctx）
+                                let plan_req_ctx = abacus_core::core::RequestContext {
+                                    thinking_intent: abacus_types::ThinkingIntent::from_str_loose(&state.thinking_depth),
+                                    ..Default::default()
+                                };
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.input_state = InputState::Thinking;
-                                state.processing_phase = "📋 Planner 修正中...".into();
+                                state.processing_phase = "📋 规划+执行中...".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
-                                    use crate::tui::api::send_planner_message_streaming;
-                                    let req_ctx = abacus_core::core::RequestContext::default();
-                                    match send_planner_message_streaming(&engine, &nudge_msg, stx, req_ctx).await {
+                                    match send_plan_and_execute_streaming(&engine, &task, stx, plan_req_ctx).await {
                                         ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                         ApiResult::Err(e) => {
                                             let _ = tx.send(EngineResponse {
-                                                text: format!("⚠️ [Plan-nudge] {}", e),
+                                                text: format!("⚠️ [Plan] {}", e),
                                                 thinking: None,
                                                 tool_records: vec![],
                                                 stats: None,
@@ -1824,7 +1868,39 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 turnkey_plan: None,
                                             });
                                         }
-                                        _ => {}
+                                        _ => { let _ = tx.send(EngineResponse::default()); }
+                                    }
+                                });
+                            } else if let crate::tui::state::SlashCommand::ExecuteWithTeam { task } = cmd {
+                                // V34: /team <task> 执行策略 — 调 send_team_message，不切换 mode
+                                // 引用关系：cmd 由 slash_commands.rs::cmd_team 构造
+                                // 设计意图：Team 降级为策略，在 Clarify mode 内部异步执行
+                                let engine = engine.clone();
+                                let tx = res_tx.clone();
+                                let stx = stream_tx.clone();
+                                state.reset_streaming();
+                                state.is_streaming = true;
+                                state.input_state = InputState::Thinking;
+                                state.processing_phase = "🤖 多 Agent 执行中...".into();
+                                state.op_started_at = Some(std::time::Instant::now());
+                                tokio::spawn(async move {
+                                    match send_team_message(&engine, &task, stx).await {
+                                        ApiResult::Ok(resp) => { let _ = tx.send(resp); }
+                                        ApiResult::Err(e) => {
+                                            let _ = tx.send(EngineResponse {
+                                                text: format!("⚠️ [Team] {}", e),
+                                                thinking: None,
+                                                tool_records: vec![],
+                                                stats: None,
+                                                progressive_state: None,
+                                                inertia_warning: None,
+                                                pending_confirmations: vec![],
+                                                meeting_experts: None,
+                                                auto_fallback_chat: None,
+                                                turnkey_plan: None,
+                                            });
+                                        }
+                                        _ => { let _ = tx.send(EngineResponse::default()); }
                                     }
                                 });
                             } else if let crate::tui::state::SlashCommand::RoleInvoke { role, content } = cmd {
@@ -2107,14 +2183,13 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         SlashCommand::ReviewRole { .. } => {
             unreachable!("ReviewRole 应该被 pending_slash_command 处理分支提前截获走流式路径")
         }
-        // V37-1: PlannerNudge 同 ReviewRole — main loop 检测 pending_slash_command 时
-        //        应走 send_planner_message_streaming 流式路径，不进入此 String-only fn
-        SlashCommand::PlannerNudge { .. } => {
-            unreachable!("PlannerNudge 应该被 pending_slash_command 处理分支提前截获走流式路径")
-        }
-        // L-3/L-4/L-5: RoleInvoke 走 send_role_message_streaming 流式路径，与 ReviewRole/PlannerNudge 同型
+        // L-3/L-4/L-5: RoleInvoke 走 send_role_message_streaming 流式路径，与 ReviewRole 同型
         SlashCommand::RoleInvoke { .. } => {
             unreachable!("RoleInvoke 应该被 pending_slash_command 处理分支提前截获走流式路径")
+        }
+        // V34: ExecuteWithPlan/ExecuteWithTeam 走流式路径，同 ReviewRole
+        SlashCommand::ExecuteWithPlan { .. } | SlashCommand::ExecuteWithTeam { .. } => {
+            unreachable!("ExecuteWithPlan/ExecuteWithTeam 应该被 pending_slash_command 处理分支提前截获走流式路径")
         }
     }
 }
@@ -2464,11 +2539,6 @@ pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
         //   兼容性: 旧 session 文件无此字段 → load 时 serde 不报错（apply_session_export 用 get-or-default）
         #[serde(skip_serializing_if = "session_tokens_is_empty")]
         session_tokens: Option<crate::tui::state::SessionTokenStats>,
-        // V38-2: 持久化 PlannerNudge attempts（防 V37-1 attempts 上限被重启绕过）
-        //   引用关系: AppState.planner_nudge_attempts ← try_switch_mode SchemaInvalid 分支递增
-        //   兼容性: 默认 0 时跳过序列化（is_zero）
-        #[serde(default, skip_serializing_if = "u8_is_zero")]
-        planner_nudge_attempts: u8,
         // V40-1: 持久化最近一次 review 结果 + strict 阻断标志
         //   引用关系: AppState.last_review / last_review_strict
         //   设计意图: 防止用户重启后丢失 strict 阻断 → 已被 fail 的 plan 被错误放进 Team
@@ -2505,8 +2575,6 @@ pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
         saved_at: String,
     }
 
-    /// V38-2: u8 零值判定 — 用于 skip_serializing_if
-    fn u8_is_zero(v: &u8) -> bool { *v == 0 }
     /// V40-1: bool false 判定 — 用于 last_review_strict skip
     fn bool_is_false(v: &bool) -> bool { !*v }
 
@@ -2550,8 +2618,6 @@ pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
         } else {
             Some(state.session_tokens.clone())
         },
-        // V38-2: 持久化 PlannerNudge attempts 计数器
-        planner_nudge_attempts: state.planner_nudge_attempts,
         // V40-1: 持久化 review 状态
         last_review: state.last_review.clone(),
         last_review_strict: state.last_review_strict,
@@ -2758,14 +2824,6 @@ fn apply_session_export(state: &mut AppState, export: &serde_json::Value) {
         if let Ok(tokens) = serde_json::from_value::<crate::tui::state::SessionTokenStats>(st.clone()) {
             state.session_tokens = tokens;
         }
-    }
-
-    // V38-2: 恢复 PlannerNudge attempts 计数器
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.planner_nudge_attempts
-    //   设计意图: 防止用户重启绕过 V37-1 attempts 上限（schema 持续不合规时无限规避）
-    //   兼容性: 旧文件无此字段 → 保持默认 0
-    if let Some(v) = export.get("planner_nudge_attempts").and_then(|x| x.as_u64()) {
-        state.planner_nudge_attempts = v.min(u8::MAX as u64) as u8;
     }
 
     // V40-1: 恢复 review 状态（last_review + strict 阻断）

@@ -221,12 +221,14 @@ impl KnowledgePalace {
         let similar = find_similar_cross_domain(&entry, &entries);
         entries.insert(entry.id.clone(), entry);
 
-        // 容量淘汰: 移除 SM-2 interval 最长（最冷）的条目
+        // M-4 fix: 容量淘汰: 移除 SM-2 interval 最短（最不稳固/反复遗忘）的条目
+        // 原 max_by(最长) 是错误的：interval 长 = 被成功记忆最多次，最稳固，不应淘汰
+        // interval 短 = 频繁遗忘/初存，这才是应淘汰的弱质知识
         if entries.len() > MAX_KNOWLEDGE_ENTRIES {
-            let coldest = entries.values()
-                .max_by(|a, b| a.sm2_interval_days.partial_cmp(&b.sm2_interval_days).unwrap_or(std::cmp::Ordering::Equal))
+            let weakest = entries.values()
+                .min_by(|a, b| a.sm2_interval_days.partial_cmp(&b.sm2_interval_days).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|e| e.id.clone());
-            if let Some(id) = coldest {
+            if let Some(id) = weakest {
                 entries.remove(&id);
             }
         }
@@ -385,7 +387,7 @@ impl RelationType {
 /// | | SupportsBehavior | 知识→行为支撑 | 知识→偏好 |
 /// | | RelatedBehavior | 行为↔行为 | 偏好相关 |
 /// | | RelatedKnowledge | 知识↔知识（通用） | 通用关联 |
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum RelationType {
     // ── 🏗 结构化 ──
     /// 父子：大类包含小类（"技术文档"→"API说明"）
@@ -438,32 +440,47 @@ pub struct MemoryRelation {
 }
 
 /// 关系链
+///
+/// M-2 fix: 新增 relation_index HashSet 提供 O(1) 去重，替代原来的 O(N) iter().any()
+/// 展开 MAX_RELATIONS=30000 时写锁内全量扫描会明显阵塞并发读
 pub struct MemoryBridge {
     relations: RwLock<std::collections::VecDeque<MemoryRelation>>,
+    /// 去重索引：(from_id, to_id, relation_type) 快速判重，与 relations 同步维护
+    /// 生命周期：add_relation 写入，remove_relations_for 清理，FIFO 淘汰时同步删除
+    relation_index: RwLock<std::collections::HashSet<(String, String, RelationType)>>,
 }
 
 impl MemoryBridge {
     pub fn new() -> Self {
         Self {
             relations: RwLock::new(std::collections::VecDeque::new()),
+            relation_index: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
     /// 添加关系（自动去重：相同 from + to + type 不重复添加）
     ///
     /// 容量超过 MAX_RELATIONS 时 FIFO 淘汰最旧关系，防止无限增长。
+    /// M-2 fix: 用 HashSet O(1) 判重替代原来的 iter().any() O(N)
     pub async fn add_relation(&self, relation: MemoryRelation) {
-        let mut relations = self.relations.write().await;
-        let exists = relations.iter().any(|r| {
-            r.from_id == relation.from_id && r.to_id == relation.to_id
-                && r.relation_type == relation.relation_type
-        });
-        if !exists {
-            if relations.len() >= MAX_RELATIONS {
-                relations.pop_front(); // FIFO 淘汰最旧关系
-            }
-            relations.push_back(relation);
+        let key = (relation.from_id.clone(), relation.to_id.clone(), relation.relation_type.clone());
+        // 先用读锁快速判重，大多数重复调用在此短路
+        {
+            let index = self.relation_index.read().await;
+            if index.contains(&key) { return; }
         }
+        // 取得写锁后再次检查（防止并发竞态）
+        let mut index = self.relation_index.write().await;
+        if index.contains(&key) { return; }
+        let mut relations = self.relations.write().await;
+        if relations.len() >= MAX_RELATIONS {
+            // FIFO 淘汰：同步从 index 删除被淘汰项
+            if let Some(oldest) = relations.pop_front() {
+                index.remove(&(oldest.from_id, oldest.to_id, oldest.relation_type));
+            }
+        }
+        index.insert(key);
+        relations.push_back(relation);
     }
 
     pub async fn get_related(&self, id: &str) -> Vec<MemoryRelation> {
@@ -475,9 +492,17 @@ impl MemoryBridge {
     }
 
     /// 删除所有涉及 `ids` 中任一 ID 的关系（用于 prune 清理悬空引用）
+    /// M-2 fix: 同步清理 relation_index 保持两者一致
     pub async fn remove_relations_for(&self, ids: &[String]) {
         let mut relations = self.relations.write().await;
-        relations.retain(|r| !ids.contains(&r.from_id) && !ids.contains(&r.to_id));
+        let mut index = self.relation_index.write().await;
+        relations.retain(|r| {
+            let keep = !ids.contains(&r.from_id) && !ids.contains(&r.to_id);
+            if !keep {
+                index.remove(&(r.from_id.clone(), r.to_id.clone(), r.relation_type.clone()));
+            }
+            keep
+        });
     }
 }
 

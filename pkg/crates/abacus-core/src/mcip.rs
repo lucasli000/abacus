@@ -128,6 +128,15 @@ pub struct McipConfirmRequest {
     /// V28：唯一 nonce，UI 用此 key 在 SessionState.mcip_confirm_channels 找回 oneshot sender
     /// 同 turn 多个工具同时需要授权时，nonce 区分各请求。空字符串表示"非 channel 路径"（兼容旧调用）
     pub nonce: String,
+    /// 系统+LLM 对本次授权请求的建议动作（由 pipeline 根据工具语义 + reason 评估计算）
+    ///   Some(true)  = 系统评估可安全放行（只读/幂等工具 + 无危险 reason）
+    ///   Some(false) = 系统建议拒绝（检测到潜在破坏性操作）
+    ///   None        = 系统无法确定，必须由用户决策
+    /// TUI 始终展示弹窗，但利用此字段调整超时行为：
+    ///   Some(true)  → 3s 后自动放行（弹窗显示"系统建议允许"倒计时）
+    ///   Some(false) → 标准 8s 超时后拒绝
+    ///   None        → 标准 10s 用户超时逻辑
+    pub suggested_action: Option<bool>,
 }
 
 /// 用户对 MCIP 授权请求的决定

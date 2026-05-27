@@ -84,6 +84,109 @@ impl ContextWindow {
 
 // ─── Session Snapshot ───────────────────────────────────────────────────────
 
+// ─── Session Checkpoint ─────────────────────────────────────────────────────
+//
+// 压缩阶段感知摘要：每次达到压缩阈值前，由 LLM 生成结构化 checkpoint，
+// 记录 accomplished / current_topic / pending（含阶段标记），
+// 作为压缩后注入 context 的历史块，确保 LLM 不丢失 session 脉络。
+//
+// 引用关系：
+//   - 写入：pipeline::generate_session_checkpoint（LLM call + deterministic fallback）
+//   - 读取：auto_compress_messages 注入历史块 + 选 compression_level
+//   - 存储：ContextTiers.checkpoints（FIFO 上限 10）
+// 生命周期：压缩完成后不清空（保留历史，注入下次 context 用）
+
+/// 会话阶段——决定压缩精度
+///
+/// Communication（沟通）→ Detailed（保留需求细节）
+/// Execution（执行）    → Brief（工具结果优先，过程可压缩）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SessionPhase {
+    Communication,
+    Execution,
+}
+
+/// 待办事项（含阶段标记）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingItem {
+    pub task: String,
+    pub phase: SessionPhase,
+}
+
+/// 结构化 checkpoint——压缩前由 LLM 生成
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCheckpoint {
+    /// 触发时 context 使用率（如 70.0 表示 70%）
+    pub context_pct: f64,
+    /// 触发时轮次号
+    pub turn_count: u32,
+    /// 已完成的事项（max 5）
+    pub accomplished: Vec<String>,
+    /// 当前正在讨论/处理的需求
+    pub current_topic: String,
+    /// 待办事项（含阶段）（max 5）
+    pub pending: Vec<PendingItem>,
+    /// 整体阶段（决定压缩精度）
+    pub overall_phase: SessionPhase,
+    pub created_at: i64,
+}
+
+impl SessionCheckpoint {
+    /// 压缩精度档位：沟通阶段→Detailed，执行阶段→Brief
+    pub fn compression_level(&self) -> CompressLevel {
+        match self.overall_phase {
+            SessionPhase::Communication => CompressLevel::Detailed,
+            SessionPhase::Execution => CompressLevel::Brief,
+        }
+    }
+
+    /// 注入 context 的结构化摘要块
+    pub fn to_context_block(&self) -> String {
+        let phase_label = match self.overall_phase {
+            SessionPhase::Communication => "沟通",
+            SessionPhase::Execution => "执行",
+        };
+        let mut block = format!(
+            "[Session Checkpoint @{:.0}% · turn {} · {}阶段]\n",
+            self.context_pct, self.turn_count, phase_label
+        );
+        if !self.accomplished.is_empty() {
+            block.push_str("✓ 已完成:\n");
+            for item in &self.accomplished {
+                block.push_str(&format!("  - {}\n", item));
+            }
+        }
+        if !self.current_topic.is_empty() {
+            block.push_str(&format!("◌ 当前: {}\n", self.current_topic));
+        }
+        if !self.pending.is_empty() {
+            block.push_str("↻ 待办:\n");
+            for p in &self.pending {
+                let ph = match p.phase {
+                    SessionPhase::Communication => "沟通",
+                    SessionPhase::Execution => "执行",
+                };
+                block.push_str(&format!("  [{}] {}\n", ph, p.task));
+            }
+        }
+        block
+    }
+}
+
+/// 自适应压缩阈值序列
+///
+/// compress_count = 已完成的压缩次数（0-based）
+/// 序列：70→80→85→90→75（稳态循环）
+pub fn compress_threshold_pct(compress_count: u32) -> f64 {
+    match compress_count {
+        0 => 70.0,
+        1 => 80.0,
+        2 => 85.0,
+        3 => 90.0,
+        _ => 75.0, // 第 5 次及后续稳态
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub session_id: String,
@@ -218,6 +321,19 @@ pub struct ContextTiers {
     /// 因为 PalaceAbsorbHook 通过 PipelineEvent 单向通信，无法 pull 数据；
     /// 用 buffer + take 模式让 hook 主动拉取，不污染 PipelineEvent 结构。
     pub recent_demoted: RwLock<std::collections::VecDeque<SessionSnapshot>>,
+    /// 压缩前 checkpoint 历史（FIFO 上限 10）
+    /// 引用关系：pipeline generate_session_checkpoint 写入；auto_compress_messages 读取注入
+    /// 生命周期：随 ContextManager；压缩后不清空，保留全部历史供 LLM 回溯
+    pub checkpoints: RwLock<std::collections::VecDeque<SessionCheckpoint>>,
+    /// 已完成的压缩次数——驱动 compress_threshold_pct 序列（70→80→85→90→75稳态）
+    pub compress_count: std::sync::atomic::AtomicU32,
+    /// LLM 自报的任务完成摘要缓冲（每轮检测到 `✓` 标记时写入）
+    ///
+    /// 引用关系：
+    ///   - 写入：pipeline post_process 检测 final_response 中的 `---\n✓ ` 标记
+    ///   - 读取：generate_session_checkpoint 填充 accomplished 字段
+    /// 生命周期：随 ContextManager；不随压缩清空（摘要本身即为 checkpoint 内容）
+    pub pending_accomplishments: RwLock<Vec<String>>,
 }
 
 /// Task #80：迁移结果统计（诊断/测试用）
@@ -240,6 +356,9 @@ impl ContextTiers {
             cold,
             compressed_messages: RwLock::new(Vec::new()),
             recent_demoted: RwLock::new(std::collections::VecDeque::new()),
+            checkpoints: RwLock::new(std::collections::VecDeque::new()),
+            compress_count: std::sync::atomic::AtomicU32::new(0),
+            pending_accomplishments: RwLock::new(Vec::new()),
         }
     }
 
@@ -257,6 +376,50 @@ impl ContextTiers {
     /// 副作用：仅写 hot_snapshots，不触发 migration（迁移由调用方显式调 migrate_tiers）。
     pub async fn record_snapshot(&self, snapshot: SessionSnapshot) {
         self.hot_snapshots.write().await.push_back(snapshot);
+    }
+
+    /// 保存压缩前 checkpoint（FIFO 上限 10）
+    ///
+    /// 引用关系：pipeline generate_session_checkpoint 写入
+    /// 消费方：auto_compress_messages 注入历史块
+    pub async fn store_checkpoint(&self, cp: SessionCheckpoint) {
+        const MAX_CHECKPOINTS: usize = 10;
+        let mut cps = self.checkpoints.write().await;
+        if cps.len() >= MAX_CHECKPOINTS {
+            cps.pop_front();
+        }
+        cps.push_back(cp);
+    }
+
+    /// 当前下一次压缩的阈值（%）
+    ///
+    /// compress_count: 已完成压缩次数（从 compress_count AtomicU32 读取）
+    pub fn next_compress_threshold_pct(&self) -> f64 {
+        let n = self.compress_count.load(std::sync::atomic::Ordering::Relaxed);
+        compress_threshold_pct(n)
+    }
+
+    /// 压缩完成：计数 +1（驱动下次阈值升挡）
+    pub fn on_compress_done(&self) {
+        self.compress_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 追加 LLM 自报的任务完成摘要（上限 20 条 FIFO）
+    ///
+    /// 引用关系：pipeline post_process 检测 `✓` 标记后调用
+    /// 消费方：generate_session_checkpoint 取出后填入 accomplished
+    pub async fn push_accomplishment(&self, summary: String) {
+        const MAX: usize = 20;
+        let mut acc = self.pending_accomplishments.write().await;
+        if acc.len() >= MAX {
+            acc.remove(0);
+        }
+        acc.push(summary);
+    }
+
+    /// 取出所有待记录的完成摘要（不清空——checkpoint 写入后由调用方决定是否清空）
+    pub async fn snapshot_accomplishments(&self) -> Vec<String> {
+        self.pending_accomplishments.read().await.clone()
     }
 
     /// Task #80：执行 hot→warm + warm→cold 迁移
@@ -794,6 +957,120 @@ impl ContextManager {
     /// 获取当前 pinned turns 列表
     pub async fn pinned_turns_list(&self) -> Vec<u32> {
         self.pinned_turns.read().await.iter().copied().collect()
+    }
+
+    /// 保存压缩前 checkpoint
+    pub async fn store_checkpoint(&self, cp: SessionCheckpoint) {
+        self.tiers.store_checkpoint(cp).await;
+    }
+
+    /// 获取所有 checkpoint 历史（用于注入 context）
+    pub async fn get_checkpoints(&self) -> Vec<SessionCheckpoint> {
+        self.tiers.checkpoints.read().await.iter().cloned().collect()
+    }
+
+    /// 当前下一次压缩阈值（%）
+    pub fn next_compress_threshold_pct(&self) -> f64 {
+        self.tiers.next_compress_threshold_pct()
+    }
+
+    /// 压缩完成：计数 +1
+    pub fn on_compress_done(&self) {
+        self.tiers.on_compress_done();
+    }
+
+    /// 追加 LLM 自报的任务完成摘要
+    pub async fn push_accomplishment(&self, summary: String) {
+        self.tiers.push_accomplishment(summary).await;
+    }
+
+    /// 读取所有待记录的完成摘要（用于 checkpoint 填充）
+    pub async fn snapshot_accomplishments(&self) -> Vec<String> {
+        self.tiers.snapshot_accomplishments().await
+    }
+
+    /// checkpoint 感知压缩：按 checkpoint.overall_phase 选精度 + 压缩后注入历史块
+    ///
+    /// 与 `auto_compress_messages` 互补：
+    ///   - auto_compress_messages: 内部 should_compress() 守卫，固定档位
+    ///   - auto_compress_with_checkpoint: 外部调用方已确认阈值，传入 checkpoint 覆盖档位
+    ///
+    /// 流程：
+    ///   1. 按 checkpoint.compression_level() 临时覆盖 default_compress_level
+    ///   2. 调用 auto_compress_messages（绕过内部守卫，直接用传入的 messages）
+    ///   3. 恢复 default_compress_level
+    ///   4. 在 early_keep 位置注入全部 checkpoint 历史块（供 LLM 回溯）
+    ///
+    /// 引用关系：pipeline post_process 在自适应阈值触发时调用
+    /// 生命周期：每次阈值触发执行一次；compress_count +1 由调用方负责（on_compress_done）
+    pub async fn auto_compress_with_checkpoint(
+        &self,
+        messages: &mut Vec<Message>,
+        checkpoint: &SessionCheckpoint,
+    ) -> Vec<CompressedMessage> {
+        // 1. 临时降低触发阈值至 1%，确保 auto_compress_messages 内部守卫通过
+        //    （pipeline 已在外层验证 usage_pct >= adaptive threshold，此处无需重复判断）
+        //    保存原始值，完成后恢复，防止影响其他并发路径
+        let orig_trigger = {
+            let mut window = self.window.write().await;
+            let orig = window.compression_trigger_pct;
+            window.compression_trigger_pct = 1;
+            orig
+        };
+
+        // 2. 临时覆盖压缩档位（按 phase 决定精度）
+        let level = checkpoint.compression_level();
+        let prev_level = *self.default_compress_level.read().await;
+        *self.default_compress_level.write().await = level;
+
+        // 3. 执行压缩
+        let result = self.auto_compress_messages(messages).await;
+
+        // 4. 恢复档位 + 触发阈值
+        *self.default_compress_level.write().await = prev_level;
+        {
+            let mut window = self.window.write().await;
+            window.compression_trigger_pct = orig_trigger;
+        }
+
+        // 4. 注入 checkpoint 历史块（在 early_keep=2 之后，作为背景上下文）
+        if !result.is_empty() {
+            let history = self.build_checkpoint_history_block().await;
+            if !history.is_empty() {
+                let insert_pos = 2.min(messages.len());
+                messages.insert(insert_pos, Message {
+                    role: MessageRole::User,
+                    content: Some(MessageContent::Text(history)),
+                    name: None, tool_calls: None, tool_call_id: None,
+                    reasoning_content: None, prefix: false,
+                });
+            }
+        }
+
+        result
+    }
+
+    /// 构建 checkpoint 历史摘要块（注入 context 用）
+    ///
+    /// 格式：
+    ///   [Session History - N checkpoints]
+    ///   [Session Checkpoint @70% · turn 5 · 执行阶段]
+    ///   ✓ 已完成: ...
+    ///   ◌ 当前: ...
+    ///   ↻ 待办: ...
+    ///
+    /// 引用关系：auto_compress_with_checkpoint 调用
+    async fn build_checkpoint_history_block(&self) -> String {
+        let checkpoints = self.tiers.checkpoints.read().await;
+        if checkpoints.is_empty() {
+            return String::new();
+        }
+        let mut block = format!("[Session History - {} checkpoints]\n", checkpoints.len());
+        for cp in checkpoints.iter() {
+            block.push_str(&cp.to_context_block());
+            block.push('\n');
+        }
+        block
     }
 
     /// Phase Z4：注入自定义 summarizer（如 LLM-driven）

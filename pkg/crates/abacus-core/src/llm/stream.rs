@@ -77,6 +77,13 @@ pub enum StreamChunk {
     CompressStart,
     /// 上下文压缩完成（携带压缩统计）
     CompressEnd { messages_compressed: usize, tokens_saved: usize },
+    /// 压缩后自动续行（Execution 阶段，phase=execution 时发出）
+    ///
+    /// TUI 收到后：① 显示"压缩完成，继续执行" toast
+    ///             ② 检查 pending_compress_input，有则自动发送；无则发送续行提示
+    /// 引用关系：pipeline post_process → checkpoint.overall_phase == Execution 时发出
+    /// 生命周期：单次消费，TUI 处理后清空 pending_compress_input
+    CompressAutoResume,
     /// Turn 完成（携带最终统计）
     Complete(TurnStats),
     /// Provider retry 通知（用户在等待重试时可见）

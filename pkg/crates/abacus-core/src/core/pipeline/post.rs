@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use abacus_types::SkillExecutionRecord;
 use chrono::Utc;
 
+use crate::core::context::{SessionCheckpoint, SessionPhase, PendingItem};
 use crate::core::interaction::{MapAnalyzer, ToolCallRecord};
 use crate::core::inertia;
 use crate::llm::{LlmRequest, Message, MessageContent, MessageRole};
@@ -28,40 +29,98 @@ impl<'a> TurnPipeline<'a> {
             // 由 persist_and_build_result 兜底处理。
         }
 
-        // Context compression — 仅在实际压缩发生时才通知 TUI + LLM
+        // ── 自适应 checkpoint + 压缩 ──────────────────────────────────────────
+        // 阈值序列：70%→80%→85%→90%→75%(稳态)，每次压缩后 compress_count +1
+        // 流程：检查阈值 → 生成 checkpoint（LLM call + fallback）→ 压缩 → 通知 TUI + LLM
         {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
-            let compressed = self.core.context_manager.auto_compress_messages(&mut msgs).await;
-            if !compressed.is_empty() {
-                let tokens_saved: usize = compressed.iter()
-                    .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
-                    .sum();
-                tracing::info!("compressed {} messages in turn {}", compressed.len(), ctx.turn_number);
+            let usage_pct = self.core.context_manager.window.read().await.usage_pct();
+            let threshold = self.core.context_manager.next_compress_threshold_pct();
 
-                // 通知 TUI
+            if usage_pct >= threshold {
+                tracing::info!(
+                    turn = ctx.turn_number, usage_pct, threshold,
+                    "adaptive compress threshold reached — generating checkpoint"
+                );
+
+                // 1. 生成结构化 checkpoint（LLM call，失败自动 fallback 确定性提取）
+                let messages_snapshot = {
+                    let s = self.session.read().await;
+                    let msgs = s.messages.read().await;
+                    msgs.clone()
+                };
+                let mut checkpoint = self.generate_session_checkpoint(ctx, &messages_snapshot).await;
+                checkpoint.context_pct = usage_pct;
+
+                // 2. 存储 checkpoint
+                self.core.context_manager.store_checkpoint(checkpoint.clone()).await;
+
+                // 3. 通知 TUI 压缩开始
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
-                    let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
-                        messages_compressed: compressed.len(),
-                        tokens_saved,
-                    });
                 }
 
-                // 注入 system message 通知 LLM
-                msgs.push(crate::llm::Message {
-                    role: crate::llm::MessageRole::System,
-                    content: Some(crate::llm::MessageContent::Text(format!(
-                        "[Context auto-compressed] {} messages summarized, ~{} tokens freed. \
-                         Use `messages_recover` tool with recover_id if you need original details.",
-                        compressed.len(), tokens_saved
-                    ))),
-                    name: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    reasoning_content: None,
-                    prefix: false,
-                });
+                // 4. 压缩（按 checkpoint phase 选精度 + 注入历史块）
+                let compressed = {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    self.core.context_manager
+                        .auto_compress_with_checkpoint(&mut msgs, &checkpoint)
+                        .await
+                };
+
+                if !compressed.is_empty() {
+                    let tokens_saved: usize = compressed.iter()
+                        .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+                        .sum();
+                    tracing::info!(
+                        turn = ctx.turn_number,
+                        compressed = compressed.len(),
+                        tokens_saved,
+                        phase = ?checkpoint.overall_phase,
+                        "checkpoint compress done"
+                    );
+
+                    // 5. 压缩计数 +1（驱动下次阈值升挡）
+                    self.core.context_manager.on_compress_done();
+
+                    // 6. 通知 TUI 压缩完成
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                            messages_compressed: compressed.len(),
+                            tokens_saved,
+                        });
+                        // Execution 阶段：发出自动续行信号
+                        if checkpoint.overall_phase == crate::core::context::SessionPhase::Execution {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::CompressAutoResume);
+                        }
+                    }
+
+                    // 7. 注入 system message 通知 LLM（含 checkpoint 摘要 + 下次阈值）
+                    let next_threshold = self.core.context_manager.next_compress_threshold_pct();
+                    let checkpoint_summary = checkpoint.to_context_block();
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::System,
+                        content: Some(MessageContent::Text(format!(
+                            "[Context compressed: {} messages summarized, ~{} tokens freed.]\
+                             \n{}\
+                             \n[Next compress threshold: {:.0}%. Use messages_recover with recover_id for original details.]",
+                            compressed.len(), tokens_saved, checkpoint_summary, next_threshold
+                        ))),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                } else {
+                    // 压缩守卫未通过（消息数不足）— 取消 CompressStart
+                    if let Some(ref stx) = self.stream_tx {
+                        // 补发一个 0-tokens CompressEnd 以保持状态机一致
+                        let _ = stx.send(crate::llm::stream::StreamChunk::CompressEnd {
+                            messages_compressed: 0,
+                            tokens_saved: 0,
+                        });
+                    }
+                }
             }
         }
 
@@ -325,6 +384,15 @@ impl<'a> TurnPipeline<'a> {
             }
         }
 
+        // ─── 任务完成摘要检测 ────────────────────────────────────────────────
+        // 检测 final_response 末尾的 `---\n✓ summary` 标记（system prompt Layer 188 规定格式）
+        // 检测到时写入 pending_accomplishments，供下次 checkpoint 生成时填入 accomplished 字段
+        // 引用：generate_session_checkpoint 调用 snapshot_accomplishments()
+        if let Some(summary) = Self::extract_completion_summary(&ctx.final_response) {
+            tracing::debug!(turn = ctx.turn_number, summary = %summary, "task completion detected");
+            self.core.context_manager.push_accomplishment(summary).await;
+        }
+
         // ─── V29.13 段1：TurnPostFanOut 广播 ───────────────────────────────
         // 引用：mag_chain::PipelineEvent::TurnPostFanOut
         // 生命周期：post_process 末尾、TurnEnd 之前 emit 一次；hook 链按优先级顺序消费
@@ -346,6 +414,263 @@ impl<'a> TurnPipeline<'a> {
             if let Err(e) = self.core.emit_pipeline_event(event).await {
                 tracing::warn!("TurnPostFanOut hook chain error (ignored): {}", e);
             }
+        }
+    }
+
+    // ─── Task Completion Detection ──────────────────────────────────────────
+
+    /// 从 final_response 末尾提取 LLM 自报的任务完成摘要
+    ///
+    /// 格式（由 system prompt Layer 188 规定）：
+    ///   ---
+    ///   ✓ [summary]
+    ///
+    /// 引用关系：post_process 每轮结束后调用；结果写入 pending_accomplishments
+    /// 生命周期：纯函数，无副作用
+    fn extract_completion_summary(response: &str) -> Option<String> {
+        let trimmed = response.trim_end();
+        // 找末尾 "---" 分隔线（支持前后有空行）
+        if let Some(sep_pos) = trimmed.rfind("\n---") {
+            let after_sep = trimmed[sep_pos + 4..]
+                .trim_start_matches('-')
+                .trim_start_matches('\n');
+            for line in after_sep.lines() {
+                let line = line.trim();
+                if line.starts_with('✓') {
+                    let summary = line.trim_start_matches('✓').trim().to_string();
+                    if !summary.is_empty() && summary.chars().count() <= 200 {
+                        return Some(summary);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // ─── Checkpoint Generation ──────────────────────────────────────────────
+
+    /// 生成结构化 session checkpoint（LLM call + deterministic fallback）
+    ///
+    /// 使用当前 turn 已选定的 provider（复用现有调用栈，适配所有 LLM）：
+    /// - 轻量 prompt：max_tokens=400, temperature=0.1, no tools, no thinking
+    /// - JSON 响应解析；失败时走确定性提取（正则 + 启发式）
+    ///
+    /// 引用关系：post_process 自适应压缩块调用
+    /// 生命周期：每次阈值触发执行一次，结果写入 ContextTiers.checkpoints
+    async fn generate_session_checkpoint(
+        &self,
+        ctx: &TurnContext,
+        messages: &[Message],
+    ) -> crate::core::context::SessionCheckpoint {
+
+        // 预载 LLM 自报的任务完成摘要（写入 accomplished，比 LLM 提取更准确）
+        // 这些摘要由 post_process 每轮检测 `✓` 标记写入，不随压缩丢失
+        let prior_accomplishments = self.core.context_manager.snapshot_accomplishments().await;
+
+        // 构建对话片段（最近 15 条，跳过 tool 协议消息）
+        let msg_snippet: String = messages.iter()
+            .filter(|m| m.tool_calls.is_none() && m.tool_call_id.is_none()
+                && !matches!(m.role, MessageRole::Tool))
+            .rev()
+            .take(15)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter_map(|m| match (&m.role, &m.content) {
+                (role, Some(MessageContent::Text(t))) => {
+                    let short: String = t.chars().take(150).collect();
+                    Some(format!("[{:?}]: {}", role, short))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            "Analyze this conversation and output a JSON checkpoint. Be concise.\n\
+             \nConversation (recent):\n{}\
+             \n\nOutput ONLY valid JSON (no markdown):\
+             \n{{\
+             \n  \"accomplished\": [\"completed task\"],\
+             \n  \"current_topic\": \"one sentence about current work\",\
+             \n  \"pending\": [{{\"task\": \"item\", \"phase\": \"communication\"}}],\
+             \n  \"overall_phase\": \"communication\"\
+             \n}}\
+             \nRules: accomplished/pending max 5 items. \
+             phase: \"communication\" (discussing) or \"execution\" (coding/implementing).",
+            msg_snippet
+        );
+
+        let request = LlmRequest {
+            model: self.core.config.default_model.clone(),
+            messages: vec![Message {
+                role: MessageRole::User,
+                content: Some(MessageContent::Text(prompt)),
+                name: None, tool_calls: None, tool_call_id: None,
+                reasoning_content: None, prefix: false,
+            }],
+            // 系统消息：guide LLM 输出格式（属于 system 约束，不是 user 消息）
+            system: Some("You are a session analyst. Output only valid JSON, no explanation.".to_string()),
+            system_segments: Vec::new(),
+            tools: Vec::new(),        // 不需要工具调用
+            temperature: Some(0.1),  // 低温，稳定 JSON 输出
+            max_tokens: Some(400),
+            top_p: None, stop: Vec::new(), stream: false,
+            thinking_intent: None,   // 不需要推理，节省 token
+            cache_config: None,
+            extra_body: HashMap::new(),
+            user_message_preamble: None,
+        };
+
+        // 使用当前 turn 选定的 provider（已验证可用，适配当前 LLM）
+        let mut cp = match ctx.provider.complete_cancellable(request, None).await {
+            Ok(resp) => {
+                let text = crate::core::extract_text(&resp.message);
+                Self::parse_checkpoint_json(&text, ctx.turn_number)
+                    .unwrap_or_else(|| {
+                        tracing::debug!("checkpoint JSON parse failed, using deterministic fallback");
+                        Self::deterministic_checkpoint(messages, ctx.turn_number)
+                    })
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "checkpoint LLM call failed, using deterministic fallback");
+                Self::deterministic_checkpoint(messages, ctx.turn_number)
+            }
+        };
+
+        // LLM 自报摘要优先追加到 accomplished 列表（精确度高于 LLM 提取的 JSON）
+        // prior_accomplishments 来自历轮 ✓ 标记，不替换而是前置合并
+        if !prior_accomplishments.is_empty() {
+            let mut merged = prior_accomplishments;
+            merged.extend(cp.accomplished.into_iter());
+            merged.dedup(); // 去重（同一摘要可能多次出现）
+            merged.truncate(5);
+            cp.accomplished = merged;
+        }
+
+        cp
+    }
+
+    /// 解析 LLM 返回的 checkpoint JSON
+    fn parse_checkpoint_json(text: &str, turn_count: u32) -> Option<crate::core::context::SessionCheckpoint> {
+
+        // 从可能的 markdown fence 中提取 JSON
+        let json_str = if let Some(start) = text.find('{') {
+            if let Some(end) = text.rfind('}') {
+                &text[start..=end]
+            } else { text.trim() }
+        } else { text.trim() };
+
+        let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+        let accomplished: Vec<String> = v.get("accomplished")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .take(5).collect())
+            .unwrap_or_default();
+
+        let current_topic = v.get("current_topic")
+            .and_then(|t| t.as_str())
+            .unwrap_or("").to_string();
+
+        let pending: Vec<PendingItem> = v.get("pending")
+            .and_then(|p| p.as_array())
+            .map(|arr| arr.iter().take(5).filter_map(|item| {
+                let task = item.get("task")?.as_str()?.to_string();
+                let phase = match item.get("phase").and_then(|p| p.as_str()) {
+                    Some("execution") => SessionPhase::Execution,
+                    _ => SessionPhase::Communication,
+                };
+                Some(PendingItem { task, phase })
+            }).collect())
+            .unwrap_or_default();
+
+        let overall_phase = match v.get("overall_phase").and_then(|p| p.as_str()) {
+            Some("execution") => SessionPhase::Execution,
+            _ => SessionPhase::Communication,
+        };
+
+        Some(SessionCheckpoint {
+            context_pct: 0.0, // 由调用方填充
+            turn_count,
+            accomplished,
+            current_topic,
+            pending,
+            overall_phase,
+            created_at: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    /// 确定性 checkpoint（LLM 失败时的 fallback）
+    ///
+    /// 从消息中启发式提取：
+    ///   - accomplished: ## 标题 + ✓ 标记行
+    ///   - pending: TODO/待办/- [ ] 行
+    ///   - current_topic: 最后一条 User 消息首 100 字符
+    ///   - overall_phase: 工具调用次数 > 5 → Execution，否则 Communication
+    fn deterministic_checkpoint(
+        messages: &[Message],
+        turn_count: u32,
+    ) -> crate::core::context::SessionCheckpoint {
+
+        let mut accomplished = Vec::new();
+        let mut pending = Vec::new();
+        let mut current_topic = String::new();
+        let mut tool_call_count = 0usize;
+
+        for msg in messages.iter().rev().take(30) {
+            if msg.tool_calls.is_some() { tool_call_count += 1; }
+            if let Some(MessageContent::Text(text)) = &msg.content {
+                for line in text.lines() {
+                    let t = line.trim();
+                    if (t.starts_with("## ") || t.starts_with("✓ ") || t.starts_with("完成："))
+                        && accomplished.len() < 5
+                    {
+                        let item = t.trim_start_matches("## ")
+                            .trim_start_matches("✓ ")
+                            .trim_start_matches("完成：")
+                            .to_string();
+                        if !item.is_empty() { accomplished.push(item); }
+                    }
+                    if (t.starts_with("- [ ]") || t.starts_with("TODO")
+                        || t.starts_with("待办") || t.starts_with("下一步"))
+                        && pending.len() < 5
+                    {
+                        let item = t.trim_start_matches("- [ ]")
+                            .trim_start_matches("TODO:")
+                            .trim_start_matches("待办：")
+                            .trim().to_string();
+                        if !item.is_empty() {
+                            pending.push(PendingItem {
+                                task: item,
+                                phase: SessionPhase::Execution,
+                            });
+                        }
+                    }
+                }
+            }
+            if current_topic.is_empty() {
+                if let (MessageRole::User, Some(MessageContent::Text(t))) = (&msg.role, &msg.content) {
+                    current_topic = t.chars().take(100).collect();
+                }
+            }
+        }
+
+        let overall_phase = if tool_call_count > 5 {
+            SessionPhase::Execution
+        } else {
+            SessionPhase::Communication
+        };
+
+        SessionCheckpoint {
+            context_pct: 0.0,
+            turn_count,
+            accomplished,
+            current_topic,
+            pending,
+            overall_phase,
+            created_at: chrono::Utc::now().timestamp(),
         }
     }
 
@@ -416,7 +741,11 @@ impl<'a> TurnPipeline<'a> {
                         let mut msgs = s.messages.write().await;
                         msgs.push(Message {
                             role: MessageRole::User,
-                            content: Some(MessageContent::Text(nudge_prompt)),
+                            content: Some(MessageContent::Text(format!(
+                                "[Abacus 惯性检测——指引与约束] 第 {} 次重试：{}\n\
+请按上述指引调整方案后继续。",
+                                attempt, nudge_prompt
+                            ))),
                             name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, prefix: false,
                         });
                     }

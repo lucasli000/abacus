@@ -225,8 +225,13 @@ impl<'a> TurnPipeline<'a> {
             return Some(intent);
         }
         // 2 + 3. 查 / 写 session sticky（write lock 串行化首轮决策，避免并发竞争）
-        let session = self.session.read().await;
-        let mut decision_guard = session.thinking_decision.write().await;
+        // C-2 fix: 先取出 Arc clone，释放 session read guard，再单独 await 内层写锁
+        // 防止 session.read() guard 跨 await 持有，与 session.write() 路径形成 livelock
+        let decision_lock = {
+            let session = self.session.read().await;
+            std::sync::Arc::clone(&session.thinking_decision)
+        }; // session read guard 在此释放
+        let mut decision_guard = decision_lock.write().await;
         if let Some(ref locked) = *decision_guard {
             return locked.clone();
         }
@@ -250,8 +255,12 @@ impl<'a> TurnPipeline<'a> {
         if let Some(intent) = self.core.build_thinking_intent() {
             return Some(intent);
         }
-        let session = self.session.read().await;
-        let guard = session.thinking_decision.read().await;
+        // C-2 fix: 先取 Arc clone 再释放 session guard，避免嵌套持锁跨 await
+        let decision_lock = {
+            let session = self.session.read().await;
+            std::sync::Arc::clone(&session.thinking_decision)
+        };
+        let guard = decision_lock.read().await;
         match guard.as_ref() {
             Some(locked) => locked.clone(),
             None => None,
@@ -1183,7 +1192,14 @@ impl<'a> TurnPipeline<'a> {
             // model 优先级：req_ctx（per-request 显式）> escalated_model（Task #96 sticky）> default
             // 引用关系：escalated_model 在 handle_model_escalation 升级成功后写入；
             // 后续所有 turn 优先用此 model 直到 session 结束——避免 cache 池来回切换
-            let escalated = self.session.read().await.escalated_model.read().await.clone();
+            // C-3 fix: 拆分两步，防止临时 session guard 跨 await 持有
+            // 1) 独立作用域取出 Arc、释放 session guard
+            let escalated_model_lock = {
+                let s = self.session.read().await;
+                std::sync::Arc::clone(&s.escalated_model)
+            }; // session guard 在此释放
+            // 2) 单独 await 内层锁，不再持有 session guard
+            let escalated = escalated_model_lock.read().await.clone();
             // 用户 /model 命令设置的运行时覆盖（应高于 escalated 优先级）
             // 不把 model_override 放进 req_ctx.model（那是 per-request），而是作为 session 级默认
             // 优先级：req_ctx.model（显式单请求覆盖）> model_override（用户 /model 设置）> escalated > default
@@ -2073,10 +2089,12 @@ impl<'a> TurnPipeline<'a> {
                             //   3. 通过 stream_tx 实时通知 UI（UI 弹窗）
                             //   4. await receiver——挂起 dispatch 等用户决策
                             //   5. true → 走真 execute 路径；false → Denied
+                            // C-4 fix: 用单调递增 AtomicU64 替代时间戳 nonce
+                            // 防止同批次出现相同 tool_id 时纳秒级码表碰撞导致 confirm channel 泡漏
+                            static MCIP_NONCE_COUNTER: std::sync::atomic::AtomicU64 =
+                                std::sync::atomic::AtomicU64::new(0);
                             let nonce = format!("{}_{}", tool_id.0,
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
-                                    .as_nanos());
+                                MCIP_NONCE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
                             let (tx_one, rx_one) = tokio::sync::oneshot::channel::<bool>();
                             {
                                 let s = self.session.read().await;

@@ -105,12 +105,13 @@ impl Default for BoundedResultStore {
 pub type ResultStore = Arc<RwLock<BoundedResultStore>>;
 
 /// 大结果阈值（字节数）。超过则截断 + 存 store。
-/// V38: 从 8KB 提升到 64KB——8KB 对文件读取场景过小，
-/// 频繁触发 result.expand 增加不必要的工具调用轮次。
-pub const RESULT_TRUNCATE_THRESHOLD: usize = 65536;
+/// 参考 Claude Code：激进截断控制单条工具输出对 context 的冲击。
+/// 16KB 覆盖 99% 文件读取场景；超大输出（grep 5000行）走 result.expand 延迟读取。
+pub const RESULT_TRUNCATE_THRESHOLD: usize = 16384; // 16KB
 
-/// 截断后 head/tail 各保留的字节数（合计 ~2KB）。
-pub const RESULT_TRUNCATE_KEEP: usize = 1024;
+/// 截断后 head/tail 各保留的字节数（合计 ~4KB）。
+/// 增大 keep 保留更多上下文，弥补阈值降低的信息损失。
+pub const RESULT_TRUNCATE_KEEP: usize = 2048; // 2KB head + 2KB tail
 
 /// Compute a stable result_id from session_id + tool_id + content hash.
 ///

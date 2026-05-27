@@ -85,7 +85,12 @@ fn build_message_lines(
     // 排版布局：参考英文 CLI 工具风格
     // 色条 "│" + 1 空格 + 内容（简洁留白，不过度缩进）
     let bar_indent = 2usize; // │ + 1空格
-    let content_width = (max_width as usize).saturating_sub(bar_indent + 1);
+    // 内容宽度分离：正文用 5/7（右侧留白提升可读性），代码/表格用全宽（不能被错误折行）
+    let full_usable = (max_width as usize).saturating_sub(bar_indent + 1);
+    let prose_width = full_usable * 5 / 7;
+    let code_width  = full_usable;
+    // content_width 保留供 Block/Trace 等非 Stream 路径使用（这些内容暂用 prose 宽）
+    let content_width = prose_width;
 
     // V30 复制修复：selection 高亮范围。由于 build_message_lines 过程中 markdown 渲染 +
     // word-wrap + code fold 会打乱 “span 原始 char offset” 映射，本阶段采用 msg-级高亮：
@@ -111,10 +116,14 @@ fn build_message_lines(
         return lines;
     }
 
-    // 性能保护：只渲染 scroll 之后最多 50 条消息（约 200 行可见区域上限）
-    let max_visible_msgs = 50;
-    for (visible_idx, msg) in messages.iter().skip(scroll).take(max_visible_msgs).enumerate() {
-        let actual_idx = scroll + visible_idx;
+    // 性能保护：只渲染最新的 N 条消息（约 200 行可见区域上限）
+    // Bug fix: 从消息列表尾部（最新）开始取，而非头部（最旧）。
+    // 原来 skip(0).take(50) 永远只渲染前 50 条（最旧的），
+    // 超过 50 条的对话中所有新消息都被「吞掉」，渲染不出来。
+    let max_visible_msgs = 200;
+    let msg_start = messages.len().saturating_sub(max_visible_msgs).saturating_add(scroll);
+    for (visible_idx, msg) in messages.iter().skip(msg_start).take(max_visible_msgs).enumerate() {
+        let actual_idx = msg_start + visible_idx;
         let msg_lines_start = lines.len(); // V30: 记录本 msg 第一行下标，末尾一次性 paint selection bg
         // V28.3: 计数 Block+Trace 在本 msg.parts 中的位置(对齐 toggle_block 内部计数)
         let mut bi: usize = 0;
@@ -167,9 +176,26 @@ fn build_message_lines(
         for part in &msg.parts {
             match part {
                 MsgContent::Stream(text) => {
+                    // 检测末尾任务完成徽章（`---\n✓ summary`）：拆分正文 + 摘要行单独渲染
+                    // 格式由 system prompt Layer 188 规定；摘要行用 success 色 + BOLD，简洁不冗长
+                    let (main_text, completion_badge) = {
+                        let t = text.trim_end();
+                        if let Some(sep_pos) = t.rfind("\n---") {
+                            let after = t[sep_pos + 4..].trim_start_matches('-').trim_start_matches('\n');
+                            let badge = after.lines()
+                                .find(|l| l.trim_start().starts_with('✓'))
+                                .map(|l| l.trim_start_matches('✓').trim().to_string());
+                            if badge.is_some() {
+                                (&text[..sep_pos + 1], badge)
+                            } else {
+                                (text.as_str(), None)
+                            }
+                        } else {
+                            (text.as_str(), None)
+                        }
+                    };
                     // Markdown 渲染 + word-wrap + 代码块折叠
-                    // V27: 把可用内容宽度传入 markdown 层,让表格按宽度预算缩列宽
-                    let styled_lines = markdown::render_markdown_bounded(text, theme, is_user, content_width);
+                    let styled_lines = markdown::render_markdown_bounded(main_text, theme, is_user, code_width);
                     let muted_dim = theme.text_style(TextRole::Caption);
                     // 代码块折叠追踪（per-Stream 段）
                     let mut in_cb = false;        // 是否在代码块中
@@ -215,24 +241,24 @@ fn build_message_lines(
                         let line_w = rline.spans.iter()
                             .map(|s| crate::tui::util::display_width(s.content.as_ref()))
                             .sum::<usize>();
-                        if line_w <= content_width {
+                        // 按行类型选择宽度：代码/fence 用全宽，正文用 prose_width
+                        let wrap_width = match styled.line_type {
+                            LineType::Code | LineType::CodeFence => code_width,
+                            _ => prose_width,
+                        };
+                        if line_w <= wrap_width {
                             lines.push(rline);
                         } else {
-                            // 超宽行需要拆分：提取纯文本内容并 word-wrap
-                            // 色条+缩进 由 styled_line_to_ratatui 已添加在前两个 span
-                            // 实际文本从第 2 个 span 之后开始
-                            // word-wrap 续行缩进与 styled_line_to_ratatui 对齐（统一 2sp）
+                            // 超宽行拆分：续行缩进与 styled_line_to_ratatui 对齐
                             let indent_str = match styled.line_type {
                                 LineType::Code => "  │ ",  // 保持 │ 边框对齐
-                                _ => "  ",                 // 2sp（与 normal 行一致）
+                                _ => "  ",
                             };
-                            // 合并所有内容 span 的文本
                             let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                             let text_style = styled.spans.first()
                                 .map(|s| s.style)
                                 .unwrap_or(Style::default().fg(theme.text));
-                            // word-wrap: 统一调用 util::word_wrap_segments
-                            let segments = crate::tui::util::word_wrap_segments(&full_text, content_width);
+                            let segments = crate::tui::util::word_wrap_segments(&full_text, wrap_width);
                             for (seg_start, seg_end) in segments {
                                 lines.push(Line::from(vec![
                                     bar.clone(),
@@ -241,6 +267,22 @@ fn build_message_lines(
                                 ]));
                             }
                         }
+                    }
+                    // 任务完成徽章：细分隔线 + ✓ 摘要行（success色 + BOLD，紧凑不冗长）
+                    if let Some(badge) = completion_badge {
+                        let sep_style = Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::DIM);
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::styled("  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌", sep_style),
+                        ]));
+                        let truncated = crate::tui::util::truncate_to_width(&badge, prose_width.saturating_sub(4));
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::styled("  ✓ ", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+                            Span::styled(truncated, Style::default().fg(theme.success)),
+                        ]));
                     }
                 }
                 MsgContent::Block {
@@ -351,7 +393,71 @@ fn build_message_lines(
                         // ── 分组: 连续同名 ToolCall id 归入同一 run ──
                         let runs = group_consecutive_tool_runs(event_ids, trace_events, trace_event_index);
 
-                        for run in &runs {
+                        // ── 工具调用历史折叠：超过 3 个 run 时只展示最新 3 个，更早的折叠为一行摘要 ──
+                        const MAX_VISIBLE_TOOL_RUNS: usize = 3;
+                        let mut visible_tool_run_count = 0usize; // 用于 run 间空行断开
+
+                        // 找出所有 ToolCall run 的下标
+                        let tool_run_indices: Vec<usize> = runs.iter().enumerate()
+                            .filter_map(|(i, run)| {
+                                let is_tool = run.first()
+                                    .and_then(|id| trace_event_index.get(id))
+                                    .and_then(|&idx| trace_events.get(idx))
+                                    .map(|ev| matches!(ev.kind, TraceKind::ToolCall { .. }))
+                                    .unwrap_or(false);
+                                if is_tool { Some(i) } else { None }
+                            })
+                            .collect();
+
+                        // 隐藏最早的若干 run（保留最新 MAX_VISIBLE_TOOL_RUNS 个）
+                        let hidden_run_count = tool_run_indices.len().saturating_sub(MAX_VISIBLE_TOOL_RUNS);
+                        let hidden_run_set: std::collections::HashSet<usize> =
+                            tool_run_indices[..hidden_run_count].iter().copied().collect();
+
+                        // 折叠的个别调用次数（用于摘要行文案）
+                        let hidden_call_count: usize = hidden_run_set.iter().map(|&i| runs[i].len()).sum();
+                        let mut history_header_shown = false;
+
+                        for (run_idx, run) in runs.iter().enumerate() {
+                            // 跳过被折叠的历史 ToolCall run
+                            if hidden_run_set.contains(&run_idx) {
+                                continue;
+                            }
+
+                            // 在第一个可见 ToolCall run 前插入历史摘要行（分隔线 + 摘要 + 分隔线）
+                            let is_tool_run = tool_run_indices.contains(&run_idx);
+                            if is_tool_run && !history_header_shown && hidden_call_count > 0 {
+                                history_header_shown = true;
+                                let sep_style = Style::default()
+                                    .fg(theme.muted)
+                                    .add_modifier(ratatui::style::Modifier::DIM);
+                                lines.push(Line::from(vec![
+                                    bar.clone(),
+                                    Span::raw("  "),
+                                    Span::styled("╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌", sep_style),
+                                ]));
+                                lines.push(Line::from(vec![
+                                    bar.clone(),
+                                    Span::raw("  "),
+                                    Span::styled(
+                                        format!("▸ {}次历史工具调用", hidden_call_count),
+                                        theme.text_style(TextRole::Caption),
+                                    ),
+                                ]));
+                                lines.push(Line::from(vec![
+                                    bar.clone(),
+                                    Span::raw("  "),
+                                    Span::styled("╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌", sep_style),
+                                ]));
+                            }
+                            // ToolCall run 之间加空行：让每组调用有呼吸感
+                            if is_tool_run {
+                                if visible_tool_run_count > 0 {
+                                    lines.push(Line::from(vec![bar.clone()]));
+                                }
+                                visible_tool_run_count += 1;
+                            }
+
                             let event_start = lines.len();
                             // 合并 run 的 focused 判断: 任一子 event 被 focus 则整组高亮
                             let is_focused = run.iter().any(|id| focused_event_id == Some(*id));
@@ -963,6 +1069,31 @@ fn paint_streaming_top_shimmer(buf: &mut Buffer, area: Rect, state: &AppState) {
     }
 }
 
+/// 压缩状态：顶部边框整条红色 + 500ms 明暗脉冲
+/// 引用关系：被 render_messages_in_card 在 processing_phase 含"压缩"时调用
+/// 生命周期：压缩期间每帧绘制；CompressEnd 后 processing_phase 清空，停止调用
+fn paint_compress_top_border(buf: &mut Buffer, area: Rect, error_color: ratatui::style::Color) {
+    if area.width < 4 || area.height < 1 { return; }
+    let inner_x = area.x + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let top_y = area.y;
+    // 500ms 交替 BOLD/DIM，产生脉冲感
+    let bold = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_millis() / 500) % 2 == 0;
+    let style = if bold {
+        Style::default().fg(error_color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(error_color)
+    };
+    for i in 0..inner_w {
+        let cell = &mut buf[(inner_x + i, top_y)];
+        cell.set_symbol("━");
+        cell.set_style(style);
+    }
+}
+
 pub fn render_messages_in_card(
     f: &mut ratatui::Frame,
     state: &AppState,
@@ -985,6 +1116,9 @@ pub fn render_messages_in_card(
     if state.is_streaming {
         state.anim_tick.set(state.anim_tick.get().wrapping_add(1));
         paint_streaming_top_shimmer(f.buffer_mut(), area, state);
+    } else if state.processing_phase.contains("压缩") {
+        // 压缩期间：顶部边框整条红色脉冲（覆盖 shimmer，因为此时 is_streaming=false）
+        paint_compress_top_border(f.buffer_mut(), area, state.theme.error);
     }
 
     // V40: 分区渲染 — streaming 期间复用 base lines，仅重建流式尾部
@@ -1052,14 +1186,25 @@ pub fn render_messages_in_card(
         } else {
             state.processing_phase.clone()
         };
+        // Braille 旋转 spinner（10 帧 × 100ms）
+        const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_millis() / 100) as usize % SPINNER.len();
+        let spinner = SPINNER[frame];
+        // 压缩阶段：红色 + BOLD；其他阶段：muted italic
+        let is_compress = phase.contains("压缩");
+        let phase_style = if is_compress {
+            Style::default().fg(state.theme.error).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)
+        };
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             bar.clone(),
             Span::raw(" "),
-            Span::styled(
-                format!("⠋ {}", phase),
-                Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
-            ),
+            Span::styled(format!("{} {}", spinner, phase), phase_style),
         ]));
     }
 
@@ -1131,15 +1276,36 @@ pub fn render_messages_in_card(
             use crate::tui::state::{TimelineEntry, StreamingToolStatus};
             match entry {
                 TimelineEntry::Thinking { summary } => {
-                    let display = if summary.is_empty() { "thinking..." } else { summary.as_str() };
-                    lines.push(Line::from(vec![
-                        bar.clone(),
-                        Span::styled(" · ", Style::default().fg(state.theme.muted)),
-                        Span::styled(
-                            display.to_string(),
-                            Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
-                        ),
-                    ]));
+                    // 流式 thinking：首行加 💭 图标，续行缩进对齐
+                    // summary 存最近 2 行非空内容（\n 分隔），实时更新
+                    let think_lines: Vec<&str> = summary.lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect();
+                    if think_lines.is_empty() {
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
+                            Span::styled("thinking...", Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                        ]));
+                    } else {
+                        for (i, line) in think_lines.iter().enumerate() {
+                            let truncated = crate::tui::util::truncate_to_width(line, content_w.saturating_sub(6));
+                            if i == 0 {
+                                lines.push(Line::from(vec![
+                                    bar.clone(),
+                                    Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
+                                    Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                                ]));
+                            } else {
+                                // 6 spaces：与 💭 后文字对齐（2sp + emoji 2col + 1sp + 1sp）
+                                lines.push(Line::from(vec![
+                                    bar.clone(),
+                                    Span::raw("      "),
+                                    Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                                ]));
+                            }
+                        }
+                    }
                 }
                 TimelineEntry::Tool { name, context, status, duration_ms, failure_kind, trace_id } => {
                     let (status_mark, mark_style) = match status {

@@ -202,7 +202,8 @@ impl<'a> MdRenderer<'a> {
         match tag {
             Tag::CodeBlock(kind) => {
                 self.flush_line(LineType::Normal);
-                // 代码块紧凑设计：无前置空行，╭ 边框即视觉边界
+                // 代码块前置空行：与后置空行对称，让代码块视觉上「浮」出正文
+                self.push_empty_line();
                 self.in_code_block = true;
                 self.code_line_num = 0;
                 self.code_lang = match kind {
@@ -224,7 +225,13 @@ impl<'a> MdRenderer<'a> {
             }
             Tag::Heading { level, .. } => {
                 self.flush_line(LineType::Normal);
-                // 标题无前置空行——标题视觉重量本身就是段落的分隔
+                // H1/H2 前置空行：章节级标题需要比普通段落更明确的视觉间距
+                // H3+ 保持紧凑（内联小标题，不需要强打断）
+                if matches!(level, pulldown_cmark::HeadingLevel::H1 | pulldown_cmark::HeadingLevel::H2)
+                    && !self.output.is_empty()
+                {
+                    self.push_empty_line();
+                }
                 self.in_heading = true;
                 self.heading_level = level as u8;
                 // 无前缀 span：H2 在 TagEnd 时内联分隔线，H1/H3+ 用样式区分
@@ -536,7 +543,7 @@ impl<'a> MdRenderer<'a> {
             let mut allocated: Vec<usize> = col_widths.iter()
                 .map(|&w| w.min(baseline))
                 .collect();
-            let mut used: usize = allocated.iter().sum();
+            let used: usize = allocated.iter().sum();
             // 剩余空间按原始比例分配给还有富余的列
             let mut surplus: Vec<usize> = col_widths.iter().enumerate()
                 .map(|(i, &w)| if w > allocated[i] { w - allocated[i] } else { 0 })
@@ -619,7 +626,6 @@ impl<'a> MdRenderer<'a> {
                                 text: format!("{}…", t),
                                 style: span.style,
                             });
-                            remaining = 0;
                             break;
                         } else {
                             break;
