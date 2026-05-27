@@ -81,6 +81,10 @@ pub use engine::{
     UserRole,
     ServerId,
     McpConfig,
+    // V35: Role 能力系统
+    RoleCapabilities,
+    BashPolicyLevel,
+    SearchProvider,
 };
 
 // sandbox re-exports

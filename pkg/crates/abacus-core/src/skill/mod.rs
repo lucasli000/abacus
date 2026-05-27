@@ -185,6 +185,11 @@ pub struct SkillEngine {
     /// 反查表：sanitized ToolId.0 → (SkillId, step_id raw)。
     /// load() 时填充；execute 时 O(1) 查询，避免 sanitize 后无法 split 的问题。
     name_map: std::sync::RwLock<HashMap<String, (SkillId, String)>>,
+    /// BehaviorPalace 弱引用，用于 evaluate_with_palace 时叠加历史置信度
+    ///
+    /// 引用: DualPalaceMemory（CoreLoop 持有 strong Arc，SkillEngine 持有 Weak 避免循环）
+    /// 生命周期: CoreLoop 构造 SkillEngine 时注入；升级失败时退化为普通 evaluate()
+    palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>,
 }
 
 impl Default for SkillEngine {
@@ -202,7 +207,16 @@ impl SkillEngine {
             experiences: std::sync::RwLock::new(HashMap::new()),
             max_candidates: 3,
             name_map: std::sync::RwLock::new(HashMap::new()),
+            palace: std::sync::Weak::new(),
         }
+    }
+
+    /// 注入 BehaviorPalace 弱引用（CoreLoop wire-up 阶段调用）
+    ///
+    /// 引用: DualPalaceMemory（Arc 弱化避免 CoreLoop ↔ SkillEngine 循环）
+    /// 生命周期: 注入后随 SkillEngine 存活；升级失败时 evaluate_with_palace 退化为 evaluate()
+    pub fn set_palace(&mut self, palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>) {
+        self.palace = palace;
     }
 
     /// 反查 sanitized ToolId → (SkillId, step_id)
@@ -239,6 +253,44 @@ impl SkillEngine {
             b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal)
         });
         candidates.into_iter().take(self.max_candidates).collect()
+    }
+
+    /// evaluate() 的 async 增强版：叠加行为宫殿历史置信度
+    ///
+    /// final_score = base_score + 0.2 * palace_confidence（上限 1.0）
+    /// 若 palace 弱引用升级失败（palace 已 drop），退化为普通 evaluate()。
+    ///
+    /// ## 引用关系
+    /// - 调用: BehaviorPalace.search (memory_palace.rs)
+    /// - 被调用: SkillEngine 持有者（CoreLoop / orchestration 层）在工具选择前
+    ///
+    /// ## 生命周期
+    /// - 每次请求调用一次，异步读取 palace 不阻塞主流程
+    /// - palace 升级失败时静默退化，不返回错误
+    pub async fn evaluate_with_palace(&self, input: &str, task_kind: Option<&str>) -> Vec<SkillCandidate> {
+        let mut candidates = self.evaluate(input, task_kind);
+
+        if let Some(palace) = self.palace.upgrade() {
+            // 查询行为宫殿中 skill:xxx 的历史置信度
+            let skill_memories = palace.behavior.search(&[
+                "skill".to_string(),
+                "success".to_string(),
+            ]).await;
+            for memory in &skill_memories {
+                // memory.pattern 形如 "skill:search_file"
+                if let Some(skill_id_str) = memory.pattern.strip_prefix("skill:") {
+                    let skill_id = SkillId(skill_id_str.to_string());
+                    if let Some(candidate) = candidates.iter_mut().find(|c| c.id == skill_id) {
+                        // 叠加置信度（max 1.0）
+                        candidate.confidence = (candidate.confidence + 0.2 * memory.confidence).min(1.0);
+                    }
+                }
+            }
+            // 重排
+            candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
+        candidates
     }
 
     /// 加载 skill：把 workflow 每个 step 注册为虚拟 ToolHandle 到 registry。
@@ -370,14 +422,20 @@ pub struct SkillExecutor {
     engine: std::sync::Weak<tokio::sync::RwLock<SkillEngine>>,
     /// dispatch 到底层真实工具用
     registry: std::sync::Weak<crate::tool::ToolRegistry>,
+    /// BehaviorPalace 弱引用，用于 Skill 执行结果写入
+    ///
+    /// 引用: DualPalaceMemory.behavior（Arc 弱化避免循环）
+    /// 生命周期: CoreLoop 持有 strong Arc; Executor 持有 Weak，升级失败时静默跳过写入
+    palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>,
 }
 
 impl SkillExecutor {
     pub fn new(
         engine: std::sync::Weak<tokio::sync::RwLock<SkillEngine>>,
         registry: std::sync::Weak<crate::tool::ToolRegistry>,
+        palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>,
     ) -> Self {
-        Self { engine, registry }
+        Self { engine, registry, palace }
     }
 
     // parse_skill_tool_id 已废弃：
@@ -432,12 +490,44 @@ impl crate::tool::ToolExecutor for SkillExecutor {
         // 调用底层真实工具——复用现有 ExecutionContext
         let output = registry_arc.execute(&real_tool_id, params, ctx).await?;
         if !output.success {
+            // Skill ↔ 行为宫殿协同：记录失败执行结果
+            // 引用: BehaviorPalace.record_interaction / record_tool_behavior (memory_palace.rs)
+            // 生命周期: 单次异步写入，不阻塞错误返回
+            if let Some(palace) = self.palace.upgrade() {
+                let skill_tag = skill_id.0.clone();
+                tokio::spawn(async move {
+                    let tags: Vec<String> = vec![
+                        skill_tag.clone(),
+                        "skill".into(),
+                        "fail".into(),
+                    ];
+                    palace.record_interaction(&format!("skill:{}", skill_tag), &tags).await;
+                    palace.record_tool_behavior(&format!("skill:{}", skill_tag), false).await;
+                });
+            }
             // 透传底层错误
             return Err(KernelError::Other(format!(
                 "skill step '{}/{}' underlying tool '{}' failed: {}",
                 skill_id.0, step_id, real_tool_id.0, output.output
             )));
         }
+
+        // Skill ↔ 行为宫殿协同：记录成功执行结果
+        // 引用: BehaviorPalace.record_interaction / record_tool_behavior (memory_palace.rs)
+        // 生命周期: 单次异步写入，不阻塞结果返回
+        if let Some(palace) = self.palace.upgrade() {
+            let skill_tag = skill_id.0.clone();
+            tokio::spawn(async move {
+                let tags: Vec<String> = vec![
+                    skill_tag.clone(),
+                    "skill".into(),
+                    "success".into(),
+                ];
+                palace.record_interaction(&format!("skill:{}", skill_tag), &tags).await;
+                palace.record_tool_behavior(&format!("skill:{}", skill_tag), true).await;
+            });
+        }
+
         Ok(output.output)
     }
 }
@@ -628,6 +718,7 @@ mod tests {
         let executor = SkillExecutor::new(
             Arc::downgrade(&engine_arc),
             Arc::downgrade(&registry_arc),
+            std::sync::Weak::new(),
         );
 
         let ctx = ExecutionContext::noop("test");
@@ -701,6 +792,7 @@ mod tests {
         let executor = SkillExecutor::new(
             Arc::downgrade(&engine_arc),
             Arc::downgrade(&registry_arc),
+            std::sync::Weak::new(),
         );
 
         let ctx = ExecutionContext::noop("test");

@@ -532,7 +532,7 @@ impl<'a> TurnPipeline<'a> {
         if turn_number == 1 {
             if let Some(ref spec) = self.core.config.model_spec {
                 // 可用窗口 = 模型最大上下文 × ratio，下限 128K
-                // ratio 由用户配置 core.context_window_ratio（默认 0.5）
+                // ratio 由用户配置 core.context_window_ratio（默认 1.0 = 全用；旧配置可能为 0.5）
                 let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
                 let available = ((spec.context_window as f64 * ratio) as usize).max(128_000);
                 self.core.context_manager.set_window(available, spec.context_window);
@@ -582,13 +582,32 @@ impl<'a> TurnPipeline<'a> {
         ).await;
 
         // Progressive prompt injection（text + segments 同步）
+        // Fix 3: context ELEVATED/CRITICAL 时跳过渐进协议，避免增加额外 token 开销
+        //         直接注入覆盖指令让 LLM 输出精简结论
         {
-            let s = self.session.read().await;
-            let ctrl = s.progressive.read().await;
-            if let Some((_priority, prompt_text)) = build_progressive_prompt(
-                ctrl.current_state(), ctrl.current_strategy(),
-            ) {
-                sys_out.push_dynamic(&prompt_text);
+            let ctx_pressure = {
+                let w = self.core.context_manager.window.read().await;
+                let pct = w.usage_pct();
+                let trigger = w.compression_trigger_pct as f64;
+                if pct >= 95.0 { "CRITICAL" }
+                else if pct >= trigger { "ELEVATED" }
+                else { "OK" }
+            };
+            if matches!(ctx_pressure, "ELEVATED" | "CRITICAL") {
+                // 上下文紧张：覆盖渐进协议，强制精简输出
+                sys_out.push_dynamic(&format!(
+                    "[Progressive Override] Context pressure={ctx_pressure}. \
+                     Skip staged/gated review — output key conclusions directly and concisely. \
+                     Do NOT produce large structured documents this turn."
+                ));
+            } else {
+                let s = self.session.read().await;
+                let ctrl = s.progressive.read().await;
+                if let Some((_priority, prompt_text)) = build_progressive_prompt(
+                    ctrl.current_state(), ctrl.current_strategy(),
+                ) {
+                    sys_out.push_dynamic(&prompt_text);
+                }
             }
         }
 
@@ -1255,7 +1274,24 @@ impl<'a> TurnPipeline<'a> {
                     (String, String), // (name, accumulated_args)
                 > = std::collections::HashMap::new();
 
-                while let Some(event) = event_rx.recv().await {
+                // BLOCK-1 fix: 用 select! 将 cancel_token 并入事件消费循环
+                // 防止 provider 后台 task 挂起（TCP half-open）导致 event_rx.recv() 永久阻塞
+                loop {
+                    let event = {
+                        let recv_fut = event_rx.recv();
+                        if let Some(ref ct) = self.cancel {
+                            tokio::select! {
+                                evt = recv_fut => evt,
+                                _ = ct.cancelled() => {
+                                    handle.abort();
+                                    break;
+                                }
+                            }
+                        } else {
+                            recv_fut.await
+                        }
+                    };
+                    let Some(event) = event else { break };
                     match event {
                         crate::llm::stream::StreamEvent::TextDelta(t) => {
                             let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(t));
@@ -1264,12 +1300,10 @@ impl<'a> TurnPipeline<'a> {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Thinking(t));
                         }
                         crate::llm::stream::StreamEvent::ToolCallStart { id, name } => {
-                            // 展示给 TUI + 同时开始累积 args
                             let _ = stx.send(crate::llm::stream::StreamChunk::ToolStart { name: name.clone() });
                             stream_tool_buf.insert(id, (name, String::new()));
                         }
                         crate::llm::stream::StreamEvent::ToolCallArgDelta { id, delta } => {
-                            // 累积 args（不向 TUI 推送，等 Done 后注入到 response）
                             if let Some((_name, args)) = stream_tool_buf.get_mut(&id) {
                                 args.push_str(&delta);
                             }
@@ -1278,7 +1312,7 @@ impl<'a> TurnPipeline<'a> {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(msg));
                         }
                         crate::llm::stream::StreamEvent::Done => break,
-                        _ => {} // Usage etc handled via final response
+                        _ => {}
                     }
                 }
 
@@ -1418,7 +1452,11 @@ impl<'a> TurnPipeline<'a> {
                                     msgs.push(Message {
                                         role: MessageRole::User,
                                         content: Some(MessageContent::Text(format!(
-                                            "[System Error] LLM request failed after repair attempt: {}. Adapt your approach.",
+                                            "[Abacus 系统约束] 修复后 LLM 请求仍失败：{}。\n\
+约束与指引：\n\
+① 简化当前工具调用参数，避免复杂嵌套结构\n\
+② 将任务拆解为更小的独立步骤逐步执行\n\
+③ 若仍无法继续，停止工具序列并向用户说明情况",
                                             err_desc
                                         ))),
                                         name: None, tool_calls: None, tool_call_id: None,
@@ -1447,7 +1485,11 @@ impl<'a> TurnPipeline<'a> {
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(format!(
-                                    "[System Error] LLM API returned 400: {}. Adapt your approach or report to user.",
+                                    "[Abacus 系统约束] API 返回 400 错误：{}。\n\
+约束与指引：\n\
+① 检查工具调用的参数格式和字段类型是否符合 schema\n\
+② 减少单次请求的 token 消耗（缩短 system prompt 或 context）\n\
+③ 若错误持续，终止工具序列并向用户报告具体错误信息",
                                     err_desc
                                 ))),
                                 name: None, tool_calls: None, tool_call_id: None,
@@ -1458,27 +1500,35 @@ impl<'a> TurnPipeline<'a> {
                     }
                 }
                 Err(e) => {
-                    // Error-recovery: non-400 provider errors → retry with backoff context
+                    let err_str = e.to_string();
+                    let is_net = is_network_error(&err_str);
+
                     ctx.provider_retries += 1;
                     if ctx.provider_retries <= 2 {
+                        // 网络错误 vs API 错误用不同前缀，TUI 据此分类显示
+                        let chunk_msg = if is_net {
+                            format!("NETWORK_ERROR:retrying {}/{}: 网络连接失败，自动重试中...",
+                                ctx.provider_retries, 3)
+                        } else {
+                            format!("Provider error (retrying {}/3): {}", ctx.provider_retries, e)
+                        };
                         if let Some(ref stx) = self.stream_tx {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("Provider error (retrying {}/3): {}", ctx.provider_retries, e)
-                            ));
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(chunk_msg));
                         }
                         ctx.recovery_attempts += 1;
                         if ctx.recovery_attempts > self.core.config.thresholds.turn_max_recovery {
                             ctx.final_response = "[System] 多次恢复尝试失败，请重新描述你的需求。".into();
                             break;
                         }
-                        {
+                        // 网络错误不注入 messages（LLM 没收到请求，注入无意义）
+                        if !is_net {
                             let s = self.session.read().await;
                             let mut msgs = s.messages.write().await;
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(format!(
-                                        "[System] LLM request failed: {}. This is attempt {}/3. I will retry.",
-                                        sanitize_provider_error(&e), ctx.provider_retries
+                                    "[Abacus 系统通知] LLM 服务暂时不可用（第 {}/3 次重试）：{}。\n当前任务上下文已保留，系统将自动重试——无需重复操作。",
+                                    ctx.provider_retries, sanitize_provider_error(&e)
                                 ))),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, prefix: false,
@@ -1486,11 +1536,14 @@ impl<'a> TurnPipeline<'a> {
                         }
                         continue;
                     } else {
-                        // 强制终止条件 #3：超时/不可达（3 次重试失败 = 等效超时）
+                        // 3 次全失败 — 区分网络错误给用户明确指引
+                        let final_err = if is_net {
+                            "NETWORK_ERROR:FATAL:网络连接失败，请检查网络后重试".to_string()
+                        } else {
+                            format!("🛑 LLM 服务不可达（3 次重试失败）: {}", e)
+                        };
                         if let Some(ref stx) = self.stream_tx {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("🛑 LLM 服务不可达（3 次重试失败）: {}", e)
-                            ));
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(final_err));
                         }
                         return Err(KernelError::Provider(format!(
                             "Provider unavailable after 3 attempts: {}", e
@@ -1928,6 +1981,7 @@ impl<'a> TurnPipeline<'a> {
                             kind: crate::mcip::McipConfirmKind::McipPolicy,
                             params_preview: None,
                             nonce: String::new(), // LLM 主动申请路径不走 channel await
+                            suggested_action: None, // LLM 主动申请：系统无法预判，由用户决策
                         });
                     }
                     Ok(ToolOutput {
@@ -2032,12 +2086,45 @@ impl<'a> TurnPipeline<'a> {
                             let preview = serde_json::to_string(&params)
                                 .ok()
                                 .map(|s| s.chars().take(120).collect::<String>());
+
+                            // 系统+LLM 建议评估：根据工具语义 + reason + schema 计算 suggested_action
+                            // 让 TUI 始终弹窗但可以基于建议调整超时行为
+                            let suggested_action: Option<bool> = {
+                                let tool_lower = tool_id.0.to_lowercase();
+                                // 破坏性标记：reason 或工具名含危险关键词
+                                let is_destructive = reason.starts_with("[destructive]")
+                                    || reason.contains("⚠")
+                                    || reason.contains("[bash]")
+                                    || ["rm ", "delete", "drop", "destroy", "format", "truncate"]
+                                        .iter().any(|k| reason.to_lowercase().contains(k));
+                                // 安全模式：工具为只读/查询/幂等
+                                let safe_prefixes = ["read", "search", "list", "get", "ls",
+                                    "tree", "grep", "info", "query", "find", "fetch", "lookup"];
+                                let is_safe_pattern = safe_prefixes.iter().any(|k| {
+                                    tool_lower == *k
+                                        || tool_lower.ends_with(&format!("_{k}"))
+                                        || tool_lower.starts_with(&format!("{k}_"))
+                                });
+                                // schema.idempotent = true 视为安全
+                                let is_idempotent = self.core.registry.get(&tool_id).await
+                                    .map(|h| h.schema.idempotent).unwrap_or(false);
+
+                                if is_destructive {
+                                    Some(false)  // 系统建议拒绝
+                                } else if is_safe_pattern || is_idempotent {
+                                    Some(true)   // 系统建议允许（仅低风险工具）
+                                } else {
+                                    None         // 需用户决策
+                                }
+                            };
+
                             let confirm_req = crate::mcip::McipConfirmRequest {
                                 tool_id: tool_id.0.clone(),
                                 reason: reason.clone(),
                                 kind: crate::mcip::McipConfirmKind::McipPolicy,
                                 params_preview: preview,
                                 nonce: nonce.clone(),
+                                suggested_action,
                             };
                             ctx.pending_confirmations.push(confirm_req.clone());
                             // V28：实时推送给 UI（流式路径）
@@ -2052,24 +2139,33 @@ impl<'a> TurnPipeline<'a> {
                                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default()
                                     .as_millis() as u64,
                             }).await;
-                            // 等待用户决策，带超时保护（15s）防止 TUI 无响应时 pipeline 永久挂起
-                            // 超时 → 非破坏性自动允许，破坏性自动拒绝（与 TUI 侧 timeout 行为一致）
-                            let approved = match tokio::time::timeout(
-                                std::time::Duration::from_secs(self.core.config.policy.thresholds.confirm_timeout_secs),
-                                rx_one,
-                            ).await {
-                                Ok(Ok(v)) => v,          // 正常收到用户决策
-                                Ok(Err(_)) => false,     // sender dropped（TUI 异常退出）→ 拒绝
-                                Err(_) => {
-                                    // 超时：非破坏性允许，破坏性拒绝
-                                    let is_dangerous = reason.contains("[bash]")
-                                        && reason.contains("⚠");
+                            // BLOCK-6 fix: 等待用户决策时加入 cancel_token 竞争，Esc 可立即中断
+                            // 非流式路径（无 stream_tx）维持原有 MCIP 行为（超时自动判定）
+                            let is_dangerous = reason.contains("[bash]") && reason.contains("⚠");
+                            let timeout_dur = std::time::Duration::from_secs(
+                                self.core.config.policy.thresholds.confirm_timeout_secs
+                            );
+                            let wait_result = if let Some(ref ct) = self.cancel {
+                                tokio::select! {
+                                    r = tokio::time::timeout(timeout_dur, rx_one) => r.map(|inner| inner.unwrap_or(false)).ok(),
+                                    _ = ct.cancelled() => {
+                                        tracing::debug!(tool = %tool_id.0, "MCIP confirm cancelled by user");
+                                        Some(false)
+                                    }
+                                }
+                            } else {
+                                tokio::time::timeout(timeout_dur, rx_one).await
+                                    .map(|inner| inner.unwrap_or(false)).ok()
+                            };
+                            let approved = match wait_result {
+                                Some(v) => v,
+                                None => {
+                                    // 超时：通知 TUI
                                     tracing::warn!(
                                         tool = %tool_id.0,
                                         dangerous = is_dangerous,
-                                        "confirm timeout (60s) — pipeline-side fallback"
+                                        "confirm timeout — pipeline-side fallback"
                                     );
-                                    // 超时备注：向 TUI 发送 AuthResult toast，让用户知道弹窗已超时自动处理
                                     if let Some(ref stx) = self.stream_tx {
                                         let _ = stx.send(crate::llm::stream::StreamChunk::AuthResult {
                                             tool: format!("超时自动:{}", &tool_id.0),
@@ -2112,6 +2208,7 @@ impl<'a> TurnPipeline<'a> {
                                             bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                                             bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
                                             tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                                            role_caps: Arc::clone(&s.role_caps),
                                         }
                                     };
                                     let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
@@ -2178,6 +2275,7 @@ impl<'a> TurnPipeline<'a> {
                                     kind: crate::mcip::McipConfirmKind::DestructiveOp,
                                     params_preview: preview,
                                     nonce: String::new(), // DestructiveOp 路径暂不走 channel（保留旧 ToolOutput 模式）
+                                    suggested_action: Some(false), // 破坏性操作：系统建议拒绝
                                 });
                                 Ok(ToolOutput {
                                     tool_id: tool_id.clone(),
@@ -2211,6 +2309,7 @@ impl<'a> TurnPipeline<'a> {
                                             bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                                             bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
                                             tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                                            role_caps: Arc::clone(&s.role_caps),
                                         }
                                     };
                                     // W2 (Task #100): clone params 因下游 dedup.record 还需要原值
@@ -2451,7 +2550,7 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::User,
                         content: Some(MessageContent::Text(format!(
-                            "[User update while you were working]: {}\n\nYou may adjust your approach based on this update, or continue with your current plan if it's still relevant.",
+                            "[Abacus 用户更新] 用户在你工作期间发来了新消息：\n{}\n\n指引：若此更新与当前任务相关，请调整方案后继续；若不相关，完成当前步骤后再处理。",
                             combined
                         ))),
                         name: None,
@@ -2919,6 +3018,26 @@ fn sanitize_provider_error(raw: impl std::fmt::Display) -> String {
     let no_url = SANITIZE_URL_RE.replace_all(&s, "[url]");
     let no_auth = SANITIZE_AUTH_RE.replace_all(&no_url, "[redacted]");
     no_auth.chars().take(200).collect()
+}
+
+/// 判断是否为网络层错误（连接/DNS/TLS/超时），区别于 API 业务错误（401/429/400）
+///
+/// 网络错误：需要用户检查连接；API 错误：请求格式或认证问题
+fn is_network_error(e: &str) -> bool {
+    let lower = e.to_lowercase();
+    lower.contains("error sending request")
+        || lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("connection timed out")
+        || lower.contains("failed to connect")
+        || lower.contains("dns error")
+        || lower.contains("dns resolution")
+        || lower.contains("no such host")
+        || lower.contains("network unreachable")
+        || lower.contains("tls error")
+        || lower.contains("ssl error")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
 }
 
 #[cfg(test)]

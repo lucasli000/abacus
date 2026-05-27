@@ -617,7 +617,7 @@ impl Default for CoreConfig {
             // V40: 64000 — 对齐主流 coding agent（Claude Code 20K, OpenCode 32K）
             // DeepSeek thinking 模式 output 可达 64K+；非 thinking 上限由模型 spec 约束
             default_max_tokens: 64000,
-            context_window_ratio: 0.5,
+            context_window_ratio: 1.0,
             system_prompt: String::new(),
             model_spec: None,
             thinking_intent: None,
@@ -979,6 +979,18 @@ pub struct SessionState {
     /// ## 并发模型
     /// tokio::sync::Mutex（TUI 写 + pipeline 读，临界区极短——push/drain）
     pub mid_turn_signals: tokio::sync::Mutex<Vec<String>>,
+
+    /// Role 能力声明，由 CoreLoop::new() 从 config 构建（通过 load_role_caps()）
+    ///
+    /// ## 引用关系
+    /// - 引用方：ExecutionContext.role_caps（pipeline 每次 tool dispatch 注入）
+    /// - 消费方：工具执行层（fs_roots / bash_policy / tool_budget_per_turn / search_provider）
+    ///
+    /// ## 生命周期
+    /// - 创建：SessionState::new / new_with_autonomy / new_with_gate_config 构造时调用 load_role_caps() 一次性读取
+    /// - 消费：pipeline Phase 4 每次 tool dispatch 时 Arc::clone 传入 ExecutionContext
+    /// - 销毁：随 SessionState drop（Arc 引用归零后释放）
+    pub role_caps: Arc<abacus_types::RoleCapabilities>,
 }
 
 impl SessionState {
@@ -1010,6 +1022,8 @@ impl SessionState {
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
             // Mid-turn signal：初始为空（用户工具循环期间注入消息的缓冲区）
             mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
+            // Role 能力：从 ~/.abacus/roles/default.toml 加载，文件不存在时用 default()
+            role_caps: Arc::new(load_role_caps()),
         }
     }
 
@@ -1039,6 +1053,7 @@ impl SessionState {
             escalated_model: Arc::new(RwLock::new(None)),
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
             mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
+            role_caps: Arc::new(load_role_caps()),
         }
     }
 
@@ -1073,6 +1088,7 @@ impl SessionState {
             escalated_model: Arc::new(RwLock::new(None)),
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
             mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
+            role_caps: Arc::new(load_role_caps()),
         }
     }
 
@@ -2392,6 +2408,8 @@ impl CoreLoop {
         let executor = Arc::new(crate::skill::SkillExecutor::new(
             Arc::downgrade(&self.skill_engine),
             Arc::downgrade(&self.registry),
+            // palace 连接由 orchestration 层在 with_memory() 后注入；当前阶段用空 Weak 占位
+            std::sync::Weak::new(),
         ));
         // 缓存 executor Arc 到 self（让后续 load_skill 复用）
         *self.skill_workflow_executor.write().await = Some(executor);
@@ -2413,6 +2431,36 @@ impl CoreLoop {
         };
         let mut engine = self.skill_engine.write().await;
         engine.load(id, &self.registry, executor).await
+    }
+
+    /// 加载所有内置场景 Skills（和执行器一起启动）
+    ///
+    /// 内部自动调用 `enable_skill_workflow_executor()`（如未启动），
+    /// 然后逐一注册内置 SkillDef 并 load。
+    ///
+    /// 引用: `crate::tool::builtin::skills::builtin_skill_defs()`
+    /// 生命周期: 进程启动时调用一次，Skill 随 SkillEngine Arc 存活
+    pub async fn load_builtin_skills(&self) {
+        // 确保 executor 已启动
+        if self.skill_workflow_executor.read().await.is_none() {
+            self.enable_skill_workflow_executor().await;
+        }
+        let defs = crate::tool::builtin::skills::builtin_skill_defs();
+        let count = defs.len();
+        {
+            let mut engine = self.skill_engine.write().await;
+            for def in defs {
+                engine.register_skill(def);
+            }
+        }
+        // load 每个 skill（把 workflow steps 注册为虚拟 ToolHandle）
+        for id in crate::tool::builtin::skills::builtin_skill_defs()
+            .into_iter().map(|d| d.id) {
+            if let Err(e) = self.load_skill(&id).await {
+                tracing::warn!("load builtin skill '{}' failed: {}", id.0, e);
+            }
+        }
+        tracing::info!("Loaded {} builtin skills", count);
     }
 
     /// 启用 WASM Plugin 系统（默认禁用）
@@ -3293,22 +3341,39 @@ impl CoreLoop {
             let decl_status = if policy.guard.explicit_declaration.is_empty() { "off" } else { "on" };
 
             // 上下文占用感知（让 LLM 每轮知道剩余空间、预算比例、模型容量）
+            //
+            // Fix 1: 将本轮最大输出纳入估算，避免 LLM 看到的百分比过乐观
+            //   effective_pct = (history_tokens + max_output_tokens) / max_tokens
+            //   ctx_status 基于 effective_pct，触发阈值提前到实际压力点
+            // Fix 2: 向 LLM 展示实际可用输出上限（受剩余空间压缩）
             let ctx_window = self.context_manager.window.read().await;
             let ctx_pct = ctx_window.usage_pct();
-            let ctx_status = if ctx_pct >= 95.0 { "CRITICAL" }
-                else if ctx_pct >= ctx_window.compression_trigger_pct as f64 { "ELEVATED" }
-                else if ctx_pct >= 70.0 { "WARNING" }
+            // 含输出预留的保守估算百分比
+            let effective_used = ctx_window.current_tokens.saturating_add(max_tokens as usize);
+            let effective_pct = (effective_used as f64 / ctx_window.max_tokens.max(1) as f64 * 100.0).min(100.0);
+            let ctx_status = if effective_pct >= 95.0 { "CRITICAL" }
+                else if effective_pct >= ctx_window.compression_trigger_pct as f64 { "ELEVATED" }
+                else if effective_pct >= 70.0 { "WARNING" }
                 else { "OK" };
+            // 实际可用输出空间（含 1024 安全余量）
+            let effective_output = ctx_window.max_tokens
+                .saturating_sub(ctx_window.current_tokens)
+                .saturating_sub(1024)
+                .min(max_tokens as usize)
+                .max(2048);
             let ratio_pct = (self.config.context_window_ratio * 100.0) as u32;
-            let ctx_info = format!("Context: {:.0}% ({}/{}tok) [{}] | Budget: {}% of {}tok model capacity",
-                ctx_pct, ctx_window.current_tokens, ctx_window.max_tokens, ctx_status,
+            let ctx_info = format!(
+                "Context: history={:.0}% effective={:.0}% ({}/{}tok) [{}] | Output: {}tok avail | Budget: {}% of {}tok",
+                ctx_pct, effective_pct,
+                ctx_window.current_tokens, ctx_window.max_tokens, ctx_status,
+                effective_output,
                 ratio_pct, ctx_window.model_limit);
             drop(ctx_window);
 
             let block = format!(
                 "[Awareness]\n\
                  Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
-                 Task: {} | Role: {} | Max output: {}tok\n\
+                 Task: {} | Role: {} | Max output: {}tok (effective: {}tok)\n\
                  {} \n\
                  [Limits] tools: 0/{} per turn | iterations: 0/{} | No session limit\n\
                  Capabilities: {} escalations available | scene_loading: {} | router: {}\n\
@@ -3326,6 +3391,7 @@ impl CoreLoop {
                 task_kind_str,
                 user_role,
                 max_tokens,
+                effective_output,
                 ctx_info,
                 self.config.thresholds.turn_max_tool_calls,
                 self.config.thresholds.turn_max_iterations,
@@ -4391,6 +4457,116 @@ fn strip_xml_tool_tags(text: &str) -> String {
         regex::Regex::new(r"</?tool_calls?>").unwrap()
     });
     RE.replace_all(text, "").trim().to_string()
+}
+
+/// 从 `~/.abacus/roles/default.toml` 加载 Role 能力配置。
+/// 文件不存在时返回 `RoleCapabilities::default()`（维持现有行为）。
+///
+/// ## 配置格式（TOML）
+/// ```toml
+/// [capabilities]
+/// fs_roots = ["/Users/admin"]
+/// bash_policy = "DevTools"   # ReadOnly | DevTools | Full
+/// tool_budget_per_turn = 20
+///
+/// [web]
+/// search_provider = "duckduckgo"  # brave | searxng | duckduckgo
+/// brave_api_key = ""
+/// searxng_url = ""
+/// ```
+///
+/// ## 引用关系
+/// - 调用方：SessionState::new / new_with_autonomy / new_with_gate_config
+/// - 结果存入：SessionState.role_caps（Arc 持有）
+/// - 消费方：pipeline Phase 4 tool dispatch → ExecutionContext.role_caps
+///
+/// ## 生命周期
+/// - 调用：SessionState 构造时一次性读取磁盘文件
+/// - 无全局状态，无副作用（纯函数：读文件 → 返回值）
+pub(crate) fn load_role_caps() -> abacus_types::RoleCapabilities {
+    use abacus_types::{BashPolicyLevel, RoleCapabilities, SearchProvider};
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let config_path = std::path::PathBuf::from(&home)
+        .join(".abacus")
+        .join("roles")
+        .join("default.toml");
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return RoleCapabilities::default(),
+    };
+
+    let val: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("roles/default.toml parse error: {e}, using defaults");
+            return RoleCapabilities::default();
+        }
+    };
+
+    let mut caps = RoleCapabilities::default();
+
+    if let Some(cap_table) = val.get("capabilities").and_then(|v| v.as_table()) {
+        if let Some(roots) = cap_table.get("fs_roots").and_then(|v| v.as_array()) {
+            let parsed: Vec<String> = roots.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            if !parsed.is_empty() {
+                caps.fs_roots = parsed;
+            }
+        }
+        if let Some(bp) = cap_table.get("bash_policy").and_then(|v| v.as_str()) {
+            caps.bash_policy = match bp {
+                "ReadOnly" => BashPolicyLevel::ReadOnly,
+                "Full"     => BashPolicyLevel::Full,
+                _          => BashPolicyLevel::DevTools,
+            };
+        }
+        if let Some(budget) = cap_table.get("tool_budget_per_turn").and_then(|v| v.as_integer()) {
+            caps.tool_budget_per_turn = budget.max(1).min(100) as u32;
+        }
+    }
+
+    if let Some(web_table) = val.get("web").and_then(|v| v.as_table()) {
+        let provider = web_table.get("search_provider").and_then(|v| v.as_str()).unwrap_or("duckduckgo");
+        caps.search_provider = match provider {
+            "brave" => {
+                let key = web_table.get("brave_api_key").and_then(|v| v.as_str()).unwrap_or("");
+                let key = if key.is_empty() {
+                    std::env::var("BRAVE_API_KEY").unwrap_or_default()
+                } else {
+                    key.to_string()
+                };
+                if key.is_empty() { SearchProvider::DuckDuckGo } else { SearchProvider::BraveApi { api_key: key } }
+            }
+            "searxng" => {
+                let url = web_table.get("searxng_url").and_then(|v| v.as_str()).unwrap_or("");
+                if url.is_empty() { SearchProvider::DuckDuckGo } else { SearchProvider::SearxNg { base_url: url.to_string() } }
+            }
+            _ => {
+                // duckduckgo（含未知值降级）；仍检查 BRAVE_API_KEY env
+                if let Ok(key) = std::env::var("BRAVE_API_KEY") {
+                    if !key.is_empty() {
+                        SearchProvider::BraveApi { api_key: key }
+                    } else {
+                        SearchProvider::DuckDuckGo
+                    }
+                } else {
+                    SearchProvider::DuckDuckGo
+                }
+            }
+        };
+    } else {
+        // 无 web 配置节时，仍检查 BRAVE_API_KEY env
+        if let Ok(key) = std::env::var("BRAVE_API_KEY") {
+            if !key.is_empty() {
+                caps.search_provider = SearchProvider::BraveApi { api_key: key };
+            }
+        }
+    }
+
+    caps
 }
 
 #[cfg(test)]

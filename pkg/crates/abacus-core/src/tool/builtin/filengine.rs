@@ -43,8 +43,8 @@
 use std::sync::Arc;
 
 use abacus_types::{
-    ToolCost, ToolEffectiveness, ToolHandle, ToolId, ToolProvider, ToolSchema,
-    ToolSecurity, ToolState,
+    BashPolicyLevel, SearchProvider, ToolCost, ToolEffectiveness, ToolHandle, ToolId,
+    ToolProvider, ToolSchema, ToolSecurity, ToolState,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -95,10 +95,27 @@ pub struct FilengineSession {
     pub bash_default_timeout: u64,
     /// Bash 最大超时（秒）— 从 policy.toml 注入，默认 120
     pub bash_max_timeout: u64,
+    /// 文件系统可访问根目录——从 role_caps 注入（替代 allowed_roots() 直调）
+    /// 注入：FilengineToolExecutor::execute() 开头从 ctx.role_caps.fs_roots 同步
+    /// 消费：NativeFilengine::resolve() 读此字段做 prefix 检查
+    pub fs_roots: Vec<String>,
+    /// Bash 执行策略——从 role_caps 注入
+    /// 注入：FilengineToolExecutor::execute() 开头同步
+    /// 消费：bash_exec() 用于决定降级 / 升级 BashDecision
+    pub bash_policy: BashPolicyLevel,
+    /// 搜索 provider——从 role_caps 注入
+    /// 注入：FilengineToolExecutor::execute() 开头同步
+    /// 消费：web_search() 按 provider 分发请求
+    pub search_provider: SearchProvider,
 }
 
 impl std::fmt::Debug for FilengineSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let provider_name = match &self.search_provider {
+            SearchProvider::BraveApi { .. } => "BraveApi",
+            SearchProvider::SearxNg { .. } => "SearxNg",
+            SearchProvider::DuckDuckGo => "DuckDuckGo",
+        };
         f.debug_struct("FilengineSession")
             .field("cwd", &self.cwd)
             .field("recent_files", &self.recent_files)
@@ -106,6 +123,9 @@ impl std::fmt::Debug for FilengineSession {
             .field("modified", &self.modified)
             .field("open_context", &self.open_context)
             .field("undo_logger_attached", &self.undo_logger.is_some())
+            .field("fs_roots", &self.fs_roots)
+            .field("bash_policy", &self.bash_policy)
+            .field("search_provider", &provider_name)
             .finish()
     }
 }
@@ -127,6 +147,10 @@ impl FilengineSession {
             undo_logger: None,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            // 默认与 allowed_roots() / RoleCapabilities::default() 保持一致
+            fs_roots: allowed_roots(),
+            bash_policy: BashPolicyLevel::DevTools,
+            search_provider: SearchProvider::DuckDuckGo,
         }
     }
 
@@ -232,7 +256,7 @@ impl NativeFilengine {
             }
         };
 
-        if !allowed_roots().iter().any(|r| canonical.starts_with(r)) {
+        if !session.fs_roots.iter().any(|r| canonical.starts_with(r)) {
             return Err(format!("path not allowed: {path}"));
         }
         Ok(canonical)
@@ -460,7 +484,12 @@ async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http/https allowed".into());
     }
+    let extract = args.get("extract").and_then(|v| v.as_bool()).unwrap_or(false);
     let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60).max(5);
+    // max_chars：extract=true 时默认 8000（可读摘要），extract=false 时默认 512 000（原始体）
+    let max_chars = args.get("max_chars").and_then(|v| v.as_u64())
+        .unwrap_or(if extract { 8_000 } else { 512_000 }) as usize;
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout))
         .build().map_err(|e| format!("client: {e}"))?;
@@ -471,24 +500,80 @@ async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value
         .get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let body = resp.bytes().await
         .map_err(|e| format!("body: {e}"))?;
-    let max_bytes = 512_000;
-    let text = if body.len() > max_bytes {
-        format!("[truncated {} bytes] {}", body.len(), String::from_utf8_lossy(&body[..max_bytes]))
+
+    if extract {
+        let html = String::from_utf8_lossy(&body).to_string();
+        let (text, truncated) = html_to_text(&html, max_chars);
+        Ok(json!({"status": status, "url": url, "text": text, "truncated": truncated}))
     } else {
-        String::from_utf8_lossy(&body).to_string()
-    };
-    Ok(json!({"status": status, "content_type": content_type, "body": text}))
+        let max_bytes = max_chars;
+        let text = if body.len() > max_bytes {
+            format!("[truncated {} bytes] {}", body.len(), String::from_utf8_lossy(&body[..max_bytes]))
+        } else {
+            String::from_utf8_lossy(&body).to_string()
+        };
+        Ok(json!({"status": status, "content_type": content_type, "body": text}))
+    }
 }
 
-async fn web_search(args: Value, _session: &mut FilengineSession) -> Result<Value, String> {
+async fn web_search(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let query = get_str(&args, "query")?;
     let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(10).min(20);
-
-    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
     let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60).max(5);
+    let deep = args.get("deep").and_then(|v| v.as_bool()).unwrap_or(false);
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout))
         .build().map_err(|e| format!("client: {e}"))?;
+
+    // provider 选택: 从 session.search_provider 读取（已由 executor 从 role_caps 同步）
+    let mut results = match &session.search_provider {
+        SearchProvider::BraveApi { api_key } => {
+            let key = api_key.clone();
+            brave_search(query, count, &key, timeout, &client).await?
+        }
+        SearchProvider::SearxNg { base_url } => {
+            let base = base_url.clone();
+            searxng_search(query, count, &base, timeout, &client).await?
+        }
+        SearchProvider::DuckDuckGo => {
+            duckduckgo_search(query, count, timeout, &client).await?
+        }
+    };
+
+    // deep 模式：对前 3 条结果 fetch+extract，补充页面全文摘要
+    if deep {
+        let mut pages = Vec::new();
+        let links: Vec<String> = results.iter().take(3)
+            .filter_map(|r| r.get("link").and_then(|v| v.as_str())
+                .filter(|l| l.starts_with("http"))
+                .map(|l| l.to_string()))
+            .collect();
+        for link in links {
+            let fetch_args = json!({"url": link, "extract": true, "max_chars": 4000});
+            // web_fetch 是无状态的，session 仅用于签名匹配，不修改 session 状态
+            if let Ok(page) = web_fetch(fetch_args, session).await {
+                pages.push(json!({
+                    "url": link,
+                    "text": page.get("text").cloned().unwrap_or(Value::Null),
+                }));
+            }
+        }
+        return Ok(json!({"results": results, "pages": pages, "query": query}));
+    }
+
+    // 截断到 count（各 provider 内部已 take(count)，防御性截断）
+    results.truncate(count as usize);
+    Ok(json!({"results": results, "query": query}))
+}
+
+/// DuckDuckGo HTML 解析搜索（原有逻辑提取为独立函数）
+///
+/// 引用：web_search() 在 provider=DuckDuckGo 时调用
+async fn duckduckgo_search(
+    query: &str, count: u64, _timeout: u64, client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
+    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
     let resp = client.get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .send().await
@@ -507,21 +592,81 @@ async fn web_search(args: Value, _session: &mut FilengineSession) -> Result<Valu
 
         let quality = assess_quality(&title, &snippet, &link);
         if matches!(quality, Quality::Low) {
-            continue;  // ⚫ 低质自动丢弃
+            continue;
         }
-        let item = json!({
+        results.push(json!({
             "title": title,
             "snippet": snippet,
             "link": link,
             "quality": quality.label(),
-        });
-        results.push(item);
+        }));
         if results.len() >= count as usize {
             break;
         }
     }
+    Ok(results)
+}
 
-    Ok(json!({"results": results, "query": query}))
+/// Brave Search API
+///
+/// 引用：web_search() 在 provider=BraveApi 时调用
+/// 生命周期：无状态，每次搜索独立创建/销毁
+async fn brave_search(
+    query: &str, count: u64, api_key: &str, timeout: u64, client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
+    let url = format!(
+        "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+        urlencoding(query), count
+    );
+    let resp = client.get(&url)
+        .header("Accept", "application/json")
+        .header("Accept-Encoding", "gzip")
+        .header("X-Subscription-Token", api_key)
+        .timeout(std::time::Duration::from_secs(timeout))
+        .send().await
+        .map_err(|e| format!("brave search: {e}"))?;
+    let json: Value = resp.json().await.map_err(|e| format!("brave json: {e}"))?;
+    let mut results = Vec::new();
+    if let Some(items) = json.get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array())
+    {
+        for item in items.iter().take(count as usize) {
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let snippet = item.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let link = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            results.push(json!({"title": title, "snippet": snippet, "link": link, "quality": "normal"}));
+        }
+    }
+    Ok(results)
+}
+
+/// SearxNG 聚合搜索
+///
+/// 引用：web_search() 在 provider=SearxNg 时调用
+/// 生命周期：无状态，每次搜索独立创建/销毁
+async fn searxng_search(
+    query: &str, count: u64, base_url: &str, timeout: u64, client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
+    let url = format!(
+        "{}/search?q={}&format=json&engines=google,bing&pageno=1",
+        base_url.trim_end_matches('/'), urlencoding(query)
+    );
+    let resp = client.get(&url)
+        .timeout(std::time::Duration::from_secs(timeout))
+        .send().await
+        .map_err(|e| format!("searxng: {e}"))?;
+    let json: Value = resp.json().await.map_err(|e| format!("searxng json: {e}"))?;
+    let mut results = Vec::new();
+    if let Some(items) = json.get("results").and_then(|r| r.as_array()) {
+        for item in items.iter().take(count as usize) {
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let snippet = item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let link = item.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            results.push(json!({"title": title, "snippet": snippet, "link": link, "quality": "normal"}));
+        }
+    }
+    Ok(results)
 }
 
 fn assess_quality(title: &str, snippet: &str, link: &str) -> Quality {
@@ -615,19 +760,39 @@ async fn fs_grep(args: Value, session: &mut FilengineSession) -> Result<Value, S
     let include = args.get("include").and_then(|v| v.as_str());
     let max_results = args.get("max_results").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
     let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0).min(5) as usize;
+    // mode: "fine"（默认，返回逐行匹配）或 "coarse"（按文件聚合，只返回文件路径+计数）
+    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("fine");
 
     let re = regex::Regex::new(pattern).map_err(|e| format!("invalid regex: {e}"))?;
     let p = if root.is_empty() { session.cwd.clone() } else { NativeFilengine::resolve(root, session)? };
 
     let include_glob = include.and_then(|s| glob::Pattern::new(s).ok());
 
-    let mut results = Vec::new();
+    let mut all_matches = Vec::new();
     let mut files_scanned = 0u32;
-    grep_dir(&p, &re, &include_glob, context, max_results as usize, &mut results, &mut files_scanned).await;
+    grep_dir(&p, &re, &include_glob, context, max_results as usize, &mut all_matches, &mut files_scanned).await;
+
+    if mode == "coarse" {
+        // 按文件统计 match 数，按 count 降序
+        let mut file_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for m in &all_matches {
+            let file = m.get("file").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            *file_counts.entry(file).or_insert(0) += 1;
+        }
+        let mut files: Vec<Value> = file_counts.into_iter()
+            .map(|(f, c)| json!({"file": f, "count": c}))
+            .collect();
+        files.sort_by(|a, b| {
+            let ca = a.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cb = b.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+            cb.cmp(&ca)
+        });
+        return Ok(json!({"mode": "coarse", "files": files, "files_scanned": files_scanned, "pattern": pattern}));
+    }
 
     Ok(json!({
-        "matches": results,
-        "total_matches": results.len(),
+        "matches": all_matches,
+        "total_matches": all_matches.len(),
         "files_scanned": files_scanned,
         "pattern": pattern,
         "root": p.to_string_lossy(),
@@ -1115,6 +1280,34 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
         return Err(format!("command not allowed: {}", command.split_whitespace().next().unwrap_or("")));
     }
 
+    // bash_policy 分流：根据 role_caps 调整 classify_bash_command 的决策
+    // ReadOnly：只允许 Allow，其余一律升为 Dangerous（拒绝）
+    // DevTools：保持 classify_bash_command 原始决策（现有行为不变）
+    // Full：Dangerous 降级为 NeedsConfirm（进 MCIP 门控而非直接拒绝）
+    let raw_decision = classify_bash_command(command);
+    let decision = match session.bash_policy {
+        BashPolicyLevel::ReadOnly => {
+            if matches!(raw_decision, BashDecision::Allow) {
+                raw_decision
+            } else {
+                BashDecision::Dangerous("bash_policy=ReadOnly: only read-only commands permitted".into())
+            }
+        }
+        BashPolicyLevel::DevTools => raw_decision,
+        BashPolicyLevel::Full => {
+            if let BashDecision::Dangerous(reason) = raw_decision {
+                BashDecision::NeedsConfirm(format!("[full-policy] {}", reason))
+            } else {
+                raw_decision
+            }
+        }
+    };
+    // NeedsConfirm / Dangerous：pipeline MCIP 门控处理；此处 inner guard 仅在无 MCIP 场景
+    // 拦截 Dangerous（安全兜底——pipeline 是主门控，inner guard 是 belt-and-suspenders）
+    if let BashDecision::Dangerous(reason) = &decision {
+        return Err(format!("command rejected by policy: {reason}"));
+    }
+
     let child = TokioCmd::new("sh")
         .arg("-c")
         .arg(command)
@@ -1185,9 +1378,13 @@ impl ToolExecutor for FilengineToolExecutor {
         // Phase 2 undo 注入：写工具前 snapshot/record，成功后 commit
         // 仅当 session.undo_logger=Some 时启用；None 走原路径（向后兼容）
         let mut session = ctx.filengine.write().await;
-        // 同步 policy 阈值到 session（ExecutionContext 每轮注入最新值）
+        // 每次工具调用前同步 role_caps → session（保持 session 与 role 策略一致）
+        // 引用：ctx.role_caps 由 pipeline 从 SessionState.role_caps 注入，工具返回后 drop
         session.bash_default_timeout = ctx.bash_default_timeout;
         session.bash_max_timeout = ctx.bash_max_timeout;
+        session.fs_roots = ctx.role_caps.fs_roots.clone();
+        session.bash_policy = ctx.role_caps.bash_policy;
+        session.search_provider = ctx.role_caps.search_provider.clone();
         let pending = if let Some(logger) = session.undo_logger.clone() {
             match tool_name {
                 "fs_write" | "fs_edit" => {
@@ -1316,19 +1513,23 @@ pub fn schemas() -> Vec<ToolSchema> {
             &["path"], true, 32, "5ms", "low"),
         schema("web_fetch", "HTTP GET 请求获取网页内容",
             json!({"url": {"type":"string", "description":"完整 URL"},
-                   "timeout": {"type":"number", "description":"超时秒数(默认60)"}}),
+                   "timeout": {"type":"number", "description":"超时秒数(默认60)"},
+                   "extract": {"type":"boolean", "description":"移除 HTML 标签返回可读文本（默认 false）"},
+                   "max_chars": {"type":"integer", "description":"最大返回字符数（extract=true 时默认 8000）"}}),
             &["url"], false, 128, "1s", "low"),
         schema("web_search", "搜索引擎搜索并返回结果标题/摘要/链接",
             json!({"query": {"type":"string", "description":"搜索关键词"},
                    "count": {"type":"number", "description":"返回条数(默认10,最大20)"},
-                   "timeout": {"type":"number", "description":"超时秒数(默认60)"}}),
+                   "timeout": {"type":"number", "description":"超时秒数(默认60)"},
+                   "deep": {"type":"boolean", "description":"true 时抓取前3条结果页面正文并附在 pages 字段（默认 false）"}}),
             &["query"], false, 128, "2s", "low"),
         schema("fs_grep", "搜索文件内容（正则匹配，返回匹配行+文件路径+行号）",
             json!({"pattern": {"type":"string", "description":"正则表达式（如 fn main|class.*Error）"},
                    "path": {"type":"string", "description":"搜索根目录绝对路径（默认当前工作目录）"},
                    "include": {"type":"string", "description":"文件名 glob 过滤（如 *.rs, *.{ts,tsx}）"},
                    "max_results": {"type":"number", "description":"最大结果数（默认20,最大100）"},
-                   "context": {"type":"number", "description":"匹配行前后上下文行数（0-5,默认0）"}}),
+                   "context": {"type":"number", "description":"匹配行前后上下文行数（0-5,默认0）"},
+                   "mode": {"type":"string", "description":"fine（默认，逐行匹配）或 coarse（按文件聚合计数）"}}),
             &["pattern"], false, 96, "500ms", "low"),
         // Wrapping-B：fs_read_multiple 已合并到 fs_read（接受 paths 数组），schema 不再注册
         // executor 路径"fs_read_multiple"仍 dispatch 旧函数（向后兼容）
@@ -1380,6 +1581,95 @@ pub async fn register_executors(registry: &ToolRegistry) {
         };
         registry.register_executor(id, executor.clone()).await;
     }
+}
+
+// ─── HTML 提取 ────────────────────────────────────────────────────
+
+/// 将 HTML 文本转换为可读纯文本，移除标签、折叠空白、截断到 max_chars。
+///
+/// ## 引用关系
+/// - 调用方：web_fetch()（extract=true 时）、deep 模式下 web_search() 内部调用 web_fetch
+///
+/// ## 处理流程
+/// 1. 移除 script/style/nav/header/footer/aside 块（含内容）
+/// 2. 移除所有 HTML 标签（< ... >）
+/// 3. 解码常见 HTML 实体（&amp; &lt; &gt; &quot; &#39; &nbsp;）
+/// 4. 折叠连续空行（最多保留一个空行分隔）
+/// 5. 按 max_chars 截断（按字符安全截断，不破坏多字节）
+///
+/// ## 返回
+/// (提取后文本, 是否已截断)
+fn html_to_text(html: &str, max_chars: usize) -> (String, bool) {
+    // 1. 移除指定块级元素（含嵌套内容）
+    let mut text = html.to_string();
+    for tag in &["script", "style", "nav", "header", "footer", "aside"] {
+        let open = format!("<{}", tag);
+        let close = format!("</{}>", tag);
+        loop {
+            match text.find(&open) {
+                Some(start) => {
+                    match text[start..].find(&close) {
+                        Some(end_rel) => {
+                            let end_pos = start + end_rel + close.len();
+                            let mut next = String::with_capacity(text.len() - (end_pos - start));
+                            next.push_str(&text[..start]);
+                            next.push_str(&text[end_pos..]);
+                            text = next;
+                        }
+                        None => break,
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+    // 2. 移除所有 HTML 标签
+    let mut stripped = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for c in text.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => stripped.push(c),
+            _ => {}
+        }
+    }
+    // 3. 解码常见 HTML 实体
+    let decoded = stripped
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    // 4. 折叠连续空行
+    let mut out = String::new();
+    let mut prev_blank = false;
+    for line in decoded.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_blank {
+                out.push('\n');
+                prev_blank = true;
+            }
+        } else {
+            out.push_str(trimmed);
+            out.push('\n');
+            prev_blank = false;
+        }
+    }
+    let out = out.trim().to_string();
+    // 5. 按字符边界截断
+    let truncated = out.chars().count() > max_chars;
+    let final_text = if truncated {
+        out.char_indices()
+            .nth(max_chars)
+            .map(|(i, _)| out[..i].to_string())
+            .unwrap_or(out.clone())
+    } else {
+        out
+    };
+    (final_text, truncated)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────
@@ -1787,6 +2077,7 @@ mod tests {
             bash_default_timeout: 30,
             bash_max_timeout: 120,
             tool_default_timeout: 60,
+            role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };
         (logger, ctx)
     }
@@ -1926,6 +2217,7 @@ mod tests {
             bash_default_timeout: 30,
             bash_max_timeout: 120,
             tool_default_timeout: 60,
+            role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };
 
         let target = tmp_path.join("nolog.txt");

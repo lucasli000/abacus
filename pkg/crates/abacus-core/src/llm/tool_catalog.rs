@@ -55,7 +55,7 @@ pub fn generate_catalog(tools: &[ToolHandle]) -> String {
     }
 
     let mut out = String::with_capacity(512);
-    out.push_str("[Available Tools — call any by name]\n");
+    out.push_str("[Available Tools — for multi-step tasks prefer skill() over individual tools]\n");
 
     if !builtin.is_empty() {
         builtin.sort_unstable();

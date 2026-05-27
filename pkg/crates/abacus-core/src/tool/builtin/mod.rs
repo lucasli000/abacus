@@ -23,6 +23,8 @@ pub mod kb;
 pub mod orchestrate;
 pub mod lsp;
 pub mod result;
+/// 内置场景 Skill 定义（由 CoreLoop::load_builtin_skills() 加载）
+pub mod skills;
 
 /// Register all built-in tool groups (schemas only for tools needing external deps).
 ///

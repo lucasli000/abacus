@@ -977,11 +977,83 @@ impl DualPalaceMemory {
         recommendations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         recommendations
     }
+
+    /// 按需检索 — Skill + 双宫殿协同的核心入口
+    ///
+    /// 三阶段：
+    /// 1. Probe: 知识宫殿 cache hit → 直接返回（0工具调用）
+    /// 2. Route: 行为宫殿推荐最优 Skill strategy
+    /// 3. Result: 返回缓存结果或路由提示
+    ///
+    /// ## 生命周期
+    /// - 创建: 每次检索请求调用一次
+    /// - 销毁: 返回 SmartRetrieveResult 后
+    ///
+    /// ## 引用关系
+    /// - 被 SkillEngine 或 CoreLoop 在工具调用前调用（可选快速路径）
+    /// - 写入: record_tool_behavior / store_knowledge（后续由 Skill 执行器调用）
+    pub async fn smart_retrieve(
+        &self,
+        query: &str,
+        domain: &str,
+    ) -> SmartRetrieveResult {
+        // Phase 1: 知识宫殿 cache probe
+        let cached = self.knowledge.search(query).await;
+        // 过滤 confidence 足够高的条目（>= 0.65）：SM-2 衰减未过期且 ease 足够高
+        let now = chrono::Utc::now().timestamp();
+        let hot: Vec<_> = cached.iter().filter(|e| {
+            e.next_review > now && e.sm2_ease >= 1.8
+        }).cloned().collect();
+
+        if !hot.is_empty() {
+            // cache hit：记录命中行为
+            let tags = vec!["palace_hit".to_string(), domain.to_string(), "retrieval".to_string()];
+            self.behavior.record_interaction(&format!("cache_hit:{}", query), &tags).await;
+            return SmartRetrieveResult::CacheHit { entries: hot };
+        }
+
+        // Phase 2: 行为宫殿 → 推荐最优 Skill
+        let skill_memories = self.behavior.search(&[
+            "skill".to_string(),
+            "success".to_string(),
+            domain.to_string(),
+        ]).await;
+
+        // 取置信度最高的成功 Skill
+        let best_skill = skill_memories.iter()
+            .filter(|m| m.pattern.starts_with("skill:") && m.confidence > 0.3)
+            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|m| m.pattern.strip_prefix("skill:").map(|s| s.to_string()));
+
+        SmartRetrieveResult::ExecutionNeeded {
+            suggested_skill: best_skill,
+            cache_miss_domain: domain.to_string(),
+        }
+    }
 }
 
 impl Default for DualPalaceMemory {
     fn default() -> Self { Self::new() }
     // Note: with_store(None) for default
+}
+
+/// smart_retrieve() 的返回类型
+///
+/// ## 引用关系
+/// - DualPalaceMemory::smart_retrieve() 返回
+/// - 被 SkillEngine 或 CoreLoop 消费
+///
+/// ## 生命周期
+/// - 一次性结果，由调用者消费后 drop
+#[derive(Debug)]
+pub enum SmartRetrieveResult {
+    /// 知识宫殿命中：直接返回缓存，无需执行工具
+    CacheHit { entries: Vec<KnowledgeEntry> },
+    /// 需要执行：返回最优 Skill 建议（None 表示无历史数据，由 LLM 自主选择）
+    ExecutionNeeded {
+        suggested_skill: Option<String>,
+        cache_miss_domain: String,
+    },
 }
 
 /// V29.13 段2：从 tool_id 提取 domain（namespace），兼容 dot+underscore 两种分隔

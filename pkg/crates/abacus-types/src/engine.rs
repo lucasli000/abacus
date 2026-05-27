@@ -194,6 +194,11 @@ pub struct SkillDef {
     pub workflow: Vec<SkillStep>,
     pub prompt: String,
     pub knowledge_refs: Vec<String>,
+    /// 行为宫殿标签：Skill 执行后向 BehaviorPalace 写入/查询时使用
+    /// 引用: SkillExecutor 执行后调用 palace.record_interaction
+    /// 生命周期: 随 SkillDef 静态存在
+    #[serde(default)]
+    pub palace_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +382,58 @@ pub struct TurnStats {
 }
 
 // ─── Security / Role System ────────────────────────────────────────────────
+
+/// bash 执行策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BashPolicyLevel {
+    ReadOnly,
+    #[default]
+    DevTools,
+    Full,
+}
+
+/// 搜索 provider 抽象
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SearchProvider {
+    BraveApi { api_key: String },
+    SearxNg { base_url: String },
+    DuckDuckGo,
+}
+
+impl Default for SearchProvider {
+    fn default() -> Self { Self::DuckDuckGo }
+}
+
+/// Role 能力声明——将限制从工具内移到 Role 层
+///
+/// 引用: ExecutionContext.role_caps; CoreLoop::new() 从 config 构建
+/// 生命周期: CoreLoop 内存持有; Arc 照顾 ExecutionContext 剪取
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleCapabilities {
+    /// 文件系统可访问根目录（替代 filengine.allowed_roots()）
+    pub fs_roots: Vec<String>,
+    pub bash_policy: BashPolicyLevel,
+    /// None=不限，Some(vec![])=禁止所有
+    pub web_domains: Option<Vec<String>>,
+    pub tool_budget_per_turn: u32,
+    pub search_provider: SearchProvider,
+}
+
+impl Default for RoleCapabilities {
+    fn default() -> Self {
+        // fs_roots 默认用 $HOME，与 filengine::allowed_roots() 保持一致
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/tmp".into());
+        Self {
+            fs_roots: vec![home],
+            bash_policy: BashPolicyLevel::DevTools,
+            web_domains: None,
+            tool_budget_per_turn: 20,
+            search_provider: SearchProvider::DuckDuckGo,
+        }
+    }
+}
 
 /// User role for MCIP access control.
 ///

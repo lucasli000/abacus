@@ -92,6 +92,12 @@ pub struct ExecutionContext {
     /// 消费方：ToolRegistry::execute() 用作非 bash 工具的安全网超时
     /// Bash 工具有独立内部超时机制，此字段对 bash 是冗余安全网（仍生效但较宽松）
     pub tool_default_timeout: u64,
+    /// Role 能力声明——替代工具内部硬编码的限制（路径、bash、web）
+    ///
+    /// 引用关系: 由 pipeline 从 SessionState.role_caps 注入；
+    ///   filengine 的 resolve()/bash_exec/web_search 读取此字段而非内部硬编码
+    /// 生命周期: 工具调用前构建，返回后随 ctx &引用 drop
+    pub role_caps: std::sync::Arc<abacus_types::RoleCapabilities>,
 }
 
 impl ExecutionContext {
@@ -109,6 +115,7 @@ impl ExecutionContext {
             bash_default_timeout: 30,
             bash_max_timeout: 120,
             tool_default_timeout: 60,
+            role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         }
     }
 }
