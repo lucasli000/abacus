@@ -433,15 +433,38 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             };
 
             // 截断 label 到可用宽度
-            let label_max = area.width.saturating_sub(8) as usize;
+            let label_max = area.width.saturating_sub(20) as usize;
             let label: String = job.label.chars().take(label_max).collect();
 
-            lines.push(Line::from(vec![
+            // 最近执行时间（相对）
+            let last_run_str = job.last_run.map(|t| {
+                let secs = t.elapsed().as_secs();
+                if secs < 60 { format!("{}s前", secs) }
+                else if secs < 3600 { format!("{}m前", secs / 60) }
+                else { format!("{}h前", secs / 3600) }
+            });
+            // 耗时展示
+            let dur_str = job.last_duration_ms.map(|ms| {
+                if ms < 1000 { format!("{}ms", ms) }
+                else { format!("{:.1}s", ms as f64 / 1000.0) }
+            });
+
+            let mut spans = vec![
                 Span::raw("  "),
                 Span::raw(kind_icon),
                 Span::styled(format!(" {} ", state_char), state_style),
                 Span::styled(label, Style::default().fg(state.theme.text)),
-            ]));
+            ];
+            // 运行次数和耗时
+            let stats_str = match (last_run_str, dur_str) {
+                (Some(t), Some(d)) => format!(" {}/{} {}", job.run_count, job.fail_count, if job.fail_count > 0 { format!("♻ {}|✕{}", t, d) } else { format!("♻ {} {}", t, d) }),
+                (Some(t), None) => format!(" ♻ {}", t),
+                _ => if job.run_count > 0 { format!(" ×{}", job.run_count) } else { String::new() },
+            };
+            if !stats_str.is_empty() {
+                spans.push(Span::styled(stats_str, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)));
+            }
+            lines.push(Line::from(spans));
         }
 
         // 运行时长

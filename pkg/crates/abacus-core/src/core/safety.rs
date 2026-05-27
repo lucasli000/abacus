@@ -70,8 +70,11 @@ impl SafetyGuard {
     }
 
     /// 检查是否为敏感操作
+    ///
+    /// 使用精确相等匹配而非 `contains()`，防止 `filengine_fs_write` 误匹配
+    /// `filengine_fs_write_batch` 等名称前缀相似的未来工具。
     pub fn is_sensitive_operation(&self, tool_id: &str) -> bool {
-        self.sensitive_operations.iter().any(|s| tool_id.contains(s))
+        self.sensitive_operations.iter().any(|s| tool_id == s)
     }
 
     /// 返回当前安全限制状态（供 TUI/API 展示）

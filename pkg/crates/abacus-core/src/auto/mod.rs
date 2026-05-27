@@ -90,33 +90,45 @@ impl AutoEngine {
     }
 
     /// 触发事件：匹配的 Trigger 启动对应的 Pipeline，并按需持久化运行历史
+    ///
+    /// M-3 fix: 在锁内仅做 clone，锁外执行 pipeline
+    /// 防止持 read lock 期间 pipeline.run().await 长时阵塞 register_* 写操作
     pub async fn fire(&self, event: &TriggerEvent) -> Vec<String> {
+        // 局限在作用域内：仅 clone 所需 pipeline，立即释放两把读锁
+        let matched_pipelines: Vec<pipeline::Pipeline> = {
+            let triggers = self.triggers.read().await;
+            let pipelines = self.pipelines.read().await;
+            triggers.iter()
+                .filter(|t| t.matches(event))
+                .filter_map(|t| pipelines.iter().find(|p| p.id == t.pipeline_id).cloned())
+                .collect()
+        }; // triggers + pipelines 读锁在此释放
+
         let mut started = Vec::new();
-        let triggers = self.triggers.read().await;
-        let pipelines = self.pipelines.read().await;
-        for trigger in triggers.iter().filter(|t| t.matches(event)) {
-            if let Some(pipeline) = pipelines.iter().find(|p| p.id == trigger.pipeline_id) {
-                let started_at = chrono::Utc::now().timestamp();
-                let result = pipeline.run().await;
-                let ended_at = chrono::Utc::now().timestamp();
-                // Task #81：写入持久化层（失败仅 warn，不影响触发返回）
-                if let Some(ref store) = self.store {
-                    if let Err(e) = store.record_run(&result, started_at, ended_at).await {
-                        tracing::warn!(error = %e, pipeline = %pipeline.id, "auto-store record_run failed");
-                    }
+        for pipeline in matched_pipelines {
+            let started_at = chrono::Utc::now().timestamp();
+            let result = pipeline.run().await; // 锁外执行，不阵塞 register_*
+            let ended_at = chrono::Utc::now().timestamp();
+            if let Some(ref store) = self.store {
+                if let Err(e) = store.record_run(&result, started_at, ended_at).await {
+                    tracing::warn!(error = %e, pipeline = %pipeline.id, "auto-store record_run failed");
                 }
-                started.push(format!("{}: {:?}", pipeline.id, result.state));
             }
+            started.push(format!("{}: {:?}", pipeline.id, result.state));
         }
         started
     }
 
     /// 直接执行某 pipeline（独立于 trigger 系统，用于手动触发）
+    ///
+    /// M-3 fix: 在锁内 clone pipeline，锁外执行
     pub async fn fire_pipeline(&self, pipeline_id: &str) -> Option<pipeline::PipelineRunResult> {
-        let pipelines = self.pipelines.read().await;
-        let pipeline = pipelines.iter().find(|p| p.id == pipeline_id)?;
+        let pipeline = {
+            let pipelines = self.pipelines.read().await;
+            pipelines.iter().find(|p| p.id == pipeline_id)?.clone()
+        }; // 读锁释放
         let started_at = chrono::Utc::now().timestamp();
-        let result = pipeline.run().await;
+        let result = pipeline.run().await; // 锁外执行
         let ended_at = chrono::Utc::now().timestamp();
         if let Some(ref store) = self.store {
             if let Err(e) = store.record_run(&result, started_at, ended_at).await {

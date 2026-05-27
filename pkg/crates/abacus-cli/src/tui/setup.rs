@@ -22,84 +22,128 @@ enum ProviderKind {
     DeepSeek,
     OpenAI,
     Anthropic,
-    Dashscope,   // 阿里通义千问
-    Moonshot,    // 月之暗面 Kimi
-    Zhipu,       // 智谱 GLM
-    SiliconFlow, // 硅基流动（多模型聚合）
-    Groq,        // Groq（快速推理）
-    Generic,     // 其他 OpenAI 兼容 API
+    Dashscope,    // 阿里云通义千问
+    Moonshot,     // 月之暗面 Kimi
+    Zhipu,        // 智谱 GLM
+    SiliconFlow,  // 硅基流动
+    Groq,         // Groq 快速推理
+    Volcengine,   // 火山引擎方舟（豆包）
+    Tencent,      // 腾讯云混元
+    MiniMax,      // MiniMax
+    Yi,           // 零一万物
+    Baichuan,     // 百川
+    Ollama,       // 本地 Ollama
+    Generic,      // 其他 OpenAI 兼容
 }
 
 impl ProviderKind {
     fn detect(base_url: &str) -> Self {
         let lower = base_url.to_lowercase();
-        // 按特征关键词匹配（优先级：精确域名 > 路径特征）
-        if lower.contains("deepseek") { return ProviderKind::DeepSeek; }
-        if lower.contains("anthropic") || lower.contains("claude") {
-            return ProviderKind::Anthropic;
+        // 优先级：精确域名特征 > 路径特征 > 通用兜底
+        if lower.contains("deepseek")                                       { return ProviderKind::DeepSeek; }
+        if lower.contains("anthropic") || lower.contains("claude")         { return ProviderKind::Anthropic; }
+        if lower.contains("dashscope") || lower.contains("aliyun") || lower.contains("bailian") { return ProviderKind::Dashscope; }
+        if lower.contains("moonshot")  || lower.contains("kimi")           { return ProviderKind::Moonshot; }
+        if lower.contains("bigmodel")  || lower.contains("zhipu")          { return ProviderKind::Zhipu; }
+        if lower.contains("siliconflow")                                    { return ProviderKind::SiliconFlow; }
+        if lower.contains("groq")                                           { return ProviderKind::Groq; }
+        // 火山引擎方舟：ark.cn-* / volces.com / volcengine
+        if lower.contains("volces") || lower.contains("volcengine") || lower.contains("ark.cn") {
+            return ProviderKind::Volcengine;
         }
-        if lower.contains("dashscope") || lower.contains("aliyun") {
-            return ProviderKind::Dashscope;
-        }
-        if lower.contains("moonshot") || lower.contains("kimi") {
-            return ProviderKind::Moonshot;
-        }
-        if lower.contains("bigmodel") || lower.contains("zhipu") {
-            return ProviderKind::Zhipu;
-        }
-        if lower.contains("siliconflow") { return ProviderKind::SiliconFlow; }
-        if lower.contains("groq") { return ProviderKind::Groq; }
-        if lower.contains("openai") { return ProviderKind::OpenAI; }
-        // Fallback: 有 /vN 路径特征 → Generic OpenAI-compatible
-        // 无任何特征 → 也当作 Generic（绝大多数新服务都是 OpenAI 兼容）
+        if lower.contains("hunyuan") || lower.contains("tencent")          { return ProviderKind::Tencent; }
+        if lower.contains("minimax")                                        { return ProviderKind::MiniMax; }
+        if lower.contains("lingyiwanwu") || lower.contains("01.ai")        { return ProviderKind::Yi; }
+        if lower.contains("baichuan")                                       { return ProviderKind::Baichuan; }
+        // Ollama 本地：localhost:11434 或含 "ollama"
+        if lower.contains("localhost:11434") || lower.contains("ollama")   { return ProviderKind::Ollama; }
+        if lower.contains("openai")                                         { return ProviderKind::OpenAI; }
         ProviderKind::Generic
     }
 
     fn label(&self) -> &'static str {
         match self {
-            ProviderKind::DeepSeek => "DeepSeek API",
-            ProviderKind::OpenAI => "OpenAI API",
-            ProviderKind::Anthropic => "Anthropic API",
-            ProviderKind::Dashscope => "通义千问 (Dashscope)",
-            ProviderKind::Moonshot => "Moonshot (Kimi)",
-            ProviderKind::Zhipu => "智谱 (GLM)",
+            ProviderKind::DeepSeek    => "DeepSeek API",
+            ProviderKind::OpenAI      => "OpenAI API",
+            ProviderKind::Anthropic   => "Anthropic API",
+            ProviderKind::Dashscope   => "阿里云百炼",
+            ProviderKind::Moonshot    => "Moonshot (Kimi)",
+            ProviderKind::Zhipu       => "智谱 (GLM)",
             ProviderKind::SiliconFlow => "SiliconFlow",
-            ProviderKind::Groq => "Groq",
-            ProviderKind::Generic => "OpenAI Compatible",
+            ProviderKind::Groq        => "Groq",
+            ProviderKind::Volcengine  => "火山引擎方舟",
+            ProviderKind::Tencent     => "腾讯云混元",
+            ProviderKind::MiniMax     => "MiniMax",
+            ProviderKind::Yi          => "零一万物",
+            ProviderKind::Baichuan    => "百川",
+            ProviderKind::Ollama      => "Ollama (本地)",
+            ProviderKind::Generic     => "OpenAI Compatible",
         }
     }
 
     fn config_prefix(&self) -> &str {
         match self {
-            ProviderKind::DeepSeek => "deepseek",
-            ProviderKind::OpenAI => "openai",
-            ProviderKind::Anthropic => "anthropic",
-            ProviderKind::Dashscope => "dashscope",
-            ProviderKind::Moonshot => "moonshot",
-            ProviderKind::Zhipu => "zhipu",
+            ProviderKind::DeepSeek    => "deepseek",
+            ProviderKind::OpenAI      => "openai",
+            ProviderKind::Anthropic   => "anthropic",
+            ProviderKind::Dashscope   => "dashscope",
+            ProviderKind::Moonshot    => "moonshot",
+            ProviderKind::Zhipu       => "zhipu",
             ProviderKind::SiliconFlow => "siliconflow",
-            ProviderKind::Groq => "groq",
-            ProviderKind::Generic => "openai",
+            ProviderKind::Groq        => "groq",
+            ProviderKind::Volcengine  => "volcengine",
+            ProviderKind::Tencent     => "tencent",
+            ProviderKind::MiniMax     => "minimax",
+            ProviderKind::Yi          => "yi",
+            ProviderKind::Baichuan    => "baichuan",
+            ProviderKind::Ollama      | ProviderKind::Generic => "openai",
         }
     }
 
     fn default_model(&self) -> &str {
         match self {
-            ProviderKind::DeepSeek => "deepseek-v4-flash",
-            ProviderKind::OpenAI => "gpt-4o",
-            ProviderKind::Anthropic => "claude-sonnet-4",
-            ProviderKind::Dashscope => "qwen-max",
-            ProviderKind::Moonshot => "moonshot-v1-128k",
-            ProviderKind::Zhipu => "glm-4-flash",
+            ProviderKind::DeepSeek    => "deepseek-v4-flash",
+            ProviderKind::OpenAI      => "gpt-4o",
+            ProviderKind::Anthropic   => "claude-sonnet-4-5",
+            ProviderKind::Dashscope   => "qwen-max",
+            ProviderKind::Moonshot    => "moonshot-v1-128k",
+            ProviderKind::Zhipu       => "glm-4-flash",
             ProviderKind::SiliconFlow => "deepseek-v4-flash",
-            ProviderKind::Groq => "llama-3.3-70b-versatile",
-            ProviderKind::Generic => "gpt-4o", // 通用兜底
+            ProviderKind::Groq        => "llama-3.3-70b-versatile",
+            ProviderKind::Volcengine  => "doubao-1-5-pro-32k",
+            ProviderKind::Tencent     => "hunyuan-turbo",
+            ProviderKind::MiniMax     => "abab6.5s-chat",
+            ProviderKind::Yi          => "yi-lightning",
+            ProviderKind::Baichuan    => "Baichuan4-Air",
+            ProviderKind::Ollama      => "llama3.2",
+            ProviderKind::Generic     => "gpt-4o",
         }
     }
 
     fn is_openai_compatible(&self) -> bool {
-        // Anthropic 使用独有协议，其余均为 OpenAI 兼容
+        // Anthropic 使用独有协议写入配置；其余（含 Ollama、各云厂商）均用 OpenAI 兼容格式
         !matches!(self, ProviderKind::Anthropic)
+    }
+
+    /// provider 层级的上下文提示（API 未返回 context_window 时的兜底）
+    fn typical_max_context(&self) -> &'static str {
+        match self {
+            ProviderKind::DeepSeek    => "最大 1M（V4 系列）",
+            ProviderKind::OpenAI      => "最大 128k（GPT-4o）",
+            ProviderKind::Anthropic   => "最大 200k（Claude 3.x）",
+            ProviderKind::Dashscope   => "最大 1M（Qwen-Long）",
+            ProviderKind::Moonshot    => "最大 128k",
+            ProviderKind::Zhipu       => "最大 128k（GLM-4）",
+            ProviderKind::SiliconFlow => "按代理模型规格",
+            ProviderKind::Groq        => "最大 128k",
+            ProviderKind::Volcengine  => "最大 128k（豆包系列）",
+            ProviderKind::Tencent     => "最大 256k（混元）",
+            ProviderKind::MiniMax     => "最大 1M（MiniMax-01）",
+            ProviderKind::Yi          => "最大 200k",
+            ProviderKind::Baichuan    => "最大 128k",
+            ProviderKind::Ollama      => "按加载模型规格",
+            ProviderKind::Generic     => "按模型规格",
+        }
     }
 }
 
@@ -117,12 +161,18 @@ struct SetupState {
     skip: bool,
     /// 从 API 检索到的模型列表
     fetched_models: Vec<String>,
+    /// 模型 → context_window（tokens），API 返回时存入；未返回则无条目
+    model_contexts: std::collections::HashMap<String, u64>,
     /// 模型检索状态
     model_fetch_status: ModelFetchStatus,
     /// 当前在 fetched_models 中的选中 index（Tab 循环）
     model_select_idx: usize,
-    /// 异步检索结果接收器
-    model_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// 异步检索结果接收器（携带 context_window）
+    model_rx: Option<std::sync::mpsc::Receiver<Vec<(String, Option<u64>)>>>,
+    /// 模型支持的最大上下文大小（单位 k token，如 "1000" = 1M，"128" = 128k）
+    context_window: String,
+    /// Abacus 实际使用的上下文（单位 k token，空 = 全用，最低 128k）
+    context_window_use: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -138,6 +188,8 @@ enum FocusField {
     BaseUrl,
     ModelName,
     ApiKey,
+    ContextWindow,
+    ContextWindowUse,
 }
 
 impl SetupState {
@@ -155,9 +207,12 @@ impl SetupState {
             exit: false,
             skip: false,
             fetched_models: Vec::new(),
+            model_contexts: std::collections::HashMap::new(),
             model_fetch_status: ModelFetchStatus::Idle,
             model_select_idx: 0,
             model_rx: None,
+            context_window: String::new(),
+            context_window_use: String::new(),
         }
     }
     fn provider(&self) -> ProviderKind {
@@ -206,7 +261,16 @@ pub fn has_api_config() -> bool {
         return true;
     }
     if let Ok(content) = std::fs::read_to_string(config_path()) {
-        if content.contains("api_key") && !content.contains("api_key: \"\"") {
+        // M3 fix: 跳过注释行，仅匹配非空 api_key 赋值行
+        // 防止高级配置注释块（含 # openai_api_key: ""）触发误报
+        let has_real_key = content.lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with('#')
+                && trimmed.contains("api_key:")
+                && !trimmed.contains("api_key: \"\"")
+                && !trimmed.contains("api_key: ''")
+        });
+        if has_real_key {
             return true;
         }
     }
@@ -225,41 +289,120 @@ fn accept_disclaimer() {
     let _ = std::fs::write(disclaimer_path(), "accepted");
 }
 
+/// 解析上下文大小输入（单位 k token）
+/// 支持格式："1000k" / "1000" / "1m" → 返回 token 数
+/// 无法解析或为 0 时返回 None
+fn parse_context_k(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() { return None; }
+    // "1m" / "2m" → 百万
+    if let Some(n_str) = s.strip_suffix('m') {
+        return n_str.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000_000));
+    }
+    // "1000k" / "128k" / "1000" → 千
+    let n_str = s.strip_suffix('k').unwrap_or(&s);
+    n_str.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000))
+}
+
+/// YAML 字符串值转义（H1 fix）
+/// 转义双引号、反斜杠、换行，防止用户输入破坏 YAML 结构
+fn yaml_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+     .replace('"', "\\\"")
+     .replace('\n', "\\n")
+     .replace('\r', "\\r")
+}
+
 fn save_config(state: &SetupState) -> Result<(), String> {
     let provider = state.provider();
-    let base_url = if state.base_url.is_empty() {
-        "https://api.openai.com"
+    let raw_url = if state.base_url.is_empty() {
+        "https://api.openai.com".to_string()
     } else {
-        // Strip trailing /v1, /v2 etc. — providers append their own path
-        state.base_url.trim_end_matches("/v1")
+        // M4 fix: 先 trim 空白，再剥离版本路径后缀，再 trim 尾斜杠
+        let trimmed = state.base_url.trim();
+        let stripped = trimmed
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
             .trim_end_matches("/v2")
             .trim_end_matches("/v3")
             .trim_end_matches("/v4")
+            .trim_end_matches('/')
             .trim()
+            .to_string();
+        stripped
     };
-
-    let resolved_model = if state.model_name.is_empty() {
+    // H1 fix: 所有用户输入字段写入 YAML 前转义
+    let base_url   = yaml_escape(&raw_url);
+    let api_key_e  = yaml_escape(&state.api_key);
+    let model_e    = yaml_escape(if state.model_name.is_empty() {
         provider.default_model()
     } else {
         &state.model_name
+    });
+
+    // model_e / api_key_e / base_url 已在上方转义，resolved_model 仅用于 cw_tokens 查找
+    let resolved_model = model_e.as_str();
+
+    // 解析上下文配置
+    // context_window 为空 → 不写入 config，引擎从 model catalog 自动取模型最大值
+    let cw_tokens_opt: Option<u64> = parse_context_k(&state.context_window)
+        .map(|n| n.max(128_000));
+    let cw_ratio = if state.context_window_use.is_empty() {
+        1.0f64 // 空 = 全用（不压缩）
+    } else {
+        let cw_base = cw_tokens_opt.unwrap_or(u64::MAX); // 无上限时按用户指定值直接用
+        let use_tokens = parse_context_k(&state.context_window_use)
+            .unwrap_or(128_000)
+            .max(128_000);
+        if cw_base == u64::MAX {
+            1.0 // 无法计算比例，全用
+        } else {
+            (use_tokens as f64 / cw_base as f64).min(1.0)
+        }
     };
 
+    // context_window 行：仅在用户明确填写时写入；空 = 引擎从 model catalog 自动取
+    let cw_line = match cw_tokens_opt {
+        Some(n) => format!("  context_window: {}\n", n),
+        None    => String::new(),
+    };
+
+    // 高级配置注释块——用户取消注释即可自定义，无需重新跑向导
+    let advanced_comment = r#"
+# ── 高级配置（取消注释即生效，向导不会覆盖此区域） ─────────────────────
+#
+# llm:
+#   temperature: 0.6          # 生成温度（0.0-2.0）
+#   max_tokens: 8192          # 单次最大输出 token
+#   top_p: 0.95
+#   # 第二提供商（同时配置多个，按需切换）：
+#   openai_base_url: ""
+#   openai_api_key: ""
+#   anthropic_api_key: ""
+#   anthropic_base_url: ""
+#
+# core:
+#   thinking: off             # off / adaptive / low / medium / high / max
+#   max_turns: 25             # 单会话最大轮次
+#   max_tool_calls: 8         # 单轮最大工具调用次数
+#   stream: true
+#
+# 完整配置文档：abacus config --list
+"#;
+
     let yaml = if provider.is_openai_compatible() {
-        // DeepSeek / OpenAI-compatible: write generic keys that engine_init reads
         format!(
             r#"# Abacus 配置（由 TUI 首次配置向导生成）
 llm:
   api_key: "{}"
   base_url: "{}"
-  temperature: 0.7
-  max_tokens: 4096
-  top_p: 0.95
 
 core:
   default_model: "{}"
   stream: true
-"#,
-            state.api_key, base_url, resolved_model,
+{}  context_window_ratio: {:.4}
+{}"#,
+            api_key_e, base_url, resolved_model, cw_line, cw_ratio, advanced_comment,
         )
     } else {
         // Anthropic: write provider-specific keys
@@ -268,15 +411,13 @@ core:
 llm:
   anthropic_api_key: "{}"
   anthropic_base_url: "{}"
-  temperature: 0.7
-  max_tokens: 4096
-  top_p: 0.95
 
 core:
   default_model: "{}"
   stream: true
-"#,
-            state.api_key, base_url, resolved_model,
+{}  context_window_ratio: {:.4}
+{}"#,
+            api_key_e, base_url, resolved_model, cw_line, cw_ratio, advanced_comment,
         )
     };
 
@@ -352,10 +493,11 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         }
     }
 
-    let cw = (area.width as f64 * 0.6).max(50.0).min(66.0) as u16;
-    let ch = (area.height as f64 * 0.85).max(22.0).min(30.0) as u16;
-    let cx = (area.width - cw) / 2;
-    let cy = (area.height - ch) / 2;
+    // H2 fix: clamp cw/ch 不超过终端实际尺寸，用 saturating_sub 防止 u16 下溢 panic
+    let cw = ((area.width as f64 * 0.6).max(50.0).min(70.0) as u16).min(area.width);
+    let ch = ((area.height as f64 * 0.90).max(32.0).min(42.0) as u16).min(area.height);
+    let cx = area.width.saturating_sub(cw) / 2;
+    let cy = area.height.saturating_sub(ch) / 2;
     let card = Rect::new(cx, cy, cw, ch);
 
     let block = Block::default()
@@ -366,20 +508,24 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
     let inner = block.inner(card);
     block.render(card, f.buffer_mut());
 
-    // 分区: 条款 | URL | 推荐 | Key | Model | 提示
+    // 分区: 条款 | URL | 推荐 | Key | Model | ContextWindow | ContextUse | 提示
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // 0 条款标题
-            Constraint::Min(3),      // 1 条款内容
-            Constraint::Length(1),   // 2 gap
-            Constraint::Length(5),   // 3 API URL
-            Constraint::Length(1),   // 4 DeepSeek 推荐
-            Constraint::Length(1),   // 5 gap
-            Constraint::Length(5),   // 6 API Key
-            Constraint::Length(1),   // 7 gap
-            Constraint::Length(3),   // 8 Model Name
-            Constraint::Length(2),   // 9 底部提示
+            Constraint::Length(1),   // 0  条款标题
+            Constraint::Min(2),      // 1  条款内容
+            Constraint::Length(1),   // 2  gap
+            Constraint::Length(3),   // 3  API URL
+            Constraint::Length(1),   // 4  provider 推荐提示
+            Constraint::Length(1),   // 5  gap
+            Constraint::Length(3),   // 6  API Key
+            Constraint::Length(1),   // 7  gap
+            Constraint::Length(3),   // 8  默认模型
+            Constraint::Length(1),   // 9  gap
+            Constraint::Length(3),   // 10 模型上下文大小
+            Constraint::Length(1),   // 11 gap
+            Constraint::Length(3),   // 12 实际使用上下文
+            Constraint::Length(2),   // 13 底部提示
         ])
         .split(inner);
 
@@ -485,7 +631,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
             if state.fetched_models.is_empty() { " (无可用模型)" }
             else { "" }
         }
-        ModelFetchStatus::Failed => " (检索失败，使用默认)",
+        ModelFetchStatus::Failed => " (检索失败，请手动输入)",
         ModelFetchStatus::Idle => "",
     };
     let model_count = if !state.fetched_models.is_empty() {
@@ -493,7 +639,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
     } else {
         String::new()
     };
-    let model_title = format!("{}Model (Tab 循环){}{}", model_focus, model_count, model_status);
+    let model_title = format!("{}默认模型 (Tab 循环选择，可随时更改){}{}", model_focus, model_count, model_status);
     let model_display = if state.model_name.is_empty() {
         let provider = state.provider();
         let def = provider.default_model();
@@ -520,7 +666,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         mn_inner,
     );
 
-    // ── 模型下拉列表（Model 字段聚焦 + 有候选模型时显示）──
+    // ── 模型下拉列表（默认模型字段聚焦 + 有候选模型时显示）──
     // 在 model_block 下方绘制浮层：最多 5 条，超出显示省略
     // 引用关系：fetched_models / model_select_idx / model_block 位置
     // 生命周期：焦点离开 ModelName 时下拉消失
@@ -533,8 +679,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         let drop_y = model_rect.y + model_rect.height;
         let drop_x = model_rect.x;
         let drop_w = model_rect.width.min(card.width);
-        // 防止超出 card 底部
-        let drop_y = drop_y.min(card.y + card.height - list_h);
+        // H3 fix: saturating_sub 防止 card.height < list_h 时 u16 下溢 panic
+        let drop_y = drop_y.min((card.y + card.height).saturating_sub(list_h));
         if drop_y + list_h <= area.height {
             let drop_area = Rect::new(drop_x, drop_y, drop_w, list_h);
             f.render_widget(Clear, drop_area);
@@ -569,19 +715,76 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         }
     }
 
+    // ── 模型上下文大小 ──
+    let cw_focus = if state.focus == FocusField::ContextWindow { " > " } else { "   " };
+    let cw_block = Block::default()
+        .title(format!("{}模型上下文大小 (单位 k，如 1000=1M，128=128k，空=128k)", cw_focus))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(
+            if state.focus == FocusField::ContextWindow { theme.primary } else { theme.border }
+        ));
+    let cw_inner = cw_block.inner(parts[10]);
+    cw_block.render(parts[10], f.buffer_mut());
+    let cw_display = if state.context_window.is_empty() {
+        // 优先用 API 返回的当前选中模型 context_window
+        if let Some(&ctx_tokens) = state.model_contexts.get(&state.model_name) {
+            let ctx_k = ctx_tokens / 1_000;
+            format!("空 = 按模型规格（{} 约 {}k）", state.model_name, ctx_k)
+        } else {
+            // 兜底：provider 层级静态提示
+            format!("空 = 按模型规格（{}）", state.provider().typical_max_context())
+        }
+    } else {
+        state.context_window.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            cw_display,
+            Style::default().fg(
+                if state.context_window.is_empty() { theme.muted } else { theme.success }
+            ),
+        ))),
+        cw_inner,
+    );
+
+    // ── 实际使用上下文 ──
+    let cwu_focus = if state.focus == FocusField::ContextWindowUse { " > " } else { "   " };
+    let cwu_block = Block::default()
+        .title(format!("{}实际使用上下文 (单位 k，空=全用，最低 128k)", cwu_focus))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(
+            if state.focus == FocusField::ContextWindowUse { theme.primary } else { theme.border }
+        ));
+    let cwu_inner = cwu_block.inner(parts[12]);
+    cwu_block.render(parts[12], f.buffer_mut());
+    let cwu_display = if state.context_window_use.is_empty() {
+        "空 = 全用 (等于模型上限)".to_string()
+    } else {
+        state.context_window_use.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            cwu_display,
+            Style::default().fg(
+                if state.context_window_use.is_empty() { theme.muted } else { theme.success }
+            ),
+        ))),
+        cwu_inner,
+    );
+
     // ── 底部提示 ──
     f.render_widget(
         Paragraph::new(vec![
             Line::from(Span::styled(
-                " Tab 切换 · Enter 确认 · Esc 退出 · Key Tab=显示/隐藏",
+                " Tab 切换字段 · Enter 确认 · Esc 退出 · Ctrl+H 显示/隐藏 Key",
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             )),
             Line::from(Span::styled(
-                " Enter 即表示同意使用条款",
+                " Enter 即表示同意使用条款，配置项后续均可修改",
                 Style::default().fg(theme.border).add_modifier(Modifier::DIM),
             )),
         ]),
-        parts[9],
+        parts[13],
     );
 }
 
@@ -600,7 +803,9 @@ fn sync_default_model(state: &mut SetupState) {
     const ALL_PROVIDERS: &[ProviderKind] = &[
         ProviderKind::DeepSeek, ProviderKind::OpenAI, ProviderKind::Anthropic,
         ProviderKind::Dashscope, ProviderKind::Moonshot, ProviderKind::Zhipu,
-        ProviderKind::SiliconFlow, ProviderKind::Groq, ProviderKind::Generic,
+        ProviderKind::SiliconFlow, ProviderKind::Groq, ProviderKind::Volcengine,
+        ProviderKind::Tencent, ProviderKind::MiniMax, ProviderKind::Yi,
+        ProviderKind::Baichuan, ProviderKind::Ollama, ProviderKind::Generic,
     ];
     let is_still_default = state.model_name.is_empty()
         || ALL_PROVIDERS.iter().any(|p| state.model_name == p.default_model());
@@ -623,7 +828,7 @@ fn trigger_model_fetch(state: &mut SetupState) {
     }
 
     state.model_fetch_status = ModelFetchStatus::Fetching;
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<(String, Option<u64>)>>();
     state.model_rx = Some(rx);
 
     let base_url = state.base_url.clone();
@@ -636,50 +841,114 @@ fn trigger_model_fetch(state: &mut SetupState) {
 }
 
 /// 同步 HTTP 请求模型列表（在子线程中执行）
-fn fetch_model_list_sync(base_url: &str, api_key: &str) -> Vec<String> {
-    // 构建 URL: {base_url}/models
-    let url = if base_url.ends_with('/') {
-        format!("{}models", base_url)
+///
+/// ## URL 策略
+/// URL 已含版本路径（/v1、/v2、/v3）→ 直接追加 /models
+/// 否则依次尝试 /v1/models → /models，第一个返回非空结果即用
+///
+/// ## Anthropic 特殊处理
+/// Anthropic 使用 `x-api-key` + `anthropic-version` 头，非标 Bearer
+fn fetch_model_list_sync(base_url: &str, api_key: &str) -> Vec<(String, Option<u64>)> {
+    let lower = base_url.to_lowercase();
+    if lower.contains("anthropic") || lower.contains("claude") {
+        return fetch_anthropic_models(base_url, api_key);
+    }
+
+    // 构建候选 URL 列表
+    let base = base_url.trim_end_matches('/');
+    let has_version = base.ends_with("/v1") || base.ends_with("/v2")
+        || base.ends_with("/v3") || base.ends_with("/v4");
+    let candidates: Vec<String> = if has_version {
+        vec![format!("{}/models", base)]
     } else {
-        format!("{}/models", base_url)
+        vec![
+            format!("{}/v1/models", base),
+            format!("{}/models", base),
+        ]
     };
 
-    // Phase1-1.1: ureq 同步 HTTP 替代 curl 子进程
-    // 引用关系：ureq crate (Cargo.toml) → 此处唯一调用点
-    // 生命周期：每次调用创建临时连接，函数返回后释放
+    for url in &candidates {
+        match ureq::get(url.as_str())
+            .set("Authorization", &format!("Bearer {}", api_key))
+            .call()
+        {
+            Ok(resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                let models = parse_models_response(&body);
+                if !models.is_empty() {
+                    return models;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    Vec::new()
+}
+
+/// Anthropic /v1/models 专用请求（x-api-key + anthropic-version 头）
+///
+/// 引用关系：被 fetch_model_list_sync 在检测到 Anthropic URL 时调用
+fn fetch_anthropic_models(base_url: &str, api_key: &str) -> Vec<(String, Option<u64>)> {
+    let base = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let url = format!("{}/v1/models", base);
     match ureq::get(&url)
-        .set("Authorization", &format!("Bearer {}", api_key))
+        .set("x-api-key", api_key)
+        .set("anthropic-version", "2023-06-01")
         .call()
     {
         Ok(resp) => {
             let body = resp.into_string().unwrap_or_default();
-            parse_models_response(&body)
+            parse_anthropic_models(&body)
         }
         Err(_) => Vec::new(),
     }
 }
 
-/// 解析 /models API 响应（OpenAI 兼容格式）
-fn parse_models_response(json: &str) -> Vec<String> {
-    // SU7: 删除"简单字符串切分"的死循环占位（已被 serde_json 路径完全取代）
+/// 解析 Anthropic /v1/models 响应
+/// 返回格式：{"data": [{"id": "claude-...", "type": "model", ...}]}
+/// Anthropic 模型列表不含 context_window，统一返回 None
+fn parse_anthropic_models(json: &str) -> Vec<(String, Option<u64>)> {
     let mut models = Vec::new();
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
         if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
             for item in data {
                 if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                    // 过滤：只保留对话类模型（排除 embedding/tts/whisper）
+                    models.push((id.to_string(), None));
+                }
+            }
+        }
+    }
+    models.sort_by(|a, b| a.0.cmp(&b.0));
+    models.reverse();
+    models
+}
+
+/// 解析 /models API 响应（OpenAI 兼容格式）
+/// 返回 (model_id, context_window_tokens)；context_window 字段缺失时为 None
+fn parse_models_response(json: &str) -> Vec<(String, Option<u64>)> {
+    let mut models = Vec::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(data) = v.get("data").and_then(|d| d.as_array()) {
+            for item in data {
+                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                    // 过滤：只保留对话类模型（排除 embedding/tts/whisper/dall）
                     let lower = id.to_lowercase();
                     if lower.contains("embed") || lower.contains("tts")
                         || lower.contains("whisper") || lower.contains("dall") {
                         continue;
                     }
-                    models.push(id.to_string());
+                    // 兼容多种字段名：context_window / context_length / max_context_length
+                    let ctx = item.get("context_window")
+                        .or_else(|| item.get("context_length"))
+                        .or_else(|| item.get("max_context_length"))
+                        .and_then(|v| v.as_u64())
+                        .filter(|&n| n > 0);
+                    models.push((id.to_string(), ctx));
                 }
             }
         }
     }
-    // 按名称排序（新模型通常名字靠后）
-    models.sort();
+    models.sort_by(|a, b| a.0.cmp(&b.0));
     models.reverse(); // 最新模型排前面
     models
 }
@@ -688,11 +957,17 @@ fn parse_models_response(json: &str) -> Vec<String> {
 fn poll_model_fetch(state: &mut SetupState) {
     if let Some(ref rx) = state.model_rx {
         match rx.try_recv() {
-            Ok(models) => {
-                if models.is_empty() {
+            Ok(items) => {
+                if items.is_empty() {
                     state.model_fetch_status = ModelFetchStatus::Failed;
                 } else {
-                    state.fetched_models = models;
+                    // 拆分：names 用于 UI 列表，contexts 用于上下文大小提示
+                    for (id, ctx) in &items {
+                        if let Some(c) = ctx {
+                            state.model_contexts.insert(id.clone(), *c);
+                        }
+                    }
+                    state.fetched_models = items.into_iter().map(|(id, _)| id).collect();
                     state.model_fetch_status = ModelFetchStatus::Done;
                     // 自动填入第一个模型（如果用户还没手动输入）
                     if state.model_name.is_empty() {
@@ -712,7 +987,7 @@ fn poll_model_fetch(state: &mut SetupState) {
     }
 }
 
-fn handle_edit(state: &mut SetupState, key: KeyCode) {
+fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers) {
     match state.focus {
         FocusField::BaseUrl => {
             match key {
@@ -734,20 +1009,24 @@ fn handle_edit(state: &mut SetupState, key: KeyCode) {
         }
         FocusField::ModelName => {
             match key {
-                KeyCode::Char(c) => state.model_name.push(c),
+                KeyCode::Char(c) => {
+                    state.model_name.push(c);
+                    // 手动输入时解除与列表的绑定（model_select_idx 不再代表当前选中）
+                    state.model_select_idx = usize::MAX;
+                }
                 KeyCode::Backspace => { state.model_name.pop(); }
                 KeyCode::Tab => {
-                    // Tab: 在检索到的模型列表中循环选择
-                    let candidates = if !state.fetched_models.is_empty() {
-                        &state.fetched_models
+                    if !state.fetched_models.is_empty() {
+                        // M1 fix: 有候选列表时循环选择
+                        let next = if state.model_select_idx >= state.fetched_models.len() {
+                            0
+                        } else {
+                            (state.model_select_idx + 1) % state.fetched_models.len()
+                        };
+                        state.model_select_idx = next;
+                        state.model_name = state.fetched_models[next].clone();
                     } else {
-                        // 没有检索结果时用静态推荐
-                        return; // 跳到下一个字段
-                    };
-                    if !candidates.is_empty() {
-                        state.model_select_idx = (state.model_select_idx + 1) % candidates.len();
-                        state.model_name = candidates[state.model_select_idx].clone();
-                    } else {
+                        // M1 fix: 无候选时直接切换焦点，不卡死
                         state.focus = FocusField::ApiKey;
                     }
                 }
@@ -757,16 +1036,37 @@ fn handle_edit(state: &mut SetupState, key: KeyCode) {
         }
         FocusField::ApiKey => {
             match key {
+                // L5 fix: Ctrl+H 切换显示/隐藏 API Key
+                KeyCode::Char('h') if key_modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.show_api_key = !state.show_api_key;
+                }
                 KeyCode::Char(c) => state.api_key.push(c),
                 KeyCode::Backspace => { state.api_key.pop(); }
                 KeyCode::Tab => {
                     state.show_api_key = false;
-                    state.focus = FocusField::BaseUrl;
-                    // Key 输入完后如果还没检索过，自动触发
+                    // Key 填完后如果还没检索过，自动触发
                     if state.model_fetch_status == ModelFetchStatus::Idle && !state.api_key.is_empty() {
                         trigger_model_fetch(state);
                     }
+                    state.focus = FocusField::ContextWindow;
                 }
+                KeyCode::Enter => if state.is_all_filled() { state.exit = true; }
+                _ => {}
+            }
+        }
+        FocusField::ContextWindow => {
+            match key {
+                KeyCode::Char(c) => state.context_window.push(c),
+                KeyCode::Backspace => { state.context_window.pop(); }
+                KeyCode::Tab | KeyCode::Enter => state.focus = FocusField::ContextWindowUse,
+                _ => {}
+            }
+        }
+        FocusField::ContextWindowUse => {
+            match key {
+                KeyCode::Char(c) => state.context_window_use.push(c),
+                KeyCode::Backspace => { state.context_window_use.pop(); }
+                KeyCode::Tab => state.focus = FocusField::BaseUrl,
                 KeyCode::Enter => if state.is_all_filled() { state.exit = true; }
                 _ => {}
             }
@@ -803,7 +1103,7 @@ pub fn run_setup(
                         state.exit = true;
                         continue;
                     }
-                    handle_edit(&mut state, key.code);
+                    handle_edit(&mut state, key.code, key.modifiers);
                 }
             }
         }

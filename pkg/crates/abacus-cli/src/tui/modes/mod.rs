@@ -1,4 +1,4 @@
-//! Abacus TUI Modes — 三大交互模式
+//! Abacus TUI Modes — 交互模式渲染（V34: Plan/Team 降级为策略，仅 Clarify/Meeting 路由）
 //!
 //! 设计规范来源: ABACUS-TUI-DESIGN-SPEC.md v1.0
 
@@ -15,8 +15,6 @@ use ratatui::Frame;
 pub fn render(f: &mut Frame, state: &AppState, terminal_rows: u16) {
     match state.mode {
         AbacusMode::Clarify => clarify::render(f, state, terminal_rows),
-        AbacusMode::Plan => plan::render(f, state, terminal_rows),
-        AbacusMode::Team => team::render(f, state, terminal_rows),
         AbacusMode::Meeting => meeting::render(f, state, terminal_rows),
     }
 

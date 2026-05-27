@@ -685,7 +685,7 @@ impl AbacusServer {
             default_model: ModelId(default_model.to_string()),
             default_temperature: temperature,
             default_max_tokens: max_tokens,
-            context_window_ratio: 0.5,
+            context_window_ratio: 1.0,
             system_prompt: system_prompt.to_string(),
             model_spec,
             thinking_intent,

@@ -537,7 +537,9 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     //   summarized | omitted（仅 Anthropic adaptive 路径生效）
     defaults.insert("core.thinking_display".into(), ConfigValue::String("summarized".into()));
     defaults.insert("core.context_window".into(), ConfigValue::Number(128000.0));
-    defaults.insert("core.context_window_ratio".into(), ConfigValue::Number(0.5));
+    // 默认 1.0 = 全用模型最大上下文（setup 向导空填写语义）
+    // 旧配置文件若显式写了 0.5，engine_init 读到后仍沿用 0.5（不被此默认覆盖）
+    defaults.insert("core.context_window_ratio".into(), ConfigValue::Number(1.0));
     defaults.insert("safety.max_input_length".into(), ConfigValue::Number(100000.0));
     defaults.insert("safety.max_tool_calls".into(), ConfigValue::Number(500.0));
     let home = std::env::var("HOME")

@@ -99,6 +99,57 @@ impl JsonlEventHook {
     // 段G: rotate 等价逻辑已 inline 到 on_event 的 spawn_blocking 闭包中
     // （因 spawn_blocking 闭包不能借用 self，外部方法无法直接调用）
 
+    // ─── cross-session 段G: rotate 文件 ──────────────────────────────────
+
+    /// 检查文件大小是否超过阈值，若超过则 archive 旧文件 + 新建空文件。
+    ///
+    /// archived 文件名：`{session_id}.{ts_nanos}_{counter}.jsonl`
+    ///   - ts_nanos：纳秒精度（毫秒精度下同 turn 多次 rotate 会碰撞）
+    ///   - counter：atomic 兜底（nanos 极端情况仍可能碰撞）
+    ///   两者组合保证 rename 永远不覆盖已 archived 文件。
+    ///
+    /// ## 引用关系
+    /// - 上游：`on_event` 的 spawn_blocking 闭包中调用
+    /// - 消费：session_id / path / rotate_max_bytes
+    /// - 副作用：可能 rename 原文件 + 用新文件句柄替换传入的 `file`
+    ///
+    /// ## 提取动机
+    /// 原实现在 spawn_blocking 闭包内联，无法单独单元测试。
+    /// 提取为静态函数后，可在测试中传入 mock 文件直接验证。
+    fn rotate_if_needed(
+        session_id: &str,
+        path: &std::path::Path,
+        rotate_max_bytes: u64,
+        file: &mut std::fs::File,
+    ) -> std::io::Result<()> {
+        if rotate_max_bytes == 0 {
+            return Ok(());
+        }
+        let meta = file.metadata()?;
+        if meta.len() < rotate_max_bytes {
+            return Ok(());
+        }
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ROT_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let ts_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let cnt = ROT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let archived = path.with_file_name(
+            format!("{}.{}_{}.jsonl", session_id, ts_nanos, cnt)
+        );
+        let _ = file.flush();
+        if std::fs::rename(path, &archived).is_ok() {
+            if let Ok(new_f) = std::fs::OpenOptions::new()
+                .create(true).append(true).open(path)
+            {
+                *file = new_f;
+            }
+        }
+        Ok(())
+    }
+
     /// 序列化 event 到 JSON 对象
     fn serialize_event(&self, event: &PipelineEvent) -> serde_json::Value {
         let ts_ms = std::time::SystemTime::now()
@@ -174,37 +225,8 @@ impl PipelineHook for JsonlEventHook {
         // append 用 spawn_blocking 包装避免占用 tokio 线程
         let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             let mut f = file.blocking_lock();
-            // 段G: rotate 检查（超阈值则 archive 旧文件 + 新建空文件）
-            // 这里复用本结构的 rotate 逻辑——因不能持 &self，inline 实现等价行为
-            //
-            // archived 文件名：{sid}.{ts_nanos}_{counter}.jsonl
-            //   - ts_nanos：纳秒精度（毫秒精度下同 turn 多次 rotate 会碰撞）
-            //   - counter：atomic 兜底（nanos 极端情况仍可能碰撞）
-            //   两者组合保证 rename 永远不覆盖已 archived 文件
-            if rotate_max_bytes > 0 {
-                if let Ok(meta) = f.metadata() {
-                    if meta.len() >= rotate_max_bytes {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static ROT_COUNTER: AtomicU64 = AtomicU64::new(0);
-                        let ts_nanos = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or(0);
-                        let cnt = ROT_COUNTER.fetch_add(1, Ordering::SeqCst);
-                        let archived = path.with_file_name(
-                            format!("{}.{}_{}.jsonl", session_id, ts_nanos, cnt)
-                        );
-                        let _ = f.flush();
-                        if std::fs::rename(&path, &archived).is_ok() {
-                            if let Ok(new_f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&path)
-                            {
-                                *f = new_f;
-                            }
-                        }
-                    }
-                }
-            }
+            // 段G: rotate 检查（复用提取的静态函数，支持单元测试）
+            Self::rotate_if_needed(&session_id, &path, rotate_max_bytes, &mut f)?;
             writeln!(f, "{}", line_str)?;
             f.flush()?;
             Ok(())
@@ -824,6 +846,37 @@ mod tests {
     }
 
     // ─── cross-session 段 G: rotation ─────────────────────────────────
+
+    /// 验证 rotate_if_needed 静态函数的直接可测性（不经过 hook/event 路径）
+    #[test]
+    fn rotate_if_needed_triggers_rename_when_exceeds_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_session.jsonl");
+        // 创建一个超过阈值（10 bytes）的文件
+        std::fs::write(&path, "x".repeat(20)).expect("write initial");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open");
+
+        // 阈值 10 → 文件 20 bytes → 应触发 rotate
+        JsonlEventHook::rotate_if_needed("test_session", &path, 10, &mut file)
+            .expect("rotate_if_needed");
+
+        // 原文件应被 rename 为 archived（文件名含 test_session. 后缀）
+        let dir_entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let archive_count = dir_entries.iter()
+            .filter(|n| n.starts_with("test_session.") && n != "test_session.jsonl")
+            .count();
+        assert_eq!(archive_count, 1, "应产生 1 个 archive 文件: {dir_entries:?}");
+
+        // active 文件应重新创建（空的，或只包含新写入内容）
+        assert!(dir_entries.contains(&"test_session.jsonl".to_string()),
+            "active 文件应继续存在: {dir_entries:?}");
+    }
 
     /// rotation 触发：超阈值后旧 jsonl 被改名 + 新空 jsonl 创建
     #[tokio::test]

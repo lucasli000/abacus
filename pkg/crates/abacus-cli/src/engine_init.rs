@@ -115,8 +115,9 @@ pub async fn create_engine(
     // DeepSeek v4-flash thinking 模式支持最高 64K+ output
     let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(64000);
     let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
-    // 可用窗口比例：用户配置占模型最大上下文的比例（0.1-1.0，默认 0.5）
-    let context_window_ratio = cfg_mgr.get_number("core.context_window_ratio").unwrap_or(0.5);
+    // 可用窗口比例：用户配置占模型最大上下文的比例（0.1-1.0）
+    // 默认 1.0 = 全用（setup 向导的空填写语义；旧配置文件中若显式写了 0.5 则沿用旧值）
+    let context_window_ratio = cfg_mgr.get_number("core.context_window_ratio").unwrap_or(1.0);
     let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
 
     // Phase 3：统一 thinking 入口。

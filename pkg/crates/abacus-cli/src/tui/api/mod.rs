@@ -116,10 +116,13 @@ impl EngineHandle {
         if guard.is_some() {
             return Ok(());
         }
+        // V35: 从 ~/.abacus/experts.yaml 加载专家配置（无配置文件时用内置默认 3 位专家）
+        // 引用关系: expert_config::load_experts → to_orchestrator_config → with_config
+        // 生命周期: 每次进入 Meeting 模式时重新加载（支持运行时 /expert 修改后立即生效）
+        let expert_defs = crate::tui::expert_config::load_experts();
+        let orch_cfg = crate::tui::expert_config::to_orchestrator_config(&expert_defs);
         let handle = MeetingSessionBuilder::new(topic)
-            .with_specialist("coder")
-            .with_specialist("reviewer")
-            .with_specialist("architect")
+            .with_config(orch_cfg)
             .build()
             .await
             .map_err(|e| e.to_string())?;

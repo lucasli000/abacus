@@ -49,10 +49,14 @@ impl MagChain {
         self.add_with_priority(100, middleware);
     }
 
-    /// Add middleware with explicit priority (lower = earlier execution).
+    /// Add middleware with explicit priority (higher = earlier execution).
+    ///
+    /// 优先级语义反转说明：直觉上"高优先级 = 先执行"，但旧实现用
+    /// sort_by_key 升序排列导致数字越小越先执行，违反直觉。
+    /// 现改为降序排列：priority=100 在 priority=50 之前执行。
     pub fn add_with_priority(&mut self, priority: u32, middleware: Arc<dyn Middleware>) {
         self.middlewares.push((priority, middleware));
-        self.middlewares.sort_by_key(|(p, _)| *p);
+        self.middlewares.sort_by(|(p1, _), (p2, _)| p2.cmp(p1));
     }
 
     pub async fn before(&self, tool_id: &ToolId, params: &serde_json::Value) -> Result<(), KernelError> {

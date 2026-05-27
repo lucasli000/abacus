@@ -227,6 +227,46 @@ impl McpGrpcTransport {
     }
 }
 
+/// stdio 持久传输层 — 复用子进程管道代替每请求 spawn/kill
+///
+/// ## 设计
+/// 保持一个持久子进程，通过 stdin/stdout 管道发送 JSON-RPC 请求/读取响应。
+/// 超时或 IO 错误时 kill 子进程，由调用方重新 spawn。
+///
+/// ## 生命周期
+/// - 创建：`McpClient::stdio_rpc` 首次调用时 spawn
+/// - 复用：后续调用直接读写已有管道
+/// - 销毁：写入/读取失败/超时 → kill，下次调用重新 spawn
+pub(super) struct McpStdioTransport {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    reader: tokio::io::BufReader<tokio::process::ChildStdout>,
+}
+
+impl McpStdioTransport {
+    /// Spawn a new persistent MCP server process.
+    async fn spawn(address: &str) -> std::io::Result<Self> {
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(address)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        let stdin = child.stdin.take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
+        let stdout = child.stdout.take()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+
+        Ok(Self {
+            child,
+            stdin,
+            reader: tokio::io::BufReader::new(stdout),
+        })
+    }
+}
+
 /// Client for a single MCP server.
 ///
 /// Manages connection lifecycle and tool discovery.
@@ -247,6 +287,11 @@ pub struct McpClient {
     /// 为 LLM 协议合规字符（`mcp_srv_my_func`），但 execute 调远程时仍需用原始 raw name。
     /// 此 map 在 discover 时一次性填充；O(1) 查询。
     name_map: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// stdio 持久传输层（仅在 transport=="stdio" 时使用）
+    ///
+    /// 首次 stdio_rpc 调用时 spawn 子进程，后续复用 stdin/stdout 管道。
+    /// 写入/读取失败或超时时 kill 当前进程，下次调用自动重新 spawn。
+    transport: Arc<RwLock<Option<McpStdioTransport>>>,
 }
 
 impl McpClient {
@@ -265,6 +310,7 @@ impl McpClient {
             grpc,
             config,
             name_map: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            transport: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -393,60 +439,67 @@ impl McpClient {
     /// Protocol: newline-delimited JSON-RPC 2.0
     /// - Write: `{"jsonrpc":"2.0","id":N,"method":"<method>","params":<params>}\n`
     /// - Read: `{"jsonrpc":"2.0","id":N,"result":<result>}\n`
+    /// 复用 McpStdioTransport 持久子进程
     async fn stdio_rpc(&self, method: &str, params: Value) -> Result<Value, KernelError> {
-        use tokio::process::Command;
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::io::AsyncBufReadExt;
+        use tokio::io::AsyncWriteExt;
 
         let address = &self.config.address;
         if address.is_empty() {
-            return Err(KernelError::Other("stdio transport requires 'address' to be the server command (e.g. 'npx @modelcontextprotocol/server-foo')".into()));
+            return Err(KernelError::Other("stdio transport requires 'address' to be the server command".into()));
         }
 
-        // Spawn server process (short-lived per call for simplicity; production should pool)
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg(address)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| KernelError::Other(format!("spawn MCP server: {e}")))?;
+        // 获取或创建持久传输层
+        let mut transport_guard = self.transport.write().await;
+        if transport_guard.is_none() {
+            *transport_guard = Some(
+                McpStdioTransport::spawn(address).await
+                    .map_err(|e| KernelError::Other(format!("spawn MCP server: {e}")))?,
+            );
+        }
+        let transport = transport_guard.as_mut().unwrap();
 
-        let mut stdin = child.stdin.take()
-            .ok_or_else(|| KernelError::Other("no stdin".into()))?;
-        let stdout = child.stdout.take()
-            .ok_or_else(|| KernelError::Other("no stdout".into()))?;
-
-        // Send JSON-RPC request
+        // 构建请求
         let request = serde_json::json!({
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": McpClient::next_request_id(),
             "method": method,
             "params": params,
         });
         let mut req_bytes = serde_json::to_vec(&request)
             .map_err(|e| KernelError::Other(format!("serialize: {e}")))?;
         req_bytes.push(b'\n');
-        stdin.write_all(&req_bytes).await
-            .map_err(|e| KernelError::Other(format!("write stdin: {e}")))?;
-        stdin.flush().await.ok();
-        drop(stdin); // Signal EOF to server
 
-        // Read response (first line of stdout)
-        let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
-
-        let read_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            reader.read_line(&mut line),
+        // 发送请求（带超时，失败时自动重试一次）
+        let write_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            transport.stdin.write_all(&req_bytes),
         ).await;
 
-        // Kill child process
-        child.kill().await.ok();
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                let _ = transport.child.kill().await;
+                *transport = McpStdioTransport::spawn(address).await
+                    .map_err(|e| KernelError::Other(format!("re-spawn MCP server: {e}")))?;
+                transport.stdin.write_all(&req_bytes).await
+                    .map_err(|e| KernelError::Other(format!("write stdin (retry): {e}")))?;
+            }
+        }
+        transport.stdin.flush().await.ok();
+
+        // 读取响应（第一行 stdout，带超时）
+        let mut line = String::new();
+        let read_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            transport.reader.read_line(&mut line),
+        ).await;
 
         match read_result {
             Ok(Ok(0)) | Ok(Err(_)) => {
-                Err(KernelError::Other("MCP server returned empty response".into()))
+                let _ = transport.child.kill().await;
+                *transport_guard = None;
+                Err(KernelError::Other("MCP server closed connection".into()))
             }
             Ok(Ok(_)) => {
                 let resp: Value = serde_json::from_str(line.trim())
@@ -457,8 +510,18 @@ impl McpClient {
                     Ok(resp.get("result").cloned().unwrap_or(Value::Null))
                 }
             }
-            Err(_) => Err(KernelError::Other("MCP server timeout (30s)".into())),
+            Err(_) => {
+                let _ = transport.child.kill().await;
+                *transport_guard = None;
+                Err(KernelError::Other("MCP server timeout (30s)".into()))
+            }
         }
+    }
+
+    /// 生成单调递增的请求 ID（进程内唯一）
+    fn next_request_id() -> u64 {
+        static REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Disconnect from the MCP server.
@@ -725,13 +788,44 @@ impl PluginLoader {
             let result_ptr = func.call(&mut store, (ptr, params_bytes.len() as i32))
                 .map_err(|e| KernelError::Other(format!("wasm call: {e}")))?;
 
-            // Scan for null terminator (up to max_memory from result_ptr)
-            let scan_len = max_memory.saturating_sub(result_ptr as usize).min(64 * 1024);
-            let mut buf = vec![0u8; scan_len];
-            memory.read(&mut store, result_ptr as usize, &mut buf)
-                .map_err(|e| KernelError::Other(format!("memory read: {e}")))?;
-            let content_end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            let result_str = String::from_utf8_lossy(&buf[..content_end]).to_string();
+            // 读取 result 指针处的 payload：前 4 字节为小端 u32 长度，后续为 JSON 字节。
+            // 与 null-terminator 双重保障（先读 header，若 length==0 则 fallback 到 null scan）。
+            let mut header_buf = [0u8; 4];
+            let header_size = max_memory.saturating_sub(result_ptr as usize).min(4);
+            memory.read(&mut store, result_ptr as usize, &mut header_buf[..header_size])
+                .map_err(|e| KernelError::Other(format!("memory read header: {e}")))?;
+            let payload_len = u32::from_le_bytes(header_buf) as usize;
+
+            // 最大允许 1MB payload（超过则截断 + 日志警告）
+            const MAX_PAYLOAD: usize = 1024 * 1024;
+            if payload_len > MAX_PAYLOAD || payload_len == 0 {
+                // header 无效或为 0 → 回退到 null-terminator scan（最多 64KB）
+                let fallback_scan = max_memory.saturating_sub(result_ptr as usize).min(64 * 1024);
+                let mut buf = vec![0u8; fallback_scan];
+                memory.read(&mut store, result_ptr as usize, &mut buf)
+                    .map_err(|e| KernelError::Other(format!("memory read (fallback): {e}")))?;
+                let content_end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                let result_str = String::from_utf8_lossy(&buf[..content_end]).to_string();
+                let result_value: Value = serde_json::from_str(&result_str).unwrap_or(Value::Null);
+                let success_flag = !result_value.is_null();
+                return Ok(ToolOutput {
+                    tool_id: ToolId(format!("plugin_{}_{}",
+                        crate::llm::tool_view::sanitize_name(plugin_id),
+                        crate::llm::tool_view::sanitize_name(tool),
+                    )),
+                    success: success_flag,
+                    output: result_value,
+                    latency_ms: 0,
+                    failure_kind: if success_flag { None } else { Some("BusinessError".into()) },
+                    try_instead: Vec::new(),
+                });
+            }
+
+            let read_len = max_memory.saturating_sub(result_ptr as usize + 4).min(payload_len);
+            let mut buf = vec![0u8; read_len];
+            memory.read(&mut store, (result_ptr + 4) as usize, &mut buf)
+                .map_err(|e| KernelError::Other(format!("memory read payload: {e}")))?;
+            let result_str = String::from_utf8_lossy(&buf[..read_len.min(payload_len)]).to_string();
             let result_value: Value = serde_json::from_str(&result_str).unwrap_or(Value::Null);
 
             let success_flag = !result_value.is_null();
