@@ -345,7 +345,7 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             // Turn 级
-            turn_max_tool_calls: 500,
+            turn_max_tool_calls: 100, // 参考 Claude Code ~50，保留 2× 余量应对复杂任务
             turn_max_iterations: 200,
             turn_max_recovery: 5,
             turn_provider_timeout_secs: 300,
@@ -2436,30 +2436,56 @@ impl CoreLoop {
     /// 加载所有内置场景 Skills（和执行器一起启动）
     ///
     /// 内部自动调用 `enable_skill_workflow_executor()`（如未启动），
-    /// 然后逐一注册内置 SkillDef 并 load。
+    /// 然后按 `def.compound` 标志分别加载：
+    /// - compound == true  → `SkillEngine::load_compound()`（1 个工具，内部串联，节省上下文）
+    /// - compound == false → `load_skill()`（每 step 一个虚拟工具，LLM 多次驱动）
     ///
     /// 引用: `crate::tool::builtin::skills::builtin_skill_defs()`
     /// 生命周期: 进程启动时调用一次，Skill 随 SkillEngine Arc 存活
     pub async fn load_builtin_skills(&self) {
-        // 确保 executor 已启动
+        // 确保 step-level executor 已启动（非 compound skill 仍需要）
         if self.skill_workflow_executor.read().await.is_none() {
             self.enable_skill_workflow_executor().await;
         }
+
+        // 创建 CompoundSkillExecutor（compound skill 专用）
+        // palace 连接由 with_memory() 后注入；当前阶段用空 Weak 占位
+        let compound_executor: std::sync::Arc<dyn crate::tool::ToolExecutor> = std::sync::Arc::new(
+            crate::skill::CompoundSkillExecutor::new(
+                std::sync::Arc::downgrade(&self.skill_engine),
+                std::sync::Arc::downgrade(&self.registry),
+                std::sync::Weak::new(),
+            )
+        );
+
         let defs = crate::tool::builtin::skills::builtin_skill_defs();
         let count = defs.len();
+
+        // 先注册所有 def（register_skill 是纯内存写，不拿 registry 锁）
         {
             let mut engine = self.skill_engine.write().await;
-            for def in defs {
-                engine.register_skill(def);
+            for def in &defs {
+                engine.register_skill(def.clone());
             }
         }
-        // load 每个 skill（把 workflow steps 注册为虚拟 ToolHandle）
-        for id in crate::tool::builtin::skills::builtin_skill_defs()
-            .into_iter().map(|d| d.id) {
-            if let Err(e) = self.load_skill(&id).await {
-                tracing::warn!("load builtin skill '{}' failed: {}", id.0, e);
+
+        // 按 compound 标志分别加载
+        for def in &defs {
+            let id = &def.id;
+            if def.compound {
+                // compound 路径：整体注册为单一工具，内部串联
+                let mut engine = self.skill_engine.write().await;
+                if let Err(e) = engine.load_compound(id, &self.registry, compound_executor.clone()).await {
+                    tracing::warn!("load compound skill '{}' failed: {}", id.0, e);
+                }
+            } else {
+                // 非 compound 路径：每 step 一个虚拟工具（原有行为）
+                if let Err(e) = self.load_skill(id).await {
+                    tracing::warn!("load builtin skill '{}' failed: {}", id.0, e);
+                }
             }
         }
+
         tracing::info!("Loaded {} builtin skills", count);
     }
 

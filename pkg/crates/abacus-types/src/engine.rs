@@ -199,6 +199,17 @@ pub struct SkillDef {
     /// 生命周期: 随 SkillDef 静态存在
     #[serde(default)]
     pub palace_tags: Vec<String>,
+    /// 复合执行模式：true = 执行器内部串联所有 step，只向 LLM 返回最终聚合结果（1条输出）
+    /// false（默认）= 当前模式：每 step 是独立 tool call，LLM 看到所有中间结果
+    ///
+    /// ## 上下文管理
+    /// compound=true 时，所有中间 step 结果不进入 session.messages，
+    /// 大幅节省上下文 token（7 步 Skill 从 7 条 tool_output 降到 1 条）。
+    ///
+    /// 引用: SkillEngine::load_compound() + CompoundSkillExecutor
+    /// 生命周期: 随 SkillDef 静态存在；序列化兼容——存量 JSON 无此字段时默认 false
+    #[serde(default)]
+    pub compound: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

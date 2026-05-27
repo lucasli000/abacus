@@ -255,9 +255,13 @@ impl SkillEngine {
         candidates.into_iter().take(self.max_candidates).collect()
     }
 
-    /// evaluate() 的 async 增强版：叠加行为宫殿历史置信度
+    /// evaluate() 的 async 增强版：叠加行为宫殿历史置信度（细粒度版）
     ///
-    /// final_score = base_score + 0.2 * palace_confidence（上限 1.0）
+    /// ## 评分策略
+    /// 1. 成功信号：时效衰减（7天半衰期）× 对数频率权重，叠加 +0.2×confidence
+    /// 2. 失败惩罚：近期失败（24h指数衰减），扣除 -0.15×confidence
+    /// 3. 域匹配：task_kind 命中 palace 标签时额外 +0.1×confidence
+    ///
     /// 若 palace 弱引用升级失败（palace 已 drop），退化为普通 evaluate()。
     ///
     /// ## 引用关系
@@ -270,26 +274,70 @@ impl SkillEngine {
     pub async fn evaluate_with_palace(&self, input: &str, task_kind: Option<&str>) -> Vec<SkillCandidate> {
         let mut candidates = self.evaluate(input, task_kind);
 
-        if let Some(palace) = self.palace.upgrade() {
-            // 查询行为宫殿中 skill:xxx 的历史置信度
-            let skill_memories = palace.behavior.search(&[
-                "skill".to_string(),
-                "success".to_string(),
+        let palace = match self.palace.upgrade() {
+            Some(p) => p,
+            None => return candidates,
+        };
+
+        let now = chrono::Utc::now().timestamp();
+
+        // 1. 成功信号（success tag）
+        let success_memories = palace.behavior.search(&[
+            "skill".to_string(), "success".to_string()
+        ]).await;
+
+        for memory in &success_memories {
+            if let Some(skill_id_str) = memory.pattern.strip_prefix("skill:") {
+                let skill_id = SkillId(skill_id_str.to_string());
+                if let Some(candidate) = candidates.iter_mut().find(|c| c.id == skill_id) {
+                    // 时效衰减：7天半衰期
+                    let age_days = (now - memory.last_seen).max(0) as f64 / 86400.0;
+                    let recency_weight = (-age_days / 7.0_f64).exp();
+                    // 频率权重（对数压制，避免极端累积）
+                    let freq_weight = (1.0 + memory.frequency as f64).ln() / 5.0;
+                    let boost = 0.2 * memory.confidence * recency_weight * freq_weight.min(1.0);
+                    candidate.confidence = (candidate.confidence + boost).min(1.0);
+                }
+            }
+        }
+
+        // 2. 失败惩罚（fail tag，近期失败降低置信度）
+        let fail_memories = palace.behavior.search(&[
+            "skill".to_string(), "fail".to_string()
+        ]).await;
+
+        for memory in &fail_memories {
+            if let Some(skill_id_str) = memory.pattern.strip_prefix("skill:") {
+                let skill_id = SkillId(skill_id_str.to_string());
+                if let Some(candidate) = candidates.iter_mut().find(|c| c.id == skill_id) {
+                    // 近期失败惩罚（24h内的失败权重更重）
+                    let age_hours = (now - memory.last_seen).max(0) as f64 / 3600.0;
+                    let recency_penalty = (-age_hours / 24.0_f64).exp();
+                    let penalty = 0.15 * memory.confidence * recency_penalty;
+                    candidate.confidence = (candidate.confidence - penalty).max(0.0);
+                }
+            }
+        }
+
+        // 3. 域匹配加权（task_kind 与 palace 域标签重叠）
+        if let Some(kind) = task_kind {
+            let domain_memories = palace.behavior.search(&[
+                kind.to_lowercase(), "skill".to_string()
             ]).await;
-            for memory in &skill_memories {
-                // memory.pattern 形如 "skill:search_file"
+            for memory in &domain_memories {
                 if let Some(skill_id_str) = memory.pattern.strip_prefix("skill:") {
                     let skill_id = SkillId(skill_id_str.to_string());
                     if let Some(candidate) = candidates.iter_mut().find(|c| c.id == skill_id) {
-                        // 叠加置信度（max 1.0）
-                        candidate.confidence = (candidate.confidence + 0.2 * memory.confidence).min(1.0);
+                        // 域命中额外加分（比纯频率权重更强的信号）
+                        candidate.confidence = (candidate.confidence + 0.1 * memory.confidence).min(1.0);
                     }
                 }
             }
-            // 重排
-            candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
         }
 
+        // 重排
+        candidates.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal));
         candidates
     }
 
@@ -347,6 +395,84 @@ impl SkillEngine {
         }
 
         self.loaded.write().unwrap().insert(id.clone(), true);
+        Ok(())
+    }
+
+    /// 加载复合 Skill：注册单一 ToolHandle（`skill_{id}`），执行时内部串联所有 steps。
+    ///
+    /// ## 与 load() 的区别
+    /// `load()` 每 step 注册一个虚拟工具，LLM 需多次 tool call 驱动；
+    /// `load_compound()` 整体注册一个工具，由 CompoundSkillExecutor 内部串联，
+    /// 只向 LLM 返回最终聚合结果——大幅节省上下文 token。
+    ///
+    /// ## 引用关系
+    /// - 调用: CoreLoop::load_builtin_skills()（compound == true 时走此路径）
+    /// - executor: CompoundSkillExecutor（Arc 由调用方传入，ToolRegistry 持有）
+    ///
+    /// ## 生命周期
+    /// 随 ToolRegistry 注册，进程级有效；`&mut self` 保证注册期间无并发修改
+    pub async fn load_compound(
+        &mut self,
+        id: &SkillId,
+        registry: &ToolRegistry,
+        executor: std::sync::Arc<dyn crate::tool::ToolExecutor>,
+    ) -> Result<(), String> {
+        if self.loaded.read().unwrap().get(id) == Some(&true) {
+            return Ok(());
+        }
+        let def = self.skills.get(id)
+            .ok_or_else(|| format!("compound skill '{}' not registered", id.0))?
+            .clone();
+
+        // 注册单一工具 — skill_{id}
+        let tool_name = format!("skill_{}", crate::llm::tool_view::sanitize_name(&id.0));
+        let tool_id = ToolId(tool_name.clone());
+
+        // 从所有 steps 聚合参数 key（供 description 展示，不生成 JSON Schema 约束）
+        let param_keys: std::collections::HashSet<String> = def.workflow.iter()
+            .filter_map(|s| {
+                if let serde_json::Value::Object(map) = &s.params {
+                    Some(map.keys().cloned().collect::<Vec<_>>())
+                } else { None }
+            })
+            .flatten()
+            .collect();
+        let params_desc = {
+            let mut keys: Vec<String> = param_keys.into_iter().collect();
+            keys.sort();
+            keys.join(", ")
+        };
+
+        let handle = abacus_types::ToolHandle {
+            id: tool_id.clone(),
+            schema: abacus_types::ToolSchema {
+                name: tool_name.clone(),
+                description: format!("{} [compound skill: {}; params: {}]", def.prompt, id.0, params_desc),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": true
+                }),
+                returns: None,
+                security: None,
+                cost: None,
+                examples: Vec::new(),
+                applicable_task_kinds: None,
+                idempotent: false,
+            },
+            provider: abacus_types::ToolProvider::Skill { skill_id: id.0.clone() },
+            state: abacus_types::ToolState::Loaded,
+            effectiveness: abacus_types::ToolEffectiveness::default(),
+        };
+
+        registry.register(handle).await;
+        registry.register_executor(tool_id.clone(), executor).await;
+
+        // 更新 name_map（compound skill 映射到 (skill_id, "compound")）
+        self.name_map.write().unwrap()
+            .insert(tool_name, (id.clone(), "compound".to_string()));
+
+        *self.loaded.write().unwrap().entry(id.clone()).or_insert(false) = true;
         Ok(())
     }
 
@@ -529,6 +655,181 @@ impl crate::tool::ToolExecutor for SkillExecutor {
         }
 
         Ok(output.output)
+    }
+}
+
+// ─── CompoundSkillExecutor ─────────────────────────────────────────────────
+//
+// 复合 Skill 执行器：一次 tool call 内部串联所有 steps，只向 LLM 返回最终聚合结果。
+//
+// ## 上下文管理
+// 所有中间 step 的结果在执行器内部传递，不进入 session.messages。
+// LLM 只看到 1 条聚合输出，相较于 SkillExecutor（每 step 一条）大幅节省上下文 token。
+//
+// ## 与 SkillExecutor 的分工
+// SkillExecutor: 每次调用对应一个 step（LLM 多次驱动）
+// CompoundSkillExecutor: 一次调用运行所有 steps（执行器内部驱动）
+//
+// ## 引用关系
+// - 创建：CoreLoop::load_builtin_skills()（compound == true 时）
+// - 注册：SkillEngine::load_compound() → ToolRegistry
+// - 持有：Weak<RwLock<SkillEngine>> + Weak<ToolRegistry> 避免循环引用
+// - 销毁：随 ToolRegistry drop；Weak 升级失败时返回错误
+pub struct CompoundSkillExecutor {
+    /// 反查 SkillDef 用
+    engine: std::sync::Weak<tokio::sync::RwLock<SkillEngine>>,
+    /// dispatch 底层工具用
+    registry: std::sync::Weak<crate::tool::ToolRegistry>,
+    /// BehaviorPalace 弱引用，执行后写入成功/失败记录
+    ///
+    /// 引用: DualPalaceMemory（Arc 弱化避免 CoreLoop ↔ CompoundSkillExecutor 循环）
+    /// 生命周期: CoreLoop 持有 strong Arc; Executor 持有 Weak，升级失败时静默跳过写入
+    palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>,
+}
+
+impl CompoundSkillExecutor {
+    /// 创建 CompoundSkillExecutor
+    ///
+    /// palace 参数：CoreLoop 在 with_memory() 后注入；初始阶段可传 Weak::new() 占位
+    pub fn new(
+        engine: std::sync::Weak<tokio::sync::RwLock<SkillEngine>>,
+        registry: std::sync::Weak<crate::tool::ToolRegistry>,
+        palace: std::sync::Weak<crate::memory_palace::DualPalaceMemory>,
+    ) -> Self {
+        Self { engine, registry, palace }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tool::ToolExecutor for CompoundSkillExecutor {
+    async fn execute(
+        &self,
+        tool_id: &ToolId,
+        params: serde_json::Value,
+        ctx: &crate::tool::ExecutionContext,
+    ) -> abacus_types::Result<serde_json::Value> {
+        use abacus_types::KernelError;
+
+        let engine_arc = self.engine.upgrade()
+            .ok_or_else(|| KernelError::Other("SkillEngine dropped".into()))?;
+        let registry_arc = self.registry.upgrade()
+            .ok_or_else(|| KernelError::Other("ToolRegistry dropped".into()))?;
+
+        // 从 name_map 反查 skill_id（compound 映射到 "compound" 占位符）
+        let skill_id = {
+            let eng = engine_arc.read().await;
+            let result = eng.name_map.read().unwrap()
+                .get(&tool_id.0)
+                .map(|(sid, _)| sid.clone());
+            result.ok_or_else(|| KernelError::Other(
+                format!("CompoundSkillExecutor: tool_id '{}' not in name_map", tool_id.0)
+            ))?
+        };
+
+        let def = {
+            let eng = engine_arc.read().await;
+            eng.skills.get(&skill_id).cloned()
+                .ok_or_else(|| KernelError::Other(
+                    format!("compound skill def not found: {}", skill_id.0)
+                ))?
+        };
+
+        // 初始化步骤间共享 context（params 作为基础模板变量）
+        let mut step_context = params.clone();
+        let mut last_output = serde_json::Value::Null;
+        let mut steps_run = 0u32;
+        let mut steps_ok = 0u32;
+
+        // 串联执行所有 steps（内部驱动，不经过 LLM）
+        'steps: for step in &def.workflow {
+            // 简单条件检查：支持 "xxx != null" 模式
+            if let Some(cond) = &step.condition {
+                if let Some(var) = cond.strip_suffix(" != null").map(|s| s.trim()) {
+                    if step_context.get(var).map(|v| v.is_null()).unwrap_or(true) {
+                        continue 'steps; // 跳过该 step
+                    }
+                }
+            }
+
+            // 防递归：禁止 compound skill step 嵌套 skill 工具
+            let real_tool_id = ToolId(step.tool.clone());
+            if real_tool_id.0.starts_with("skill_") {
+                tracing::warn!(
+                    "CompoundSkillExecutor: skip nested skill tool '{}' in step '{}'",
+                    real_tool_id.0, step.id
+                );
+                continue 'steps;
+            }
+
+            // 执行底层工具（直接调用 ToolRegistry，不经过 LLM）
+            let output = registry_arc.execute(&real_tool_id, step_context.clone(), ctx).await;
+            steps_run += 1;
+
+            match output {
+                Ok(tool_out) if tool_out.success => {
+                    steps_ok += 1;
+                    last_output = tool_out.output.clone();
+                    // 把这个 step 的输出合并到 step_context（供后续 step 使用）
+                    if let serde_json::Value::Object(map) = &tool_out.output {
+                        if let serde_json::Value::Object(ctx_map) = &mut step_context {
+                            for (k, v) in map {
+                                ctx_map.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    // 同时以 step.id 为 key 保存该 step 结果（供条件表达式引用）
+                    if let serde_json::Value::Object(ctx_map) = &mut step_context {
+                        ctx_map.insert(step.id.clone(), tool_out.output);
+                    }
+                }
+                Ok(tool_out) => {
+                    // step 失败：有 fallback 则取 fallback step 的结果继续
+                    if let Some(fallback_id) = &step.fallback {
+                        if let Some(fb_val) = step_context.get(fallback_id.as_str()) {
+                            last_output = fb_val.clone();
+                        }
+                    } else if step.condition.is_none() {
+                        // 无条件的必须步骤失败，记录并终止
+                        tracing::warn!(
+                            "CompoundSkillExecutor: required step '{}' failed: {}",
+                            step.id, tool_out.output
+                        );
+                        break 'steps;
+                    }
+                }
+                Err(e) => {
+                    if step.fallback.is_none() && step.condition.is_none() {
+                        tracing::warn!(
+                            "CompoundSkillExecutor: required step '{}' error: {}", step.id, e
+                        );
+                        break 'steps;
+                    }
+                }
+            }
+        }
+
+        // palace 写入（成功/失败记录）
+        let success = steps_ok > 0;
+        if let Some(palace) = self.palace.upgrade() {
+            let skill_tag = skill_id.0.clone();
+            tokio::spawn(async move {
+                let tags: Vec<String> = vec![
+                    skill_tag.clone(),
+                    "skill".into(),
+                    if success { "success".into() } else { "fail".into() },
+                ];
+                palace.record_interaction(&format!("skill:{}", skill_tag), &tags).await;
+                palace.record_tool_behavior(&format!("skill:{}", skill_tag), success).await;
+            });
+        }
+
+        // 返回聚合结果（1 条 tool_output，不进入 session.messages 中间步骤）
+        Ok(serde_json::json!({
+            "skill": skill_id.0,
+            "steps_run": steps_run,
+            "steps_ok": steps_ok,
+            "result": last_output,
+        }))
     }
 }
 

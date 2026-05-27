@@ -74,6 +74,7 @@ fn skill_search_file() -> SkillDef {
         prompt: "用于在文件系统中按名称或内容查找文件，三阶段：glob 发现 → 内容定位 → 读取".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["file_search".into(), "fs".into(), "discovery".into()],
+        compound: true,
     }
 }
 
@@ -122,6 +123,7 @@ fn skill_search_code() -> SkillDef {
         prompt: "在代码库中定位函数/类/符号，三阶段：文件发现 → 符号 grep → 读取上下文".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["code_search".into(), "fs".into(), "symbol".into()],
+        compound: true,
     }
 }
 
@@ -162,6 +164,7 @@ fn skill_web_research() -> SkillDef {
         prompt: "网络调研：搜索摘要后自动抓取高质量页面正文，适合文档查阅、最新信息检索".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["web".into(), "research".into(), "fetch".into()],
+        compound: true,
     }
 }
 
@@ -202,6 +205,7 @@ fn skill_knowledge() -> SkillDef {
         prompt: "知识库两阶段检索：宽泛语义搜索 → 精化锁定，适合领域知识查阅".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["knowledge".into(), "kb".into(), "semantic".into()],
+        compound: true,
     }
 }
 
@@ -250,6 +254,7 @@ fn skill_data_query() -> SkillDef {
         prompt: "数据库三阶段查询：schema 探查 → count 粗查 → full 精查，避免无效大查询".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["database".into(), "db".into(), "query".into()],
+        compound: true,
     }
 }
 
@@ -298,6 +303,7 @@ fn skill_diagnose() -> SkillDef {
         prompt: "系统错误诊断三阶段：快速状态检查 → 错误模式搜索 → 读取上下文".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["diagnose".into(), "debug".into(), "error".into()],
+        compound: true,
     }
 }
 
@@ -337,5 +343,6 @@ fn skill_config_find() -> SkillDef {
         prompt: "配置文件两阶段：搜索 yaml/toml/json 等配置文件 → 读取内容，适合项目配置查阅".into(),
         knowledge_refs: vec![],
         palace_tags: vec!["config".into(), "settings".into(), "file".into()],
+        compound: true,
     }
 }
