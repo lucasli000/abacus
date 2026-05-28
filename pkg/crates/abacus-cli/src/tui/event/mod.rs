@@ -2232,6 +2232,42 @@ pub fn submit_message(state: &mut AppState) {
         return;
     }
 
+    // 2026-05-28: 确认弹窗文本兜底——用户直接输入中文/英文表达授权意图
+    // 覆盖场景：IME 拦截 Y/N 快捷键、用户习惯打字而非按键
+    if state.confirm_dialog.is_some() {
+        let lower = text.to_lowercase();
+        let is_allow = lower == "y" || lower == "yes" || lower == "ok"
+            || lower.contains("批准") || lower.contains("同意") || lower.contains("允许")
+            || lower.contains("可以") || lower.contains("确认") || lower.contains("继续")
+            || lower.contains("通过") || lower.contains("放行");
+        let is_deny = lower == "n" || lower == "no"
+            || lower.contains("拒绝") || lower.contains("不行") || lower.contains("不可以")
+            || lower.contains("禁止") || lower.contains("取消") || lower.contains("不要")
+            || lower.contains("不允许") || lower.contains("否");
+        if is_allow || is_deny {
+            let dialog = state.confirm_dialog.take().unwrap();
+            let ts = chrono::Local::now().format("%H:%M").to_string();
+            if is_allow {
+                state.add_event(&ts, "session", &format!("✓ 已授权: {}", dialog.action),
+                    crate::tui::state::EventLevel::Notice);
+                state.add_toast("✓ 已授权", Duration::from_secs(2));
+                state.pending_confirmation_response = Some(true);
+            } else {
+                state.add_event(&ts, "session", &format!("✗ 已拒绝: {}", dialog.action),
+                    crate::tui::state::EventLevel::Warning);
+                state.add_toast("✗ 已拒绝", Duration::from_secs(2));
+                state.pending_confirmation_response = Some(false);
+            }
+            state.input.clear();
+            state.cursor_pos = 0;
+            state.cursor_line = 0;
+            state.cursor_col = 0;
+            state.rendered_lines_dirty.set(true);
+            return;
+        }
+        // 如果输入不匹配任何意图词，忽略（保留弹窗）
+    }
+
     // 2026-05-27: Meeting 执行提案确认拦截
     // 当 pending_meeting_execution 存在且未超时时，拦截 Y/n 输入
     if let Some(ref prompt) = state.pending_meeting_execution.clone() {

@@ -1469,11 +1469,12 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "path": {"type": "string", "description": "单文件绝对路径"},
                 "paths": {"type": "array", "items": {"type": "string"}, "description": "批量文件路径(最多20)；与 path 二选一"}
             }), &["path"], false, 64, "10ms", "low"),
+        // 2026-05-28: confirm_required=false — pipeline MCIP sensitive_operations 已覆盖
         schema("fs_write", "创建或覆盖文件",
             json!({
                 "path": {"type":"string", "description": "目标文件绝对路径"},
                 "content": {"type":"string", "description": "写入的完整文件内容"}
-            }), &["path","content"], true, 64, "10ms", "medium"),
+            }), &["path","content"], false, 64, "10ms", "medium"),
         schema("fs_edit", "精确替换文件中的文本段（old_string 必须在文件中唯一匹配）",
             json!({
                 "path": {"type":"string", "description": "文件绝对路径"},
@@ -1484,7 +1485,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             json!({
                 "source": {"type":"string", "description": "源文件/目录绝对路径"},
                 "destination": {"type":"string", "description": "目标绝对路径"}
-            }), &["source","destination"], true, 48, "10ms", "medium"),
+            }), &["source","destination"], false, 48, "10ms", "medium"),
         schema("fs_info", "获取文件或目录元数据（大小/权限/修改时间）",
             json!({"path": {"type":"string", "description": "文件或目录绝对路径"}}),
             &["path"], false, 32, "5ms", "low"),
@@ -1500,7 +1501,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             }), &["path"], false, 32, "5ms", "low"),
         schema("fs_mkdir", "递归创建目录（含所有父目录）",
             json!({"path": {"type":"string", "description": "要创建的目录绝对路径"}}),
-            &["path"], true, 32, "5ms", "low"),
+            &["path"], false, 32, "5ms", "low"),
         schema("web_fetch", "HTTP GET 请求获取网页内容",
             json!({"url": {"type":"string", "description":"完整 URL"},
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"},
