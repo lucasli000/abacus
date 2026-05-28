@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 // ─── Tool System ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ToolId(pub String);
 
 impl From<&str> for ToolId {

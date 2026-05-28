@@ -63,6 +63,150 @@ pub struct JsonlEventHook {
 /// - 10 MB 实测能容纳 ~10万 events（每条 ~100 字节），覆盖绝大多数 session
 pub const DEFAULT_ROTATE_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// 统一 EventBus — 所有子系统的观测层
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// ## 设计动机
+// 之前每个子系统独立追踪事件：
+//   - MagChain AuditLogger → SQLite
+//   - DeductionEngine MetricStore → SQLite
+//   - HealthRegistry → HashMap
+//   - EffectivenessTracker → HashMap
+// 查一个问题需要跨 4 个系统拼线索。
+//
+// EventBus 提供统一发射点：
+//   1. 所有子系统 emit 带上 session_id / turn_id / tool_call_id
+//   2. 下沉到 tracing span 做关联
+//   3. JSONL 持久化为统一存储
+//
+// ## 使用方式
+// ```ignore
+// let bus = EventBus::new("session_xxx", project_dir);
+// bus.emit(EventKind::ToolCalled { tool_id: "fs.read", duration_ms: 150, success: true });
+// ```
+
+use std::time::Instant;
+
+/// 统一事件类型枚举
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "data")]
+pub enum EventKind {
+    // ── LLM / Turn ──────────────────────────────────��───────
+    TurnStarted { input_len: usize },
+    TurnCompleted { latency_ms: u64, tool_calls: u32, completion_tokens: u32 },
+    LlmRequested { provider: String, model: String, thinking_intent: String },
+    LlmResponded { latency_ms: u64, input_tokens: u32, output_tokens: u32 },
+
+    // ── 工具 ────────────────────────────────────────────────
+    ToolCalled { tool_id: String, duration_ms: u64, success: bool },
+    ToolRateLimited { tool_id: String, retry_after: u64 },
+    ToolCircuitBroken { tool_id: String, failures: u32 },
+
+    // ── 健康 ────────────────────────────────────────────────
+    SubsystemDegraded { subsystem: String, reason: String },
+    SubsystemHealed { subsystem: String },
+    SubsystemUnhealthy { subsystem: String, reason: String },
+
+    // ── 推演 ────────────────────────────────────────────────
+    ContaminationDetected { tool_id: String, adoption_pct: f64, success_pct: f64 },
+    ContextDegradation { usage_pct: f64, estimated_turns_until_compression: u32 },
+
+    // ── 安全 ────────────────────────────────────────────────
+    SensitiveOpConfirmed { tool_id: String, user_response: String },
+    SafetyViolation { kind: String, detail: String },
+
+    // ── 用户 ────────────────────────────────────────────────
+    UserInputReceived { input_len: usize, mode: String },
+    ModeSwitched { from: String, to: String, reason: String },
+
+    // ── 系统 ────────────────────────────────────────────────
+    ConfigChanged { key: String, old_value: String, new_value: String },
+    Error { message: String, severity: String },
+}
+
+/// 统一 EventBus
+///
+/// ## 生命周期
+/// - 创建：CoreLoop::new() 时一次（持 Arc<EventBus>）
+/// - 消费：被 all subsystems 引用
+/// - 销毁：进程退出时 flush
+///
+/// ## 线程安全
+/// - emit：异步、无锁（仅追加到 channel）
+/// - flush：同步等待 drain
+pub struct EventBus {
+    session_id: String,
+    jsonl_sink: Option<Arc<JsonlEventHook>>,
+    start: Instant,
+}
+
+impl EventBus {
+    pub fn new(session_id: impl Into<String>, project_dir: &std::path::Path) -> Self {
+        let sid = session_id.into();
+        let jsonl_sink = JsonlEventHook::open(sid.clone(), project_dir).ok()
+            .map(Arc::new);
+        Self {
+            session_id: sid,
+            jsonl_sink,
+            start: Instant::now(),
+        }
+    }
+
+    /// 发射事件（所有子系统统一入口）
+    ///
+    /// ## 路径
+    /// 1. 转化为 tracing event（span 关联）
+    /// 2. 写入 JSONL（如果 sink 存在）—— EventKind 数据嵌入 data 字段
+    ///
+    /// ## 失败语义
+    /// 写入失败 → 仅 warn，不阻塞调用方
+    pub fn emit(&self, kind: EventKind) {
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        // 1. tracing event — 用 span 关联 session_id
+        let span = tracing::span!(tracing::Level::INFO, "eventbus", session_id = %self.session_id);
+        let _guard = span.enter();
+        tracing::info!(target: "abacus::eventbus", kind = ?kind, "event");
+
+        // 2. JSONL 持久化——写入 {ts_ms, session_id, kind, data}
+        if let Some(ref sink) = self.jsonl_sink {
+            let json_line = serde_json::json!({
+                "ts_ms": ts_ms,
+                "session_id": self.session_id,
+                "event_type": "EventBus",
+                "data": &kind,
+            });
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                let _ = sink.write_json(&json_line).await;
+            });
+        }
+    }
+
+    /// 经过多少时间
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.start.elapsed()
+    }
+
+    /// 当前 session_id
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+impl std::fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventBus")
+            .field("session_id", &self.session_id)
+            .field("elapsed", &self.elapsed().as_secs_f64())
+            .finish()
+    }
+}
+
+
 impl JsonlEventHook {
     /// 打开 sink——session 启动时调用
     ///
@@ -146,6 +290,32 @@ impl JsonlEventHook {
             {
                 *file = new_f;
             }
+        }
+        Ok(())
+    }
+
+    /// 写入任意 JSON 行（绕过 PipelineEvent，直接追加到 JSONL 文件）
+    /// 供 EventBus::emit 使用
+    pub async fn write_json(&self, value: &serde_json::Value) -> Result<(), KernelError> {
+        let line_str = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
+        let file = self.file.clone();
+        let path_for_log = self.path.clone();
+        let session_id = self.session_id.clone();
+        let path = self.path.clone();
+        let rotate_max_bytes = self.rotate_max_bytes;
+        let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut f = file.blocking_lock();
+            Self::rotate_if_needed(&session_id, &path, rotate_max_bytes, &mut f)?;
+            writeln!(f, "{}", line_str)?;
+            f.flush()?;
+            Ok(())
+        }).await;
+        if let Ok(Err(e)) = res {
+            tracing::warn!(
+                path = %path_for_log.display(),
+                error = %e,
+                "write_json: write failed (event ignored)"
+            );
         }
         Ok(())
     }

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+use crate::core::event_sink::{EventBus, EventKind};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum HealthState {
     Healthy,
@@ -32,6 +34,8 @@ pub struct HealthRegistry {
     probes: RwLock<Vec<Arc<dyn HealthProbe>>>,
     states: RwLock<HashMap<String, HealthState>>,
     pending_warnings: RwLock<Vec<String>>,
+    /// 统一 EventBus 引用（可选）
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl Default for HealthRegistry {
@@ -46,13 +50,36 @@ impl HealthRegistry {
             probes: RwLock::new(Vec::new()),
             states: RwLock::new(HashMap::new()),
             pending_warnings: RwLock::new(Vec::new()),
+            event_bus: None,
         }
+    }
+
+    /// 绑定 EventBus（推荐——让状态变更事件进入统一观测层）
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     pub async fn register(&self, probe: Arc<dyn HealthProbe>) {
         let state = probe.check().await;
-        self.states.write().await.insert(probe.subsystem().to_string(), state);
+        let subsystem = probe.subsystem().to_string();
+        self.states.write().await.insert(subsystem.clone(), state.clone());
         self.probes.write().await.push(probe);
+        // 通过 EventBus 通知初始状态
+        if let Some(ref bus) = self.event_bus {
+            let kind = match &state {
+                HealthState::Degraded { reason, .. } => EventKind::SubsystemDegraded {
+                    subsystem: subsystem.clone(),
+                    reason: reason.clone(),
+                },
+                HealthState::Unhealthy { reason, .. } => EventKind::SubsystemUnhealthy {
+                    subsystem: subsystem.clone(),
+                    reason: reason.clone(),
+                },
+                HealthState::Healthy => return, // 健康初始状态无需通知
+            };
+            bus.emit(kind);
+        }
     }
 
     /// Called each turn. Checks probes, attempts healing, returns warnings.
@@ -69,6 +96,21 @@ impl HealthRegistry {
                 } else {
                     new_state
                 };
+                // 通过 EventBus 发送状态变更
+                if let Some(ref bus) = self.event_bus {
+                    let kind = match &final_state {
+                        HealthState::Degraded { reason, .. } => EventKind::SubsystemDegraded {
+                            subsystem: subsystem.clone(), reason: reason.clone(),
+                        },
+                        HealthState::Unhealthy { reason, .. } => EventKind::SubsystemUnhealthy {
+                            subsystem: subsystem.clone(), reason: reason.clone(),
+                        },
+                        HealthState::Healthy => EventKind::SubsystemHealed {
+                            subsystem: subsystem.clone(),
+                        },
+                    };
+                    bus.emit(kind);
+                }
                 if let Some(msg) = probe.user_message(&final_state) {
                     warnings.push(msg.clone());
                     self.pending_warnings.write().await.push(msg);

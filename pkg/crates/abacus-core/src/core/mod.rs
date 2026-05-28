@@ -1009,66 +1009,12 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(session_id: impl Into<String>) -> Self {
-        let gate = ProgressiveGate::from_autonomy(AutonomyLevel::default());
-        let progressive = ProgressiveController::new(gate, AutonomyLevel::default(), None);
-        Self {
-            session_id: session_id.into(),
-            messages: Arc::new(RwLock::new(Vec::new())),
-            context_messages: Arc::new(RwLock::new(Vec::new())),
-            turn_count: 0,
-            expert_bound: None,
-            metadata: HashMap::new(),
-            filengine_session: Arc::new(RwLock::new(FilengineSession::new())),
-            interaction_map: Arc::new(RwLock::new(InteractionMap::new())),
-            user_role: UserRole::default(),
-            progressive: Arc::new(RwLock::new(progressive)),
-            session_focus: Arc::new(RwLock::new(None)),
-            mcip_grants: std::sync::RwLock::new(std::collections::HashSet::new()),
-            mcip_confirm_channels: std::sync::Mutex::new(std::collections::HashMap::new()),
-            // Phase 2：session-sticky task_kind 锁定 — 初始 None 表示"首轮还没决定"
-            task_kind_locked: Arc::new(RwLock::new(None)),
-            // B 方案：session-sticky thinking — 初始 None 表示"首轮还没决定"
-            thinking_decision: Arc::new(RwLock::new(None)),
-            // Task #96：初始无升级
-            escalation_count: std::sync::atomic::AtomicU32::new(0),
-            escalated_model: Arc::new(RwLock::new(None)),
-            // Task #95：初始空 cache 统计
-            cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
-            // Mid-turn signal：初始为空（用户工具循环期间注入消息的缓冲区）
-            mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
-            // Role 能力：从 ~/.abacus/roles/default.toml 加载，文件不存在时用 default()
-            role_caps: Arc::new(load_role_caps()),
-        }
+        Self::build(session_id, AutonomyLevel::default(), None)
     }
 
     /// Create session with custom autonomy level
     pub fn new_with_autonomy(session_id: impl Into<String>, autonomy: AutonomyLevel) -> Self {
-        let gate = ProgressiveGate::from_autonomy(autonomy);
-        let progressive = ProgressiveController::new(gate, autonomy, None);
-        Self {
-            session_id: session_id.into(),
-            messages: Arc::new(RwLock::new(Vec::new())),
-            context_messages: Arc::new(RwLock::new(Vec::new())),
-            turn_count: 0,
-            expert_bound: None,
-            metadata: HashMap::new(),
-            filengine_session: Arc::new(RwLock::new(FilengineSession::new())),
-            interaction_map: Arc::new(RwLock::new(InteractionMap::new())),
-            user_role: UserRole::default(),
-            progressive: Arc::new(RwLock::new(progressive)),
-            session_focus: Arc::new(RwLock::new(None)),
-            mcip_grants: std::sync::RwLock::new(std::collections::HashSet::new()),
-            mcip_confirm_channels: std::sync::Mutex::new(std::collections::HashMap::new()),
-            // Phase 2：session-sticky task_kind 锁定 — 初始 None 表示"首轮还没决定"
-            task_kind_locked: Arc::new(RwLock::new(None)),
-            // B 方案：session-sticky thinking — 初始 None 表示"首轮还没决定"
-            thinking_decision: Arc::new(RwLock::new(None)),
-            escalation_count: std::sync::atomic::AtomicU32::new(0),
-            escalated_model: Arc::new(RwLock::new(None)),
-            cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
-            mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
-            role_caps: Arc::new(load_role_caps()),
-        }
+        Self::build(session_id, autonomy, None)
     }
 
     /// Create session with custom GateConfig（R1: 配置孤岛修复入口）
@@ -1077,8 +1023,20 @@ impl SessionState {
     /// 从 ConfigManager 读取配置后构造 GateConfig，传入此方法。
     /// Server 初始化时使用，替代 `new()` 的硬编码默认值。
     pub fn new_with_gate_config(session_id: impl Into<String>, gate_config: crate::core::progressive_gate::GateConfig) -> Self {
-        let autonomy = AutonomyLevel::default();
-        let gate = ProgressiveGate::new(gate_config);
+        Self::build(session_id, AutonomyLevel::default(), Some(gate_config))
+    }
+
+    /// 2026-05-28: DRY — 三个构造器统一内部实现
+    /// 差异仅在 ProgressiveGate 初始化方式（autonomy vs gate_config）
+    fn build(
+        session_id: impl Into<String>,
+        autonomy: AutonomyLevel,
+        gate_config: Option<crate::core::progressive_gate::GateConfig>,
+    ) -> Self {
+        let gate = match gate_config {
+            Some(cfg) => ProgressiveGate::new(cfg),
+            None => ProgressiveGate::from_autonomy(autonomy),
+        };
         let progressive = ProgressiveController::new(gate, autonomy, None);
         Self {
             session_id: session_id.into(),
@@ -1094,9 +1052,7 @@ impl SessionState {
             session_focus: Arc::new(RwLock::new(None)),
             mcip_grants: std::sync::RwLock::new(std::collections::HashSet::new()),
             mcip_confirm_channels: std::sync::Mutex::new(std::collections::HashMap::new()),
-            // Phase 2：session-sticky task_kind 锁定 — 初始 None 表示"首轮还没决定"
             task_kind_locked: Arc::new(RwLock::new(None)),
-            // B 方案：session-sticky thinking — 初始 None 表示"首轮还没决定"
             thinking_decision: Arc::new(RwLock::new(None)),
             escalation_count: std::sync::atomic::AtomicU32::new(0),
             escalated_model: Arc::new(RwLock::new(None)),
@@ -1303,7 +1259,7 @@ pub struct CoreLoop {
     ///
     /// 用于 build_tool_definitions_for 按频率修剪。0 = 从未调用。
     /// 由 pipeline 在每次工具成功后通过 `record_tool_invocation()` 写入。
-    pub(crate) tool_last_invoked: Arc<RwLock<HashMap<ToolId, u64>>>,
+    pub(crate) tool_last_invoked: Arc<RwLock<std::collections::BTreeMap<ToolId, u64>>>,
 
     /// W2 (Task #100): Tool result dedup 池
     ///
@@ -1597,7 +1553,7 @@ impl CoreLoop {
         crate::tool::builtin::config::register_executors(
             &registry, runtime_overrides.clone(), config.clone(),
         ).await;
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(HashMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()) };
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()) };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
