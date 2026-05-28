@@ -1776,7 +1776,7 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
             let end = lines.len().saturating_sub(state.timeline_scroll_offset);
             let start = end.saturating_sub(vis);
             lines = lines[start..end].to_vec();
-            if state.timeline_scroll_offset > 0 {
+            if state.timeline_scroll_offset > 0 && !lines.is_empty() {
                 lines[0] = Line::styled(format!(" ↑ {} 更新", state.timeline_scroll_offset), dim);
             }
         }
