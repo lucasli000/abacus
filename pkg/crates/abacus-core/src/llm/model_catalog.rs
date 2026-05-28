@@ -282,6 +282,53 @@ impl ModelCatalog {
         Ok(count)
     }
 
+    /// 从 ProviderEntry 的 ModelEntry 合并模型参数到 catalog
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs 注册 provider 时
+    /// - 读取: per-model 参数覆盖 ModelCatalog 内置默认值
+    pub fn merge_model_entry(&mut self, entry: &abacus_types::ModelEntry) {
+        let id = ModelId(entry.name.clone());
+        let mut spec = self.lookup(&id)
+            .map(|arc| (*arc).clone())
+            .unwrap_or_default();
+
+        if let Some(cw) = entry.context_window {
+            spec.context_window = cw as usize;
+        }
+        if let Some(mt) = entry.max_tokens {
+            spec.max_output_tokens = mt;
+        }
+        // thinking: 将字符串转为 ThinkingCapabilities
+        // off → 清空 supported_modes; adaptive/low/medium/high/max → 设置对应模式
+        if let Some(ref thinking_str) = entry.thinking {
+            use abacus_types::{ThinkingModeKind, ThinkingCapabilities, MultiTurnReplay, EffortLevel};
+            match thinking_str.as_str() {
+                "off" => {
+                    spec.thinking_capabilities = ThinkingCapabilities::default();
+                }
+                "adaptive" => {
+                    spec.thinking_capabilities.supported_modes = vec![ThinkingModeKind::AdaptiveEffort];
+                }
+                level @ ("low" | "medium" | "high" | "max" | "xhigh") => {
+                    spec.thinking_capabilities.supported_modes = vec![ThinkingModeKind::ExtendedBudget];
+                    let eff = match level {
+                        "low" => EffortLevel::Low,
+                        "medium" => EffortLevel::Medium,
+                        "high" => EffortLevel::High,
+                        _ => EffortLevel::XHigh,
+                    };
+                    // 保持 Low → Medium → High → XHigh 顺序，去重
+                    let mut levels = vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High];
+                    if !levels.contains(&eff) { levels.push(eff); }
+                    spec.thinking_capabilities.effort_levels = levels;
+                }
+                _ => {} // 未知值忽略
+            }
+        }
+        self.specs.insert(id, Arc::new(spec));
+    }
+
     /// 已注册模型数（不区分内置 vs 覆盖）
     pub fn len(&self) -> usize { self.specs.len() }
     pub fn is_empty(&self) -> bool { self.specs.is_empty() }

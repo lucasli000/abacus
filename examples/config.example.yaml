@@ -1,0 +1,91 @@
+# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║  ABACUS 配置文件 (config.yaml)                                              ║
+# ╠═══════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                             ║
+# ║  providers:                   # 供应商列表（按优先级排序）                   ║
+# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
+# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
+# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
+# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
+# ║      models:                  # 模型列表（简写或详写）                       ║
+# ║        - model-name           # 简写：用 provider 默认参数                   ║
+# ║        - name: model-name     # 详写：覆盖默认参数（未指定字段用默认值）     ║
+# ║          context_window: N    #   上下文窗口（token 数）                     ║
+# ║          max_tokens: N        #   单次最大输出 token                         ║
+# ║          temperature: 0.0-2.0 #   生成温度                                  ║
+# ║          thinking: off|adaptive|low|medium|high|max                         ║
+# ║          top_p: 0.0-1.0      #   核采样                                     ║
+# ║                                                                             ║
+# ║  core:                        # 全局运行参数                                 ║
+# ║    default_model: <model>     # 默认模型                                    ║
+# ║    stream: true               # 流式输出                                    ║
+# ║                                                                             ║
+# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
+# ║                                                                             ║
+# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
+# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
+# ║                                                                             ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
+providers:
+  # DeepSeek（官方 API）
+  - id: deepseek
+    type: deepseek
+    api_key: env:DEEPSEEK_API_KEY        # 从环境变量读取
+    base_url: https://api.deepseek.com
+    models:
+      - name: deepseek-v4-flash
+        context_window: 128000
+        max_tokens: 64000
+        thinking: adaptive
+
+      - name: deepseek-v4-pro
+        context_window: 128000
+        max_tokens: 64000
+        thinking: high
+
+  # Anthropic Claude
+  - id: anthropic
+    type: anthropic
+    api_key: env:ANTHROPIC_API_KEY
+    models:
+      - name: claude-sonnet-4
+        context_window: 200000
+        max_tokens: 32000
+        thinking: adaptive
+
+      - name: claude-opus-4
+        context_window: 200000
+        max_tokens: 32000
+        thinking: high
+        temperature: 0.5
+
+  # OpenRouter（多模型聚合平台）
+  - id: openrouter
+    type: openai-compatible
+    api_key: env:OPENROUTER_API_KEY
+    base_url: https://openrouter.ai/api/v1
+    models:
+      - meta-llama/llama-4-scout        # 简写：用默认参数
+      - google/gemini-2.5-pro
+
+  # 本地 Ollama（无需 API key）
+  - id: local
+    type: openai-compatible
+    base_url: http://localhost:11434/v1
+    api_key: ollama
+    models:
+      - llama3:latest
+      - codestral:latest
+
+# ─── 全局设置 ───────────────────────────────────────────────────────────────────
+core:
+  default_model: deepseek-v4-pro
+  stream: true
+  context_window: 128000
+  context_window_ratio: 1.0
+
+# ─── 回退链（可选）──────────────────────────────────────────────────────────────
+# provider 不可达时按顺序尝试下一个
+fallback_chain: [deepseek, anthropic, openrouter]

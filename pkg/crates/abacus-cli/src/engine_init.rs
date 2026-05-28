@@ -179,6 +179,13 @@ pub async fn create_engine(
         Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
         Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
     }
+    // 2026-05-28: 从 providers[].models[] per-model 参数合并到 catalog
+    let provider_entries_for_catalog = cfg_mgr.parse_providers();
+    for entry in &provider_entries_for_catalog {
+        for model_entry in &entry.models {
+            catalog.merge_model_entry(model_entry);
+        }
+    }
     let model_catalog = Some(std::sync::Arc::new(catalog));
 
     let config = CoreConfig {
@@ -295,7 +302,7 @@ pub async fn create_engine(
         for entry in &provider_entries {
             let api_key = entry.api_key.clone().unwrap_or_default();
             let models: Vec<ModelId> = entry.models.iter()
-                .map(|m| ModelId(m.clone())).collect();
+                .map(|m| ModelId(m.name.clone())).collect();
 
             match entry.provider_type {
                 ProviderType::Anthropic => {

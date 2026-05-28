@@ -367,59 +367,60 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         None    => String::new(),
     };
 
-    // 高级配置注释块——用户取消注释即可自定义，无需重新跑向导
-    let advanced_comment = r#"
-# ── 高级配置（取消注释即生效，向导不会覆盖此区域） ─────────────────────
-#
-# llm:
-#   temperature: 0.6          # 生成温度（0.0-2.0）
-#   max_tokens: 8192          # 单次最大输出 token
-#   top_p: 0.95
-#   # 第二提供商（同时配置多个，按需切换）：
-#   openai_base_url: ""
-#   openai_api_key: ""
-#   anthropic_api_key: ""
-#   anthropic_base_url: ""
-#
-# core:
-#   thinking: off             # off / adaptive / low / medium / high / max
-#   max_turns: 25             # 单会话最大轮次
-#   max_tool_calls: 8         # 单轮最大工具调用次数
-#   stream: true
-#
-# 完整配置文档：abacus config --list
-"#;
-
-    let yaml = if provider.is_openai_compatible() {
-        format!(
-            r#"# Abacus 配置（由 TUI 首次配置向导生成）
-llm:
-  api_key: "{}"
-  base_url: "{}"
-
-core:
-  default_model: "{}"
-  stream: true
-{}  context_window_ratio: {:.4}
-{}"#,
-            api_key_e, base_url, resolved_model, cw_line, cw_ratio, advanced_comment,
-        )
+    // 2026-05-28: 新格式 — providers 数组 + 固化配置指引头部
+    let provider_type_str = if provider.is_openai_compatible() {
+        if base_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
     } else {
-        // Anthropic: write provider-specific keys
-        format!(
-            r#"# Abacus 配置（由 TUI 首次配置向导生成）
-llm:
-  anthropic_api_key: "{}"
-  anthropic_base_url: "{}"
+        "anthropic"
+    };
 
+    let yaml = format!(
+        r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
+# ║  ABACUS 配置文件 (config.yaml)                                              ║
+# ╠═══════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                             ║
+# ║  providers:                   # 供应商列表（按优先级排序）                   ║
+# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
+# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
+# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
+# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
+# ║      models:                  # 模型列表（简写或详写）                       ║
+# ║        - model-name           # 简写：用 provider 默认参数                   ║
+# ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║
+# ║          context_window: N    #   上下文窗口（token 数）                     ║
+# ║          max_tokens: N        #   单次最大输出 token                         ║
+# ║          temperature: 0.0-2.0 #   生成温度                                  ║
+# ║          thinking: off|adaptive|low|medium|high|max                         ║
+# ║                                                                             ║
+# ║  core:                        # 全局运行参数                                 ║
+# ║    default_model: <model>     # 默认模型                                    ║
+# ║    stream: true               # 流式输出                                    ║
+# ║                                                                             ║
+# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
+# ║                                                                             ║
+# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
+# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
+# ║                                                                             ║
+# ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
+providers:
+  - id: primary
+    type: {}
+    api_key: "{}"
+    base_url: "{}"
+    models:
+      - {}
+
+# ─── 全局设置 ───────────────────────────────────────────────────────────────────
 core:
   default_model: "{}"
   stream: true
 {}  context_window_ratio: {:.4}
-{}"#,
-            api_key_e, base_url, resolved_model, cw_line, cw_ratio, advanced_comment,
-        )
-    };
+"#,
+        provider_type_str, api_key_e, base_url, resolved_model,
+        resolved_model, cw_line, cw_ratio,
+    );
 
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;

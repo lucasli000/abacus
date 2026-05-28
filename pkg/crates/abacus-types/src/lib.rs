@@ -203,6 +203,7 @@ pub use engine::{
     // Multi-provider configuration
     ProviderEntry,
     ProviderType,
+    ModelEntry,
 };
 
 // sandbox re-exports

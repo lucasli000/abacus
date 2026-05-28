@@ -416,8 +416,95 @@ pub struct ProviderEntry {
     #[serde(default)]
     pub base_url: Option<String>,
     /// 该 provider 下可用的模型列表
+    /// 支持两种格式：
+    /// - 简写: ["model-a", "model-b"]（纯字符串，用 ModelCatalog 默认参数）
+    /// - 详写: [{name: "model-a", max_tokens: 8192, ...}]（对象，覆盖默认参数）
+    #[serde(default, deserialize_with = "deserialize_model_entries")]
+    pub models: Vec<ModelEntry>,
+}
+
+/// 单个模型配置（provider 内的 per-model 参数）
+///
+/// ## 引用关系
+/// - 生产者: config.yaml providers[].models[] 解析
+/// - 消费者: engine_init → ModelCatalog.register_override()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// 模型 ID（必填）
+    pub name: String,
+    /// 上下文窗口大小（覆盖 ModelCatalog 默认值）
     #[serde(default)]
-    pub models: Vec<String>,
+    pub context_window: Option<u64>,
+    /// 单次最大输出 token
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// 生成温度 0.0-2.0
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// 思考模式: off / adaptive / low / medium / high / max
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Top-p 核采样
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    /// 是否支持图片输入
+    #[serde(default)]
+    pub supports_images: Option<bool>,
+    /// 是否支持 tool_call
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+}
+
+/// 自定义反序列化：支持 models 字段的两种格式
+/// - 字符串数组: ["model-a", "model-b"] → ModelEntry { name: "model-a", ... }
+/// - 对象数组: [{name: "model-a", max_tokens: 8192}] → 直接解析
+fn deserialize_model_entries<'de, D>(deserializer: D) -> Result<Vec<ModelEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct ModelEntriesVisitor;
+
+    impl<'de> de::Visitor<'de> for ModelEntriesVisitor {
+        type Value = Vec<ModelEntry>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a sequence of strings or model entry objects")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: de::SeqAccess<'de>,
+        {
+            let mut entries = Vec::new();
+            while let Some(item) = seq.next_element::<serde_json::Value>()? {
+                match item {
+                    serde_json::Value::String(name) => {
+                        entries.push(ModelEntry {
+                            name,
+                            context_window: None,
+                            max_tokens: None,
+                            temperature: None,
+                            thinking: None,
+                            top_p: None,
+                            supports_images: None,
+                            supports_tools: None,
+                        });
+                    }
+                    serde_json::Value::Object(_) => {
+                        let entry: ModelEntry = serde_json::from_value(item)
+                            .map_err(de::Error::custom)?;
+                        entries.push(entry);
+                    }
+                    _ => return Err(de::Error::custom("model entry must be string or object")),
+                }
+            }
+            Ok(entries)
+        }
+    }
+
+    deserializer.deserialize_seq(ModelEntriesVisitor)
 }
 
 /// 供应商协议类型
