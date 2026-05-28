@@ -1428,6 +1428,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
     // Right 光标移动（unicode-width 计算 display column）
     if code == KeyCode::Right {
         if state.cursor_pos < state.input.len() {
+            // 光标不在末尾：正常右移一字符
             let rest = &state.input[state.cursor_pos..];
             if let Some(ch) = rest.chars().next() {
                 state.cursor_pos += ch.len_utf8();
@@ -1437,6 +1438,13 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                     state.cursor_col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
                 }
             }
+        } else if let Some(suggestion) = state.inline_suggestion.take() {
+            // 2026-05-28: 光标在末尾 + 有 inline suggestion → 采纳（fish shell 风格）
+            state.input = suggestion;
+            state.cursor_pos = state.input.len();
+            state.recalculate_cursor();
+            state.inline_candidates.clear();
+            state.rendered_lines_dirty.set(true);
         }
         return;
     }
