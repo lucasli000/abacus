@@ -175,9 +175,12 @@ pub async fn send_chat_message(
     message: &str,
     req_ctx: abacus_core::core::RequestContext,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁，请等待上一个请求完成".to_string()),
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.inflight_guard.acquire(),
+    ).await {
+        Ok(Ok(p)) => p,
+        _ => return ApiResult::Err("请求排队超时，请稍后再试".to_string()),
     };
     let _guard = handle.session_swap_lock.read().await;
 
@@ -215,9 +218,12 @@ pub async fn send_chat_message_streaming(
     stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
     req_ctx: abacus_core::core::RequestContext,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁，请等待上一个请求完成".to_string()),
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.inflight_guard.acquire(),
+    ).await {
+        Ok(Ok(p)) => p,
+        _ => return ApiResult::Err("请求排队超时，请稍后再试".to_string()),
     };
     let _guard = handle.session_swap_lock.read().await;
 
@@ -870,9 +876,12 @@ pub async fn send_team_message(
     message: &str,
     stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁，请等待上一个请求完成".to_string()),
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.inflight_guard.acquire(),
+    ).await {
+        Ok(Ok(p)) => p,
+        _ => return ApiResult::Err("请求排队超时，请稍后再试".to_string()),
     };
 
     let cancel = tokio_util::sync::CancellationToken::new();
@@ -1226,9 +1235,12 @@ pub async fn send_meeting_message(
     handle: &EngineHandle,
     message: &str,
 ) -> ApiResult<EngineResponse> {
-    let _permit = match handle.inflight_guard.try_acquire() {
-        Ok(p) => p,
-        Err(_) => return ApiResult::Err("请求过于频繁".to_string()),
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.inflight_guard.acquire(),
+    ).await {
+        Ok(Ok(p)) => p,
+        _ => return ApiResult::Err("请求排队超时，请稍后再试".to_string()),
     };
 
     let work = async {
