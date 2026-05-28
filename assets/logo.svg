@@ -1,76 +1,55 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 280" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 220" fill="none">
   <!--
-    ABACUS LOGO — 1024 encoded
-    Design: Black/white, 3-tier line weights
-    Beads: horizontal rounded rectangles (横置算珠)
-    Frame: continuous closed rectangle (无缺口)
-    Encoding: 千(1) 百(0) 十(2) 个(4)
+    ABACUS LOGO — 1024
+    Beads: wide-flat horizontal capsules (48×10, rx=5)
+    Activated: stroke 2.5px (bold presence)
+    Resting: stroke 0.8px (light)
+    4 rods at x=88, 144, 200, 256 (spacing 56px)
   -->
 
-  <!-- === FRAME — continuous closed border === -->
-  <rect x="60" y="30" width="280" height="190" rx="0" stroke="black" stroke-width="5" fill="white"/>
+  <!-- FRAME -->
+  <rect x="40" y="20" width="280" height="168" rx="0" stroke="black" stroke-width="4" fill="white"/>
 
-  <!-- === BEAM — horizontal divider === -->
-  <rect x="60" y="92" width="280" height="3" fill="black"/>
+  <!-- BEAM -->
+  <rect x="40" y="72" width="280" height="2.5" fill="black"/>
 
-  <!-- === RODS — vertical thin lines (不穿透 frame，仅在内部) === -->
-  <line x1="130" y1="35" x2="130" y2="215" stroke="black" stroke-width="1.2"/>
-  <line x1="200" y1="35" x2="200" y2="215" stroke="black" stroke-width="1.2"/>
-  <line x1="270" y1="35" x2="270" y2="215" stroke="black" stroke-width="1.2"/>
-  <line x1="340" y1="35" x2="340" y2="215" stroke="black" stroke-width="0.6" stroke-dasharray="none" opacity="0.4"/>
+  <!-- RODS -->
+  <line x1="88"  y1="24" x2="88"  y2="184" stroke="black" stroke-width="0.7"/>
+  <line x1="144" y1="24" x2="144" y2="184" stroke="black" stroke-width="0.7"/>
+  <line x1="200" y1="24" x2="200" y2="184" stroke="black" stroke-width="0.7"/>
+  <line x1="256" y1="24" x2="256" y2="184" stroke="black" stroke-width="0.7"/>
 
-  <!-- ═══════════════════════════════════════════ -->
-  <!-- UPPER DECK — 1 bead per rod (天珠, worth 5) -->
-  <!-- All resting (not activated for 1024)        -->
-  <!-- Bead shape: 横置圆角矩形 (wide, short)       -->
-  <!-- ═══════════════════════════════════════════ -->
+  <!-- UPPER DECK — all resting (thin, near top) -->
+  <rect x="64"  y="38" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="120" y="38" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="176" y="38" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="232" y="38" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="0.8"/>
 
-  <!-- Thousands: upper bead resting at top -->
-  <rect x="108" y="48" width="44" height="14" rx="7" fill="none" stroke="black" stroke-width="1.5"/>
-  <!-- Hundreds -->
-  <rect x="178" y="48" width="44" height="14" rx="7" fill="none" stroke="black" stroke-width="1.5"/>
-  <!-- Tens -->
-  <rect x="248" y="48" width="44" height="14" rx="7" fill="none" stroke="black" stroke-width="1.5"/>
-  <!-- Ones -->
-  <rect x="318" y="48" width="44" height="14" rx="7" fill="none" stroke="black" stroke-width="1.5"/>
+  <!-- LOWER DECK -->
+  <!-- Rod 1 (千=1): ● ○ ○ ○ -->
+  <rect x="64"  y="84"  width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="66"  y="108" width="44" height="9"  rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="66"  y="130" width="44" height="9"  rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="66"  y="152" width="44" height="9"  rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
 
-  <!-- ═══════════════════════════════════════════ -->
-  <!-- LOWER DECK — 4 beads per rod (地珠, worth 1) -->
-  <!-- Activated = filled (pushed up to beam)       -->
-  <!-- Resting = outlined (away from beam)          -->
-  <!-- Bead spacing: 26px vertical                  -->
-  <!-- ═══════════════════════════════════════════ -->
+  <!-- Rod 2 (百=0): ○ ○ ○ ○ -->
+  <rect x="122" y="104" width="44" height="9" rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="122" y="126" width="44" height="9" rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="122" y="148" width="44" height="9" rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="122" y="170" width="44" height="9" rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
 
-  <!-- Thousands rod = 1: ■ □ □ □ -->
-  <rect x="108" y="104" width="44" height="14" rx="7" fill="black"/>
-  <rect x="112" y="134" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="112" y="160" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="112" y="186" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
+  <!-- Rod 3 (十=2): ● ● ○ ○ -->
+  <rect x="176" y="84"  width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="176" y="106" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="178" y="132" width="44" height="9"  rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
+  <rect x="178" y="154" width="44" height="9"  rx="4.5" fill="white" stroke="black" stroke-width="0.8"/>
 
-  <!-- Hundreds rod = 0: □ □ □ □ -->
-  <rect x="182" y="130" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="182" y="156" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="182" y="182" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="182" y="200" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="0.8" opacity="0.35"/>
+  <!-- Rod 4 (个=4): ● ● ● ● -->
+  <rect x="232" y="84"  width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="232" y="106" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="232" y="128" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
+  <rect x="232" y="150" width="48" height="10" rx="5" fill="white" stroke="black" stroke-width="2.5"/>
 
-  <!-- Tens rod = 2: ■ ■ □ □ -->
-  <rect x="248" y="104" width="44" height="14" rx="7" fill="black"/>
-  <rect x="248" y="130" width="44" height="14" rx="7" fill="black"/>
-  <rect x="252" y="164" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-  <rect x="252" y="190" width="36" height="12" rx="6" fill="none" stroke="black" stroke-width="1.2"/>
-
-  <!-- Ones rod = 4: ■ ■ ■ ■ -->
-  <rect x="318" y="104" width="44" height="14" rx="7" fill="black"/>
-  <rect x="318" y="130" width="44" height="14" rx="7" fill="black"/>
-  <rect x="318" y="156" width="44" height="14" rx="7" fill="black"/>
-  <rect x="318" y="182" width="44" height="14" rx="7" fill="black"/>
-
-  <!-- === DIGIT LABELS === -->
-  <text x="130" y="234" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="300" fill="black" opacity="0.4">1</text>
-  <text x="200" y="234" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="300" fill="black" opacity="0.4">0</text>
-  <text x="270" y="234" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="300" fill="black" opacity="0.4">2</text>
-  <text x="340" y="234" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10" font-weight="300" fill="black" opacity="0.4">4</text>
-
-  <!-- === WORDMARK === -->
-  <text x="200" y="268" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="16" font-weight="200" letter-spacing="10" fill="black">ABACUS</text>
+  <!-- WORDMARK -->
+  <text x="180" y="208" text-anchor="middle" font-family="'SF Mono', Menlo, monospace" font-size="13" font-weight="200" letter-spacing="7" fill="black">ABACUS</text>
 </svg>

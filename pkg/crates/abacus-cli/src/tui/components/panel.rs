@@ -2087,10 +2087,10 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         // 两行表格：固定 label 宽度对齐
         lns.push(Line::from(vec![
             Span::styled("  turns ", label),
-            Span::styled(format!("{:<4}", state.turn_count), Style::default().fg(state.theme.accent)),
-            Span::styled("  you ", label),
-            Span::styled(format!("{:<4}", uc), val),
-            Span::styled("  ai ", label),
+            Span::styled(format!("{}", state.turn_count), Style::default().fg(state.theme.accent)),
+            Span::styled(" · you ", label),
+            Span::styled(format!("{}", uc), val),
+            Span::styled(" · ai ", label),
             Span::styled(format!("{}", ac), val),
         ]));
         lns.push(Line::from(vec![
@@ -2114,7 +2114,8 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ]));
         lns.push(Line::from(vec![
             Span::styled("  cache ", label),
-            Span::styled(format!("♻{}%", cpct), Style::default().fg(state.theme.success)),
+            Span::styled(format!("{}%", cpct), Style::default().fg(state.theme.success)),
+            Span::styled(" ♻", Style::default().fg(state.theme.success).add_modifier(Modifier::DIM)),
         ]));
     }
 
