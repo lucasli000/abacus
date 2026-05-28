@@ -2079,26 +2079,24 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ]));
     }
 
-    // ── 第2行：回合 + 事件 ──
+    // ── 第2行：回合统计（两行 key:value 表格）──
     {
         let uc = state.messages.iter().filter(|m| matches!(m.role, crate::tui::state::MsgRole::User)).count();
         let ac = state.messages.iter().filter(|m| matches!(m.role, crate::tui::state::MsgRole::Session | crate::tui::state::MsgRole::Expert(_))).count();
         let ev = state.trace_events.len();
-        let parts = vec![
-            (format!("turns  {}", state.turn_count), Style::default().fg(state.theme.accent)),
-            (format!("you  {}", uc), val),
-            (format!("ai  {}", ac), val),
-            (format!("ev  {}", ev), dim),
-        ];
-        let total_w: usize = parts.iter().map(|(s, _)| crate::tui::util::display_width(s) + 2).sum();
-        let gap = if total_w < w { w - total_w } else { 0 };
-        let mut sp: Vec<Span> = Vec::new();
-        for (i, (s, st)) in parts.iter().enumerate() {
-            if i > 0 { sp.push(Span::styled("  ", label)); }
-            sp.push(Span::styled(s.clone(), *st));
-        }
-        if gap > 0 { sp.push(Span::raw(" ".repeat(gap))); }
-        lns.push(Line::from(sp));
+        // 两行表格：固定 label 宽度对齐
+        lns.push(Line::from(vec![
+            Span::styled("  turns ", label),
+            Span::styled(format!("{:<4}", state.turn_count), Style::default().fg(state.theme.accent)),
+            Span::styled("  you ", label),
+            Span::styled(format!("{:<4}", uc), val),
+            Span::styled("  ai ", label),
+            Span::styled(format!("{}", ac), val),
+        ]));
+        lns.push(Line::from(vec![
+            Span::styled("  ev    ", label),
+            Span::styled(format!("{}", ev), dim),
+        ]));
     }
 
     // ── 第3行：token 输入/输出 + 缓存命中 ──
@@ -2107,37 +2105,38 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let out = state.session_tokens.completion_tokens;
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
-        let cache_s = format!("♻{}%", cpct);
-        let parts = vec![
-            (format!("in  {}", format_ctx(inp as usize)), val),
-            (format!("out {}", format_ctx(out as usize)), val),
-            (cache_s, Style::default().fg(state.theme.success)),
-        ];
-        let total_w: usize = parts.iter().map(|(s, _)| crate::tui::util::display_width(s) + 2).sum();
-        let gap = if total_w < w { w - total_w } else { 0 };
-        let mut sp: Vec<Span> = Vec::new();
-        for (i, (s, st)) in parts.iter().enumerate() {
-            if i > 0 { sp.push(Span::raw("  ")); }
-            sp.push(Span::styled(s.clone(), *st));
-        }
-        if gap > 0 { sp.push(Span::raw(" ".repeat(gap))); }
-        lns.push(Line::from(sp));
+        // 对齐的两行
+        lns.push(Line::from(vec![
+            Span::styled("  in    ", label),
+            Span::styled(format!("{:<8}", format_ctx(inp as usize)), val),
+            Span::styled("  out ", label),
+            Span::styled(format!("{}", format_ctx(out as usize)), val),
+        ]));
+        lns.push(Line::from(vec![
+            Span::styled("  cache ", label),
+            Span::styled(format!("♻{}%", cpct), Style::default().fg(state.theme.success)),
+        ]));
     }
 
-    // ── 第4行：费用（仅 >0） + 压缩（仅 >0） ──
-    let cost_cny = state.session_tokens.cost_cny;
+    // cost（仅有数据时）
+    if state.session_tokens.cost_cny > 0.001 {
+        lns.push(Line::from(vec![
+            Span::styled("  cost  ", label),
+            Span::styled(
+                crate::tui::cost::format_cny(state.session_tokens.cost_cny),
+                Style::default().fg(state.theme.gold),
+            ),
+        ]));
+    }
+
+    // ── 压缩统计（仅发生过压缩时） ──
     let comp_n = state.session_tokens.compress_count;
     let comp_s = state.session_tokens.compress_tokens_saved;
-    if cost_cny > 0.001 || comp_n > 0 {
-        let mut sp: Vec<Span> = Vec::new();
-        if cost_cny > 0.001 {
-            sp.push(Span::styled(format!("cost  {}", cost::format_cny(cost_cny)), gold));
-        }
-        if comp_n > 0 {
-            if !sp.is_empty() { sp.push(Span::raw("  ")); }
-            sp.push(Span::styled(format!("cmp  {}次  freed {}", comp_n, format_ctx(comp_s as usize)), dim));
-        }
-        lns.push(Line::from(sp));
+    if comp_n > 0 {
+        lns.push(Line::from(vec![
+            Span::styled("  cmp   ", label),
+            Span::styled(format!("{}× freed {}", comp_n, format_ctx(comp_s as usize)), dim),
+        ]));
     }
 
     f.render_widget(Paragraph::new(lns), area);
