@@ -1255,11 +1255,11 @@ pub fn render_messages_in_card(
             let status_text = status_badge.content.to_string();
             let status_w = crate::tui::util::display_width(&status_text);
             let time_w = crate::tui::util::display_width(time_text);
-            let content_w_hdr = (inner.width as usize).saturating_sub(4); // bar(1)+space(1)+margin
+            let content_w_hdr = (inner.width as usize).saturating_sub(5); // bar(1)+2sp+margin(2)
             let header_gap = content_w_hdr.saturating_sub(badge_w + status_w + time_w + 2);
             lines.push(Line::from(vec![
                 bar.clone(),
-                Span::raw(" "),
+                Span::raw("  "),
                 badge_span,
                 Span::raw(" ".repeat(header_gap)),
                 status_badge,
@@ -1333,7 +1333,7 @@ pub fn render_messages_in_card(
                     };
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::styled(" · ", Style::default().fg(state.theme.muted)),
+                        Span::styled("  · ", Style::default().fg(state.theme.muted)),
                         Span::styled(name.clone(), Style::default().fg(state.theme.muted)),
                         context_span,
                         Span::styled(format!(" {}{}{}", status_mark, dur_text, failure_text), mark_style),
@@ -1394,7 +1394,7 @@ pub fn render_messages_in_card(
                     lines.push(Line::from(vec![
                         bar.clone(),
                         Span::styled(
-                            format!(" ─ #{} ", number),
+                            format!("  ─ #{} ", number),
                             Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
                         ),
                     ]));

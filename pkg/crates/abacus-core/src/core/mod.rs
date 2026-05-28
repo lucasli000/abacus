@@ -2821,12 +2821,13 @@ impl CoreLoop {
     pub fn config_mut(&mut self) -> &mut CoreConfig { &mut self.config }
 
     /// 运行时热切换模型（TUI /model 命令调用）
-    pub fn set_model_override(&self, model: impl Into<String>) {
-        *self.model_override.blocking_write() = Some(ModelId(model.into()));
+    /// 2026-05-28: 改为 async 避免在 tokio runtime 内调 blocking_write panic
+    pub async fn set_model_override(&self, model: impl Into<String>) {
+        *self.model_override.write().await = Some(ModelId(model.into()));
     }
 
-    pub fn clear_model_override(&self) {
-        *self.model_override.blocking_write() = None;
+    pub async fn clear_model_override(&self) {
+        *self.model_override.write().await = None;
     }
 
     // ── 2026-05-28: TUI /set + /preset 运行时参数 setter ────────────────

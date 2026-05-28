@@ -490,9 +490,11 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     };
     s.model_name = name.to_string();
     s.theme.apply_model_brand(name);
-    // 热切换：下达到 CoreLoop
+    // 热切换：下达到 CoreLoop（async 方法，需 spawn）
     if let Some(ref engine) = s.engine_handle {
-        engine.core.set_model_override(name);
+        let core = engine.core.clone();
+        let model_name = name.to_string();
+        tokio::spawn(async move { core.set_model_override(&model_name).await; });
     }
     s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
     CmdResult::Consumed

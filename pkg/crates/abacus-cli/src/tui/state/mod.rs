@@ -2733,7 +2733,9 @@ impl AppState {
         self.model_name = next.to_string();
         self.theme.apply_model_brand(next);
         if let Some(ref engine) = self.engine_handle {
-            engine.core.set_model_override(next);
+            let core = engine.core.clone();
+            let model = next.to_string();
+            tokio::spawn(async move { core.set_model_override(&model).await; });
         }
         next.to_string()
     }
