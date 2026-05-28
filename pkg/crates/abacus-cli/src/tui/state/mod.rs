@@ -3518,6 +3518,13 @@ impl AppState {
         }
         let lower = input.to_lowercase();
 
+        // 2026-05-28: 采纳后抑制 — 如果 input 已完全匹配一个命令名，不再建议
+        if input.starts_with('/') {
+            let all_names = crate::tui::slash_commands::all_command_names();
+            let exact = all_names.iter().any(|n| format!("/{}", n).to_lowercase() == lower);
+            if exact { return None; }
+        }
+
         // 优先级 1: 斜杠命令补全（至少输入 /+1字符 才触发）
         if input.starts_with('/') && input.len() > 1 {
             let all_names = crate::tui::slash_commands::all_command_names();
@@ -3537,7 +3544,12 @@ impl AppState {
         }
 
         // 优先级 2: 历史记录补全
+        // 2026-05-28: 精确匹配历史条目时不再建议（采纳后抑制重复弹出）
         if !self.input_history.is_empty() {
+            let exact_history = self.input_history.iter()
+                .any(|h| h.trim().to_lowercase() == lower);
+            if exact_history { return None; }
+
             if let Some(h) = self.input_history.iter()
                 .rev()
                 .find(|h| {
