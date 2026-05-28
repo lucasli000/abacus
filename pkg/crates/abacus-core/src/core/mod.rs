@@ -3026,6 +3026,23 @@ impl CoreLoop {
                 }
             }
         }
+
+        // 2026-05-28: 将发现的模型写回 ProviderGroup — 让 resolve_provider() 能匹配到
+        // 解决：config 中 models 为空或只有占位符时，group.supports(model) 失败的问题
+        if !result.is_empty() {
+            let mut groups = self.provider_groups.write().await;
+            for group in groups.iter_mut() {
+                if let Some(discovered) = result.get(&group.id) {
+                    let new_models: Vec<ModelId> = discovered.iter()
+                        .map(|m| ModelId(m.clone()))
+                        .collect();
+                    if new_models.len() > group.models.len() {
+                        group.models = new_models;
+                    }
+                }
+            }
+        }
+
         result
     }
 
