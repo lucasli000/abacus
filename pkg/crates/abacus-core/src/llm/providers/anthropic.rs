@@ -1022,6 +1022,35 @@ impl LlmProvider for AnthropicProvider {
     fn supported_models(&self) -> Vec<ModelId> {
         vec![self.model.clone()]
     }
+
+    /// 2026-05-28: 调用 Anthropic /v1/models API 发现所有可用模型
+    ///
+    /// ## 引用关系
+    /// - 调用方: CoreLoop::discover_all_models()
+    /// - 依赖: Anthropic Models API (GET /v1/models, x-api-key header)
+    async fn discover_models(&self) -> abacus_types::Result<Vec<ModelId>> {
+        let resp = crate::llm::shared_http_client()
+            .get(format!("{}/v1/models", self.base_url))
+            .timeout(std::time::Duration::from_secs(15))
+            .header("x-api-key", self.api_key.as_str())
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| abacus_types::KernelError::Provider(format!("discover models: {e}")))?;
+        if !resp.status().is_success() {
+            // Anthropic 可能不支持 /v1/models（旧版 API）→ 回退到内置列表
+            tracing::debug!(status = resp.status().as_u16(), "Anthropic /v1/models not available, fallback");
+            return Ok(self.supported_models());
+        }
+        #[derive(serde::Deserialize)]
+        struct ModelEntry { id: String }
+        #[derive(serde::Deserialize)]
+        struct ModelList { data: Vec<ModelEntry> }
+        match resp.json::<ModelList>().await {
+            Ok(parsed) => Ok(parsed.data.into_iter().map(|e| ModelId(e.id)).collect()),
+            Err(_) => Ok(self.supported_models()), // 解析失败回退
+        }
+    }
 }
 
 impl std::fmt::Debug for AnthropicProvider {
