@@ -407,7 +407,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let models = if flat.is_empty() {
                                 engine_clone.core.list_models().await
                             } else {
-                                flat
+                                // 2026-05-28: 去重——多 provider 可能注册同名模型（如 deepseek-v4-pro）
+                                let mut seen = std::collections::HashSet::new();
+                                flat.into_iter().filter(|m| seen.insert(m.clone())).collect()
                             };
                             let _ = tx.send(models);
                         });
