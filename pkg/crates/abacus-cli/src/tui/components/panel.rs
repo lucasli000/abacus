@@ -2115,7 +2115,6 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         lns.push(Line::from(vec![
             Span::styled("  cache ", label),
             Span::styled(format!("{}%", cpct), Style::default().fg(state.theme.success)),
-            Span::styled(" ♻", Style::default().fg(state.theme.success).add_modifier(Modifier::DIM)),
         ]));
     }
 
