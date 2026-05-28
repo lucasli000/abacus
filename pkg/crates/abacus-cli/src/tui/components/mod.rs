@@ -1273,7 +1273,6 @@ pub fn render_messages_in_card(
         // P7 优化：所有 streaming 内容直接 push（O(1)）
         // 旧 cursor_line 已移除
         let content_w = inner.width.saturating_sub(5) as usize;
-        let content_w = inner.width.saturating_sub(5) as usize;
 
         // ── 正文文本推迟到最后渲染，避免被工具调用夹在中间 ──
         let mut pending_text_render = false;
@@ -1292,21 +1291,27 @@ pub fn render_messages_in_card(
                             Span::styled("thinking...", Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
                         ]));
                     } else {
+                        // 2026-05-28: thinking 文本自动 word-wrap 到消息流宽度（不再硬截断）
+                        let think_prefix_w = 6usize; // "  💭 " 占 6 列
+                        let wrap_w = content_w.saturating_sub(think_prefix_w);
                         for (i, line) in think_lines.iter().enumerate() {
-                            let truncated = crate::tui::util::truncate_to_width(line, content_w.saturating_sub(6));
-                            if i == 0 {
-                                lines.push(Line::from(vec![
-                                    bar.clone(),
-                                    Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
-                                    Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
-                                ]));
-                            } else {
-                                // 续行：与 💭 后文字对齐（2sp + "  " + 2sp = 6col）
-                                lines.push(Line::from(vec![
-                                    bar.clone(),
-                                    Span::styled("    · ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                                    Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
-                                ]));
+                            let segments = crate::tui::util::word_wrap_segments(line, wrap_w);
+                            for (seg_idx, (seg_start, seg_end)) in segments.iter().enumerate() {
+                                let text = &line[*seg_start..*seg_end];
+                                let s = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
+                                if i == 0 && seg_idx == 0 {
+                                    lines.push(Line::from(vec![
+                                        bar.clone(),
+                                        Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
+                                        Span::styled(text.to_string(), s),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        bar.clone(),
+                                        Span::styled("    · ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                                        Span::styled(text.to_string(), s),
+                                    ]));
+                                }
                             }
                         }
                     }
