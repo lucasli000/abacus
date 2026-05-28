@@ -413,8 +413,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let models = if flat.is_empty() {
                                 engine_clone.core.list_models().await
                             } else {
-                                let mut seen = std::collections::HashSet::new();
-                                flat.into_iter().filter(|m| seen.insert(m.clone())).collect()
+                                // 不去重——同名模型可能来自不同供应商（价格/速度/配额不同）
+                                // picker 按 provider 分组显示，用户靠分组区分
+                                flat
                             };
                             let _ = tx.send((models, providers_grouped));
                         });

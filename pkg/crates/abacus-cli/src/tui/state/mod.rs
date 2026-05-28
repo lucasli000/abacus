@@ -2786,7 +2786,6 @@ impl AppState {
                 for (provider_id, models) in &self.available_providers {
                     let start = items.len();
                     for model_name in models {
-                        if items.contains(model_name) { continue; } // 跨 provider 去重
                         let desc = KNOWN_DESCS.iter()
                             .find(|(k, _)| *k == model_name.as_str())
                             .map(|(_, d)| *d)
