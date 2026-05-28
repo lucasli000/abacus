@@ -1,30 +1,46 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" fill="none">
   <!--
-    Compact 64x64 version — 1024 on abacus
-    Thick frame, thin rods, solid=active, hollow=inactive
+    Compact 80x80 — 1024 on abacus
+    Same design system: 3 line weights, filled/outlined beads
   -->
   <!-- Frame -->
-  <rect x="4" y="4" width="56" height="56" stroke="black" stroke-width="3" fill="white"/>
+  <rect x="8" y="8" width="64" height="56" rx="2" stroke="black" stroke-width="2.5" fill="white"/>
   <!-- Beam -->
-  <rect x="4" y="22" width="56" height="2" fill="black"/>
-  <!-- Rods (thin) -->
-  <line x1="18" y1="4" x2="18" y2="60" stroke="black" stroke-width="0.75"/>
-  <line x1="32" y1="4" x2="32" y2="60" stroke="black" stroke-width="0.75"/>
-  <line x1="46" y1="4" x2="46" y2="60" stroke="black" stroke-width="0.75"/>
-  <!-- Upper beads (at rest, all at top) -->
-  <rect x="13" y="9" width="10" height="5" rx="2.5" fill="black"/>
-  <rect x="27" y="9" width="10" height="5" rx="2.5" fill="black"/>
-  <rect x="41" y="9" width="10" height="5" rx="2.5" fill="black"/>
-  <!-- Lower: Thousands=1 (1 up) -->
-  <rect x="13" y="28" width="10" height="5" rx="2.5" fill="black"/>
-  <rect x="14" y="40" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
-  <rect x="14" y="48" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
-  <!-- Lower: Hundreds=0 (none up) -->
-  <rect x="28" y="36" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
-  <rect x="28" y="44" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
-  <rect x="28" y="52" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
-  <!-- Lower: Tens=2 (2 up) -->
-  <rect x="41" y="28" width="10" height="5" rx="2.5" fill="black"/>
-  <rect x="41" y="37" width="10" height="5" rx="2.5" fill="black"/>
-  <rect x="42" y="50" width="8" height="4" rx="2" fill="none" stroke="black" stroke-width="1"/>
+  <line x1="8" y1="26" x2="72" y2="26" stroke="black" stroke-width="1.8"/>
+  <!-- Rods -->
+  <line x1="22" y1="10" x2="22" y2="62" stroke="black" stroke-width="0.6"/>
+  <line x1="38" y1="10" x2="38" y2="62" stroke="black" stroke-width="0.6"/>
+  <line x1="54" y1="10" x2="54" y2="62" stroke="black" stroke-width="0.6"/>
+  <line x1="68" y1="10" x2="68" y2="62" stroke="black" stroke-width="0.4" opacity="0.6"/>
+
+  <!-- Upper beads (all resting = outlined) -->
+  <rect x="17" y="13" width="10" height="4.5" rx="2.2" fill="none" stroke="black" stroke-width="0.9"/>
+  <rect x="33" y="13" width="10" height="4.5" rx="2.2" fill="none" stroke="black" stroke-width="0.9"/>
+  <rect x="49" y="13" width="10" height="4.5" rx="2.2" fill="none" stroke="black" stroke-width="0.9"/>
+  <rect x="63" y="13" width="10" height="4.5" rx="2.2" fill="none" stroke="black" stroke-width="0.9"/>
+
+  <!-- Lower: Thousands=1 -->
+  <rect x="17" y="31" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="18" y="41" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+  <rect x="18" y="49" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+  <rect x="18" y="57" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+
+  <!-- Lower: Hundreds=0 -->
+  <rect x="34" y="39" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+  <rect x="34" y="47" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+  <rect x="34" y="55" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+
+  <!-- Lower: Tens=2 -->
+  <rect x="49" y="31" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="49" y="39" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="50" y="51" width="8" height="3.5" rx="1.8" fill="none" stroke="black" stroke-width="0.7"/>
+
+  <!-- Lower: Ones=4 -->
+  <rect x="63" y="31" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="63" y="39" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="63" y="47" width="10" height="4.5" rx="2.2" fill="black"/>
+  <rect x="63" y="55" width="10" height="4.5" rx="2.2" fill="black"/>
+
+  <!-- Wordmark -->
+  <text x="40" y="75" text-anchor="middle" font-family="SF Mono, Menlo, monospace" font-size="7" font-weight="200" letter-spacing="3" fill="black">ABACUS</text>
 </svg>
