@@ -1523,11 +1523,13 @@ pub fn schemas() -> Vec<ToolSchema> {
             &["pattern"], false, 96, "500ms", "low"),
         // Wrapping-B：fs_read_multiple 已合并到 fs_read（接受 paths 数组），schema 不再注册
         // executor 路径"fs_read_multiple"仍 dispatch 旧函数（向后兼容）
+        // 2026-05-28: confirm_required=false — pipeline 层 classify_bash_command() 已做命令级门控
+        // 不需要 schema 级 blanket confirm（否则 `find`/`ls | grep` 等安全命令也弹确认）
         schema("bash_exec", "执行 shell 命令并返回输出",
             json!({"command": {"type":"string", "description":"shell命令"},
                    "timeout": {"type":"number", "description":"超时秒数(默认30,最大120)"},
                    "workdir": {"type":"string", "description":"工作目录(默认session.cwd)"}}),
-            &["command"], true, 96, "1s", "medium"),
+            &["command"], false, 96, "1s", "medium"),
     ]
 }
 
