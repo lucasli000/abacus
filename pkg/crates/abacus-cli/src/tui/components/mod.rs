@@ -1301,10 +1301,10 @@ pub fn render_messages_in_card(
                                     Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
                                 ]));
                             } else {
-                                // 6 spaces：与 💭 后文字对齐（2sp + emoji 2col + 1sp + 1sp）
+                                // 续行：与 💭 后文字对齐（2sp + "  " + 2sp = 6col）
                                 lines.push(Line::from(vec![
                                     bar.clone(),
-                                    Span::raw("      "),
+                                    Span::styled("    · ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                                     Span::styled(truncated, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
                                 ]));
                             }

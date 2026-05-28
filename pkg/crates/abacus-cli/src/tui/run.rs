@@ -1029,11 +1029,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         //   触发 try_render_edit_diff: args 含 old_string/new_string → 走 diff 视图
                         StreamChunk::ToolArgs { name, args_json } => {
                             // T-1 fix: 用 trace_event_index O(1) 查找，替代原来 O(n) iter().find()
-                            if let Some(tool) = state.streaming_tools.iter().rev()
+                            // 2026-05-28: 用 trace_id 精确匹配（修复并行同名工具只更新最后一个的 bug）
+                            let matched_tid = state.streaming_tools.iter().rev()
                                 .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
-                            {
-                                let tid = tool.3;
-                                // O(1) index 查找，再通过 index 知道数组下标
+                                .map(|t| t.3);
+                            if let Some(tid) = matched_tid {
+                                // 更新 trace event 的 args
                                 if let Some(&idx) = state.trace_event_index.get(&tid) {
                                     if let Some(ev) = state.trace_events.get_mut(idx) {
                                         if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
@@ -1041,14 +1042,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         }
                                     }
                                 }
-                            }
-                            // V40: 更新 timeline Tool entry 的 context（从 args 提取摘要）
-                            if let Some(crate::tui::state::TimelineEntry::Tool { context, .. }) =
-                                state.streaming_timeline.iter_mut().rev()
-                                    .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { name: n, status: s, .. }
-                                        if *n == name && *s == crate::tui::state::StreamingToolStatus::Running))
-                            {
-                                *context = crate::tui::components::block_detail::extract_tool_param_summary(&args_json);
+                                // 更新 timeline Tool entry 的 context — 用 trace_id 精确匹配
+                                let summary = crate::tui::components::block_detail::extract_tool_param_summary(&args_json);
+                                if let Some(crate::tui::state::TimelineEntry::Tool { context, .. }) =
+                                    state.streaming_timeline.iter_mut().rev()
+                                        .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { trace_id: t, .. } if *t == tid))
+                                {
+                                    *context = summary;
+                                }
                             }
                             had_streaming_update = true;
                         }
