@@ -1385,6 +1385,14 @@ impl<'a> TurnPipeline<'a> {
                                 })
                                 .collect();
                             tracing::debug!(n = assembled.len(), "streaming: assembled tool_calls from SSE deltas");
+                            // 2026-05-28: 组装完成后立即发 ToolArgs，让 TUI Running 状态就能显示路径
+                            // （不等 dispatch 阶段再发——消除 ToolStart 和 ToolArgs 之间的时间差）
+                            for tc in &assembled {
+                                let _ = stx.send(crate::llm::stream::StreamChunk::ToolArgs {
+                                    name: tc.function.name.clone(),
+                                    args_json: tc.function.arguments.clone(),
+                                });
+                            }
                             response.message.tool_calls = Some(assembled);
                         }
                         Ok(response)
