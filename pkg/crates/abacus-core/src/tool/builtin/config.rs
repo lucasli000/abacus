@@ -51,6 +51,9 @@ const SUPPORTED_KEYS: &[&str] = &[
     "silent_router",
     "max_escalations",
     "compress_level",
+    "context_ratio",
+    "dedup_enabled",
+    "turn_timeout",
 ];
 
 /// Runtime overrides 共享类型别名
@@ -164,6 +167,9 @@ impl ConfigToolExecutor {
             },
             "adaptive_d_tier_hide" => self.base_config.adaptive_d_tier_hide.to_string(),
             "silent_router" => self.base_config.silent_router_enabled.to_string(),
+            "context_ratio" => self.base_config.context_window_ratio.to_string(),
+            "dedup_enabled" => self.base_config.tool_result_dedup_enabled.to_string(),
+            "turn_timeout" => self.base_config.thresholds.turn_provider_timeout_secs.to_string(),
             "max_escalations" => self.base_config.max_escalations.to_string(),
             "compress_level" => match self.base_config.default_compress_level {
                 CompressLevel::Brief => "brief".into(),
@@ -219,6 +225,22 @@ impl ConfigToolExecutor {
                         value
                     )));
                 }
+            }
+            "context_ratio" => {
+                value.parse::<f64>().map_err(|_| KernelError::Other(format!(
+                    "invalid f64 value for 'context_ratio': '{}'", value
+                )))?;
+            }
+            "dedup_enabled" => {
+                parse_bool(value).ok_or_else(|| KernelError::Other(format!(
+                    "invalid bool value for 'dedup_enabled': '{}'. Expected: true/false/1/0/on/off",
+                    value
+                )))?;
+            }
+            "turn_timeout" => {
+                value.parse::<u64>().map_err(|_| KernelError::Other(format!(
+                    "invalid u64 value for 'turn_timeout': '{}'", value
+                )))?;
             }
             _ => {}
         }

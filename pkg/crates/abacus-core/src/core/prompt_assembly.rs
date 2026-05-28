@@ -416,6 +416,29 @@ impl PromptAssembly {
             result.push_str("Show your reasoning process in <thinking> tags before responding.\n");
         }
 
+        // ═══ PromptConflictDetector ═══════════════════════════════════════
+        // 检测 Layer 间矛盾指令（只读，zero side effect）
+        // 仅在有多个段时执行检测
+        if layers.len() >= 2 {
+            let segments_for_check: Vec<(u8, &str)> = layers.iter()
+                .flat_map(|(prio, segs)| segs.iter().map(move |s| (*prio, s.as_str())))
+                .collect();
+            let conflicts = crate::core::context::PromptConflictDetector::detect(&segments_for_check);
+            if !conflicts.is_empty() {
+                for c in &conflicts {
+                    tracing::warn!(
+                        target: "abacus::prompt_conflict",
+                        layer_a = c.layer_a,
+                        layer_b = c.layer_b,
+                        severity = ?c.severity,
+                        directive_a = %c.directive_a,
+                        directive_b = %c.directive_b,
+                        "Prompt Layer conflict detected"
+                    );
+                }
+            }
+        }
+
         result
     }
 

@@ -102,6 +102,8 @@ pub enum PickerKind {
     History,
     /// Meeting 操作菜单（进入会诊 / 专家配置 / 历史记录）
     Meeting,
+    /// 2026-05-28: 场景预设选择
+    Preset,
 }
 
 /// Picker 状态
@@ -454,6 +456,27 @@ pub enum InputState {
     /// LLM 流式输出中
     Outputting,
     Paused,
+    /// 2026-05-28: 全屏编辑器模式 — 接管所有键盘输入
+    /// 引用关系：handle_editor_key 消费 + render_fullscreen_editor 渲染
+    /// 生命周期：open_editor() 创建 → close_editor() / submit 销毁
+    Editor,
+}
+
+/// 2026-05-28: 全屏编辑器状态
+/// 引用关系：render_fullscreen_editor 读取渲染 + handle_editor_key 更新
+/// 生命周期：open_editor() 创建 → close_editor() 销毁
+#[derive(Debug, Clone)]
+pub struct EditorState {
+    /// 编辑器内滚动偏移（首行行号，0-based）
+    pub scroll_top: usize,
+    /// 打开时刻（防 150ms 内重复触发）
+    pub opened_at: std::time::Instant,
+    /// 渲染侧写入的实际可见行数（键盘侧用于精确 PgUp/PgDn 计算）
+    /// 引用关系：render_fullscreen_editor 每帧写入 → handle_editor_key PgUp/PgDn 读取
+    /// 使用 Cell 允许在 &self（渲染期间 &AppState）下修改
+    pub last_visible_h: std::cell::Cell<usize>,
+    /// Shift+Arrow 选区起始 byte offset（None = 无选区）
+    pub selection_anchor: Option<usize>,
 }
 
 /// 全局焦点区域
@@ -520,6 +543,22 @@ pub struct Toast {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 专家 (Meeting / Team 模式)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 2026-05-27: Meeting 结论后的执行提案 — 等待用户确认
+///
+/// ## 生命周期
+/// 创建(try_switch_mode) → 30s 内等待确认 → 确认(Y)/拒绝(n)/超时/其他输入 → 清空
+#[derive(Debug, Clone)]
+pub struct MeetingExecutionPrompt {
+    /// 从结论中提取的行动项文本列表
+    pub action_items: Vec<String>,
+    /// 完整结论文本（用于组装 /plan 的 goal）
+    pub full_conclusion: String,
+    /// 是否建议使用 /team 而非 /plan（action_items > 3 且多领域）
+    pub suggest_team: bool,
+    /// 创建时刻（用于 30s 超时判断）
+    pub created_at: std::time::Instant,
+}
 
 #[derive(Clone, Debug)]
 pub struct Expert {
@@ -670,6 +709,17 @@ pub enum SlashCommand {
 // AppState — 集中式状态
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// 记忆宫殿快照（异步从 core 拉取，用于仓库 Tab 展示 palace 本体数据）
+#[derive(Debug, Clone, Default)]
+pub struct PalaceSnapshot {
+    /// 行为宫殿条目总数
+    pub behavior_count: usize,
+    /// 知识宫殿按 domain 聚合：(domain_name, entry_count)
+    pub knowledge_domains: Vec<(String, u32)>,
+    /// 知识宫殿总条目数
+    pub knowledge_total: u32,
+}
+
 pub struct AppState {
     pub theme: Theme,
     /// 上次渲染的主题名（仅首帧或主题切换时重刷全屏背景）
@@ -791,6 +841,45 @@ pub struct AppState {
     /// ## 默认值
     /// false（保持现有行为，只有用户显式启用才生效）
     pub auto_review_plan: bool,
+
+    // ─── 2026-05-28: /preset + /set 运行时参数 ─────────────────────────────
+    pub runtime_temperature: Option<f64>,
+    pub runtime_max_tokens: Option<u32>,
+    pub runtime_context_ratio: Option<f64>,
+    pub runtime_tool_limit: Option<u32>,
+    pub runtime_timeout: Option<u64>,
+    pub runtime_router: Option<bool>,
+    pub runtime_dedup: Option<bool>,
+    pub active_preset: Option<String>,
+
+    // ─── 2026-05-27: 三模式流转修复 ─────────────────────────────────────────────────
+
+    /// Meeting 结论后待确认的执行提案
+    ///
+    /// ## 引用关系
+    /// - 写: `try_switch_mode` (Meeting→Clarify) 提取 action_items 后设置
+    /// - 读: `event/mod.rs` 输入确认 (Y/n) → 转为 pending_slash_command
+    /// - 清除: 用户输入 "n"/新消息/超时 30s 后自动清空
+    ///
+    /// ## 生命周期
+    /// 设置 → 30s 内等待确认 → 确认/拒绝/超时后清空
+    pub pending_meeting_execution: Option<MeetingExecutionPrompt>,
+
+    /// Meeting 路由失败后保留的用户原始输入（供 Clarify 模式复用）
+    ///
+    /// ## 引用关系
+    /// - 写: run.rs needs_clarify 信号触发时保存
+    /// - 读: 输入框预填充（下次渲染周期）
+    /// - 清除: 用户提交新输入后清空
+    pub preserved_input: Option<String>,
+
+    /// 本 session 是否已建议过 Meeting 模式（防反复骚扰）
+    ///
+    /// ## 引用关系
+    /// - 写: run.rs analyzer 建议触发时置 true
+    /// - 读: analyzer 判断是否跳过建议
+    /// - 清除: /new 重置 session 时归 false
+    pub meeting_suggested_this_session: bool,
 
     /// Session UUID。启动时 Uuid::new_v4() 生成；load_last_session 恢复时覆盖。
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
@@ -1000,6 +1089,8 @@ pub struct AppState {
 
     /// Engine bridge — set when TUI connects to real backend
     pub engine_handle: Option<EngineHandle>,
+    /// 记忆宫殿本体数据快照（从 core 异步拉取，用于仓库 Tab palace 层级展示）
+    pub palace_data: Option<PalaceSnapshot>,
     /// Channel sender for engine responses
     pub engine_tx: Option<mpsc::UnboundedSender<crate::tui::api::EngineResponse>>,
     /// Text pending for async engine submission
@@ -1010,6 +1101,16 @@ pub struct AppState {
     pub completion_index: usize,
     /// 补全触发时的前缀（用于替换）
     pub completion_prefix: String,
+    /// 静默内联补全 — ghost text 显示在光标后。
+    /// Tab 首次接受当前候选，连续 Tab 循环切换下一个候选。
+    pub inline_suggestion: Option<String>,
+    /// 2026-05-28: Tab 循环候选列表（连续 Tab 在多候选间切换）
+    /// 首次 Tab 接受 inline_suggestion → 写入 input；
+    /// 连续 Tab → 从 inline_candidates 取下一个覆盖 input。
+    /// 任何非 Tab 输入清空此列表。
+    pub inline_candidates: Vec<String>,
+    /// 当前 Tab 循环索引
+    pub inline_candidate_idx: usize,
     /// 已提交输入的历史（FIFO，上限 100）
     pub input_history: Vec<String>,
     /// 排队的输入（忙碌态下用户 Enter 提交的消息，当前请求完成后自动发送）
@@ -1071,6 +1172,10 @@ pub struct AppState {
     ///           render_picker_popup 渲染；Esc/Enter 关闭
     /// 生命周期：单次选择期间存在，应用或取消即设回 None
     pub picker: Option<PickerState>,
+    /// 2026-05-28: 全屏编辑器状态
+    /// 引用关系：render_fullscreen_editor 渲染 + handle_editor_key 更新
+    /// 生命周期：open_editor() 创建 → close_editor() 销毁（InputState::Editor 同步）
+    pub editor_state: Option<EditorState>,
     /// 主题预览面板打开状态（`/theme preview` 触发）
     /// 引用关系：cmd_theme 设置；render_info_panel 渲染时优先于 info_panel_text；event Esc 关闭
     /// 生命周期：单次切换可见 / Esc 或再次 /theme 切走时清零
@@ -2179,6 +2284,19 @@ impl AppState {
             pending_review_kind: crate::tui::api::ReviewKind::Plan, // V41-4: 默认 Plan
             review_required: false, // V41-2: 默认关闭强约束
             review_max_age_secs: 600, // V41-2: 默认 10 分钟 fresh-age
+            // 2026-05-28: /preset + /set
+            runtime_temperature: None,
+            runtime_max_tokens: None,
+            runtime_context_ratio: None,
+            runtime_tool_limit: None,
+            runtime_timeout: None,
+            runtime_router: None,
+            runtime_dedup: None,
+            active_preset: None,
+            // 2026-05-27: 三模式流转修复
+            pending_meeting_execution: None,
+            preserved_input: None,
+            meeting_suggested_this_session: false,
             // Session UUID 启动生成；恢复 session 时由 apply_session_export 覆盖。
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
@@ -2253,11 +2371,15 @@ impl AppState {
             op_started_at: None,
             accumulated_elapsed: std::time::Duration::ZERO,
             engine_handle: None,
+            palace_data: None,
             engine_tx: None,
             pending_text: None,
             completion_candidates: Vec::new(),
             completion_index: usize::MAX,
             completion_prefix: String::new(),
+            inline_suggestion: None,
+            inline_candidates: Vec::new(),
+            inline_candidate_idx: 0,
             input_history: Vec::new(),
             pending_inputs: Vec::new(),
             pending_send: false,
@@ -2282,6 +2404,7 @@ impl AppState {
             info_panel_text: String::new(),
             info_panel_auto_open: false,
             picker: None,
+            editor_state: None,
             theme_preview_open: false,
             cached_lines: RefCell::new(Vec::new()),
             cached_width: RefCell::new(0),
@@ -2641,28 +2764,57 @@ impl AppState {
         let mut groups: Vec<(String, std::ops::Range<usize>)> = Vec::new();
 
         if !self.available_models.is_empty() {
-            // 动态列表：engine 已拉取，显示全部可用模型（单组"可用模型"）
-            // 已知模型描述表（与静态兜底保持一致）
+            // 动态列表：engine 已拉取，按模型 ID 前缀推断 provider 分组
             const KNOWN_DESCS: &[(&str, &str)] = &[
                 ("deepseek-chat",     "通用对话"),
                 ("deepseek-reasoner", "推理增强"),
                 ("deepseek-v4-flash", "最快响应"),
                 ("deepseek-v4-pro",   "最强推理"),
             ];
-            let start = 0;
+            // 从模型 ID 推断 provider 名（按前缀匹配）
+            fn infer_provider(id: &str) -> &'static str {
+                let lower = id.to_lowercase();
+                if lower.starts_with("deepseek") { "DeepSeek" }
+                else if lower.starts_with("qwen") { "Qwen" }
+                else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("chatgpt") { "OpenAI" }
+                else if lower.starts_with("claude") { "Anthropic" }
+                else if lower.starts_with("gemini") { "Gemini" }
+                else if lower.starts_with("glm") || lower.starts_with("zhipu") { "智谱" }
+                else if lower.starts_with("moonshot") || lower.starts_with("kimi") { "Moonshot" }
+                else if lower.starts_with("doubao") || lower.starts_with("ark") { "火山引擎" }
+                else { "其他" }
+            }
+            // 按 provider 分组构建 items，保持组间顺序
+            let mut provider_order: Vec<&'static str> = Vec::new();
+            let mut provider_items: std::collections::HashMap<&'static str, Vec<(&str, &str)>> = std::collections::HashMap::new();
             for id in &self.available_models {
-                items.push(id.clone());
+                let prov = infer_provider(id);
                 let desc = KNOWN_DESCS.iter()
                     .find(|(k, _)| *k == id.as_str())
                     .map(|(_, d)| *d)
                     .unwrap_or("");
-                labels.push(if desc.is_empty() {
-                    id.clone()
-                } else {
-                    format!("{:<22}  {}", id, desc)
-                });
+                if !provider_items.contains_key(prov) {
+                    provider_order.push(prov);
+                }
+                provider_items.entry(prov).or_default().push((id.as_str(), desc));
             }
-            groups.push(("可用模型".to_string(), start..items.len()));
+            for prov in &provider_order {
+                let start = items.len();
+                if let Some(models) = provider_items.get(prov) {
+                    for (id, desc) in models {
+                        items.push((*id).to_string());
+                        labels.push(if desc.is_empty() {
+                            (*id).to_string()
+                        } else {
+                            format!("{:<22}  {}", id, desc)
+                        });
+                    }
+                }
+                let end = items.len();
+                if end > start {
+                    groups.push((prov.to_string(), start..end));
+                }
+            }
         } else {
             // 静态兜底
             for (provider, models) in STATIC_GROUPS {
@@ -2947,6 +3099,57 @@ impl AppState {
         self.rendered_lines_dirty.set(true);
     }
 
+    /// 通用 picker 打开方法 — 供不需要特殊初始化逻辑的 picker 使用
+    ///
+    /// 引用关系：cmd_preset 等通用 picker 调用
+    /// 生命周期：picker 关闭后 apply_picker_selection 按 kind 分发
+    pub fn open_picker_generic(&mut self, kind: PickerKind, items: Vec<String>, labels: Vec<String>) {
+        self.picker = Some(PickerState {
+            kind,
+            selected: 0,
+            current: None,
+            items,
+            labels,
+            groups: None,
+            show_thinking_slider: false,
+            opened_at: std::time::Instant::now(),
+            review_strict: false,
+        });
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 2026-05-28: 打开全屏编辑器
+    /// 引用关系：Ctrl+E 手动触发 + Paste > 3 行自动触发
+    /// 生命周期：设置 InputState::Editor + 创建 EditorState → close_editor 销毁
+    pub fn open_editor(&mut self) {
+        // 防重复触发
+        if self.input_state == InputState::Editor { return; }
+        self.editor_state = Some(EditorState {
+            scroll_top: 0,
+            opened_at: std::time::Instant::now(),
+            last_visible_h: std::cell::Cell::new(20), // 初始估计值，渲染后更新
+            selection_anchor: None,
+        });
+        self.input_state = InputState::Editor;
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 2026-05-28: 关闭全屏编辑器
+    /// submit=true 时调用方应接着调 submit_message；false 时保留 input 内容不提交
+    pub fn close_editor(&mut self) {
+        self.editor_state = None;
+        self.input_state = InputState::Ready;
+        self.rendered_lines_dirty.set(true);
+    }
+
+    /// 2026-05-28: 安全设置 busy 态（Editor 态不覆盖——用户正在编辑时后台 streaming 不抢夺输入焦点）
+    /// 引用关系：run.rs 所有 `state.input_state = InputState::Thinking/Executing/Outputting` 替换为此调用
+    /// 设计意图：编辑器打开期间，streaming 仍正常处理，但不切换 InputState 导致编辑器被隐式关闭
+    pub fn set_busy_state(&mut self, target: InputState) {
+        if self.input_state == InputState::Editor { return; }
+        self.input_state = target;
+    }
+
     pub fn cleanup_toasts(&mut self) {
         let now = Instant::now();
         self.toasts.retain(|t| t.expire_at > now);
@@ -2982,10 +3185,13 @@ impl AppState {
         self.cursor_pos = 0;
         self.cursor_line = 0;
         self.cursor_col = 0;
+        self.inline_suggestion = None;
+        // 2026-05-28: reset 时关闭编辑器（防止 editor_state 悬挂）
+        self.editor_state = None;
         if self.pending_text.is_some() {
             self.pending_text = None;
-            self.input_state = InputState::Ready;
         }
+        self.input_state = InputState::Ready;
         // trace_event_index 同步清理（与 trace_events 对称）
         self.trace_event_index.clear();
         // 标记渲染缓存失效
@@ -3274,6 +3480,7 @@ impl AppState {
                 self.theme.accent
             }
             InputState::Paused => self.theme.semantic_fg(crate::tui::theme::SemanticIntent::Warning),
+            InputState::Editor => self.theme.accent,
         }
     }
 
@@ -3291,6 +3498,101 @@ impl AppState {
 
     pub fn expert_count(&self) -> usize {
         self.expert_names_cache.len()
+    }
+
+    /// 根据当前输入计算最佳内联补全候选（从 history 匹配）
+    /// 返回最先匹配的完整历史输入，若当前输入已完整或无可匹配则返回 None。
+    /// 用于在光标后显示灰色建议文本，Tab 接受。
+    /// 2026-05-28: 统一 inline suggestion 计算（合并历史补全 + 斜杠命令补全）
+    ///
+    /// 优先级：斜杠命令 > 历史记录
+    /// 渲染：光标后 ghost text（DIM muted）
+    /// 接受：Tab 键填充到输入框
+    /// 跳过：继续输入，suggestion 自动更新
+    pub fn compute_inline_suggestion(&self) -> Option<String> {
+        let input = self.input.trim();
+        if input.is_empty() {
+            return None;
+        }
+        let lower = input.to_lowercase();
+
+        // 优先级 1: 斜杠命令补全（至少输入 /+1字符 才触发）
+        if input.starts_with('/') && input.len() > 1 {
+            let all_names = crate::tui::slash_commands::all_command_names();
+            let mut matches: Vec<String> = all_names.iter()
+                .map(|n| format!("/{}", n))
+                .filter(|c| {
+                    let cl = c.to_lowercase();
+                    cl.starts_with(&lower) && cl.len() > lower.len()
+                })
+                .collect();
+            // 排序：字母序（稳定、可预测）
+            // /cl → /clarify, /clear, /cls 按字母序；用户继续输入缩小范围
+            matches.sort();
+            if let Some(best) = matches.first() {
+                return Some(best.clone());
+            }
+        }
+
+        // 优先级 2: 历史记录补全
+        if !self.input_history.is_empty() {
+            if let Some(h) = self.input_history.iter()
+                .rev()
+                .find(|h| {
+                    let hl = h.trim().to_lowercase();
+                    hl.starts_with(&lower) && hl.len() > lower.len()
+                })
+            {
+                return Some(h.trim().to_string());
+            }
+        }
+
+        None
+    }
+
+    /// 计算所有匹配的 inline 候选（用于 Tab 循环）
+    ///
+    /// 返回排序后的全部候选列表（斜杠命令优先，历史次之）。
+    /// 第一项与 `compute_inline_suggestion()` 结果一致。
+    pub fn compute_all_inline_candidates(&self) -> Vec<String> {
+        let input = self.input.trim();
+        if input.is_empty() {
+            return Vec::new();
+        }
+        let lower = input.to_lowercase();
+        let mut candidates: Vec<String> = Vec::new();
+
+        // 斜杠命令（至少 /+1字符）
+        if input.starts_with('/') && input.len() > 1 {
+            let all_names = crate::tui::slash_commands::all_command_names();
+            let mut cmd_matches: Vec<String> = all_names.iter()
+                .map(|n| format!("/{}", n))
+                .filter(|c| {
+                    let cl = c.to_lowercase();
+                    cl.starts_with(&lower) && cl.len() > lower.len()
+                })
+                .collect();
+            cmd_matches.sort();
+            candidates.extend(cmd_matches);
+        }
+
+        // 历史记录
+        let hist_matches: Vec<String> = self.input_history.iter()
+            .rev()
+            .filter(|h| {
+                let hl = h.trim().to_lowercase();
+                hl.starts_with(&lower) && hl.len() > lower.len()
+            })
+            .take(10)
+            .map(|h| h.trim().to_string())
+            .collect();
+        for h in hist_matches {
+            if !candidates.contains(&h) {
+                candidates.push(h);
+            }
+        }
+
+        candidates
     }
 }
 

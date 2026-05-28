@@ -31,6 +31,7 @@ pub async fn handle_team(args: &super::TeamArgs, formatter: &mut Box<dyn OutputF
                 priority: 0,
                 depends_on: vec![],
                 required_role: None,
+                needs_review: false,
             });
 
             let session = builder.build();

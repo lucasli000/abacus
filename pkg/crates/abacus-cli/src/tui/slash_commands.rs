@@ -29,88 +29,79 @@ fn registry() -> &'static [Entry] {
         let mut v = Vec::new();
 
         // ════════════════════════════════════════════════════════════════
-        // 命令排布原则：按使用频次从高到低；/help 置最后（通常用于初次探索）
+        // 2026-05-28: 分层设计
+        //   Tier 0: 基础操作（新手第一天会用）
+        //   Tier 1: 核心能力（每天用）
+        //   Tier 2: 进阶功能（按需学）
+        //   Tier 3: 诊断/高级（大多数人不碰）
+        //
+        // /help 只显示 Tier 0+1；/help all 展开全部
+        // 排布仍按 tier 从低到高；同 tier 按频率从高到低
         // ════════════════════════════════════════════════════════════════
 
-        // ── 高频：日常会话操作 ──
+        // ── Tier 0: 基础操作 ──
         v.push(Entry { names: &["clear", "cls"],    handler: cmd_clear,    help: "清空屏幕" });
         v.push(Entry { names: &["new", "reset"],    handler: cmd_new,      help: "新建会话" });
-        v.push(Entry { names: &["model", "m"],      handler: cmd_model,    help: "模型设置 - /model [<name>|thinking|provider]" });
-        v.push(Entry { names: &["plan"],            handler: cmd_plan,     help: "/plan <任务> — 触发规划+执行策略" });
-        v.push(Entry { names: &["team"],            handler: cmd_team,     help: "/team <任务> — 触发多 agent 执行策略" });
-        v.push(Entry { names: &["mode"],            handler: cmd_mode,     help: "切换模式（picker）— Clarify / Meeting" });
-        v.push(Entry { names: &["clarify", "chat"], handler: cmd_clarify,  help: "切换到 澄清 模式" });
         v.push(Entry { names: &["copy"],            handler: cmd_copy,     help: "复制最后回复到剪贴板" });
         v.push(Entry { names: &["save"],            handler: cmd_save,     help: "保存当前会话" });
         v.push(Entry { names: &["quit", "exit", "q"], handler: cmd_quit,   help: "退出" });
 
-        // ── 中高频：上下文与工具操作 ──
-        v.push(Entry { names: &["context", "ctx"],  handler: cmd_context,  help: "查询上下文使用状态" });
-        v.push(Entry { names: &["compress"],        handler: cmd_compress, help: "手动压缩上下文" });
-        v.push(Entry { names: &["search"],          handler: cmd_search,   help: "搜索消息 /search <query>" });
-        v.push(Entry { names: &["undo"],            handler: cmd_undo,     help: "撤销文件操作 /undo [seq <N>|turn <N>|history|timeline]" });
-        v.push(Entry { names: &["redo"],            handler: cmd_redo,     help: "重做最后一次撤销" });
+        // ── Tier 1: 核心能力 ──
+        v.push(Entry { names: &["model", "m", "thinking", "think"], handler: cmd_model, help: "模型+思考+上下文 - /model [name|thinking <level>]" });
+        v.push(Entry { names: &["preset"],          handler: cmd_preset,   help: "场景预设 - /preset [quick|code|creative|lean|marathon|debug]" });
+        v.push(Entry { names: &["set"],             handler: cmd_set,      help: "调参数 - /set [key value] 或 /set 查看全部" });
+        v.push(Entry { names: &["plan"],            handler: cmd_plan,     help: "规划+执行 - /plan <任务>" });
+        v.push(Entry { names: &["auto", "turnkey", "tk"], handler: cmd_turnkey, help: "全托管 - /auto <目标>（规划+执行不确认）" });
+
+        // ── Tier 2: 进阶功能 ──
+        v.push(Entry { names: &["team"],            handler: cmd_team,     help: "多 agent 协作 - /team <任务>" });
+        v.push(Entry { names: &["meeting"],         handler: cmd_meeting,  help: "专家会诊模式" });
+        v.push(Entry { names: &["mode"],            handler: cmd_mode,     help: "切换模式 — Clarify / Meeting" });
+        v.push(Entry { names: &["clarify", "chat"], handler: cmd_clarify,  help: "切到澄清模式" });
+        v.push(Entry { names: &["done"],            handler: cmd_done,     help: "完成当前模式，推进下一步" });
+        v.push(Entry { names: &["review"],          handler: cmd_review,   help: "审查 - /review <plan|diff|security> [--strict]" });
+        v.push(Entry { names: &["role"],            handler: cmd_role,     help: "调用角色 - /role <fix|summarize|test>" });
+        v.push(Entry { names: &["theme"],           handler: cmd_theme,    help: "切换主题" });
+        v.push(Entry { names: &["undo"],            handler: cmd_undo,     help: "撤销 - /undo [seq|turn|history|timeline]" });
+        v.push(Entry { names: &["redo"],            handler: cmd_redo,     help: "重做" });
+        v.push(Entry { names: &["search"],          handler: cmd_search,   help: "搜索消息 - /search <query>" });
         v.push(Entry { names: &["diff"],            handler: cmd_diff,     help: "git diff - /diff [path]" });
-        v.push(Entry { names: &["export"],          handler: cmd_export,   help: "导出会话到 ~/abacus_session_<ts>.md" });
+        v.push(Entry { names: &["export"],          handler: cmd_export,   help: "导出会话" });
+        v.push(Entry { names: &["context", "ctx"],  handler: cmd_context,  help: "上下文状态" });
+        v.push(Entry { names: &["compress"],        handler: cmd_compress, help: "手动压缩上下文" });
+        v.push(Entry { names: &["inject"],          handler: cmd_inject,   help: "注入临时知识 - /inject <text>" });
+        v.push(Entry { names: &["rename"],          handler: cmd_rename,   help: "重命名会话 - /rename <alias>" });
+        v.push(Entry { names: &["resume"],          handler: cmd_resume,   help: "恢复 session - /resume [uuid]" });
+        v.push(Entry { names: &["branch", "fork"],  handler: cmd_branch,   help: "派生新会话" });
+        v.push(Entry { names: &["history"],         handler: cmd_history,  help: "输入历史" });
+        v.push(Entry { names: &["meeting-list", "ml"],   handler: cmd_meeting_list, help: "列出历史会议" });
+        v.push(Entry { names: &["meeting-load", "mload"], handler: cmd_meeting_load, help: "注入历史会议 - /meeting-load <id>" });
+        v.push(Entry { names: &["expert"],          handler: cmd_expert,   help: "专家配置 - /expert list|add|remove" });
 
-        // ── 中频：代码审查与角色 ──
-        // /review plan|diff|security [--strict] [content]
-        //   V39-2: --strict 让 verdict!=pass 时阻断 Plan→Team 切换
-        v.push(Entry { names: &["review"],          handler: cmd_review,        help: "审查 - /review <plan|diff|security> [--strict] [内容]" });
-        v.push(Entry { names: &["auto-review"],     handler: cmd_auto_review,   help: "自动 review 联动 - /auto-review <on|off|status>" });
-        // /role fix|summarize|test [content]（content 可省，自动用末尾 Session 消息）
-        v.push(Entry { names: &["role"],            handler: cmd_role,          help: "调用角色 - /role <fix|summarize|test> [内容]" });
-
-        // ── 中频：配置与显示 ──
-        v.push(Entry { names: &["theme"],           handler: cmd_theme,    help: "切换主题 (brand/light/dracula/...)" });
-        v.push(Entry { names: &["tokens", "tok"],   handler: cmd_tokens,   help: "显示 token 统计" });
-        v.push(Entry { names: &["status"],          handler: cmd_status,   help: "显示当前状态" });
+        // ── Tier 3: 诊断与高级 ──
+        v.push(Entry { names: &["status"],          handler: cmd_status,   help: "当前状态" });
+        v.push(Entry { names: &["tokens", "tok"],   handler: cmd_tokens,   help: "Token 统计" });
         v.push(Entry { names: &["models"],          handler: cmd_models,   help: "列出可用模型" });
-        v.push(Entry { names: &["tools"],           handler: cmd_tools,    help: "列出已注册工具" });
-        v.push(Entry { names: &["inject"],          handler: cmd_inject,   help: "注入临时知识 /inject <text>" });
-
-        // ── 中频：会话管理 ──
-        v.push(Entry { names: &["rename"],          handler: cmd_rename,   help: "重命名会话 - /rename <alias>|clear" });
-        v.push(Entry { names: &["resume"],          handler: cmd_resume,   help: "恢复 session - /resume [<uuid prefix>]" });
-        v.push(Entry { names: &["branch", "fork"],  handler: cmd_branch,   help: "派生新会话 - /branch [alias]" });
-        v.push(Entry { names: &["history"],         handler: cmd_history,  help: "显示输入历史 /history [n]" });
-
-        // ── 中低频：会议模式 ──
-        v.push(Entry { names: &["meeting"],         handler: cmd_meeting,      help: "切换到 会诊 模式（多专家会议）" });
-        v.push(Entry { names: &["meeting-list", "ml"],   handler: cmd_meeting_list, help: "列出历史会议记录" });
-        v.push(Entry { names: &["meeting-load", "mload"], handler: cmd_meeting_load, help: "/meeting-load <id> — 注入历史会议结论" });
-        // V35: 专家角色配置
-        v.push(Entry { names: &["expert"], handler: cmd_expert, help: "/expert list|add <name> <domain> [--model <id>]|set <name> --model <id>|remove <name>|reset" });
-        v.push(Entry { names: &["done"],            handler: cmd_done,     help: "标记当前模式完成，推进下一阶段" });
-
-        // ── 低频：面板导航 ──
-        v.push(Entry { names: &["memory"],          handler: cmd_memory,   help: "打开 Memory 面板" });
-        v.push(Entry { names: &["plugins", "mcp"],  handler: cmd_plugins,  help: "打开 Components 面板" });
-        v.push(Entry { names: &["settings"],        handler: cmd_settings, help: "打开设置面板" });
-
-        // ── 低频：诊断与安全 ──
-        v.push(Entry { names: &["tool-stats", "stats"], handler: cmd_tool_stats, help: "显示工具效能统计" });
-        v.push(Entry { names: &["allow"],           handler: cmd_allow,    help: "管理自动授权 - /allow [list|revoke <tool>|clear]" });
-        v.push(Entry { names: &["safety"],          handler: cmd_safety,   help: "显示安全状态" });
+        v.push(Entry { names: &["tools"],           handler: cmd_tools,    help: "已注册工具" });
+        v.push(Entry { names: &["tool-stats", "stats"], handler: cmd_tool_stats, help: "工具效能统计" });
+        v.push(Entry { names: &["allow"],           handler: cmd_allow,    help: "授权管理 - /allow [list|revoke|clear]" });
+        v.push(Entry { names: &["safety"],          handler: cmd_safety,   help: "安全状态" });
         v.push(Entry { names: &["doctor"],          handler: cmd_doctor,   help: "系统健康检查" });
-        v.push(Entry { names: &["debug"],           handler: cmd_debug,    help: "显示调试信息" });
+        v.push(Entry { names: &["debug"],           handler: cmd_debug,    help: "调试信息" });
+        v.push(Entry { names: &["streaming", "stream"], handler: cmd_streaming, help: "切换流式输出" });
+        v.push(Entry { names: &["info"],            handler: cmd_info,     help: "会话详情" });
+        v.push(Entry { names: &["memory"],          handler: cmd_memory,   help: "Memory 面板" });
+        v.push(Entry { names: &["plugins", "mcp"],  handler: cmd_plugins,  help: "Components 面板" });
+        v.push(Entry { names: &["settings"],        handler: cmd_settings, help: "设置面板" });
+        v.push(Entry { names: &["auto-review"],     handler: cmd_auto_review, help: "自动 review - /auto-review <on|off>" });
+        v.push(Entry { names: &["review-clear"],    handler: cmd_review_clear, help: "清除 review 阻断" });
+        v.push(Entry { names: &["review-history"],  handler: cmd_review_history, help: "review 历史" });
+        v.push(Entry { names: &["review-required"], handler: cmd_review_required, help: "review 强约束 - /review-required <on|off>" });
+        v.push(Entry { names: &["feedback"],        handler: cmd_feedback, help: "提交反馈" });
+        v.push(Entry { names: &["version", "v"],    handler: cmd_version,  help: "版本号" });
 
-        // ── 低频：其他工具 ──
-        v.push(Entry { names: &["turnkey", "tk"],   handler: cmd_turnkey,  help: "全托管目标 - /turnkey <goal>" });
-        v.push(Entry { names: &["streaming", "stream"], handler: cmd_streaming, help: "切换流式输出模式" });
-        v.push(Entry { names: &["info"],            handler: cmd_info,     help: "显示会话详情" });
-        v.push(Entry { names: &["feedback"],        handler: cmd_feedback, help: "提交反馈 /feedback <text>" });
-        v.push(Entry { names: &["version", "v"],    handler: cmd_version,  help: "显示版本号" });
-
-        // ── 极低频：Review 辅助与废弃命令 ──
-        v.push(Entry { names: &["review-clear"],    handler: cmd_review_clear,    help: "清除 review 阻断" });
-        v.push(Entry { names: &["review-history"],  handler: cmd_review_history,  help: "显示 review 历史（最近 20 条）" });
-        v.push(Entry { names: &["review-required"], handler: cmd_review_required, help: "review 强约束 - /review-required <on|off|status> [<秒>]" });
-        // V34 废弃，保留入口避免"未知命令"错误
-        v.push(Entry { names: &["plan-prefix"],     handler: cmd_plan_prefix,     help: "（已废弃）改用 /plan <任务>" });
-
-        // ── /help 置最后：初次探索使用，不占补全首位 ──
-        v.push(Entry { names: &["help", "h"],       handler: cmd_help,     help: "显示所有命令" });
+        // ── /help 置最后 ──
+        v.push(Entry { names: &["help", "h"],       handler: cmd_help,     help: "帮助 - /help [all|<命令名>]" });
 
         v
     })
@@ -601,7 +592,225 @@ fn cmd_team(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     CmdResult::Consumed
 }
 
-/// V34: 模式 DAG 流转门控 — 验证转移合法性后调 switch_mode
+// ─── /preset — 场景预设 ─────────────────────────────────────────────────
+//
+// 预设定义：每个预设是一组参数组合。应用预设 = 批量 set。
+// 预设列表在本函数内静态定义（不持久化——用户自定义预设 TODO）。
+
+/// 场景预设定义
+struct Preset {
+    name: &'static str,
+    icon: &'static str,
+    description: &'static str,
+    temperature: f64,
+    max_tokens: u32,
+    thinking: &'static str,
+    tool_limit: u32,
+    context_ratio: f64,
+    router: bool,
+    dedup: bool,
+}
+
+const PRESETS: &[Preset] = &[
+    Preset { name: "quick",    icon: "⚡", description: "快速问答",   temperature: 0.3, max_tokens: 2048,  thinking: "off",  tool_limit: 10, context_ratio: 0.5,  router: true,  dedup: false },
+    Preset { name: "code",     icon: "🔧", description: "深度编码",   temperature: 0.6, max_tokens: 64000, thinking: "high", tool_limit: 50, context_ratio: 1.0,  router: true,  dedup: true  },
+    Preset { name: "creative", icon: "✨", description: "创意写作",   temperature: 0.9, max_tokens: 16384, thinking: "off",  tool_limit: 5,  context_ratio: 0.75, router: false, dedup: false },
+    Preset { name: "lean",     icon: "💰", description: "省 Token",  temperature: 0.5, max_tokens: 4096,  thinking: "low",  tool_limit: 20, context_ratio: 0.5,  router: true,  dedup: true  },
+    Preset { name: "marathon", icon: "🏃", description: "长任务",    temperature: 0.5, max_tokens: 32000, thinking: "medium", tool_limit: 50, context_ratio: 0.8,  router: true,  dedup: false },
+    Preset { name: "debug",    icon: "🔍", description: "调试",      temperature: 0.3, max_tokens: 8192,  thinking: "high", tool_limit: 50, context_ratio: 1.0,  router: false, dedup: false },
+];
+
+fn cmd_preset(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        // 打开 Preset picker
+        let items: Vec<String> = PRESETS.iter().map(|p| p.name.to_string()).collect();
+        let labels: Vec<String> = PRESETS.iter().map(|p| {
+            format!("{} {}  temp={} tok={}K think={}", p.icon, p.description,
+                p.temperature, p.max_tokens / 1000, p.thinking)
+        }).collect();
+        s.open_picker_generic(crate::tui::state::PickerKind::Preset, items, labels);
+        return CmdResult::Consumed;
+    }
+    let name = args[0].to_lowercase();
+    if let Some(preset) = PRESETS.iter().find(|p| p.name == name) {
+        apply_preset(s, preset);
+        s.add_toast(
+            format!("{} 预设已应用: {} (temp={} tok={} think={})",
+                preset.icon, preset.description, preset.temperature, preset.max_tokens, preset.thinking),
+            std::time::Duration::from_secs(4),
+        );
+    } else {
+        let valid: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+        s.add_toast(
+            format!("未知预设。可选: {}", valid.join(" / ")),
+            std::time::Duration::from_secs(4),
+        );
+    }
+    CmdResult::Consumed
+}
+
+fn apply_preset(s: &mut AppState, p: &Preset) {
+    s.thinking_depth = p.thinking.to_string();
+    s.active_preset = Some(p.name.to_string());
+    // 其余参数通过 engine 层设置（需 engine_handle）
+    if let Some(ref handle) = s.engine_handle {
+        let core = handle.core.clone();
+        let temp = p.temperature;
+        let max_tok = p.max_tokens;
+        let tool_limit = p.tool_limit;
+        let ctx_ratio = p.context_ratio;
+        let router = p.router;
+        let dedup = p.dedup;
+        tokio::spawn(async move {
+            core.set_temperature(temp).await;
+            core.set_max_tokens(max_tok).await;
+            core.set_tool_limit(tool_limit).await;
+            core.set_context_ratio(ctx_ratio).await;
+            core.set_silent_router(router).await;
+            core.set_dedup(dedup).await;
+        });
+    }
+}
+
+// ─── /set — 单项参数调整 ────────────────────────────────────────────────
+
+fn cmd_set(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    if args.is_empty() {
+        // 显示所有可调参数及当前值
+        let info = format!(
+            "可调参数 (/set <key> <value>)\n\n\
+             temperature | temp     {}\n\
+             max-tokens  | tokens   {}\n\
+             context-ratio | ctx    {}\n\
+             tool-limit  | tools    {}\n\
+             timeout              {}s\n\
+             router               {}\n\
+             dedup                {}\n\
+             thinking             {}\n\
+             preset               {}",
+            s.runtime_temperature.unwrap_or(0.6),
+            s.runtime_max_tokens.unwrap_or(64000),
+            s.runtime_context_ratio.unwrap_or(1.0),
+            s.runtime_tool_limit.unwrap_or(50),
+            s.runtime_timeout.unwrap_or(300),
+            s.runtime_router.unwrap_or(true),
+            s.runtime_dedup.unwrap_or(false),
+            s.thinking_depth,
+            s.active_preset.as_deref().unwrap_or("(none)"),
+        );
+        s.show_info(info);
+        return CmdResult::Consumed;
+    }
+    if args.len() < 2 {
+        s.add_toast("用法: /set <参数名> <值>", std::time::Duration::from_secs(3));
+        return CmdResult::Consumed;
+    }
+    let key = args[0].to_lowercase();
+    let val = args[1];
+    match key.as_str() {
+        "temperature" | "temp" => {
+            if let Ok(v) = val.parse::<f64>() {
+                let v = v.clamp(0.0, 2.0);
+                s.runtime_temperature = Some(v);
+                if let Some(ref handle) = s.engine_handle {
+                    let core = handle.core.clone();
+                    tokio::spawn(async move { core.set_temperature(v).await; });
+                }
+                s.add_toast(format!("temperature → {}", v), std::time::Duration::from_secs(2));
+            } else {
+                s.add_toast("temperature 需要数字 (0.0-2.0)", std::time::Duration::from_secs(3));
+            }
+        }
+        "max-tokens" | "tokens" => {
+            if let Ok(v) = val.parse::<u32>() {
+                s.runtime_max_tokens = Some(v);
+                if let Some(ref handle) = s.engine_handle {
+                    let core = handle.core.clone();
+                    tokio::spawn(async move { core.set_max_tokens(v).await; });
+                }
+                s.add_toast(format!("max_tokens → {}", v), std::time::Duration::from_secs(2));
+            } else {
+                s.add_toast("max-tokens 需要整数", std::time::Duration::from_secs(3));
+            }
+        }
+        "context-ratio" | "ctx" => {
+            if let Ok(v) = val.parse::<f64>() {
+                let v = v.clamp(0.1, 1.0);
+                s.runtime_context_ratio = Some(v);
+                if let Some(ref handle) = s.engine_handle {
+                    let core = handle.core.clone();
+                    tokio::spawn(async move { core.set_context_ratio(v).await; });
+                }
+                s.add_toast(format!("context_ratio → {}%", (v * 100.0) as u32), std::time::Duration::from_secs(2));
+            } else {
+                s.add_toast("context-ratio 需要数字 (0.1-1.0)", std::time::Duration::from_secs(3));
+            }
+        }
+        "tool-limit" | "tools" => {
+            if let Ok(v) = val.parse::<u32>() {
+                s.runtime_tool_limit = Some(v);
+                if let Some(ref handle) = s.engine_handle {
+                    let core = handle.core.clone();
+                    tokio::spawn(async move { core.set_tool_limit(v).await; });
+                }
+                s.add_toast(format!("tool_limit → {}", v), std::time::Duration::from_secs(2));
+            } else {
+                s.add_toast("tool-limit 需要整数", std::time::Duration::from_secs(3));
+            }
+        }
+        "timeout" => {
+            if let Ok(v) = val.parse::<u64>() {
+                s.runtime_timeout = Some(v);
+                if let Some(ref handle) = s.engine_handle {
+                    let core = handle.core.clone();
+                    tokio::spawn(async move { core.set_timeout(v).await; });
+                }
+                s.add_toast(format!("timeout → {}s", v), std::time::Duration::from_secs(2));
+            } else {
+                s.add_toast("timeout 需要整数（秒）", std::time::Duration::from_secs(3));
+            }
+        }
+        "router" => {
+            let enabled = matches!(val, "on" | "true" | "1" | "yes");
+            s.runtime_router = Some(enabled);
+            if let Some(ref handle) = s.engine_handle {
+                let core = handle.core.clone();
+                tokio::spawn(async move { core.set_silent_router(enabled).await; });
+            }
+            s.add_toast(format!("router → {}", if enabled { "on" } else { "off" }), std::time::Duration::from_secs(2));
+        }
+        "dedup" => {
+            let enabled = matches!(val, "on" | "true" | "1" | "yes");
+            s.runtime_dedup = Some(enabled);
+            if let Some(ref handle) = s.engine_handle {
+                let core = handle.core.clone();
+                tokio::spawn(async move { core.set_dedup(enabled).await; });
+            }
+            s.add_toast(format!("dedup → {}", if enabled { "on" } else { "off" }), std::time::Duration::from_secs(2));
+        }
+        "thinking" => {
+            match abacus_types::ThinkingIntent::from_str_loose(val) {
+                Some(intent) => {
+                    let label = intent.to_str();
+                    s.thinking_depth = label.clone();
+                    s.add_toast(format!("thinking → {}", label), std::time::Duration::from_secs(2));
+                }
+                None => s.add_toast("thinking: off|low|medium|high|max|xhigh", std::time::Duration::from_secs(3)),
+            }
+        }
+        _ => {
+            s.add_toast(
+                format!("未知参数: {}。可调: temperature/max-tokens/context-ratio/tool-limit/timeout/router/dedup/thinking", key),
+                std::time::Duration::from_secs(4),
+            );
+        }
+    }
+    // 应用 set 后清除 preset 标记（不再是预设状态）
+    s.active_preset = None;
+    CmdResult::Consumed
+}
+
+/// 模式 DAG 流转门控 — 验证转移合法性后调 switch_mode
 ///
 /// 引用关系：cmd_clarify/meeting 入口；abacus_types::AbacusMode::can_transit_to 判定
 /// 失败行为：toast 提示合法路径 + 不切换
@@ -649,7 +858,10 @@ fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
             // topic: 优先取会议首条用户消息，退回到结论前 10 词
             let topic = extract_meeting_topic(&s.messages)
                 .unwrap_or_else(|| text.split_whitespace().take(10).collect::<Vec<_>>().join(" "));
-            match crate::tui::meeting_cache::quick_save(&topic, &text, specialists, &cwd) {
+            // 2026-05-27: 提取结构化行动项（零 LLM 开销）
+            let action_items = crate::tui::meeting_cache::extract_action_items_from_text(&text);
+
+            match crate::tui::meeting_cache::quick_save(&topic, &text, specialists, &cwd, action_items.clone()) {
                 Ok(path) => s.add_toast(
                     format!("📋 会议记录已保存: {}", path.file_name().unwrap_or_default().to_string_lossy()),
                     std::time::Duration::from_secs(4),
@@ -659,6 +871,26 @@ fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
                     std::time::Duration::from_secs(3),
                 ),
             }
+
+            // 2026-05-27: 如果提取到行动项 → 设置执行提案，等待用户确认
+            if !action_items.is_empty() {
+                let items_text: Vec<String> = action_items.iter().map(|a| a.text.clone()).collect();
+                let suggest_team = items_text.len() > 3;
+                let cmd_hint = if suggest_team { "/team" } else { "/plan" };
+                s.pending_meeting_execution = Some(crate::tui::state::MeetingExecutionPrompt {
+                    action_items: items_text.clone(),
+                    full_conclusion: text.clone(),
+                    suggest_team,
+                    created_at: std::time::Instant::now(),
+                });
+                let preview: String = items_text.iter().take(3).cloned().collect::<Vec<_>>().join("; ");
+                let more = if items_text.len() > 3 { format!(" (+{})", items_text.len() - 3) } else { String::new() };
+                s.add_toast(
+                    format!("🎯 检测到 {} 个行动项: {}{}. 输入 Y 使用 {} 执行", items_text.len(), preview, more, cmd_hint),
+                    std::time::Duration::from_secs(15),
+                );
+            }
+
             s.mode_artifact = Some(abacus_types::ModeArtifact::MeetingConclusion(text));
         }
     }

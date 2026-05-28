@@ -134,6 +134,10 @@ struct TurnContext {
     tools_exhausted: bool,
     /// 80% 工具配额 warning 是否已发出（确保单轮只触发一次）
     tool_warning_emitted: bool,
+    /// 2026-05-27: 时长预算感知——turn 开始时刻
+    turn_started_at: std::time::Instant,
+    /// 时长 warning 是否已发出（确保单轮只触发一次）
+    time_warning_emitted: bool,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -866,6 +870,8 @@ impl<'a> TurnPipeline<'a> {
             recovery_attempts: 0,
             tools_exhausted: false,
             tool_warning_emitted: false,
+            turn_started_at: std::time::Instant::now(),
+            time_warning_emitted: false,
         })
     }
 
@@ -892,15 +898,21 @@ impl<'a> TurnPipeline<'a> {
         if msgs.is_empty() { return; }
 
         // ── Case 1: dangling assistant tool_calls without matching responses ──
-        let last_assistant_with_tools = msgs.iter().rposition(|m| {
-            m.role == MessageRole::Assistant && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
-        });
-        if let Some(idx) = last_assistant_with_tools {
-            let tool_calls = msgs[idx].tool_calls.as_ref().unwrap();
+        // 2026-05-27 修复：扫描全部（不仅最后一个），因为 force_discard 压缩可能在中间留下孤儿。
+        // 从后向前扫描，移除时 index 不影响后续遍历。
+        let mut indices_to_remove: Vec<usize> = Vec::new();
+        for idx in 0..msgs.len() {
+            if msgs[idx].role != MessageRole::Assistant { continue; }
+            let tool_calls = match msgs[idx].tool_calls.as_ref() {
+                Some(tc) if !tc.is_empty() => tc,
+                _ => continue,
+            };
             let expected_ids: std::collections::HashSet<&str> = tool_calls.iter()
                 .map(|tc| tc.id.as_str())
                 .collect();
+            // 向后搜索 tool responses（直到下一个 user/assistant 消息或末尾）
             let found_ids: std::collections::HashSet<&str> = msgs[idx + 1..].iter()
+                .take_while(|m| m.role == MessageRole::Tool || m.role == MessageRole::Assistant)
                 .filter(|m| m.role == MessageRole::Tool)
                 .filter_map(|m| m.tool_call_id.as_deref())
                 .collect();
@@ -910,8 +922,12 @@ impl<'a> TurnPipeline<'a> {
                     missing = ?(expected_ids.difference(&found_ids).collect::<Vec<_>>()),
                     "removing dangling tool_calls message from history"
                 );
-                msgs.remove(idx);
+                indices_to_remove.push(idx);
             }
+        }
+        // 从后往前移除，保持 index 稳定
+        for idx in indices_to_remove.into_iter().rev() {
+            msgs.remove(idx);
         }
 
         // ── Case 2: orphaned tool responses without preceding assistant tool_calls ──
@@ -985,6 +1001,19 @@ impl<'a> TurnPipeline<'a> {
                 merged.push(msg);
             }
             *msgs = merged;
+        }
+
+        // ── Case 4: 预防性 content=None 修复 ──
+        // 2026-05-28: assistant message 无 tool_calls 时 content 不能为 null/None
+        // （OpenAI/DeepSeek 均拒绝）。有 tool_calls 时 content=null 合法。
+        // 预防性修复：填充空字符串（不等 400 后再补）。
+        for m in msgs.iter_mut() {
+            if m.role == MessageRole::Assistant
+                && m.content.is_none()
+                && m.tool_calls.as_ref().map(|tc| tc.is_empty()).unwrap_or(true)
+            {
+                m.content = Some(MessageContent::Text(String::new()));
+            }
         }
     }
 
@@ -1835,13 +1864,39 @@ impl<'a> TurnPipeline<'a> {
                 msgs.push(Message {
                     role: MessageRole::System,
                     content: Some(MessageContent::Text(format!(
-                        "[Abacus] Tool usage: {}/{} (75%). {} calls remaining. \
-                         Prioritize impactful actions; batch related operations.",
+                        "[Abacus 资源提示] 工具调用: {}/{}（75%），剩余 {} 次。\
+                         优先高价值操作；若即将超限请停止工具调用并总结当前进展。",
                         ctx.total_tool_calls, tool_limit, tool_limit - ctx.total_tool_calls
                     ))),
                     name: None, tool_calls: None, tool_call_id: None,
                     reasoning_content: None, prefix: false,
                 });
+            }
+
+            // ── 2026-05-27: 时长预算感知 ──
+            // 在 turn 时间消耗达到 provider timeout 的 60% 时注入提示（仅一次）
+            // 让 LLM 感知剩余时间，优先完成关键步骤
+            if !ctx.time_warning_emitted {
+                let elapsed = ctx.turn_started_at.elapsed();
+                let budget = std::time::Duration::from_secs(
+                    self.core.config.thresholds.turn_provider_timeout_secs
+                );
+                if elapsed > budget.mul_f64(0.6) {
+                    ctx.time_warning_emitted = true;
+                    let remaining_secs = budget.saturating_sub(elapsed).as_secs();
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.push(Message {
+                        role: MessageRole::System,
+                        content: Some(MessageContent::Text(format!(
+                            "[Abacus 资源提示] 本轮已运行 {}s，剩余约 {}s。\
+                             若即将超限，请立即停止工具调用并输出当前进展总结（已完成/未完成/建议下一步）。",
+                            elapsed.as_secs(), remaining_secs
+                        ))),
+                        name: None, tool_calls: None, tool_call_id: None,
+                        reasoning_content: None, prefix: false,
+                    });
+                }
             }
 
             // ── 95% 强制压缩：压缩上下文释放空间，LLM 继续工作（不终止）──
@@ -1871,8 +1926,8 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[Abacus] Tool budget at 95% ({}/{}). Context compressed. \
-                             Complete current task with remaining budget.",
+                            "[Abacus 资源提示] 工具调用已达 95%（{}/{}），上下文已压缩。\
+                             立即停止新工具调用，输出进展总结（已完成/未完成/建议下一步）。",
                             ctx.total_tool_calls, tool_limit
                         ))),
                         name: None, tool_calls: None, tool_call_id: None,
@@ -2549,8 +2604,15 @@ impl<'a> TurnPipeline<'a> {
             }
 
             // ── Mid-turn user signal injection ──────────────────────────────
-            // 检查用户是否在工具执行期间发送了新消息。
-            // 如果有，drain 后注入为特殊格式 user message，让 LLM 下次迭代时自主决策。
+            // 用户在 LLM 工作期间发送了消息 → 注入让 LLM 感知。
+            //
+            // ## 2026-05-27 根因修复
+            // 旧设计用 role=User 注入，但 assistant(tool_calls) → user → assistant
+            // 会在某些 API (OpenAI) 触发 400（tool_calls 必须紧跟 tool responses）。
+            // 改为 role=System 注入：
+            //   1. System 不参与 tool_calls/tool 配对校验，不破坏协议
+            //   2. LLM 仍能感知内容（System 消息优先级高于 User）
+            //   3. 明确指令：不中断当前工具序列，完成后再处理
             //
             // ## 死锁预防
             // mid_turn_signals lock 在独立 scope 内获取并 drain，
@@ -2566,9 +2628,12 @@ impl<'a> TurnPipeline<'a> {
                     let s = self.session.read().await;
                     let mut msgs = s.messages.write().await;
                     msgs.push(Message {
-                        role: MessageRole::User,
+                        role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[Abacus 用户更新] 用户在你工作期间发来了新消息：\n{}\n\n指引：若此更新与当前任务相关，请调整方案后继续；若不相关，完成当前步骤后再处理。",
+                            "[Abacus 用户插入] 用户发来新消息：\n{}\n\n\
+                             约束：不要中断正在进行的工具调用序列。\
+                             完成当前步骤后，在下次文本输出中回应用户消息。\
+                             若用户要求停止，完成当前工具调用后立即停止并总结。",
                             combined
                         ))),
                         name: None,
@@ -2577,6 +2642,10 @@ impl<'a> TurnPipeline<'a> {
                         reasoning_content: None,
                         prefix: false,
                     });
+                    // 通知 stream 层（TUI 可据此显示 "用户消息已注入" 事件）
+                    if let Some(ref stx) = self.stream_tx {
+                        let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(String::new()));
+                    }
                 }
             }
 

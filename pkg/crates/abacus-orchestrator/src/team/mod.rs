@@ -63,6 +63,32 @@ pub struct TaskSpec {
     pub priority: u32,              // 0 = 最高
     pub depends_on: Vec<String>,    // 依赖的 task id 列表
     pub required_role: Option<AgentRole>, // 指定执行角色，None = 任意 Member
+    /// 2026-05-27: 标记此 task 执行后需要 mini-Meeting 专家审查
+    ///
+    /// ## 引用关系
+    /// - 写: Leader 分解任务时根据复杂度/风险设置
+    /// - 读: execute_task_with_review 检查是否触发嵌套 Meeting
+    ///
+    /// ## 设计
+    /// opt-in：默认 false，只有 Leader 判断需要审查时才设为 true
+    /// bounded：嵌套最多 1 层（review Meeting 内不可再嵌 Team）
+    #[serde(default)]
+    pub needs_review: bool,
+}
+
+/// 2026-05-27: Mini-Meeting 审查结果 — Team 子任务专家评审产物
+///
+/// ## 引用关系
+/// - 生产者: execute_task_with_review 内嵌 MeetingManager.run_all() 完成后组装
+/// - 消费者: send_team_message 汇总报告中包含审查意见
+///
+/// ## 生命周期
+/// 随 task 执行结果一起返回；不持久化
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingReviewResult {
+    pub verdict: String,           // "pass" | "needs_work" | "block"
+    pub specialist_opinions: Vec<(String, String)>,  // (specialist_name, opinion)
+    pub suggestions: Vec<String>,
 }
 
 /// 任务状态
@@ -516,6 +542,89 @@ impl TeamSession {
 
         Ok(all_results)
     }
+
+    /// 2026-05-27: 执行 task 后嵌套 mini-Meeting 审查（opt-in，bounded 1 level）
+    ///
+    /// ## 流程
+    /// 1. 正常执行 task (execute_task_with_core)
+    /// 2. 如果 task.needs_review == true 且有 review_specialists → spawn MeetingManager
+    /// 3. MeetingManager.run_all() 收集审查意见
+    /// 4. 组装 MeetingReviewResult 返回
+    ///
+    /// ## 约束
+    /// - 最多 1 层嵌套：review Meeting 内不嵌 Team（bounded by max_rounds=1）
+    /// - review 失败不阻断 task result（graceful degradation）
+    /// - max_concurrent=2, max_rounds=1
+    ///
+    /// ## 引用关系
+    /// - 调用方: send_team_message (api/mod.rs) 当 task.needs_review == true 时走此路径
+    /// - 内部调用: self.execute_task_with_core + MeetingManager::new/build/run_all
+    pub async fn execute_task_with_review(
+        &self,
+        core: &std::sync::Arc<abacus_core::core::CoreLoop>,
+        task: &TaskSpec,
+        role: &AgentRole,
+        review_specialists: Vec<crate::meeting::manager::SpecialistConfig>,
+    ) -> Result<(String, Option<MeetingReviewResult>), KernelError> {
+        // Phase 1: 正常执行 task
+        let result = self.execute_task_with_core(core, task, role).await?;
+
+        // Phase 2: 如果不需要 review 或无可用 specialist → 直接返回
+        if !task.needs_review || review_specialists.is_empty() {
+            return Ok((result, None));
+        }
+
+        // Phase 3: 嵌套 mini-Meeting 审查
+        let session_state = std::sync::Arc::new(
+            tokio::sync::RwLock::new(
+                abacus_core::core::SessionState::new(format!("review_{}", task.id))
+            )
+        );
+        let mut mgr = crate::meeting::manager::MeetingManager::new(
+            core.clone(),
+            session_state,
+            format!("审查任务 '{}' 的执行结果: {}", task.id, &result.chars().take(100).collect::<String>()),
+        )
+        .with_max_concurrent(2)
+        .with_max_rounds(1);
+
+        for sp in review_specialists {
+            mgr.add_specialist(sp);
+        }
+
+        // Build + run（failure = graceful degradation, 返回 result 无 review）
+        match mgr.build().await {
+            Ok(()) => match mgr.run_all().await {
+                Ok(results) => {
+                    let opinions: Vec<(String, String)> = results.iter()
+                        .map(|r| (r.target_specialist.0.clone(), r.engine_output.clone()))
+                        .collect();
+                    let verdict = if opinions.iter().all(|(_, o)| {
+                        let lower = o.to_lowercase();
+                        lower.contains("pass") || lower.contains("通过") || lower.contains("good")
+                    }) {
+                        "pass".to_string()
+                    } else {
+                        "needs_work".to_string()
+                    };
+                    let suggestions: Vec<String> = results.iter()
+                        .filter_map(|r| r.opinion.as_ref())
+                        .flat_map(|o| o.suggestions.clone())
+                        .collect();
+
+                    Ok((result, Some(MeetingReviewResult { verdict, specialist_opinions: opinions, suggestions })))
+                }
+                Err(e) => {
+                    tracing::warn!("Task '{}' review meeting failed: {}, returning without review", task.id, e);
+                    Ok((result, None))
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Task '{}' review meeting build failed: {}, returning without review", task.id, e);
+                Ok((result, None))
+            }
+        }
+    }
 }
 
 // ─── Team Builder ───────────────────────────────────────────────────────
@@ -671,12 +780,12 @@ mod tests {
         let task_a = TaskSpec {
             id: "a".into(), description: "task A".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 0, depends_on: vec![], required_role: None,
+            priority: 0, depends_on: vec![], required_role: None, needs_review: false,
         };
         let task_b = TaskSpec {
             id: "b".into(), description: "task B".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 1, depends_on: vec!["a".into()], required_role: None,
+            priority: 1, depends_on: vec!["a".into()], required_role: None, needs_review: false,
         };
 
         let session = TeamBuilder::new("t3", "dep test")
@@ -758,7 +867,7 @@ mod tests {
             task: TaskSpec {
                 id: "task_1".into(), description: "do thing".into(),
                 required_capabilities: vec![], allowed_tools: vec![],
-                priority: 0, depends_on: vec![], required_role: None,
+                priority: 0, depends_on: vec![], required_role: None, needs_review: false,
             },
             boundary: crate::subagent::SubAgentBoundary::default(),
         }).await;
@@ -806,13 +915,13 @@ mod tests {
             id: "impl_auth".into(), description: "实现登录功能".into(),
             required_capabilities: vec!["rust".into()],
             allowed_tools: vec!["filengine_fs_read".into(), "filengine_fs_write".into()],
-            priority: 0, depends_on: vec![], required_role: Some(AgentRole::Member),
+            priority: 0, depends_on: vec![], required_role: Some(AgentRole::Member), needs_review: false,
         };
         let task_b = TaskSpec {
             id: "test_auth".into(), description: "编写登录测试".into(),
             required_capabilities: vec!["testing".into()],
             allowed_tools: vec!["filengine_fs_read".into(), "filengine_fs_write".into()],
-            priority: 1, depends_on: vec!["impl_auth".into()], required_role: Some(AgentRole::PM),
+            priority: 1, depends_on: vec!["impl_auth".into()], required_role: Some(AgentRole::PM), needs_review: false,
         };
 
         let session = TeamBuilder::new("team_sim", "实现用户认证系统")
@@ -909,22 +1018,22 @@ mod tests {
         let task_leader = TaskSpec {
             id: "plan".into(), description: "Plan architecture".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 0, depends_on: vec![], required_role: Some(AgentRole::Leader),
+            priority: 0, depends_on: vec![], required_role: Some(AgentRole::Leader), needs_review: false,
         };
         let task_member_a = TaskSpec {
             id: "impl_a".into(), description: "Implement feature A".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 1, depends_on: vec![], required_role: Some(AgentRole::Member),
+            priority: 1, depends_on: vec![], required_role: Some(AgentRole::Member), needs_review: false,
         };
         let task_member_b = TaskSpec {
             id: "impl_b".into(), description: "Implement feature B".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 1, depends_on: vec![], required_role: Some(AgentRole::Member),
+            priority: 1, depends_on: vec![], required_role: Some(AgentRole::Member), needs_review: false,
         };
         let task_any = TaskSpec {
             id: "docs".into(), description: "Write docs".into(),
             required_capabilities: vec![], allowed_tools: vec![],
-            priority: 2, depends_on: vec![], required_role: None,
+            priority: 2, depends_on: vec![], required_role: None, needs_review: false,
         };
 
         let session = TeamBuilder::new("t_role", "role dispatch test")

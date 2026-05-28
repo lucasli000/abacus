@@ -1,3 +1,17 @@
+//! Core module — CoreLoop, SessionState, tool registration
+//!
+//! ## ⚠️ 文件过大（321KB）— 计划拆分边界：
+//! - `loop.rs`：CoreLoop（主循环逻辑）
+//! - `state.rs`：SessionState + TurnResult + RequestContext
+//! - `registration.rs`：工具注册 + module init
+//! - `mod.rs`：mod re-exports + 共享类型
+//!
+//! ## 拆分步骤
+//! 1. 建 loop.rs：移动 CoreLoop + pub use 重导出
+//! 2. 建 state.rs：移动 SessionState + TurnResult + RequestContext
+//! 3. 建 registration.rs：移动工具注册函数
+//! 4. mod.rs 保留 re-exports + 共享 use 声明
+
 pub mod context;
 pub mod compute;
 pub mod env;
@@ -32,7 +46,7 @@ use crate::knowledge_store::KnowledgeStore;
 use crate::memory_palace::DualPalaceMemory;
 
 use abacus_types::{
-    CapabilityContext, CapabilityKind, CapabilityRequest, KernelError, ModelId, ToolId, ToolOutput, TurnStats, UserRole,
+    CapabilityContext, CapabilityKind, CapabilityRequest, KernelError, ModelId, ToolId, ToolOutput, TurnStats, UserProfile, UserRole,
 };
 use abacus_types::progressive::{
     AutonomyLevel, GateScope, UserResponse,
@@ -345,7 +359,7 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             // Turn 级
-            turn_max_tool_calls: 100, // 参考 Claude Code ~50，保留 2× 余量应对复杂任务
+            turn_max_tool_calls: 50, // 2026-05-27: 从 100 降至 50，对齐 Claude Code 量级
             turn_max_iterations: 200,
             turn_max_recovery: 5,
             turn_provider_timeout_secs: 300,
@@ -611,7 +625,7 @@ impl Default for CoreConfig {
         Self {
             // V29.13: 5 → 25, 同步 config.rs default_config()
             max_turns_per_request: 1000,
-            max_tool_calls_per_turn: 100,
+            max_tool_calls_per_turn: 50,
             default_model: ModelId("deepseek-v4-flash".into()),
             default_temperature: 0.6,
             // V40: 64000 — 对齐主流 coding agent（Claude Code 20K, OpenCode 32K）
@@ -1485,7 +1499,7 @@ impl CoreLoop {
             &config.system_prompt,
             "", // auto-load from abacusbr.md
         );
-        let safety_guard = SafetyGuard::new();
+        let safety_guard = SafetyGuard::from_profile(&UserProfile::load_default());
 
         // Phase 3 (lint)：在 register_all 之前注入 lint overrides
         // 副作用：替换 registry.lint_rules；后续所有 register() 都看到 allowed list
@@ -2857,6 +2871,51 @@ impl CoreLoop {
 
     pub fn clear_model_override(&self) {
         *self.model_override.blocking_write() = None;
+    }
+
+    // ── 2026-05-28: TUI /set + /preset 运行时参数 setter ────────────────
+    // 写入 runtime_overrides（与 config_set tool 共享同一 map），pipeline 自动消费。
+    // 引用关系：TUI slash_commands::apply_preset / cmd_set → tokio::spawn async move
+    // 生命周期：写入后立即生效于下一次 pipeline execute_loop
+
+    pub async fn set_temperature(&self, v: f64) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("temperature".to_string(), v.to_string());
+    }
+
+    pub async fn set_max_tokens(&self, v: u32) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("max_tokens".to_string(), v.to_string());
+    }
+
+    pub async fn set_tool_limit(&self, v: u32) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("max_tool_calls".to_string(), v.to_string());
+    }
+
+    pub async fn set_context_ratio(&self, v: f64) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("context_ratio".to_string(), v.to_string());
+    }
+
+    pub async fn set_silent_router(&self, enabled: bool) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("silent_router".to_string(), enabled.to_string());
+    }
+
+    pub async fn set_dedup(&self, enabled: bool) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("dedup_enabled".to_string(), enabled.to_string());
+    }
+
+    pub async fn set_timeout(&self, seconds: u64) {
+        self.runtime_overrides.write().unwrap_or_else(|p| p.into_inner())
+            .insert("turn_timeout".to_string(), seconds.to_string());
+    }
+
+    /// 获取记忆宫殿引用（TUI 面板数据拉取用）
+    pub fn memory_palace(&self) -> Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>> {
+        self.memory_palace.clone()
     }
 
     /// 读取当前运行时模型覆盖（pipeline execute_loop 内用）

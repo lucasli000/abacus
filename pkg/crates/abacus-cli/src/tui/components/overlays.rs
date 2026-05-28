@@ -501,6 +501,11 @@ pub fn render_overlays(
     input_area: Rect,
     messages_area: Rect,
 ) {
+    // 2026-05-28: 全屏编辑器覆盖所有其他 overlay
+    if state.input_state == crate::tui::state::InputState::Editor {
+        render_fullscreen_editor(f, state);
+        return;
+    }
     render_toasts(f, state);
     render_confirm_dialog(f, state, input_area);
     // P1 z-order 修复：confirm_dialog 存在时不渲染其他弹窗，避免遇策弹窗被遗漏覆盖
@@ -540,12 +545,12 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         PickerKind::Resume   => format!(" 恢复会话 ({}) ", p.items.len()),
         PickerKind::History  => format!(" 输入历史 ({}) ", p.items.len()),
         PickerKind::Meeting  => " 🧠 Meeting 会诊 ".to_string(),
+        PickerKind::Preset   => " ⚡ 场景预设 ".to_string(),
     };
     let frame = f.area();
 
-    // 宽度：固定为输入框的 6/8，内容在此宽度内自动排版
-    // 下限 36，上限 frame.width
-    let popup_w = (input_area.width * 6 / 8).max(36).min(frame.width);
+    // 宽度：输入框的 6/8，下限 40（与 confirm dialog 统一）
+    let popup_w = (input_area.width * 6 / 8).max(40).min(frame.width);
     let group_overhead = p.groups.as_ref().map(|g| g.len()).unwrap_or(0);
     let slider_overhead = if p.show_thinking_slider { 2 } else { 0 };
     // 底部键位提示行（所有 picker 都有）+ Review picker 的 strict toggle 行
@@ -731,6 +736,7 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         PickerKind::Resume   => " ↑↓ 选会话 · Enter 恢复 · Esc 取消",
         PickerKind::History  => " ↑↓ 选记录 · Enter 重发 · Esc 取消",
         PickerKind::Meeting  => " ↑↓ 选操作 · Enter 执行 · Esc 取消",
+        PickerKind::Preset   => " ↑↓ 选预设 · Enter 应用 · Esc 取消",
     };
     lines.push(Line::from(vec![
         Span::styled(hint, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
@@ -803,4 +809,262 @@ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rec
         state.theme.text_style(TextRole::Caption),
     )));
     f.render_widget(hint, rows[5]);
+}
+
+// ════════════════════════════════════════════════════════════════
+// 全屏编辑器 (2026-05-28)
+// ════════════════════════════════════════════════════════════════
+
+/// 全屏编辑器渲染 — 覆盖整个终端区域
+///
+/// 布局：
+///   ╭─ 编辑器 (Ctrl+S 发送 · Esc 取消) ──────────╮
+///   │  1 │ 文本内容...                              │
+///   │  2 │ ...                                      │
+///   ╰─ Ln 1, Col 0 · 2 lines · 42 chars ──────────╯
+///
+/// 引用关系：render_overlays 在 InputState::Editor 时调用
+/// 生命周期：编辑器打开期间每帧绘制
+fn render_fullscreen_editor(f: &mut ratatui::Frame, state: &AppState) {
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let frame = f.area();
+    let ed = match &state.editor_state {
+        Some(e) => e,
+        None => return,
+    };
+
+    // 外框
+    let title = " 编辑器 (Ctrl+S 发送 · Esc 取消) ";
+    let total_lines = state.input.matches('\n').count() + 1;
+    let total_chars = state.input.chars().count();
+    let bottom_info = format!(
+        " Ln {}, Col {} · {} lines · {} chars ",
+        state.cursor_line + 1, state.cursor_col + 1, total_lines, total_chars
+    );
+
+    let block = Block::default()
+        .title(title)
+        .title_bottom(Line::from(Span::styled(&bottom_info, Style::default().fg(state.theme.muted))))
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(state.theme.accent))
+        .style(Style::default().bg(state.theme.bg));
+
+    f.render_widget(Clear, frame);
+    let inner = block.inner(frame);
+    f.render_widget(block, frame);
+
+    if inner.width < 10 || inner.height < 3 { return; }
+
+    // 行号宽度（动态）：至少 3 位 + 1 分隔
+    let line_num_width: u16 = {
+        let digits = format!("{}", total_lines).len().max(3);
+        (digits + 1) as u16  // "NNN│"
+    };
+    let content_width = inner.width.saturating_sub(line_num_width) as usize;
+    let visible_h = inner.height as usize;
+
+    // 滚动计算
+    let scroll_top = ed.scroll_top;
+    let lines: Vec<&str> = state.input.split('\n').collect();
+
+    // 写入 last_visible_h 供键盘侧精确计算 PgUp/PgDn（Cell 允许 &self 下修改）
+    if let Some(ref ed) = state.editor_state {
+        ed.last_visible_h.set(visible_h);
+    }
+
+    // 代码围栏状态：只扫描 0..scroll_top 确定初始态（O(scroll_top) 但避免 O(total_lines) 每帧分配）
+    // 然后在渲染循环中逐行追踪
+    let mut fence_active = false;
+    for i in 0..scroll_top.min(lines.len()) {
+        if lines[i].trim_start().starts_with("```") {
+            fence_active = !fence_active;
+        }
+    }
+
+    // 渲染可见行
+    let mut render_lines: Vec<Line> = Vec::with_capacity(visible_h);
+    for vis_row in 0..visible_h {
+        let line_idx = scroll_top + vis_row;
+        if line_idx >= lines.len() {
+            // 空行（编辑区超过文本行数）
+            let num_span = Span::styled(
+                format!("{:>width$}│", "~", width = (line_num_width - 1) as usize),
+                Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+            );
+            render_lines.push(Line::from(vec![num_span]));
+            continue;
+        }
+
+        let line_text = lines[line_idx];
+        let is_cursor_line = line_idx == state.cursor_line;
+
+        // 行号
+        let num_style = if is_cursor_line {
+            Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(state.theme.muted)
+        };
+        let num_span = Span::styled(
+            format!("{:>width$}│", line_idx + 1, width = (line_num_width - 1) as usize),
+            num_style,
+        );
+
+        // 内容（带 Markdown 语法着色 + code fence 状态）
+        // 逐行追踪围栏状态（toggle on ``` line，内部行标记 in_fence）
+        let is_fence_marker = line_text.trim_start().starts_with("```");
+        let is_in_fence = if is_fence_marker {
+            fence_active = !fence_active;
+            false // ``` 行本身不标记为 in_fence（有自己的围栏行样式）
+        } else {
+            fence_active
+        };
+        let content_spans = highlight_markdown_line(line_text, state, content_width, is_in_fence);
+
+        let mut spans = vec![num_span];
+        spans.extend(content_spans);
+        render_lines.push(Line::from(spans));
+    }
+
+    let para = Paragraph::new(render_lines);
+    f.render_widget(para, inner);
+
+    // 光标定位
+    let visual_line = state.cursor_line.saturating_sub(scroll_top);
+    if visual_line < visible_h {
+        let cursor_x = inner.x + line_num_width + state.cursor_col as u16;
+        let cursor_y = inner.y + visual_line as u16;
+        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+            f.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
+}
+
+/// Markdown 行级语法着色（零依赖，支持 inline parse）
+///
+/// 参数 in_code_block: 此行是否在 ``` 围栏内部（由调用方跟踪状态）
+fn highlight_markdown_line<'a>(
+    line: &'a str,
+    state: &AppState,
+    _max_width: usize,
+    in_code_block: bool,
+) -> Vec<Span<'a>> {
+    let trimmed = line.trim_start();
+
+    // 围栏内部行 → 代码色（muted + DIM）
+    if in_code_block {
+        return vec![Span::styled(
+            line,
+            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+        )];
+    }
+
+    // 围栏标记行本身
+    if trimmed.starts_with("```") {
+        return vec![Span::styled(
+            line,
+            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+        )];
+    }
+
+    // 标题
+    if trimmed.starts_with("# ") || trimmed.starts_with("## ") || trimmed.starts_with("### ")
+        || trimmed.starts_with("#### ")
+    {
+        return vec![Span::styled(
+            line,
+            Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
+        )];
+    }
+
+    // 列表项
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        let indent = line.len() - trimmed.len();
+        let prefix_end = indent + 2;
+        let mut spans = vec![
+            Span::styled(&line[..prefix_end], Style::default().fg(state.theme.gold)),
+        ];
+        spans.extend(parse_inline_markdown(&line[prefix_end..], state));
+        return spans;
+    }
+
+    // 数字列表
+    if trimmed.len() > 2 && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+        && trimmed.contains(". ")
+    {
+        let indent = line.len() - trimmed.len();
+        if let Some(dot_pos) = trimmed.find(". ") {
+            let prefix_end = indent + dot_pos + 2;
+            let mut spans = vec![
+                Span::styled(&line[..prefix_end], Style::default().fg(state.theme.gold)),
+            ];
+            spans.extend(parse_inline_markdown(&line[prefix_end..], state));
+            return spans;
+        }
+    }
+
+    // 有 inline 标记 → 逐字符 parse
+    if line.contains('`') || line.contains("**") {
+        return parse_inline_markdown(line, state);
+    }
+
+    // 默认：普通文本
+    vec![Span::styled(line, Style::default().fg(state.theme.text))]
+}
+
+/// Inline markdown 解析：`code` 和 **bold** 片段着色
+/// 返回按顺序排列的 Span 列表
+fn parse_inline_markdown<'a>(text: &'a str, state: &AppState) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut i = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let text_style = Style::default().fg(state.theme.text);
+    let code_style = Style::default().fg(state.theme.muted);
+    let bold_style = Style::default().fg(state.theme.text).add_modifier(Modifier::BOLD);
+
+    while i < len {
+        // 行内代码 `...`
+        if bytes[i] == b'`' && i + 1 < len {
+            // 不处理 ``` (那是围栏)
+            if i + 2 < len && bytes[i + 1] == b'`' && bytes[i + 2] == b'`' {
+                spans.push(Span::styled(&text[i..], text_style));
+                break;
+            }
+            if let Some(end) = text[i + 1..].find('`') {
+                let code_end = i + 1 + end;
+                spans.push(Span::styled(&text[i..=code_end], code_style));
+                i = code_end + 1;
+                continue;
+            }
+        }
+        // **bold**
+        if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            if let Some(end) = text[i + 2..].find("**") {
+                let bold_end = i + 2 + end + 2;
+                spans.push(Span::styled(&text[i..bold_end], bold_style));
+                i = bold_end;
+                continue;
+            }
+        }
+        // 普通文本：扫描到下一个特殊字符
+        let start = i;
+        while i < len && bytes[i] != b'`' && !(i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*') {
+            i += 1;
+        }
+        if i > start {
+            spans.push(Span::styled(&text[start..i], text_style));
+        }
+        // 防止无限循环（单个 * 不匹配时跳过）
+        if i < len && i == start {
+            let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            spans.push(Span::styled(&text[i..i + ch_len], text_style));
+            i += ch_len;
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(text, text_style));
+    }
+    spans
 }

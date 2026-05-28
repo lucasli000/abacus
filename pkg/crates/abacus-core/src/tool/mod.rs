@@ -1,5 +1,15 @@
 //! ToolRegistry — 工具注册中心与统一执行接口
 //!
+//! ## ⚠️ 计划增强：ToolCategorizer
+//! 当工具数超过 50 时，LLM 的 tool choice 准确率会下降。
+//! ToolCategorizer 按 category 分片注入，每轮只给 LLM 相关类别的工具。
+//!
+//! 拆分标记：
+//! - `categorizer.rs`：ToolCategory enum + Categorizer 逻辑
+//! - `mod.rs`：ToolRegistry + ToolExecutor trait（现有）
+//!
+//! ## Dependencies
+//!
 //! ## Dependencies (external crates)
 //! - `tokio::sync::RwLock`: concurrent read/write access to tool registry
 //! - `serde_json::Value`: tool parameter and result serialization
@@ -471,9 +481,224 @@ fn tier_visible(tool_tier: &VisibilityTier, threshold: &VisibilityTier) -> bool 
     rank(tool_tier) >= rank(threshold)
 }
 
+/// 对工具按 category 分组（用于分批注入给 LLM）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ToolCategory {
+    /// 文件系统操作（fs.read / ls / grep 等）
+    FileSystem,
+    /// Shell 执行（bash.exec）
+    Shell,
+    /// 网络请求（web.fetch / web.search）
+    Network,
+    /// 代码执行（code.execute）
+    CodeExec,
+    /// 知识库（kb.query / kb.search / kb.ingest）
+    Knowledge,
+    /// 数据库（db.query / db.mutate 等）
+    Database,
+    /// LSP 工具（lsp.*）
+    Lsp,
+    /// 会话管理（session.* / context.*）
+    Session,
+    /// 配置（config.*）
+    Config,
+    /// 编排（orchestrate.* / task.* / mode.*）
+    Orchestration,
+    /// MCP 动态发现
+    Mcp,
+    /// LLM introspection（deduction.* / magchain.*）
+    Introspection,
+}
+
+/// ToolCategorizer — 按类别分批注入工具定义给 LLM
+///
+/// ## 场景
+/// 当注册工具数超过 50 时，LLM 的 tool choice 准确率下降。
+/// ToolCategorizer 根据当前 task_kind 只注入相关类别，减少 LLM 选择空间。
+///
+/// ## 使用方式
+/// ```ignore
+/// let cat = ToolCategorizer::new(registry);
+/// let tools = cat.for_task(TaskKind::CodeGeneration); // 只返回 FileSystem + CodeExec + Lsp
+/// ```
+pub struct ToolCategorizer;
+
+impl ToolCategorizer {
+    /// 为某类任务选择工具类别
+    pub fn categories_for_task(task_kind: &str) -> Vec<ToolCategory> {
+        match task_kind {
+            "code_review" | "code_generation" | "debugging" => {
+                vec![ToolCategory::FileSystem, ToolCategory::CodeExec, ToolCategory::Lsp]
+            }
+            "data_analysis" | "research" => {
+                vec![ToolCategory::Network, ToolCategory::Knowledge, ToolCategory::CodeExec]
+            }
+            "web_development" | "frontend" => {
+                vec![ToolCategory::FileSystem, ToolCategory::CodeExec, ToolCategory::Lsp]
+            }
+            "devops" | "deployment" => {
+                vec![ToolCategory::Shell, ToolCategory::FileSystem, ToolCategory::Network]
+            }
+            "general_chat" => {
+                vec![ToolCategory::FileSystem, ToolCategory::Knowledge, ToolCategory::Network]
+            }
+            "meeting" | "planning" => {
+                vec![ToolCategory::Orchestration, ToolCategory::Knowledge]
+            }
+            _ => {
+                // 默认：注入除 Shell + Orchestration 之外的所有工具
+                vec![
+                    ToolCategory::FileSystem, ToolCategory::Network,
+                    ToolCategory::CodeExec, ToolCategory::Knowledge,
+                    ToolCategory::Database, ToolCategory::Lsp,
+                    ToolCategory::Session, ToolCategory::Config,
+                    ToolCategory::Introspection,
+                ]
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TieredOnboarding — 渐进式引导
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// ## 设计动机
+// 新用户首次启动 Abacus 时看到大量配置项（config.example.toml 含 8 个注释块 + deprecated 字段），
+// 学习曲线陡峭。TieredOnboarding 检测首次运行，渐进暴露功能。
+//
+// ## 阶段
+// Tier 0: 首次启动 — 只提示 API Key 配置
+// Tier 1: 3 次对话后 — 显示 /mode 命令提示
+// Tier 2: 10 次对话后 — 显示 specialist / meeting 配置
+// Tier 3: 30 次对话后 — 显示所有高级功能
+
+/// 用户上手阶段
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingTier {
+    /// 首次启动 — 只配 API Key
+    Zero,
+    /// 基础使用（<3 次对话）
+    One,
+    /// 功能探索（3-10 次对话）
+    Two,
+    /// 高级用户（>10 次对话）
+    Three,
+}
+
+impl OnboardingTier {
+    pub fn from_turn_count(turns: u32) -> Self {
+        if turns == 0 { Self::Zero }
+        else if turns < 3 { Self::One }
+        else if turns < 10 { Self::Two }
+        else { Self::Three }
+    }
+
+    /// 当前阶段应向用户展示的提示
+    pub fn tips(&self) -> Vec<&'static str> {
+        match self {
+            Self::Zero => vec![
+                "欢迎使用 Abacus！请先配置 API Key：/config set llm.api_key <your_key>",
+                "配置完成后输入任意问题开始使用",
+            ],
+            Self::One => vec![
+                "输入 /help 查看可用命令",
+                "输入 /mode 切换模式（Clarify/Plan/Team/Meeting）",
+            ],
+            Self::Two => vec![
+                "输入 /model 切换不同 LLM 模型",
+                "试试 /meeting 模式召开多专家会议",
+            ],
+            Self::Three => vec![
+                "支持自定义 specialist YAML 配置专家角色",
+                "输入 /team 启动多 Agent 协作执行",
+            ],
+        }
+    }
+}
+
+// ─── UsageDrivenReveal ──────────────────────────────────────────────────────
+
+/// 使用量驱动的功能渐进暴露
+pub struct UsageTracker {
+    counters: tokio::sync::RwLock<std::collections::HashMap<String, u32>>,
+    thresholds: std::collections::HashMap<String, u32>,
+}
+
+impl UsageTracker {
+    pub fn new() -> Self {
+        let mut thresholds = std::collections::HashMap::new();
+        thresholds.insert("meeting".into(), 3);
+        thresholds.insert("team".into(), 2);
+        thresholds.insert("workflow".into(), 5);
+        thresholds.insert("specialist_config".into(), 8);
+        Self {
+            counters: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            thresholds,
+        }
+    }
+
+    pub async fn record(&self, feature: &str) -> Option<u32> {
+        let mut ctr = self.counters.write().await;
+        *ctr.entry(feature.to_string()).or_insert(0) += 1;
+        let threshold = self.thresholds.get(feature).copied()?;
+        let count = *ctr.get(feature)?;
+        if count >= threshold { Some(count) } else { None }
+    }
+
+    pub async fn count(&self, feature: &str) -> u32 {
+        self.counters.read().await.get(feature).copied().unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
+
+    #[test]
+    fn test_tool_categorizer_for_code_review() {
+        let cats = ToolCategorizer::categories_for_task("code_review");
+        assert!(cats.contains(&ToolCategory::Lsp));
+        assert!(!cats.contains(&ToolCategory::Shell));
+    }
+
+    #[test]
+    fn test_tool_categorizer_default() {
+        let cats = ToolCategorizer::categories_for_task("unknown_task_type");
+        assert!(cats.contains(&ToolCategory::FileSystem));
+        assert!(!cats.contains(&ToolCategory::Shell));
+    }
+
+    #[test]
+    fn test_onboarding_tier_progression() {
+        assert_eq!(OnboardingTier::from_turn_count(0), OnboardingTier::Zero);
+        assert_eq!(OnboardingTier::from_turn_count(1), OnboardingTier::One);
+        assert_eq!(OnboardingTier::from_turn_count(5), OnboardingTier::Two);
+        assert_eq!(OnboardingTier::from_turn_count(20), OnboardingTier::Three);
+    }
+
+    #[test]
+    fn test_onboarding_tier_zero_has_api_key_tip() {
+        let tips = OnboardingTier::Zero.tips();
+        assert!(tips[0].contains("API Key"));
+    }
+
+    #[tokio::test]
+    async fn test_usage_tracker_records_and_triggers() {
+        let tracker = UsageTracker::new();
+        assert_eq!(tracker.count("meeting").await, 0);
+        assert!(tracker.record("meeting").await.is_none());
+        assert!(tracker.record("meeting").await.is_none());
+        assert_eq!(tracker.record("meeting").await, Some(3));
+        assert_eq!(tracker.count("meeting").await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_usage_tracker_unknown_feature() {
+        let tracker = UsageTracker::new();
+        assert!(tracker.record("unknown").await.is_none());
+    }
+
     use abacus_types::{ToolProvider, ToolSchema};
 
     #[tokio::test]

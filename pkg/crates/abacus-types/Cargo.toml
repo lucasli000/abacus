@@ -8,5 +8,7 @@ description = "Abacus Agent Kernel — L0 type definitions"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = "5"
 [lints]
 workspace = true

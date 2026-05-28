@@ -13,6 +13,8 @@
 //! - max_recursion_depth（跨轮无意义）
 //! - max_session_duration（不限制长对话）
 
+use abacus_types::UserProfile;
+
 /// 安全不变量守卫（纯 Turn 级）
 ///
 /// 只保护单轮内的资源消耗，不对 session 做任何累积限制。
@@ -21,7 +23,7 @@ pub struct SafetyGuard {
     pub max_input_length: usize,
     /// 单轮工具调用次数上限（一次用户消息 → LLM 回复的完整过程）
     pub max_total_tool_calls: u32,
-    /// 敏感操作列表（需要用户确认）
+    /// 敏感操作列表（从 UserProfile 加载，可覆盖默认）
     pub sensitive_operations: Vec<String>,
 }
 
@@ -42,6 +44,25 @@ impl SafetyGuard {
                 "filengine_bash_exec".into(),
                 "web_fetch".into(),
             ],
+        }
+    }
+
+    /// 从 UserProfile 创建安全守卫（白名单覆盖）
+    pub fn from_profile(profile: &UserProfile) -> Self {
+        let mut guard = Self::new();
+        // 从 UserProfile 覆盖敏感操作白名单
+        if !profile.safe_operations.is_empty() {
+            guard.sensitive_operations.retain(|op| !profile.safe_operations.contains(op));
+        }
+        guard.max_total_tool_calls = profile.max_tool_calls_per_turn;
+        guard
+    }
+
+    /// 判断是否需要用户确认
+    pub fn requires_confirmation(&self, tool_id: &str, profile: Option<&UserProfile>) -> bool {
+        match profile {
+            Some(p) => p.requires_confirmation(tool_id),
+            None => self.is_sensitive_operation(tool_id),
         }
     }
 

@@ -56,13 +56,26 @@ pub fn panel_inner(area: Rect) -> (Rect, Rect) {
 /// - Tall  (≥40 行)：6 行 = 顶栏(1)+文本(2)+底栏(1)+边框(2)（V14：去掉冗余留白，Ready/Enter 行贴底）
 /// - Normal(20-39)：5 行 = 顶栏(1)+文本(1)+底栏(1)+边框(2)
 /// - Short (<20)  ：3 行 = 文本(1)+边框(2)（极窄模式省略顶/底栏）
-pub fn chat_input_height(terminal_rows: u16) -> u16 {
-    // K7 完善：真按高度自适应
-    match TerminalHeight::classify(terminal_rows) {
-        TerminalHeight::Tall => 6,    // ≥40 行：顶栏+2行+底栏+边框=6（紧凑无空行）
-        TerminalHeight::Normal => 5,  // 20-39 行：顶栏+1行+底栏+边框=5
-        TerminalHeight::Short => 3,   // <20 行：单行+边框=3
+/// 2026-05-28: 自适应高度 — 按 input 行数动态扩展（2→8 行文本区）
+/// 参数 input_lines: 当前输入的行数（0 = 空输入）
+/// 参数 prev_h: 上一帧的高度（用于 hysteresis：只涨不跌，除非 input 回到 ≤2 行）
+/// 结构：border(2) + status_line(1) + text_lines(N) + info_line(1)
+///       即总高 = N + 4（最小 5，最大 12）
+pub fn chat_input_height_adaptive(terminal_rows: u16, input_lines: usize) -> u16 {
+    if matches!(TerminalHeight::classify(terminal_rows), TerminalHeight::Short) {
+        return 3;
     }
+    // 文本行上限：终端高度的 40%，且不超过 8 行
+    let max_text_lines = ((terminal_rows as usize) * 40 / 100).min(8).max(2);
+    let desired_text_lines = input_lines.max(2).min(max_text_lines);
+    // 总高 = text_lines + 4 (border×2 + status + info)
+    let h = (desired_text_lines + 4) as u16;
+    h.min(terminal_rows / 2) // 绝不超过屏幕一半
+}
+
+pub fn chat_input_height(terminal_rows: u16) -> u16 {
+    // 向后兼容：无 input 行数时用默认值
+    chat_input_height_adaptive(terminal_rows, 2)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

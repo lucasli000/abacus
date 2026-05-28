@@ -130,6 +130,63 @@ impl ModelCatalog {
             Arc::new(make_spec_gemini((512, 24_576), 1_000_000, 8_192)),
         );
 
+        // ─── 智谱 GLM（OpenAI-compatible，thinking 走 EnabledToggle）──────────
+        // 参考: https://docs.z.ai/guides/llm/glm-5.1
+        // GLM-5.1: 200K context, 16K output, 旗舰（SWE-bench Pro 开源第一）
+        // GLM-5: 200K context, 16K output, 编程 SOTA
+        // GLM-5-Turbo: 200K context, 16K output, Agent 专用（高频工具调用）
+        // GLM-5.1-highspeed: 200K context, 16K output, 400 tok/s 高速版
+        for model_id in ["glm-5.1", "glm-5.1-highspeed", "glm-5", "glm-5-turbo"] {
+            specs.insert(
+                ModelId(model_id.into()),
+                Arc::new(make_spec_glm_thinking(200_000, 16_384)),
+            );
+        }
+        // GLM-4.7 / GLM-4.6: 128K, thinking
+        for model_id in ["glm-4.7", "glm-4.6", "glm-4-plus", "glm-4-long"] {
+            specs.insert(
+                ModelId(model_id.into()),
+                Arc::new(make_spec_glm_thinking(128_000, 8_192)),
+            );
+        }
+        // GLM-4-Flash 系列: 128K, 无 thinking
+        for model_id in ["glm-4-flash", "glm-4-flashx", "glm-4-air"] {
+            specs.insert(
+                ModelId(model_id.into()),
+                Arc::new(base_spec(128_000, 4_096)),
+            );
+        }
+
+        // ─── Kimi/Moonshot（OpenAI-compatible）────────────────────────────────
+        // 参考: https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart
+        // Kimi K2.6: 262K context, 1T MoE (32B active), 旗舰（多模态+Agent）
+        // Kimi K2 Thinking: 256K context, 深度推理版（200-300 tool calls 稳定）
+        // Kimi K2: 256K context, 初代 1T MoE
+        specs.insert(
+            ModelId("kimi-k2.6".into()),
+            Arc::new(make_spec_kimi_thinking(262_144, 16_384)),
+        );
+        specs.insert(
+            ModelId("kimi-k2-thinking".into()),
+            Arc::new(make_spec_kimi_thinking(256_000, 16_384)),
+        );
+        for model_id in ["kimi-k2", "kimi-latest"] {
+            specs.insert(
+                ModelId(model_id.into()),
+                Arc::new(make_spec_kimi_thinking(256_000, 8_192)),
+            );
+        }
+        // Moonshot 旧系列: 无 thinking
+        for model_id in ["moonshot-v1-128k", "moonshot-v1-32k", "moonshot-v1-8k"] {
+            let cw = if model_id.contains("128k") { 128_000 }
+                else if model_id.contains("32k") { 32_000 }
+                else { 8_000 };
+            specs.insert(
+                ModelId(model_id.into()),
+                Arc::new(base_spec(cw, 4_096)),
+            );
+        }
+
         Self { specs }
     }
 
@@ -454,6 +511,34 @@ fn make_spec_openai_classic_reasoning(
     s
 }
 
+/// 2026-05-28: 智谱 GLM 流派（带 thinking）
+/// OpenAI-compatible API；thinking 走 EnabledToggle；多轮回传 reasoning_content
+fn make_spec_glm_thinking(context_window: usize, max_output_tokens: u32) -> ModelSpec {
+    let mut s = base_spec(context_window, max_output_tokens);
+    s.thinking_capabilities = ThinkingCapabilities {
+        supported_modes: vec![ThinkingModeKind::EnabledToggle],
+        default_mode: Some(ThinkingModeKind::EnabledToggle),
+        effort_levels: vec![EffortLevel::High], // GLM 无显式档位，默认 high
+        budget_range: None,
+        multi_turn_replay: MultiTurnReplay::ReasoningContent,
+    };
+    s
+}
+
+/// 2026-05-28: Kimi/Moonshot 流派（带 thinking）
+/// OpenAI-compatible API；k1/k2 thinking 走 EnabledToggle；reasoning_content 回传
+fn make_spec_kimi_thinking(context_window: usize, max_output_tokens: u32) -> ModelSpec {
+    let mut s = base_spec(context_window, max_output_tokens);
+    s.thinking_capabilities = ThinkingCapabilities {
+        supported_modes: vec![ThinkingModeKind::EnabledToggle],
+        default_mode: Some(ThinkingModeKind::EnabledToggle),
+        effort_levels: vec![EffortLevel::High], // Kimi 无显式档位
+        budget_range: None,
+        multi_turn_replay: MultiTurnReplay::ReasoningContent,
+    };
+    s
+}
+
 /// Gemini 流派：BudgetInt（-1=动态、0=禁用、范围内整数）
 fn make_spec_gemini(
     budget_range: (u32, u32),
@@ -478,11 +563,56 @@ mod tests {
     #[test]
     fn test_builtin_contains_known_models() {
         let cat = ModelCatalog::builtin();
-        // 抽样验证四家覆盖
+        // 抽样验证六家覆盖
         assert!(cat.lookup(&ModelId("claude-opus-4-7".into())).is_some());
         assert!(cat.lookup(&ModelId("deepseek-v4-pro".into())).is_some());
         assert!(cat.lookup(&ModelId("gpt-5".into())).is_some());
         assert!(cat.lookup(&ModelId("gemini-2.5-pro".into())).is_some());
+        assert!(cat.lookup(&ModelId("glm-4.7".into())).is_some());
+        assert!(cat.lookup(&ModelId("kimi-k2".into())).is_some());
+    }
+
+    #[test]
+    fn test_glm_5_1_thinking_support() {
+        let cat = ModelCatalog::builtin();
+        let spec = cat.lookup(&ModelId("glm-5.1".into())).unwrap();
+        assert_eq!(spec.context_window, 200_000);
+        assert_eq!(spec.max_output_tokens, 16_384);
+        assert!(spec.thinking_capabilities.supported_modes.contains(&ThinkingModeKind::EnabledToggle));
+        assert_eq!(spec.thinking_capabilities.multi_turn_replay, MultiTurnReplay::ReasoningContent);
+    }
+
+    #[test]
+    fn test_glm_4_flash_no_thinking() {
+        let cat = ModelCatalog::builtin();
+        let spec = cat.lookup(&ModelId("glm-4-flash".into())).unwrap();
+        assert_eq!(spec.context_window, 128_000);
+        assert!(spec.thinking_capabilities.supported_modes.is_empty());
+    }
+
+    #[test]
+    fn test_kimi_k2_6_thinking_support() {
+        let cat = ModelCatalog::builtin();
+        let spec = cat.lookup(&ModelId("kimi-k2.6".into())).unwrap();
+        assert_eq!(spec.context_window, 262_144);
+        assert_eq!(spec.max_output_tokens, 16_384);
+        assert!(spec.thinking_capabilities.supported_modes.contains(&ThinkingModeKind::EnabledToggle));
+        assert_eq!(spec.thinking_capabilities.multi_turn_replay, MultiTurnReplay::ReasoningContent);
+    }
+
+    #[test]
+    fn test_kimi_k2_thinking_256k() {
+        let cat = ModelCatalog::builtin();
+        let spec = cat.lookup(&ModelId("kimi-k2-thinking".into())).unwrap();
+        assert_eq!(spec.context_window, 256_000);
+    }
+
+    #[test]
+    fn test_moonshot_no_thinking() {
+        let cat = ModelCatalog::builtin();
+        let spec = cat.lookup(&ModelId("moonshot-v1-128k".into())).unwrap();
+        assert_eq!(spec.context_window, 128_000);
+        assert!(spec.thinking_capabilities.supported_modes.is_empty());
     }
 
     #[test]

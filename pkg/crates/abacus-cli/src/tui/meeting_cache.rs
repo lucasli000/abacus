@@ -268,6 +268,89 @@ pub fn load_record(id: &str) -> Option<MeetingRecord> {
     from_file_content(&content)
 }
 
+/// 从会议结论文本中提取结构化行动项（零 LLM 开销，纯文本解析）
+///
+/// ## 匹配模式（优先级由高到低）
+/// 1. Markdown checkbox: `- [ ] xxx` / `- [x] xxx`
+/// 2. Numbered imperative: `1. 实现...` / `2. 修复...`
+/// 3. Heading-scoped bullets: "行动项:" / "Action Items:" 标题下的 `- xxx`
+/// 4. Bullet with action verb: `- 实现/修复/添加/重构/测试/部署...`
+///
+/// ## 引用关系
+/// - 消费方: `try_switch_mode` (Meeting→Clarify) 提取后传入 `quick_save` + 设置 `pending_meeting_execution`
+///
+/// ## 设计
+/// - 返回空 Vec 表示无结构化行动项（调用方应跳过执行提案）
+/// - 不做去重（同一行不会被多模式重复匹配，但不同行内容可能语义相似）
+pub fn extract_action_items_from_text(text: &str) -> Vec<RecordActionItem> {
+    let mut items: Vec<RecordActionItem> = Vec::new();
+    let mut in_action_section = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        // Pattern 1: Markdown checkbox — `- [ ] xxx` / `- [x] xxx` / `* [ ] xxx`
+        if let Some(rest) = trimmed.strip_prefix("- [") {
+            if let Some(content) = rest.strip_prefix("] ") {
+                items.push(RecordActionItem { text: content.trim().to_string(), done: false });
+                continue;
+            }
+            if let Some(content) = rest.strip_prefix("x] ") {
+                items.push(RecordActionItem { text: content.trim().to_string(), done: true });
+                continue;
+            }
+        }
+
+        // Pattern 2: Numbered imperative — `1. xxx` / `2. xxx` (1-99)
+        if let Some(dot_pos) = trimmed.find(". ") {
+            let prefix = &trimmed[..dot_pos];
+            if prefix.len() <= 2 && prefix.chars().all(|c| c.is_ascii_digit()) {
+                let content = trimmed[dot_pos + 2..].trim();
+                if !content.is_empty() && !items.iter().any(|i| i.text == content) {
+                    items.push(RecordActionItem { text: content.to_string(), done: false });
+                    continue;
+                }
+            }
+        }
+
+        // Pattern 3: Section header detection
+        let lower = trimmed.to_lowercase();
+        if lower.starts_with("行动项") || lower.starts_with("action item")
+            || lower.starts_with("## 行动") || lower.starts_with("## action")
+            || lower.starts_with("### 行动") || lower.starts_with("### action")
+        {
+            in_action_section = true;
+            continue;
+        }
+        // Exit section on next heading or empty line after items
+        if in_action_section {
+            if trimmed.starts_with('#') || (trimmed.is_empty() && !items.is_empty()) {
+                in_action_section = false;
+                continue;
+            }
+            // Bullets inside action section
+            if let Some(content) = trimmed.strip_prefix("- ") {
+                if !content.is_empty() {
+                    items.push(RecordActionItem { text: content.trim().to_string(), done: false });
+                    continue;
+                }
+            }
+        }
+
+        // Pattern 4: Bullet with Chinese action verb (only if not already captured)
+        if let Some(content) = trimmed.strip_prefix("- ") {
+            let action_verbs = ["实现", "修复", "添加", "重构", "测试", "部署", "优化", "删除", "更新", "迁移", "创建", "配置"];
+            if action_verbs.iter().any(|v| content.starts_with(v)) {
+                if !items.iter().any(|i| i.text == content) {
+                    items.push(RecordActionItem { text: content.to_string(), done: false });
+                }
+            }
+        }
+    }
+
+    items
+}
+
 /// 快捷保存：Meeting→Clarify 转移时直接调用
 ///
 /// ## 参数
@@ -275,6 +358,7 @@ pub fn load_record(id: &str) -> Option<MeetingRecord> {
 /// - `conclusion_body`: 会议结论 Markdown 正文
 /// - `specialists`: 参与专家名称列表
 /// - `cwd`: 当前工作目录
+/// - `action_items`: 2026-05-27 新增 — 从结论中提取的行动项（空 Vec = 无结构化行动项）
 ///
 /// ## 错误处理
 /// IO 错误不 panic，调用方收到 Err 后 toast 提示即可
@@ -286,6 +370,7 @@ pub fn quick_save(
     conclusion_body: &str,
     specialists: Vec<String>,
     cwd: &str,
+    action_items: Vec<RecordActionItem>,
 ) -> std::io::Result<PathBuf> {
     let now = Utc::now();
     let mut record = MeetingRecord {
@@ -296,7 +381,7 @@ pub fn quick_save(
         date: now,
         cwd: cwd.to_string(),
         specialists,
-        action_items: vec![],
+        action_items,
         unresolved: vec![],
         body: conclusion_body.to_string(),
     };
@@ -466,5 +551,51 @@ mod tests {
         assert!(injected.contains("security"));
         assert!(injected.contains("fix auth"));
         assert!(injected.contains("接口设计"));
+    }
+
+    // ─── 2026-05-27: extract_action_items_from_text 测试 ──────────────────────
+
+    #[test]
+    fn extract_markdown_checkboxes() {
+        let text = "讨论完毕：\n- [ ] 实现登录功能\n- [x] 修复 bug\n- [ ] 部署上线";
+        let items = extract_action_items_from_text(text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "实现登录功能");
+        assert!(!items[0].done);
+        assert_eq!(items[1].text, "修复 bug");
+        assert!(items[1].done);
+    }
+
+    #[test]
+    fn extract_numbered_list() {
+        let text = "结论：\n1. 重构 auth 模块\n2. 添加测试覆盖\n3. 部署到 staging";
+        let items = extract_action_items_from_text(text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].text, "重构 auth 模块");
+    }
+
+    #[test]
+    fn extract_action_section() {
+        let text = "# 会议结论\n讨论很好\n\n## 行动项\n- 优化数据库查询\n- 添加缓存层\n\n## 其他";
+        let items = extract_action_items_from_text(text);
+        assert!(items.len() >= 2);
+        assert!(items.iter().any(|i| i.text == "优化数据库查询"));
+        assert!(items.iter().any(|i| i.text == "添加缓存层"));
+    }
+
+    #[test]
+    fn extract_action_verbs() {
+        let text = "建议如下：\n- 实现用户认证\n- 这是普通描述不是行动项\n- 部署到生产环境";
+        let items = extract_action_items_from_text(text);
+        assert!(items.iter().any(|i| i.text == "实现用户认证"));
+        assert!(items.iter().any(|i| i.text == "部署到生产环境"));
+        assert!(!items.iter().any(|i| i.text.contains("普通描述")));
+    }
+
+    #[test]
+    fn extract_empty_for_no_structure() {
+        let text = "这是一段没有任何结构化行动项的纯文本讨论。大家同意了方案 A。";
+        let items = extract_action_items_from_text(text);
+        assert!(items.is_empty());
     }
 }

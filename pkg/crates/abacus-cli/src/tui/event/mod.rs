@@ -73,6 +73,7 @@ pub fn apply_picker_selection(state: &mut AppState) {
                 _              => "/meeting".to_string(),  // default: switch mode
             }
         }
+        PickerKind::Preset   => format!("/preset {}", value),
         PickerKind::History  => {
             // History 不走 slash dispatch，直接写入 input 并 submit
             state.picker = None; // 已被 take，确保清空
@@ -114,6 +115,11 @@ pub fn handle_slash_command(state: &mut AppState, text: &str) -> bool {
         "/review"                      => { state.open_picker_review();   return true; }
         "/resume"                      => { state.open_picker_resume();   return true; }
         "/history"                     => { state.open_picker_history();  return true; }
+        "/preset"                      => {
+            // 无参 /preset → 走 cmd_preset 内部逻辑打开 picker
+            let _ = crate::tui::slash_commands::dispatch(state, "/preset");
+            return true;
+        }
         _ => {}
     }
     match slash_commands::dispatch(state, text) {
@@ -182,6 +188,8 @@ fn handle_save_session(state: &mut AppState) {
 pub enum EscAction {
     CloseSettings,
     ClosePicker,
+    /// 2026-05-28: 全屏编辑器关闭（保留 input 不提交）
+    CloseEditor,
     CloseThemePreview,
     ExitCompletion,
     CancelOperation,
@@ -196,6 +204,8 @@ pub fn dispatch_esc(state: &AppState) -> EscAction {
     if state.show_settings { return EscAction::CloseSettings; }
     // V13: picker 打开时 Esc 优先关闭（用户期望"取消选择"）
     if state.picker.is_some() { return EscAction::ClosePicker; }
+    // 2026-05-28: 全屏编辑器打开时 Esc 关闭编辑器（保留内容）
+    if state.input_state == InputState::Editor { return EscAction::CloseEditor; }
     // V10：theme preview 优先级低于 settings，高于 completion / pause
     if state.theme_preview_open { return EscAction::CloseThemePreview; }
     if state.input_state == InputState::Completing { return EscAction::ExitCompletion; }
@@ -228,6 +238,9 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
         EscAction::ClosePicker => {
             state.picker = None;
             state.add_toast("已取消", Duration::from_millis(800));
+        }
+        EscAction::CloseEditor => {
+            state.close_editor();
         }
         EscAction::CloseThemePreview => {
             state.theme_preview_open = false;
@@ -815,65 +828,31 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
 
 /// 触发补全：分析当前输入，生成候选列表。
 /// 返回 true 表示有候选（进入 Completing 状态），false 表示无匹配。
+/// 2026-05-28: 补全统一走 inline suggestion（不再弹窗）
+///
+/// 旧行为：设置 InputState::Completing + 弹窗候选列表
+/// 新行为：计算最佳候选 → 写入 state.inline_suggestion → ghost text 渲染
+///        用户 Tab 接受 / 继续输入覆盖 / Esc 清除
+///
+/// 返回 true 表示有候选（Tab 不应插入缩进）
 pub fn trigger_completion(state: &mut AppState) -> bool {
-    let input = state.input.as_str();
-    let cursor = state.cursor_pos;
-
-    // 取光标前的部分作为补全前缀
-    let prefix = &input[..cursor];
-    if prefix.is_empty() {
-        // 空输入 → 无补全
-        return false;
-    }
-
-    // 提取最后一个 token（以空格或 / 开头为界）
-    let last_token_start = prefix.rfind(|c: char| c.is_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let token = &prefix[last_token_start..];
-    let partial = &input[..last_token_start]; // 补全前缀之前的固定部分
-
-    let candidates: Vec<String> = if token.starts_with('/') {
-        // 斜杠命令补全 — Phase 3: 动态从 registry 获取（SSoT）
-        let lower = token.to_lowercase();
-        let all_names = crate::tui::slash_commands::all_command_names();
-        all_names.iter()
-            .map(|n| format!("/{}", n))
-            .filter(|c| c.to_lowercase().starts_with(&lower))
-            .collect()
-    } else if token.contains('/') || token.contains('\\') || token.starts_with('.') || token.starts_with('~') {
-        // 路径补全 — 简单前缀匹配（文件列表由后端异步提供）
-        // 此处先使用空列表，Ctrl+Space 时异步调用 filengine
-        Vec::new()
+    // 重算 inline suggestion（统一入口已涵盖斜杠命令 + 历史）
+    let suggestion = state.compute_inline_suggestion();
+    if suggestion.is_some() {
+        state.inline_suggestion = suggestion;
+        true
     } else {
-        // 历史补全 + 命令补全：匹配已提交过的输入
-        let lower = token.to_lowercase();
-        let mut from_history: Vec<String> = state.input_history.iter()
-            .filter(|h| h.to_lowercase().starts_with(&lower))
-            .take(20)
-            .cloned()
-            .collect();
-        from_history.dedup();
-        from_history
-    };
-
-    if candidates.is_empty() {
-        return false;
+        state.inline_suggestion = None;
+        false
     }
-
-    state.completion_candidates = candidates;
-    state.completion_index = 0;
-    state.completion_prefix = partial.to_string();
-    state.input_state = InputState::Completing;
-    true
 }
 
 /// 接受当前选中的补全候选。
 ///
 /// 旗杆命令逻辑：
 /// - 候选以 '/' 开头 且 completion_prefix 为空（根级命令，不是路径补全的参数部分）
-///   → 填充完后直接调 submit_message（一次 Enter 即执行）
-///   符合 VS Code / fish / zsh 用户直觉（命令面板 Enter = 执行）
+///   → 仅 1 个候选时直接调 submit_message（一次 Enter 即执行），
+///     多候选时只填充输入框，用户再按 Enter 确认（V32-2：防误选）
 /// - 其他候选（文件路径、带参数的命令）→ 仅填充输入框，用户继续编辑
 fn accept_completion(state: &mut AppState) {
     if state.completion_index >= state.completion_candidates.len() {
@@ -883,24 +862,25 @@ fn accept_completion(state: &mut AppState) {
     let chosen = state.completion_candidates[state.completion_index].clone();
     // L3-17: 仅斜杠命令后加空格，文件路径不加
     let suffix = if chosen.starts_with('/') { " " } else { "" };
-    // cancel_completion 会清 completion_prefix，必须在此先捕获判断结果
+    // V32-2: 在 cancel_completion 清空列表前捕获候选数
+    let unambiguous = state.completion_candidates.len() == 1;
     let is_slash_root_cmd = chosen.starts_with('/') && state.completion_prefix.is_empty();
     state.input = format!("{}{}{}", state.completion_prefix, chosen, suffix);
     state.cursor_pos = state.input.len();
     state.recalculate_cursor();
     cancel_completion(state);
     state.input_state = InputState::Typing;
-    // 斜杠命令一次 Enter 即执行（不需要第二次 Enter 确认）
-    if is_slash_root_cmd {
+    // V32-2: 仅单一候选时自动提交，避免多个候选时误选（如 /mode 选中 /model）
+    if is_slash_root_cmd && unambiguous {
         submit_message(state);
     }
 }
-
 /// 取消补全，清除候选列表。
 fn cancel_completion(state: &mut AppState) {
     state.completion_candidates.clear();
     state.completion_index = usize::MAX;
     state.completion_prefix.clear();
+    state.inline_suggestion = None;
     if state.input_state == InputState::Completing {
         state.input_state = InputState::Typing;
     }
@@ -1041,6 +1021,14 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         }
     }
 
+    // ── 2026-05-28: 全屏编辑器键盘拦截 ──
+    // 引用关系：InputState::Editor 时接管所有输入
+    // 生命周期：open_editor() 激活 → Ctrl+S/Esc 退出
+    if state.input_state == InputState::Editor {
+        handle_editor_key(state, code, mods);
+        return;
+    }
+
     // 忙碌态：允许打字（字符输入到 buffer），但禁止 Enter 发送
     // Paused 态仍完全阻塞
     if state.input_state == InputState::Paused {
@@ -1112,6 +1100,11 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 state.add_toast("⏳ 已暂存，压缩完成后自动发送", Duration::from_secs(3));
             } else {
                 // ── Thinking/Outputting：注入 mid-turn signal 让 LLM 实时感知 ──
+                // 2026-05-27: 同时写入 TUI state.messages 让消息面板显示用户消息
+                state.add_message(crate::tui::state::Message::new_user(
+                    msg.clone(),
+                    chrono::Local::now().format("%H:%M").to_string(),
+                ));
                 if let Some(ref handle) = state.engine_handle {
                     let session = handle.session.clone();
                     let msg_clone = msg.clone();
@@ -1220,6 +1213,12 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                     }
                     state.recalculate_cursor();
                 }
+                // 更新内联补全候选
+                state.inline_suggestion = if state.input.is_empty() {
+                    None
+                } else {
+                    state.compute_inline_suggestion()
+                };
                 if state.input.is_empty() {
                     cancel_completion(state);
                 } else {
@@ -1234,6 +1233,12 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         }
     }
 
+    // 2026-05-28: Ctrl+E → 打开全屏编辑器
+    if code == KeyCode::Char('e') && mods.contains(KeyModifiers::CONTROL) {
+        state.open_editor();
+        return;
+    }
+
     // Enter: 发送消息  |  Shift+Enter / Ctrl+Enter: 换行
     if code == KeyCode::Enter {
         if mods.contains(KeyModifiers::SHIFT) || mods.contains(KeyModifiers::CONTROL) {
@@ -1246,10 +1251,51 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // Tab: 触发补全
+    // Tab: 触发补全 — 优先接受内联建议（不阻塞输入），否则走原有的补全弹窗
+    // 2026-05-28: Tab = inline 补全接受 + 连续 Tab 循环候选（fish shell 模式）
+    //
+    // 流程:
+    //   首次 Tab: 接受 inline_suggestion → 填入 input
+    //   连续 Tab: 从 inline_candidates 取下一个覆盖 input
+    //   无候选时: 插入缩进
+    //
+    // 任何非 Tab 输入会在字符处理路径清空 inline_candidates（见 Char 分支）
     if code == KeyCode::Tab && !mods.contains(KeyModifiers::CONTROL) {
+        // 路径 A: 已有 inline_candidates（连续 Tab 循环）
+        if !state.inline_candidates.is_empty() {
+            state.inline_candidate_idx = (state.inline_candidate_idx + 1) % state.inline_candidates.len();
+            let next = state.inline_candidates[state.inline_candidate_idx].clone();
+            state.input = next;
+            state.cursor_pos = state.input.len();
+            state.recalculate_cursor();
+            state.inline_suggestion = None; // 循环中不显示 ghost text
+            state.input_state = InputState::Typing;
+            return;
+        }
+
+        // 路径 B: 首次 Tab — 接受 inline_suggestion 并构建候选列表
+        if let Some(suggestion) = state.inline_suggestion.take() {
+            let current_input = state.input.trim().to_string();
+            if suggestion.len() > current_input.len() {
+                // 构建全部候选列表（供连续 Tab 循环）
+                let candidates = state.compute_all_inline_candidates();
+                state.input = suggestion.clone();
+                state.cursor_pos = state.input.len();
+                state.recalculate_cursor();
+                state.input_state = InputState::Typing;
+                // 设置循环列表（包含当前已接受的作为第 0 项）
+                if candidates.len() > 1 {
+                    state.inline_candidates = candidates;
+                    state.inline_candidate_idx = 0;
+                }
+                return;
+            }
+        }
+
+        // 路径 C: 尝试触发补全（可能产生新 inline_suggestion）
         if trigger_completion(state) { return; }
-        // 无候选 → Tab 插入缩进
+
+        // 路径 D: 无任何候选 → Tab 插入缩进
         state.input.insert(state.cursor_pos, '\t');
         state.cursor_pos += 1;
         state.input_state = InputState::Typing;
@@ -1352,6 +1398,12 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 }
             }
         }
+        // 更新内联补全候选
+        state.inline_suggestion = if state.input.is_empty() {
+            None
+        } else {
+            state.compute_inline_suggestion()
+        };
         if state.input.is_empty() {
             state.input_state = InputState::Ready;
         }
@@ -1401,6 +1453,11 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             state.cursor_col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
         }
 
+        // 更新内联补全候选（不阻塞输入）+ 清空 Tab 循环状态
+        state.inline_suggestion = state.compute_inline_suggestion();
+        state.inline_candidates.clear();
+        state.inline_candidate_idx = 0;
+
         // V32 · Slash 自动补全：用户在输入栏首位敲 `/` 起头的命令时自动弹候选
         //
         // 特殊路径：Picker 命令直接执行，跳过补全弹窗中间步骤
@@ -1411,10 +1468,9 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         if state.input.starts_with('/') && state.cursor_pos == state.input.len() {
             let trimmed = state.input.trim().to_string(); // to_string() 释放借用，避免后续可变借用冲突
             let is_direct_picker = matches!(trimmed.as_str(),
-                "/model" | "/m" | "/theme" | "/thinking" | "/think"
+                "/model" | "/m" | "/mode" | "/theme" | "/thinking" | "/think"
             );
             if is_direct_picker {
-                // 直接执行，跳过补全弹窗
                 if handle_slash_command(state, &trimmed) {
                     state.input.clear();
                     state.cursor_pos = 0;
@@ -1922,6 +1978,222 @@ fn extract_selection_text(
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 消息提交流程 (设计规范核心流程)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 全屏编辑器键盘处理
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 2026-05-28: 全屏编辑器模式键盘事件处理
+/// 引用关系：handle_input_key 中 InputState::Editor 时调用
+/// 生命周期：编辑器打开期间每个 KeyPress 调用一次
+fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
+    match code {
+        // Ctrl+S → 提交消息
+        KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+            state.close_editor();
+            submit_message(state);
+        }
+        // Esc → 取消编辑器（保留 input 内容不提交）
+        KeyCode::Esc => {
+            state.close_editor();
+        }
+        // Enter → 插入换行（编辑器中 Enter 不提交！）
+        KeyCode::Enter => {
+            state.input.insert(state.cursor_pos, '\n');
+            state.cursor_pos += 1;
+            state.recalculate_cursor();
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        // Tab → 插入 4 空格
+        KeyCode::Tab => {
+            for _ in 0..4 {
+                state.input.insert(state.cursor_pos, ' ');
+                state.cursor_pos += 1;
+            }
+            state.cursor_col += 4;
+            state.rendered_lines_dirty.set(true);
+        }
+        // 光标移动
+        KeyCode::Up => {
+            let before = &state.input[..state.cursor_pos];
+            if let Some(nl) = before.rfind('\n') {
+                let current_col = state.cursor_col;
+                let line_start = before[..nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let prev_line = &before[line_start..nl];
+                let target_col = current_col.min(
+                    prev_line.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)).sum()
+                );
+                // 找到 prev_line 中 target_col display width 对应的 byte offset
+                let mut col = 0;
+                let mut byte_offset = line_start;
+                for ch in prev_line.chars() {
+                    if col >= target_col { break; }
+                    col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                    byte_offset += ch.len_utf8();
+                }
+                state.cursor_pos = byte_offset;
+                state.recalculate_cursor();
+            }
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::Down => {
+            let after = &state.input[state.cursor_pos..];
+            if let Some(nl) = after.find('\n') {
+                let current_col = state.cursor_col;
+                let next_line_start = state.cursor_pos + nl + 1;
+                let next_line_end = state.input[next_line_start..].find('\n')
+                    .map(|i| next_line_start + i)
+                    .unwrap_or(state.input.len());
+                let next_line = &state.input[next_line_start..next_line_end];
+                let mut col = 0;
+                let mut byte_offset = next_line_start;
+                for ch in next_line.chars() {
+                    if col >= current_col { break; }
+                    col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                    byte_offset += ch.len_utf8();
+                }
+                state.cursor_pos = byte_offset;
+                state.recalculate_cursor();
+            }
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::Left => {
+            if state.cursor_pos > 0 {
+                let prev_char_start = state.input[..state.cursor_pos]
+                    .char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                state.cursor_pos = prev_char_start;
+                state.recalculate_cursor();
+            }
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::Right => {
+            if state.cursor_pos < state.input.len() {
+                let next = state.input[state.cursor_pos..].chars().next()
+                    .map(|c| c.len_utf8()).unwrap_or(0);
+                state.cursor_pos += next;
+                state.recalculate_cursor();
+            }
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::Home => {
+            let before = &state.input[..state.cursor_pos];
+            let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            state.cursor_pos = line_start;
+            state.recalculate_cursor();
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::End => {
+            let after = &state.input[state.cursor_pos..];
+            let line_end = after.find('\n')
+                .map(|i| state.cursor_pos + i)
+                .unwrap_or(state.input.len());
+            state.cursor_pos = line_end;
+            state.recalculate_cursor();
+            state.rendered_lines_dirty.set(true);
+        }
+        // 字符插入
+        KeyCode::Char(c) => {
+            state.input.insert(state.cursor_pos, c);
+            state.cursor_pos += c.len_utf8();
+            state.recalculate_cursor();
+            state.rendered_lines_dirty.set(true);
+        }
+        // 删除
+        KeyCode::Backspace => {
+            if state.cursor_pos > 0 {
+                if let Some((idx, _)) = state.input[..state.cursor_pos].char_indices().next_back() {
+                    state.input.remove(idx);
+                    state.cursor_pos = idx;
+                    state.recalculate_cursor();
+                }
+            }
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::Delete => {
+            if state.cursor_pos < state.input.len() {
+                state.input.remove(state.cursor_pos);
+            }
+            state.rendered_lines_dirty.set(true);
+        }
+        // PgUp/PgDn — 滚动 ±(visible_h - 2) 并移动光标
+        KeyCode::PageUp => {
+            let page = state.editor_state.as_ref()
+                .map(|e| e.last_visible_h.get().saturating_sub(2).max(1))
+                .unwrap_or(18);
+            // 光标上移 page 行
+            for _ in 0..page {
+                let before = &state.input[..state.cursor_pos];
+                if before.rfind('\n').is_none() { break; }
+                // 模拟 Up 一次
+                let nl = before.rfind('\n').unwrap();
+                let line_start = before[..nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let prev_line = &before[line_start..nl];
+                let target_col = state.cursor_col.min(
+                    prev_line.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)).sum()
+                );
+                let mut col = 0;
+                let mut byte_offset = line_start;
+                for ch in prev_line.chars() {
+                    if col >= target_col { break; }
+                    col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                    byte_offset += ch.len_utf8();
+                }
+                state.cursor_pos = byte_offset;
+                state.recalculate_cursor();
+            }
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        KeyCode::PageDown => {
+            let page = state.editor_state.as_ref()
+                .map(|e| e.last_visible_h.get().saturating_sub(2).max(1))
+                .unwrap_or(18);
+            let total_lines = state.input.matches('\n').count();
+            for _ in 0..page {
+                if state.cursor_line >= total_lines { break; }
+                let after = &state.input[state.cursor_pos..];
+                if let Some(nl) = after.find('\n') {
+                    let next_line_start = state.cursor_pos + nl + 1;
+                    let next_line_end = state.input[next_line_start..].find('\n')
+                        .map(|i| next_line_start + i)
+                        .unwrap_or(state.input.len());
+                    let next_line = &state.input[next_line_start..next_line_end];
+                    let mut col = 0;
+                    let mut byte_offset = next_line_start;
+                    for ch in next_line.chars() {
+                        if col >= state.cursor_col { break; }
+                        col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+                        byte_offset += ch.len_utf8();
+                    }
+                    state.cursor_pos = byte_offset;
+                    state.recalculate_cursor();
+                } else {
+                    break;
+                }
+            }
+            editor_ensure_visible(state);
+            state.rendered_lines_dirty.set(true);
+        }
+        _ => {}
+    }
+}
+
+/// 编辑器滚动：确保光标在可见区域内（使用 last_visible_h 精确计算）
+fn editor_ensure_visible(state: &mut AppState) {
+    if let Some(ref mut ed) = state.editor_state {
+        let cursor_line = state.cursor_line;
+        let visible_h = ed.last_visible_h.get().max(3); // 用渲染侧记录的实际值
+        if cursor_line < ed.scroll_top {
+            ed.scroll_top = cursor_line;
+        } else if cursor_line >= ed.scroll_top + visible_h {
+            ed.scroll_top = cursor_line.saturating_sub(visible_h - 1);
+        }
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 消息发送流程: 输入 → 非空校验 → 长度校验 → 斜杠命令拦截 → 禁用输入 → 提交引擎
 /// 引擎调用由 main.rs 的事件循环通过 channel 异步执行
@@ -1951,6 +2223,49 @@ pub fn submit_message(state: &mut AppState) {
         state.input_state = InputState::Ready;
         return;
     }
+
+    // 2026-05-27: Meeting 执行提案确认拦截
+    // 当 pending_meeting_execution 存在且未超时时，拦截 Y/n 输入
+    if let Some(ref prompt) = state.pending_meeting_execution.clone() {
+        if prompt.created_at.elapsed() < Duration::from_secs(30) {
+            let input_lower = text.trim().to_lowercase();
+            if input_lower == "y" || input_lower == "yes" {
+                // 用户确认：组装 goal 并触发执行
+                let goal = prompt.action_items.join("; ");
+                let suggest_team = prompt.suggest_team;
+                state.pending_meeting_execution = None;
+                state.pending_slash_command = if suggest_team {
+                    Some(crate::tui::state::SlashCommand::ExecuteWithTeam { task: goal })
+                } else {
+                    Some(crate::tui::state::SlashCommand::ExecuteWithPlan { task: goal })
+                };
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Thinking;
+                return;
+            } else if input_lower == "n" || input_lower == "no" {
+                // 用户拒绝
+                state.pending_meeting_execution = None;
+                state.add_toast("已取消自动执行".to_string(), Duration::from_secs(2));
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Ready;
+                return;
+            }
+            // 其他输入：清除提案，作为普通消息继续处理
+            state.pending_meeting_execution = None;
+        } else {
+            // 超时：静默清除
+            state.pending_meeting_execution = None;
+        }
+    }
+
+    // 2026-05-27: 清除保留输入（如果有）
+    state.preserved_input = None;
 
     state.add_message(crate::tui::state::Message::new_user(
         text.clone(),

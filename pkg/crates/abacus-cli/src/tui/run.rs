@@ -15,7 +15,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 //   handle_mouse 函数永远不被命中。本次补上启用调用使鼠标功能真正生效。
 //   Trade-off: 开启后接管终端原生文本选择 — 但 V25/V26 已实现 Drag+Shift 自定义选择,
 //   自定义路径覆盖原生路径, 用户体验不退化。
-use crossterm::event::{EnableFocusChange, DisableFocusChange, EnableMouseCapture, DisableMouseCapture};
+use crossterm::event::{EnableFocusChange, DisableFocusChange, EnableMouseCapture, DisableMouseCapture, EnableBracketedPaste, DisableBracketedPaste};
 use crossterm::execute;
 use ratatui::Terminal;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -52,6 +52,9 @@ impl TermGuard {
         //   不支持的终端忽略此 escape sequence(罕见, 主流终端都支持)
         //   失败也不影响启动, 仅意味着鼠标功能不可用 — 键盘路径仍完整可用
         let _ = execute!(stdout, EnableMouseCapture);
+        // 2026-05-28: 启用 bracketed paste — 粘贴文本作为 Event::Paste(String) 一次性到达,
+        // 不再逐字符触发 KeyCode::Enter 导致多行文本被切成多条消息
+        let _ = execute!(stdout, EnableBracketedPaste);
         // 尝试启用键盘增强；失败/不支持就静默降级（Apple Terminal.app 不支持）
         let kbd_enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
             && execute!(
@@ -72,6 +75,7 @@ impl TermGuard {
             // V29.6: 关闭鼠标事件订阅, 与 EnableMouseCapture 对称
             //   清理顺序: 必须在 LeaveAlternateScreen 之前, 否则主屏幕的鼠标行为可能残留
             let _ = execute!(io::stdout(), DisableMouseCapture);
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
             disable_raw_mode()?;
             execute!(io::stdout(), LeaveAlternateScreen)
         } else {
@@ -102,6 +106,8 @@ fn spawn_event_poller(
                         //   crossterm 收到这两种 Event 需 EnableFocusChange 启用(在 TermGuard 处)
                         //   不支持的终端(Apple Terminal.app 等)永远收不到这类事件,自动降级为"不暂停"
                         Event::FocusGained | Event::FocusLost => { let _ = tx.send(evt); }
+                        // 2026-05-28: bracketed paste — 粘贴文本作为整块到达
+                        Event::Paste(_) => { let _ = tx.send(evt); }
                         _ => {}
                     }
                 }
@@ -249,6 +255,23 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             // 可用模型列表延迟到首次打开 /model picker 时通过 pending_model_fetch 触发
             // 避免启动时同步阻塞（虽然 list_models 是内存操作，但避免任何潜在 lock 争用）
             state.pending_model_fetch = true;
+
+            // 异步拉取记忆宫殿本体数据（行为宫殿条目数 + 知识宫殿 domain 分布）
+            {
+                use abacus_core::memory_palace::DualPalaceMemory;
+                let palace_opt = e.core.memory_palace();
+                if let Some(palace) = palace_opt {
+                    let p = palace.read().await;
+                    let behavior = p.behavior.len().await;
+                    let domains = p.knowledge.domain_summary().await;
+                    let total: u32 = domains.iter().map(|(_, c)| c).sum();
+                    state.palace_data = Some(crate::tui::state::PalaceSnapshot {
+                        behavior_count: behavior,
+                        knowledge_domains: domains,
+                        knowledge_total: total,
+                    });
+                }
+            }
             e
         }
         Ok(Err(e)) => {
@@ -399,6 +422,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         if let Ok(mtime) = meta.modified() {
                             if state.config_mtime.map_or(true, |t| mtime != t) {
                                 state.config_mtime = Some(mtime);
+                                // 配置变更时重新拉取模型列表（应对新增 API key / provider 变更）
+                                state.pending_model_fetch = true;
                                 if let Ok(content) = std::fs::read_to_string(&config_path) {
                                     if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
                                         if let Some(cw) = yaml["core"]["context_window"].as_u64() {
@@ -489,8 +514,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // trace 摘要在正文上方，折叠态，用户可 Space 展开
                             parts.push(MsgContent::Trace {
                                 event_ids: trace_ids,
-                                collapsed: true,
-                                expanded_event_ids: std::collections::HashSet::new(),
+                                collapsed: false,
+                // 默认展开显示 thinking 摘要 + tool 列表
+                expanded_event_ids: std::collections::HashSet::new(),
                             });
                         }
                         parts.push(MsgContent::Stream(response.text.clone()));
@@ -531,6 +557,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // V28: 落档完成,现在清流式累积字段(streaming_text/thinking/tools/trace_ids)
                         state.reset_streaming();
 
+                        let response_tool_count = response.tool_records.len();
                         state.tool_records.extend(response.tool_records);
                         // 保持 tool_records 有界（最近 200 条）
                         if state.tool_records.len() > 200 {
@@ -602,8 +629,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             per_m.cost_cny += cny_delta;
                             per_m.turns += 1;
 
-                            // Model Escalation 通知：检测到模型切换时告知用户
+                            // Model Escalation 通知：检测到模型切换时同步 state.model_name + 主题色
                             if !stats.model_id.is_empty() && stats.model_id != state.model_name {
+                                state.model_name = stats.model_id.clone();
+                                state.theme.apply_model_brand(&stats.model_id);
                                 state.add_toast(
                                     format!("🔄 已自动升级到 {} 以获得更深层推理", stats.model_id),
                                     Duration::from_secs(5),
@@ -635,6 +664,26 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 "session",
                                 &format!("自动兜底切到 Clarify：{}", reason),
                                 crate::tui::state::EventLevel::Warning,
+                            );
+                        }
+
+                        // 2026-05-27: Meeting 路由失败 → needs_clarify 信号 → 自动切到 Clarify
+                        // 引用关系:
+                        //   信号源: send_meeting_message_streaming 路由预检返回 NoMatch 时设 needs_clarify
+                        //   副作用: 切 mode + toast 建议 + 保留用户输入到 preserved_input
+                        if let Some(ref suggestion) = response.needs_clarify {
+                            if state.mode != crate::tui::state::AbacusMode::Clarify {
+                                crate::tui::event::switch_mode(&mut state, crate::tui::state::AbacusMode::Clarify);
+                            }
+                            state.add_toast(
+                                format!("💡 建议澄清: {}", suggestion),
+                                Duration::from_secs(8),
+                            );
+                            state.add_event(
+                                &ts,
+                                "session",
+                                "Meeting 路由无匹配，自动切到 Clarify",
+                                crate::tui::state::EventLevel::Notice,
                             );
                         }
 
@@ -764,9 +813,30 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                         state.add_event(&ts, "llm", crate::tui::i18n::t("event.gen_complete"), crate::tui::state::EventLevel::Notice);
 
+                        // 2026-05-27: Clarify 模式下检测是否建议 Meeting
+                        if state.mode == crate::tui::state::AbacusMode::Clarify
+                            && !state.meeting_suggested_this_session
+                        {
+                            let tool_count = response_tool_count;
+                            if crate::tui::modes::analyzer::suggest_mode_from_response(
+                                &response.text,
+                                tool_count,
+                                state.meeting_suggested_this_session,
+                            ).is_some() {
+                                state.meeting_suggested_this_session = true;
+                                state.add_toast(
+                                    "💡 此话题可能适合专家会诊模式 (/meeting)".to_string(),
+                                    Duration::from_secs(8),
+                                );
+                            }
+                        }
+
                         // 有待确认工具时，保持 Executing 状态（等用户确认后再恢复）
                         if state.pending_mcip_confirmations.is_empty() {
-                            state.input_state = InputState::Ready;
+                            // Editor 态保护：不覆盖用户正在编辑的状态
+                            if state.input_state != InputState::Editor {
+                                state.input_state = InputState::Ready;
+                            }
                             state.op_started_at = None;
                             state.accumulated_elapsed = Duration::ZERO;
 
@@ -807,7 +877,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.streaming_thinking_started = false;
                             state.streaming_text_started = false;
                             if iteration > 0 {
-                                state.input_state = InputState::Thinking;
+                                state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = format!("· iteration {}", iteration + 1);
                                 // V40: timeline 迭代分隔
                                 state.streaming_timeline.push(
@@ -832,7 +902,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if !t.is_empty() && !state.streaming_text_started {
                                 state.streaming_text_started = true;
                                 // V38: 切换状态指示到 Outputting
-                                state.input_state = InputState::Outputting;
+                                state.set_busy_state(InputState::Outputting);
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始输出", crate::tui::state::EventLevel::Info);
                             }
@@ -871,7 +941,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // V29.5: 同 TextDelta, 用 streaming_thinking_started 判首次
                             if !t.is_empty() && !state.streaming_thinking_started {
                                 state.streaming_thinking_started = true;
-                                state.input_state = InputState::Thinking;
+                                state.set_busy_state(InputState::Thinking);
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
                                 // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
@@ -940,7 +1010,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 trace_id,
                             ));
                             // V38: 状态栏实时反映当前工具名（Working · tool_name）
-                            state.input_state = InputState::Executing;
+                            state.set_busy_state(InputState::Executing);
                             state.processing_phase = format!("· {}", name);
                             // V40: timeline Tool entry（ToolArgs/ToolEnd 会原地更新）
                             state.streaming_timeline.push(
@@ -1214,7 +1284,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::CompressStart => {
                             // 显式状态切换：压缩是可见操作阶段
                             state.pre_compress_input_state = Some(state.input_state);
-                            state.input_state = InputState::Executing;
+                            state.set_busy_state(InputState::Executing);
                             state.processing_phase = crate::tui::i18n::t("compress.phase").to_string();
                             state.add_toast(crate::tui::i18n::t("compress.toast_start"), Duration::from_secs(3));
                             state.rendered_lines_dirty.set(true);
@@ -1300,7 +1370,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // Pipeline 可能继续执行工具 + 发起新 LLM 调用。
                             // 只有 EngineResponse 到达才真正设 Ready。
                             // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
-                            state.input_state = InputState::Executing;
+                            state.set_busy_state(InputState::Executing);
                             state.processing_phase = "· 收尾中...".into();
                             state.rendered_lines_dirty.set(true);
                             // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
@@ -1326,7 +1396,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
 
                             state.reset_streaming();
-                            state.input_state = InputState::Ready;
+                            if state.input_state != InputState::Editor {
+                                state.input_state = InputState::Ready;
+                            }
                             state.op_started_at = None;
                             state.accumulated_elapsed = Duration::ZERO;
                             state.rendered_lines_dirty.set(true);
@@ -1587,8 +1659,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
-                // 处理异步补全结果
+                // 处理异步补全结果（Editor 态忽略——编辑器不发起补全）
                 while let Ok((candidates, prefix)) = comp_rx.try_recv() {
+                    if state.input_state == InputState::Editor { continue; }
                     if candidates.is_empty() {
                         state.input_state = InputState::Typing;
                     } else {
@@ -1710,7 +1783,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                     pending_confirmations: vec![],
                                                     meeting_experts: None,
                                                     auto_fallback_chat: None,
-                                                    turnkey_plan: None,
+                                                    turnkey_plan: None, needs_clarify: None,
                                                 });
                                             }
                                             _ => { let _ = tx.send(EngineResponse::default()); }
@@ -1739,7 +1812,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         pending_confirmations: vec![],
                                                         meeting_experts: None,
                                                         auto_fallback_chat: None,
-                                                        turnkey_plan: None,
+                                                        turnkey_plan: None, needs_clarify: None,
                                                     });
                                                 }
                                                 _ => { let _ = tx.send(EngineResponse::default()); }
@@ -1760,7 +1833,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         pending_confirmations: vec![],
                                                         meeting_experts: None,
                                                         auto_fallback_chat: None,
-                                                        turnkey_plan: None,
+                                                        turnkey_plan: None, needs_clarify: None,
                                                     });
                                                 }
                                                 _ => { let _ = tx.send(EngineResponse::default()); }
@@ -1806,7 +1879,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
-                                state.input_state = InputState::Outputting;
+                                state.set_busy_state(InputState::Outputting);
                                 state.processing_phase = format!("🔍 审查{}...", kind.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
@@ -1827,7 +1900,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None,
+                                                turnkey_plan: None, needs_clarify: None,
                                             });
                                         }
                                         _ => {}
@@ -1847,7 +1920,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 };
                                 state.reset_streaming();
                                 state.is_streaming = true;
-                                state.input_state = InputState::Thinking;
+                                state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "📋 规划+执行中...".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
@@ -1864,7 +1937,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None,
+                                                turnkey_plan: None, needs_clarify: None,
                                             });
                                         }
                                         _ => { let _ = tx.send(EngineResponse::default()); }
@@ -1879,7 +1952,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
                                 state.is_streaming = true;
-                                state.input_state = InputState::Thinking;
+                                state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "🤖 多 Agent 执行中...".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
@@ -1896,7 +1969,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None,
+                                                turnkey_plan: None, needs_clarify: None,
                                             });
                                         }
                                         _ => { let _ = tx.send(EngineResponse::default()); }
@@ -1911,7 +1984,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
                                 state.is_streaming = true;
-                                state.input_state = InputState::Outputting;
+                                state.set_busy_state(InputState::Outputting);
                                 state.processing_phase = format!("🤖 {} 处理中...", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
@@ -1930,7 +2003,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None,
+                                                turnkey_plan: None, needs_clarify: None,
                                             });
                                         }
                                         _ => {}
@@ -1956,6 +2029,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         meeting_experts: None,
                                         auto_fallback_chat: None,
                                         turnkey_plan,
+                                        needs_clarify: None,
                                     });
                                 });
                             }
@@ -1977,6 +2051,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if let Some(t) = d.focus_lost_at.take() {
                                 d.paused_total = d.paused_total.saturating_add(t.elapsed());
                             }
+                        }
+                    }
+                    // 2026-05-28: bracketed paste — 粘贴内容整块插入输入栏（保留换行）
+                    // 不触发 submit，用户粘贴后可编辑再手动 Enter 发送
+                    Event::Paste(text) => {
+                        // O(1) 插入代替逐字符 O(N²)
+                        state.input.insert_str(state.cursor_pos, &text);
+                        state.cursor_pos += text.len();
+                        state.recalculate_cursor();
+                        state.rendered_lines_dirty.set(true);
+                        // 2026-05-28: 粘贴 > 5 行时自动打开全屏编辑器
+                        let line_count = state.input.matches('\n').count() + 1;
+                        if line_count > 5 && state.input_state != crate::tui::state::InputState::Editor {
+                            state.open_editor();
                         }
                     }
                     _ => {}

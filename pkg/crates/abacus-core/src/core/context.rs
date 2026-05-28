@@ -1,3 +1,12 @@
+//! Context management — ContextWindow, SessionView, SessionStore, ContextManager
+//!
+//! ## ⚠️ 文件过大（170KB）— 计划拆分边界：
+//! - `context_window.rs`：ContextWindow + OverflowAction
+//! - `session_view.rs`：SessionView 只读投影
+//! - `session_manager.rs`：ContextManager + SessionManager
+//! - `session_store.rs`：SessionStore trait + SessionSnapshot（已独立）
+//! - `context.rs`：mod re-exports
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -2057,33 +2066,40 @@ impl ContextManager {
 
             // 中间段
             if force {
-                // force_discard：丢弃中间所有（含 tool 序列；接受 cache miss 与可能的 sanitize 触发）
-                // 累积一条总体记录
-                let role = format!("{:?}", msg.role);
-                let text = match &msg.content {
-                    Some(MessageContent::Text(t)) => t.clone(),
-                    _ => String::new(),
-                };
-                compressed_records.push(CompressedMessage {
-                    original_role: role,
-                    summary: format!("[Force-discarded: {} tok]", estimate_tokens(&text)),
-                    original_tokens: estimate_tokens(&text),
-                    compressed_tokens: 0,
-                });
-                continue; // 不写入 new_messages
+                // force_discard：丢弃中间段释放空间。
+                // 2026-05-28: tool 协议消息必须成组保留——找到完整的
+                // assistant(tool_calls)→tool→...→tool 组，整组保留或整组丢弃。
+                // 策略：跳过单独的 tool 协议消息（由下方整组检测处理），
+                //       非 tool 消息直接丢弃。
+                if is_tool_protocol(msg) {
+                    // Tool 协议消息在 force 模式下也整组保留（防 400）
+                    // 代价：force 压缩率略低，但不会触发 API 协议违规
+                    new_messages.push(msg.clone());
+                } else {
+                    let role = format!("{:?}", msg.role);
+                    let text = match &msg.content {
+                        Some(MessageContent::Text(t)) => t.clone(),
+                        _ => String::new(),
+                    };
+                    compressed_records.push(CompressedMessage {
+                        original_role: role,
+                        summary: format!("[Force-discarded: {} tok]", estimate_tokens(&text)),
+                        original_tokens: estimate_tokens(&text),
+                        compressed_tokens: 0,
+                    });
+                }
+                continue; // 不写入 new_messages (tool 已在上面 push)
             }
 
             let score = importance_score(msg);
 
             if is_tool_protocol(msg) {
-                // Tool 协议消息：高重要性（错误/决策相关）→ 保留；低重要性 → 压缩为一行摘要
-                if score >= 0.5 {
-                    flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
-                    new_messages.push(msg.clone());
-                } else {
-                    // 低重要性 tool 结果（如简单的文件读取成功）→ 进入 pending 压缩
-                    pending_summary.push(msg);
-                }
+                // 2026-05-28: Tool 协议消息必须成组保留或成组丢弃。
+                // 单独压缩 tool response 会破坏 assistant→tool 配对 → API 400。
+                // 策略：tool 协议消息无条件保留（不进 pending 压缩）。
+                // 空间代价可控：tool results 通常短（JSON output），不是主要 token 消耗源。
+                flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+                new_messages.push(msg.clone());
             } else if score >= 0.7 {
                 // 高重要性非 tool 消息（决策/结论/错误）→ 保留原文但截断到前 300 chars
                 flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
@@ -2144,7 +2160,261 @@ impl ContextManager {
     }
 }
 
-// ─── Index Generators ───────────────────────────────────────────────────────
+// ─── SessionView ────────────────────────────────────────────────────────────
+
+/// SessionView — 只读投影，供 TUI/CLI/API 消费
+///
+/// ## 设计动机
+/// 之前 TUI 直接读取 RwLock<SessionState>，与 CoreLoop 耦合。
+/// SessionView 是只读快照，TUI 只消费此结构，不直接访问 CoreLoop 内部。
+///
+/// ## 引用关系
+/// - 创建：CoreLoop 在每轮处理后 snapshot() 方法
+/// - 消费：TUI state/mod.rs、CLI output.rs、API routes
+/// - 生命周期：值类型，每次 snapshot 新构建
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionView {
+    pub session_id: String,
+    pub turn_count: u32,
+    pub messages_count: usize,
+    pub context_usage_pct: f64,
+    pub current_model: String,
+    pub mode: String,
+    pub health_status: HashMap<String, String>,
+    pub tool_stats: ToolStatsView,
+    pub elapsed_secs: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolStatsView {
+    pub total_calls: u64,
+    pub success_rate: f64,
+    pub avg_latency_ms: f64,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PromptConflictDetector — Layer 间矛盾指令检测
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// ## 场景
+// PromptAssembly 的 9 层系统缺乏验证——Layer 2 (abacusbr) 说"不要 X"，
+// Layer 4 (Knowledge) 说"优先使用 X"，LLM 看到矛盾指令行为不可预测。
+//
+// ConflictDetector 在 assemble() 输出后做静态分析：
+// 1. 提取各 Layer 的指令（"do X"/"don't do X" 模式）
+// 2. 匹配矛盾对
+// 3. 输出警告列表
+//
+// ## 引用关系
+// - 消费方：PromptAssembly::assemble() 收尾调用
+// - 数据源：已组装好的各层 segment 文本
+
+/// 检测到的指令矛盾
+#[derive(Debug, Clone)]
+pub struct InstructionConflict {
+    pub layer_a: u8,
+    pub layer_b: u8,
+    pub directive_a: String,
+    pub directive_b: String,
+    pub severity: ConflictSeverity,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictSeverity {
+    Warning,
+    Critical,
+}
+
+/// 简单的矛盾检测器
+///
+/// ## 检测模式
+/// 1. "不要 X" vs "请 X" / "优先 X" / "必须 X"
+/// 2. "禁止 X" vs "允许 X"
+/// 3. 匹配方式：子字符串匹配（不依赖 NLP）
+pub struct PromptConflictDetector;
+
+impl PromptConflictDetector {
+    /// 检测分段列表中的矛盾
+    /// segments: Vec<(layer_priority, layer_text)>
+    pub fn detect(segments: &[(u8, &str)]) -> Vec<InstructionConflict> {
+        let mut conflicts = Vec::new();
+        for i in 0..segments.len() {
+            for j in (i+1)..segments.len() {
+                let (p_a, text_a) = &segments[i];
+                let (p_b, text_b) = &segments[j];
+                // 提取"否定指令"（不要/禁止/avoid/never/禁止）
+                let prohibitions_a = Self::extract_prohibitions(text_a);
+                let prohibitions_b = Self::extract_prohibitions(text_b);
+                // 提取"肯定指令"（请/必须/always/优先/推荐）
+                let affirmatives_a = Self::extract_affirmatives(text_a);
+                let affirmatives_b = Self::extract_affirmatives(text_b);
+                // 矛盾：A 禁止 X && B 肯定 X
+                for (topic, detail) in &prohibitions_a {
+                    if affirmatives_b.iter().any(|(t, _)| t == topic) {
+                        conflicts.push(InstructionConflict {
+                            layer_a: *p_a, layer_b: *p_b,
+                            directive_a: detail.clone(),
+                            directive_b: affirmatives_b.iter().find(|(t, _)| t == topic).map(|(_, d)| d.clone()).unwrap_or_default(),
+                            severity: ConflictSeverity::Warning,
+                        });
+                    }
+                }
+                // 反向：B 禁止 X && A 肯定 X
+                for (topic, detail) in &prohibitions_b {
+                    if affirmatives_a.iter().any(|(t, _)| t == topic) {
+                        conflicts.push(InstructionConflict {
+                            layer_a: *p_a, layer_b: *p_b,
+                            directive_a: affirmatives_a.iter().find(|(t, _)| t == topic).map(|(_, d)| d.clone()).unwrap_or_default(),
+                            directive_b: detail.clone(),
+                            severity: ConflictSeverity::Warning,
+                        });
+                    }
+                }
+            }
+        }
+        conflicts
+    }
+
+    fn extract_prohibitions(text: &str) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        let lower = text.to_lowercase();
+        // 中文模式
+        for pattern in ["不要", "禁止", "避免", "切勿", "别用", "不能"] {
+            if let Some(pos) = lower.find(pattern) {
+                let end = (pos + pattern.len() + 60).min(lower.len());
+                let snippet = &lower[pos..end];
+                let topic = snippet.split(&['。', '！', '！', '.', '!', '\n'][..]).next().unwrap_or(snippet).to_string();
+                result.push((topic, snippet.to_string()));
+            }
+        }
+        // 英文模式
+        let eng_patterns = ["never ", "do not ", "don't ", "avoid ", "must not ", "should not "];
+        for pattern in eng_patterns {
+            if let Some(pos) = lower.find(pattern) {
+                let end = (pos + pattern.len() + 80).min(lower.len());
+                let snippet = lower[pos..end].to_string();
+                let topic = snippet.split(&['.', '!', '\n'][..]).next().unwrap_or(&snippet).to_string();
+                result.push((topic, snippet));
+            }
+        }
+        result
+    }
+
+    fn extract_affirmatives(text: &str) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        let lower = text.to_lowercase();
+        let patterns = ["请", "必须", "优先", "推荐", "always ", "must ", "prefer ", "always use ", "recommend "];
+        for pattern in patterns {
+            if let Some(pos) = lower.find(pattern) {
+                let end = (pos + pattern.len() + 80).min(lower.len());
+                let snippet = lower[pos..end].to_string();
+                let topic = snippet.split(&['。', '！', '！', '.', '!', '\n'][..]).next().unwrap_or(&snippet).to_string();
+                result.push((topic, snippet));
+            }
+        }
+        result
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Renderable trait — 统一所有状态/错误的 UI 渲染
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// ## 设计动机
+// 之前每种错误/状态有自己的 Display/format：KernelError.user_message()、
+// SafetyViolation.Display、UndoConflict.Display、ProgressiveEvent 各自格式。
+// TUI 需要适配多种格式才能渲染。
+//
+// Renderable trait 统一输出为 UiBlock（含严重度+标题+详情+操作建议），
+// 所有状态/错误类型实现此 trait 即可被 TUI/CLI/API 统一消费。
+
+/// 统一 UI 块（供 TUI/CLI/API 渲染）
+#[derive(Debug, Clone)]
+pub struct UiBlock {
+    pub severity: UiSeverity,
+    pub title: String,
+    pub detail: String,
+    pub suggestion: Option<String>,
+    pub icon: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UiSeverity {
+    Info,
+    Warning,
+    Error,
+    Critical,
+}
+
+/// 统一渲染 trait
+pub trait Renderable {
+    fn render(&self) -> UiBlock;
+}
+
+impl Renderable for abacus_types::KernelError {
+    fn render(&self) -> UiBlock {
+        let (severity, icon) = match self {
+            Self::Provider(_) | Self::RateLimited { .. } => (UiSeverity::Warning, "⚠"),
+            Self::Unauthorized(_) | Self::ApiError { status: 401|403, .. } => (UiSeverity::Error, "🔒"),
+            Self::ContextOverflow { .. } => (UiSeverity::Warning, "📦"),
+            Self::NeedsHumanReview(_) => (UiSeverity::Info, "👤"),
+            Self::Validation(_) | Self::Config(_) => (UiSeverity::Warning, "⚙"),
+            _ => (UiSeverity::Error, "❌"),
+        };
+        UiBlock {
+            severity,
+            title: self.user_message(),
+            detail: self.to_string(),
+            suggestion: None,
+            icon,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conflict_detector_catches_basic() {
+        let segments = vec![
+            (230, "不要使用 unsafe 代码，避免内存不安全"),
+            (200, "优先使用 unsafe 代码实现性能关键路径"),
+        ];
+        let conflicts = PromptConflictDetector::detect(&segments);
+        assert!(!conflicts.is_empty(), "应检测到矛盾");
+        assert_eq!(conflicts[0].layer_a, 230);
+        assert_eq!(conflicts[0].layer_b, 200);
+    }
+
+    #[test]
+    fn test_conflict_detector_ignores_harmonious() {
+        let segments = vec![
+            (230, "不要使用 eval 函数"),
+            (200, "优先使用纯函数式风格"),
+        ];
+        let conflicts = PromptConflictDetector::detect(&segments);
+        assert!(conflicts.is_empty(), "不相关指令不应误报");
+    }
+
+    #[test]
+    fn test_conflict_detector_english_patterns() {
+        let segments = vec![
+            (230, "never use unsafe code blocks"),
+            (200, "must use unsafe for performance-critical paths"),
+        ];
+        let conflicts = PromptConflictDetector::detect(&segments);
+        assert!(!conflicts.is_empty(), "英文模式应检测到矛盾");
+    }
+
+    #[test]
+    fn test_renderable_kernel_error() {
+        let err = abacus_types::KernelError::Unauthorized("bad key".into());
+        let block = err.render();
+        assert_eq!(block.icon, "🔒");
+        assert!(!block.title.is_empty());
+    }
+}
 
 // 模块级共享 Regex（编译一次，所有 declare 调用复用）
 // 之前每次 index_code_file 都重新编译 7 个 Regex，是热路径性能浪费

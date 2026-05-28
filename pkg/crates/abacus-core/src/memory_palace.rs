@@ -287,6 +287,18 @@ impl KnowledgePalace {
         self.entries.read().await.get(id).cloned()
     }
 
+    /// 按 domain 聚合统计各领域条目数（供 UI 展示 palace 本体层级）
+    pub async fn domain_summary(&self) -> Vec<(String, u32)> {
+        let entries = self.entries.read().await;
+        let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for entry in entries.values() {
+            *counts.entry(entry.domain.clone()).or_insert(0) += 1;
+        }
+        let mut result: Vec<_> = counts.into_iter().collect();
+        result.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        result
+    }
+
     /// 获取到期需 review 的条目（遗忘曲线：SM-2 next_review ≤ now）
     pub async fn get_due_for_review(&self) -> Vec<KnowledgeEntry> {
         let now = chrono::Utc::now().timestamp();

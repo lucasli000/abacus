@@ -36,7 +36,15 @@ pub fn render_standard_frame(f: &mut Frame, state: &AppState, terminal_rows: u16
     }
     components::render_global_background(f, state);
 
-    let input_h = layout::chat_input_height(terminal_rows);
+    // 2026-05-28: 自适应输入框高度
+    // Hysteresis: input > 2 行时扩展；input ≤ 2 行时收缩回基准
+    // Editor 模式下用基准高度（全屏编辑器覆盖整个屏幕，input_bar 不可见）
+    let input_lines = if state.input_state == crate::tui::state::InputState::Editor {
+        2
+    } else {
+        state.input.matches('\n').count() + 1
+    };
+    let input_h = layout::chat_input_height_adaptive(terminal_rows, input_lines);
 
     let root = Layout::default()
         .direction(Direction::Vertical)

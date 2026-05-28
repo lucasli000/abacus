@@ -1,3 +1,20 @@
+//! LLM provider abstraction — model catalog, thinking resolution, HTTP client
+//!
+//! ## Thinking Pipeline（统一决议层）
+//! 之前 thinking 配置在 4 处重复定义，语义需反向解码：
+//!   - config.toml: core.thinking = "off"
+//!   - Anthropic: extended_thinking.budget_tokens = N
+//!   - RequestContext: thinking_intent = ThinkingIntent
+//!   - Specialist YAML: engagement.thinking = "high"
+//!
+//! ThinkingPipeline 在 RequestContext 层完成最终决议：
+//!   1. 用户配置 → ThinkingIntent
+//!   2. 模型能力 → clamp/fallback
+//!   3. provider 只做序列化映射
+//!
+//! ## 拆分标记
+//! 本模块内文件不拆分（~30KB 总计，合理范围）
+
 pub mod fallback_provider;
 pub mod retry_provider;
 pub mod provider;
@@ -36,12 +53,7 @@ use std::sync::OnceLock;
 
 static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
-/// 获取进程级共享 reqwest Client。
-///
-/// ## 注意
-/// - 不设全局 timeout — 由每个请求的 `RequestBuilder.timeout(...)` 决定
-/// - 连接池：默认每 host 32 idle，按 reqwest 默认；适配 LLM 调用模式
-/// - 失败时回退到 `Client::default()`（永远不会 panic）
+/// 进程级共享 reqwest Client（见上方 doc）
 pub fn shared_http_client() -> &'static reqwest::Client {
     SHARED_HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -50,4 +62,134 @@ pub fn shared_http_client() -> &'static reqwest::Client {
             .build()
             .unwrap_or_default()
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ThinkingPipeline — 统一思考意图决议
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// ## 问题
+// thinking 配置在 4 个地方重复定义，语义不同：
+//   - config.toml: "off" / "adaptive" / "high"
+//   - Anthropic: extended_thinking.budget_tokens
+//   - RequestContext: ThinkingIntent enum
+//   - Specialist YAML: engagement.thinking
+//
+// ThinkingPipeline 在 RequestContext 层完成一次决议，provider 只做序列化。
+//
+// ## 流程
+// 1. resolve(): 用户输入 + 模型能力 → ThinkingRequest（最终参数）
+// 2. provider 调用 to_provider_specific() → 各厂商自有格式
+// 3. 所有 provider 不再自己解码 thinking 语义
+
+use abacus_types::{EffortLevel, ModelSpec, ThinkingCapabilities, ThinkingIntent};
+
+/// 最终思考请求参数（Provider 只需序列化此结构）
+#[derive(Debug, Clone)]
+pub struct ThinkingRequest {
+    pub enabled: bool,
+    pub budget_tokens: Option<u32>,
+    pub effort: Option<EffortLevel>,
+    pub adaptive: bool,
+    pub display: ThinkingDisplay,
+}
+
+#[derive(Debug, Clone)]
+pub enum ThinkingDisplay {
+    Summarized,
+    Omitted,
+    Full,
+}
+
+/// 统一思考意图决议器
+pub struct ThinkingPipeline;
+
+impl ThinkingPipeline {
+    /// 从用户 intent + 模型能力 → 最终 ThinkingRequest
+    pub fn resolve(intent: ThinkingIntent, caps: &ThinkingCapabilities) -> ThinkingRequest {
+        match intent {
+            ThinkingIntent::Off => ThinkingRequest {
+                enabled: false, budget_tokens: None, effort: None,
+                adaptive: false, display: ThinkingDisplay::Omitted,
+            },
+            ThinkingIntent::Adaptive => {
+                if caps.supports_adaptive() {
+                    ThinkingRequest {
+                        enabled: true, budget_tokens: None, effort: None,
+                        adaptive: true, display: ThinkingDisplay::Summarized,
+                    }
+                } else {
+                    // fallback: 不支持 adaptive → 用 highest supported effort
+                    let best = crate::llm::thinking_resolver::highest_supported_effort(caps);
+                    ThinkingRequest {
+                        enabled: true, budget_tokens: None, effort: best,
+                        adaptive: false, display: ThinkingDisplay::Summarized,
+                    }
+                }
+            }
+            ThinkingIntent::Effort(level) => {
+                let clamped = crate::llm::thinking_resolver::pick_nearest_supported(level, &caps.effort_levels);
+                ThinkingRequest {
+                    enabled: true, budget_tokens: None, effort: Some(clamped),
+                    adaptive: false, display: ThinkingDisplay::Summarized,
+                }
+            }
+            ThinkingIntent::Budget(budget) => {
+                let clamped = crate::llm::thinking_resolver::clamp_budget(budget, caps);
+                ThinkingRequest {
+                    enabled: clamped > 0, budget_tokens: Some(clamped),
+                    effort: None, adaptive: false, display: ThinkingDisplay::Full,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+    use abacus_types::{EffortLevel, ThinkingCapabilities, ThinkingModeKind, MultiTurnReplay};
+
+    fn caps_with_modes(modes: Vec<ThinkingModeKind>) -> ThinkingCapabilities {
+        ThinkingCapabilities {
+            supported_modes: modes,
+            default_mode: None,
+            effort_levels: vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High],
+            budget_range: Some((1024, 64000)),
+            multi_turn_replay: MultiTurnReplay::None,
+        }
+    }
+
+    #[test]
+    fn test_off_disables_thinking() {
+        let req = ThinkingPipeline::resolve(ThinkingIntent::Off, &ThinkingCapabilities::default());
+        assert!(!req.enabled);
+    }
+
+    #[test]
+    fn test_adaptive_with_capability() {
+        let caps = caps_with_modes(vec![ThinkingModeKind::AdaptiveEffort]);
+        let req = ThinkingPipeline::resolve(ThinkingIntent::Adaptive, &caps);
+        assert!(req.adaptive);
+        assert!(req.enabled);
+    }
+
+    #[test]
+    fn test_adaptive_fallback_when_unsupported() {
+        let caps = caps_with_modes(vec![ThinkingModeKind::ExtendedBudget]);
+        let req = ThinkingPipeline::resolve(ThinkingIntent::Adaptive, &caps);
+        assert!(!req.adaptive);
+        assert!(req.enabled);
+        assert_eq!(req.effort, Some(EffortLevel::High));
+    }
+
+    #[test]
+    fn test_effort_clamps_to_supported() {
+        let caps = caps_with_modes(vec![ThinkingModeKind::ExtendedBudget]);
+        // XHigh not supported → clamp down to High
+        let req = ThinkingPipeline::resolve(
+            ThinkingIntent::Effort(EffortLevel::XHigh), &caps,
+        );
+        assert_eq!(req.effort, Some(EffortLevel::High));
+    }
 }

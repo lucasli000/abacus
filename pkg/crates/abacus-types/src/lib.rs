@@ -5,6 +5,115 @@ pub mod error;
 pub mod engine;
 pub mod sandbox;
 pub mod progressive;
+pub mod user_profile {
+    //! UserProfile — 用户单源真相 (Single Source of Truth)
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct UserProfile {
+        pub display_name: String,
+        pub default_model: String,
+        pub thinking: String,
+        pub autonomy: String,
+        pub safe_operations: HashSet<String>,
+        pub safe_shell_prefixes: Vec<String>,
+        pub tool_timeout_secs: u64,
+        pub max_tool_calls_per_turn: u32,
+        pub context_window_tokens: usize,
+        pub ui: UiPreferences,
+        pub features: FeatureFlags,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct UiPreferences {
+        pub theme: String,
+        pub language: String,
+        pub info_density: String,
+        pub streaming: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FeatureFlags {
+        pub silent_router: bool,
+        pub auto_mode_switch: bool,
+        pub cross_session_memory: bool,
+        pub adaptive_progress: bool,
+        pub workflow_engine: bool,
+        pub usage_driven_reveal: bool,
+    }
+
+    impl Default for UserProfile {
+        fn default() -> Self {
+            Self {
+                display_name: "User".into(),
+                default_model: "deepseek-v4-flash".into(),
+                thinking: "off".into(),
+                autonomy: "confirm_sensitive".into(),
+                safe_operations: HashSet::new(),
+                safe_shell_prefixes: vec![],
+                tool_timeout_secs: 60,
+                max_tool_calls_per_turn: 500,
+                context_window_tokens: 128_000,
+                ui: UiPreferences {
+                    theme: "dark".into(), language: "zh".into(),
+                    info_density: "normal".into(), streaming: true,
+                },
+                features: FeatureFlags {
+                    silent_router: true, auto_mode_switch: true,
+                    cross_session_memory: true, adaptive_progress: true,
+                    workflow_engine: false, usage_driven_reveal: true,
+                },
+            }
+        }
+    }
+
+    impl UserProfile {
+        pub fn load(path: impl AsRef<std::path::Path>) -> Self {
+            let path = path.as_ref();
+            if path.exists() {
+                match std::fs::read_to_string(path) {
+                    Ok(content) => match serde_json::from_str(&content) {
+                        Ok(profile) => return profile,
+                        Err(e) => tracing::warn!("UserProfile parse error: {e}"),
+                    },
+                    Err(e) => tracing::warn!("UserProfile read error: {e}"),
+                }
+            }
+            Self::default()
+        }
+
+        pub fn save(&self, path: impl AsRef<std::path::Path>) {
+            let path = path.as_ref();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(self) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+
+        pub fn default_path() -> std::path::PathBuf {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".abacus").join("profile.json")
+        }
+
+        pub fn load_default() -> Self { Self::load(Self::default_path()) }
+
+        pub fn requires_confirmation(&self, tool_id: &str) -> bool {
+            match self.autonomy.as_str() {
+                "full" => false,
+                "manual" | "confirm_all" => true,
+                _ => {
+                    let s = matches!(tool_id, "filengine_fs_write" | "filengine_fs_move"
+                        | "filengine_fs_mkdir" | "filengine_bash_exec" | "web_fetch");
+                    s && !self.safe_operations.contains(tool_id)
+                }
+            }
+        }
+    }
+}
 pub mod collections;
 
 // V33: AbacusMode + ModeArtifact 统一导出
@@ -44,6 +153,12 @@ pub use model_registry::{
 };
 
 // error re-exports
+pub use user_profile::{
+    UserProfile,
+    UiPreferences,
+    FeatureFlags,
+};
+
 pub use error::{
     KernelError,
     Result,

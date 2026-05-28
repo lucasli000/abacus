@@ -369,6 +369,8 @@ impl McipGateway {
     #[tracing::instrument(skip(self, params))]
     pub fn check(&self, tool_id: &ToolId, params: &Value, role: UserRole) -> McipDecision {
         // Rate limiting: simple sliding window (1-second window)
+        // 2026-05-27: rate limit 不再 Denied——MCIP 只是猫眼，不关门。
+        // 超限时仍弹窗（附带 rate limit 提示），让用户决定。
         if self.max_checks_per_sec > 0 {
             if let Ok(mut guard) = self.rate_limit.lock() {
                 let now = std::time::Instant::now();
@@ -377,8 +379,9 @@ impl McipGateway {
                 } else {
                     guard.1 += 1;
                     if guard.1 > self.max_checks_per_sec {
-                        return McipDecision::Denied(
-                            "rate limit exceeded: too many tool checks per second".into()
+                        return McipDecision::NeedsConfirm(
+                            format!("[rate-limit] tool {} 调用频率过高（{}/s），是否继续？",
+                                tool_id.0, guard.1)
                         );
                     }
                 }
@@ -420,11 +423,12 @@ impl McipGateway {
         for policy in &self.policies {
             if glob_match(&policy.tool_id_pattern, id_str) {
                 matched = true;
-                // Tier 1: Role gate
+                // Tier 1: Role gate — 2026-05-27: 不静默拒绝，弹窗让用户决定
+                // MCIP 是猫眼不是门锁：权限不足时提示用户但不代替用户拒绝
                 if role < policy.min_role {
-                    return McipDecision::Denied(
-                        format!("insufficient role: need {need}, have {have} for tool {tool}",
-                            need = policy.min_role, have = role, tool = id_str)
+                    return McipDecision::NeedsConfirm(
+                        format!("[role-escalation] tool {} 需要 {} 权限（当前 {}），是否授权？",
+                            id_str, policy.min_role, role)
                     );
                 }
                 // Tier 2: Confirmation gate
@@ -433,9 +437,11 @@ impl McipGateway {
                         format!("tool {} requires confirmation", id_str)
                     );
                 }
-                // Tier 3: Capability gate
+                // Tier 3: Capability gate — 2026-05-27: 不静默拒绝，弹窗标注风险
                 if let Err(reason) = self.check_capabilities(policy, params) {
-                    return McipDecision::Denied(reason);
+                    return McipDecision::NeedsConfirm(
+                        format!("[capability-violation] {}", reason)
+                    );
                 }
             }
         }
@@ -660,8 +666,8 @@ mod tests {
             max_execution_ms: 60000,
             min_role: UserRole::Admin,
         });
-        let denied = gateway2.check(&ToolId("admin/delete".into()), &Value::Null, UserRole::Developer);
-        assert!(matches!(denied, McipDecision::Denied(ref r) if r.contains("insufficient role")));
+        let needs_confirm = gateway2.check(&ToolId("admin/delete".into()), &Value::Null, UserRole::Developer);
+        assert!(matches!(needs_confirm, McipDecision::NeedsConfirm(ref r) if r.contains("role-escalation")));
 
         // Admin with same policy → allowed (no confirm_required)
         let allowed = gateway2.check(&ToolId("admin/delete".into()), &Value::Null, UserRole::Admin);

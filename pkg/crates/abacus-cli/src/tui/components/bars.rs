@@ -318,6 +318,9 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         InputState::Executing => (format!("{} {} {} {}{}", spinner(), t("event.working"), mode_label, phase, elapsed), state.theme.gold),
         InputState::Outputting => (format!("{} {} {}{}", spinner(), t("event.outputting"), mode_label, elapsed), state.theme.success),
         InputState::Paused => (format!("⏸ {}", t("hint.paused")), state.theme.semantic_fg(SemanticIntent::Warning)),
+        _ if state.engine_handle.is_some() && state.inline_suggestion.is_some() => {
+            (format!("● {} · Tab ↵ {}", t("event.ready"), mode_label), state.theme.success)
+        }
         _ if state.engine_handle.is_some() => (format!("● {} · {}", t("event.ready"), mode_label), state.theme.success),
         _ => (format!("● {} · {}", t("event.ready"), mode_label), state.theme.muted),
     };
@@ -325,14 +328,18 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Span::styled(status_text, Style::default().fg(status_color)),
     ]));
 
-    // ── 中间：输入文本区（始终 2 行）──
+    // ── 中间：输入文本区（自适应高度：inner.height - 2 (status + info)）──
+    // 2026-05-28: 从固定 2 行改为动态（layout 已自适应扩展 input_h）
+    let text_area_h = inner.height.saturating_sub(2).max(1) as usize; // 减去 status + info 行
     let display_lines: Vec<&str> = state.input.lines().collect();
-    let start = display_lines.len().saturating_sub(2);
+    let start = display_lines.len().saturating_sub(text_area_h);
     let visible_lines: Vec<&str> = if display_lines.is_empty() {
-        vec!["", ""]
+        let mut v = Vec::with_capacity(text_area_h);
+        for _ in 0..text_area_h { v.push(""); }
+        v
     } else {
         let mut v: Vec<&str> = display_lines[start..].to_vec();
-        while v.len() < 2 {
+        while v.len() < text_area_h {
             v.push("");
         }
         v
@@ -358,7 +365,27 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
             // 光标行和普通行都直接渲染原始文本
             // 终端光标由 f.set_cursor_position() 定位，无需 ▎ 字符占位
             // （▎ 会把光标后的文字右移 1 列，产生视觉偏移）
-            input_lines.push(Line::styled(line.to_string(), Style::default().fg(state.theme.text)));
+            let mut spans: Vec<Span> = vec![
+                Span::styled(line.to_string(), Style::default().fg(state.theme.text)),
+            ];
+            // 在光标行追加内联建议（灰色静默补全）
+            let is_cursor_line = i == cursor_visible_line;
+            let is_last_visible = i == visible_lines.len() - 1
+                || visible_lines.iter().skip(i + 1).all(|l| l.is_empty());
+            if is_cursor_line && is_last_visible && state.cursor_pos == state.input.len() {
+                if let Some(sugg) = &state.inline_suggestion {
+                    let full_input = state.input.trim();
+                    let rest = sugg.strip_prefix(full_input)
+                        .filter(|r| !r.is_empty());
+                    if let Some(r) = rest {
+                        spans.push(Span::styled(
+                            r,
+                            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+                        ));
+                    }
+                }
+            }
+            input_lines.push(Line::from(spans));
         }
         let _ = cursor_color; // 光标颜色由终端控制，此变量不再用于渲染
     }

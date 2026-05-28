@@ -161,6 +161,11 @@ struct ResponseMessage {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<ToolCall>>,
+    /// 2026-05-28: GLM/Kimi thinking 模式返回的推理过程
+    /// OpenAI 原生不返回此字段（GPT-5 reasoning 在 completion_tokens_details 中）
+    /// 但 GLM/Kimi 兼容 DeepSeek 的 reasoning_content 协议
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// OpenAI-compatible 请求缓存统计（prompt_tokens_details 子字段）
@@ -416,7 +421,9 @@ impl OpenAICompatibleProvider {
                     .collect()
             }),
             tool_call_id: None,
-            reasoning_content: None,
+            // 2026-05-28: 透传 reasoning_content（GLM/Kimi thinking 模式）
+            // OpenAI 原生模型此字段为 None（不影响现有行为）
+            reasoning_content: choice.message.reasoning_content,
             prefix: false,
         };
 
@@ -673,6 +680,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         let mut byte_stream = resp.bytes_stream();
         let mut buffer = String::new();
         let mut full_text = String::new();
+        let mut reasoning_buf = String::new(); // 2026-05-28: GLM/Kimi reasoning_content 流式收集
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
         let mut cached_tokens_stream = 0u64;
@@ -712,6 +720,13 @@ impl LlmProvider for OpenAICompatibleProvider {
                                             let _ = tx.send(StreamEvent::TextDelta(content.to_string()));
                                         }
                                     }
+                                    // 2026-05-28: GLM/Kimi reasoning_content 流式收集
+                                    if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+                                        if !rc.is_empty() {
+                                            reasoning_buf.push_str(rc);
+                                            let _ = tx.send(StreamEvent::ThinkingDelta(rc.to_string()));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -747,7 +762,8 @@ impl LlmProvider for OpenAICompatibleProvider {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
-                reasoning_content: None,
+                // 2026-05-28: 透传流式收集的 reasoning_content
+                reasoning_content: if reasoning_buf.is_empty() { None } else { Some(reasoning_buf) },
                 prefix: false,
             },
             finish_reason: "stop".to_string(),

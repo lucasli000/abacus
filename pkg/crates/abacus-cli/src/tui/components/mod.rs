@@ -51,6 +51,7 @@ use crate::tui::effects;
 use crate::tui::markdown::{self, LineType};
 use crate::tui::state::{
     AppState, BlockKind, Focus, MsgContent, MsgRole,
+    StreamingToolStatus, TimelineEntry,
 };
 use crate::tui::theme::{TextRole, Theme};
 
@@ -393,8 +394,8 @@ fn build_message_lines(
                         // ── 分组: 连续同名 ToolCall id 归入同一 run ──
                         let runs = group_consecutive_tool_runs(event_ids, trace_events, trace_event_index);
 
-                        // ── 工具调用历史折叠：超过 3 个 run 时只展示最新 3 个，更早的折叠为一行摘要 ──
-                        const MAX_VISIBLE_TOOL_RUNS: usize = 3;
+                        // ── 工具调用历史折叠：超过 5 个 run 时只展示最新 5 个，更早的折叠为一行摘要 ──
+                        const MAX_VISIBLE_TOOL_RUNS: usize = 5;
                         let mut visible_tool_run_count = 0usize; // 用于 run 间空行断开
 
                         // 找出所有 ToolCall run 的下标
@@ -479,7 +480,7 @@ fn build_message_lines(
                                     }
                                     Some(ev) => {
                                         let fully_expanded = code_blocks_expanded || expanded_event_ids.contains(id);
-                                        let max_lines_think = if fully_expanded { 0 } else { 30 };
+                                        let max_lines_think = if fully_expanded { 0 } else { 2 };
                                         let max_lines_tool = if fully_expanded { 0 } else { 20 };
                                         render_single_trace_event(
                                             ev, &bar, theme, max_lines_think, max_lines_tool,
@@ -1208,7 +1209,93 @@ pub fn render_messages_in_card(
         ]));
     }
 
-    // ── 流式消息：追加 streaming 状态（thinking + tools + text）──
+    // ── 流式消息 ──
+    // Timeline-based 渲染（thinking → tool → text）
+    if state.is_streaming {
+            let bar = Span::styled("▎", Style::default().fg(state.theme.session));
+            let content_w = inner.width.saturating_sub(5) as usize;
+            let mut pending_text_render = false;
+
+            // 区块 1: Thinking 最新 2 行
+            if !state.streaming_thinking.is_empty() {
+                let think_lines: Vec<&str> = state.streaming_thinking.lines()
+                    .filter(|l| !l.trim().is_empty()).collect();
+                if !think_lines.is_empty() {
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
+                        Span::styled(format!("Thinking · {}行", think_lines.len()),
+                            state.theme.text_style(TextRole::Caption)),
+                    ]));
+                    let mut vis_lines = 0usize;
+                    let mut has_more = false;
+                    'outer: for l in &think_lines {
+                        let segments = crate::tui::util::word_wrap_segments(l, content_w.saturating_sub(6));
+                        for (seg_start, seg_end) in &segments {
+                            if vis_lines >= 2 { has_more = true; break 'outer; }
+                            let text = &l[*seg_start..*seg_end];
+                            let s = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
+                            if vis_lines == 0 {
+                                lines.push(Line::from(vec![
+                                    bar.clone(), Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
+                                    Span::styled(text.to_string(), s),
+                                ]));
+                            } else {
+                                lines.push(Line::from(vec![bar.clone(), Span::raw("      "), Span::styled(text.to_string(), s)]));
+                            }
+                            vis_lines += 1;
+                        }
+                    }
+                    if has_more {
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::styled(format!("      ↳ +{} 行", think_lines.len().saturating_sub(2)),
+                                state.theme.text_style(TextRole::Caption)),
+                        ]));
+                    }
+                }
+            }
+
+            // 区块 2: Tool 最新 5 个 + 历史折叠
+            if !state.streaming_tools.is_empty() {
+                use crate::tui::state::StreamingToolStatus;
+                let total = state.streaming_tools.len();
+                let hidden = total.saturating_sub(5);
+                for (name, status, dur_opt, _) in &state.streaming_tools[hidden..] {
+                    let (mk, mc) = match status {
+                        StreamingToolStatus::Running => ("…", state.theme.gold),
+                        StreamingToolStatus::Success => ("✓", state.theme.success),
+                        StreamingToolStatus::Failed => ("✗", state.theme.error),
+                    };
+                    let d = dur_opt.map(|d| format!(" {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        bar.clone(), Span::raw("  · "),
+                        Span::styled(name.clone(), Style::default().fg(state.theme.muted)),
+                        Span::styled(format!(" {}{}", mk, d), Style::default().fg(mc)),
+                    ]));
+                }
+                if hidden > 0 {
+                    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+                    lines.push(Line::from(vec![bar.clone(), Span::styled("  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌", dim)]));
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled(format!("  ▸ {}次历史工具调用", hidden),
+                            state.theme.text_style(TextRole::Caption)),
+                    ]));
+                }
+            }
+
+            // 区块 3: 正文
+            if pending_text_render && !state.streaming_text.is_empty() {
+                let sl = crate::tui::markdown::render_markdown_bounded(
+                    &state.streaming_text, &state.theme, false, content_w,
+                );
+                for s in &sl {
+                    lines.push(crate::tui::markdown::styled_line_to_ratatui(s, &bar, &state.theme));
+                }
+            }
+        }
+    // (thinking + tools + text)
     // build_message_lines 只渲染 header + cursor，这里补充完整的流式内容
     if state.is_streaming {
         let bar = Span::styled("▎", Style::default().fg(state.theme.session));
@@ -1267,13 +1354,16 @@ pub fn render_messages_in_card(
             ]));
         }
 
-        // V40: 统一时序流渲染 — 遍历 streaming_timeline 按到达顺序渲染
+        // 旧流式循环已删除，内容由上方三区块渲染替代
+        // ──
         // P7 优化：所有 streaming 内容直接 push（O(1)）
-        let cursor_line: Option<Line<'static>> = None; // 不再需要占位行
+        // 旧 cursor_line 已移除
+        let content_w = inner.width.saturating_sub(5) as usize;
         let content_w = inner.width.saturating_sub(5) as usize;
 
-        for entry in state.streaming_timeline.iter() {
-            use crate::tui::state::{TimelineEntry, StreamingToolStatus};
+        // ── 正文文本推迟到最后渲染，避免被工具调用夹在中间 ──
+        let mut pending_text_render = false;
+        for entry in &state.streaming_timeline {
             match entry {
                 TimelineEntry::Thinking { summary } => {
                     // 流式 thinking：首行加 💭 图标，续行缩进对齐
@@ -1381,53 +1471,10 @@ pub fn render_messages_in_card(
                     }
                 }
                 TimelineEntry::Text { start, end: _ } => {
-                    // 正文文本：通过 mdstream 渲染 streaming_text[start..end]
-                    // 为简化实现，整个 streaming_text 交给 mdstream 统一渲染
-                    // （mdstream 已增量缓存 committed blocks，此处只在首次 Text entry 时渲染全部）
-                    // 后续 Text entries 跳过（因为 mdstream 渲染的是完整 streaming_text）
+                    // 标记正文推迟到所有工具之后渲染
                     if *start == 0 {
-                        // 首个 Text entry: 渲染整个 streaming_text
-                        let styled_lines: Vec<crate::tui::markdown::StyledLine> = {
-                            let mut smd_ref = state.streaming_md.borrow_mut();
-                            if let Some(ref mut smd) = *smd_ref {
-                                smd.all_styled(&state.theme, false, content_w)
-                            } else {
-                                crate::tui::markdown::render_markdown_bounded(
-                                    &state.streaming_text, &state.theme, false, content_w,
-                                )
-                            }
-                        };
-                        for styled in &styled_lines {
-                            let rline = crate::tui::markdown::styled_line_to_ratatui(styled, &bar, &state.theme);
-                            if styled.line_type == crate::tui::markdown::LineType::Table {
-                                lines.push(rline);
-                                continue;
-                            }
-                            let line_w: usize = rline.spans.iter()
-                                .map(|s| crate::tui::util::display_width(s.content.as_ref()))
-                                .sum();
-                            if line_w <= content_w + 4 {
-                                lines.push(rline);
-                            } else {
-                                // 2sp 与 build_message_lines 的 word-wrap 保持一致
-                                let indent_str = match styled.line_type {
-                                    crate::tui::markdown::LineType::Code => "  │ ",
-                                    _ => "  ",
-                                };
-                                let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
-                                let text_style = styled.spans.first().map(|s| s.style)
-                                    .unwrap_or(Style::default().fg(state.theme.text));
-                                let segments = crate::tui::util::word_wrap_segments(&full_text, content_w);
-                                for (seg_start, seg_end) in segments {
-                                    lines.push(Line::from(vec![
-                                        bar.clone(), Span::raw(indent_str.to_string()),
-                                        Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
-                                    ]));
-                                }
-                            }
-                        }
+                        pending_text_render = true;
                     }
-                    // 非首个 Text entry: 跳过（mdstream 已渲染完整 streaming_text）
                 }
                 TimelineEntry::Iteration { number } => {
                     lines.push(Line::from(vec![
@@ -1437,6 +1484,48 @@ pub fn render_messages_in_card(
                             Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
                         ),
                     ]));
+                }
+            }
+        }
+
+        // 正文推迟到所有 thinking 和 tool 之后渲染（避免被夹在中间）
+        if pending_text_render && !state.streaming_text.is_empty() {
+            let styled_lines: Vec<crate::tui::markdown::StyledLine> = {
+                let mut smd_ref = state.streaming_md.borrow_mut();
+                if let Some(ref mut smd) = *smd_ref {
+                    smd.all_styled(&state.theme, false, content_w)
+                } else {
+                    crate::tui::markdown::render_markdown_bounded(
+                        &state.streaming_text, &state.theme, false, content_w,
+                    )
+                }
+            };
+            for styled in &styled_lines {
+                let rline = crate::tui::markdown::styled_line_to_ratatui(styled, &bar, &state.theme);
+                if styled.line_type == crate::tui::markdown::LineType::Table {
+                    lines.push(rline);
+                    continue;
+                }
+                let line_w: usize = rline.spans.iter()
+                    .map(|s| crate::tui::util::display_width(s.content.as_ref()))
+                    .sum();
+                if line_w <= content_w + 4 {
+                    lines.push(rline);
+                } else {
+                    let indent_str = match styled.line_type {
+                        crate::tui::markdown::LineType::Code => "  │ ",
+                        _ => "  ",
+                    };
+                    let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
+                    let text_style = styled.spans.first().map(|s| s.style)
+                        .unwrap_or(Style::default().fg(state.theme.text));
+                    let segments = crate::tui::util::word_wrap_segments(&full_text, content_w);
+                    for (seg_start, seg_end) in segments {
+                        lines.push(Line::from(vec![
+                            bar.clone(), Span::raw(indent_str.to_string()),
+                            Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
+                        ]));
+                    }
                 }
             }
         }
@@ -1459,10 +1548,7 @@ pub fn render_messages_in_card(
             }
         }
 
-        // P7: push 回占位光标行（streaming 内容全部 push 到它前面完毕）
-        if let Some(cl) = cursor_line {
-            lines.push(cl);
-        }
+        // P7: streaming 光标由 streaming_text 尾部自动渲染（旧版 cursor_line pop/push 已移除）
     }
 
     // 视窗滚动：scroll=0 表示自动跟随底部，>0 表示向上偏移 N 行

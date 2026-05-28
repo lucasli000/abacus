@@ -1164,7 +1164,7 @@ pub async fn send_team_message(
             pending_confirmations: vec![],
             meeting_experts: None,
             auto_fallback_chat: None,
-            turnkey_plan: None,
+            turnkey_plan: None, needs_clarify: None,
         })
     };
 
@@ -1313,7 +1313,7 @@ pub async fn send_meeting_message(
                     pending_confirmations: vec![],
                     meeting_experts: Some(experts),
                     auto_fallback_chat: None,
-                    turnkey_plan: None,
+                    turnkey_plan: None, needs_clarify: None,
                 })
             }
             Err(e) => ApiResult::Err(format!("Meeting 轮次失败: {}", e)),
@@ -1391,7 +1391,7 @@ pub async fn send_meeting_message(
                             pending_confirmations: vec![],
                             meeting_experts: None,
                             auto_fallback_chat: Some("Meeting + Chat 双失败".to_string()),
-                            turnkey_plan: None,
+                            turnkey_plan: None, needs_clarify: None,
                         })
                     }
                     other => other,
@@ -1447,6 +1447,32 @@ pub async fn send_meeting_message_streaming(
                 if let Err(e) = mtg.start() {
                     return ApiResult::Err(format!("Meeting 启动失败 (status={:?}): {}", status, e));
                 }
+            }
+        }
+
+        // 2026-05-27: Phase 1.5 — 路由预检：如果输入无法匹配任何专家 → 返回 needs_clarify
+        {
+            let decision = mtg.session().route_input(message);
+            if let abacus_orchestrator::meeting::router::RoutingDecision::NoMatch { suggestion, .. } = decision {
+                let clarify_msg = format!(
+                    "我无法确定应由哪位专家来处理你的问题。{}\n请更具体地描述你的需求，或使用 @专家名 直接指定。",
+                    suggestion
+                );
+                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(clarify_msg.clone()));
+                let experts_snapshot: Vec<crate::tui::state::Expert> = mtg.session().participants.values()
+                    .map(|sp| crate::tui::state::Expert {
+                        name: sp.name.clone(),
+                        domain: sp.specialty.domain.clone(),
+                        status: crate::tui::state::ExpertStatus::Idle,
+                        confidence: 0.0,
+                    })
+                    .collect();
+                return ApiResult::Ok(EngineResponse {
+                    text: clarify_msg,
+                    meeting_experts: Some(experts_snapshot),
+                    needs_clarify: Some(suggestion),
+                    ..Default::default()
+                });
             }
         }
 
@@ -1590,7 +1616,7 @@ pub async fn send_meeting_message_streaming(
             pending_confirmations: vec![],
             meeting_experts: Some(experts),
             auto_fallback_chat: None,
-            turnkey_plan: None,
+            turnkey_plan: None, needs_clarify: None,
         })
     };
 
@@ -1696,7 +1722,7 @@ pub async fn send_plan_and_execute_streaming(
                 pending_confirmations: vec![],
                 meeting_experts: None,
                 auto_fallback_chat: None,
-                turnkey_plan: None,
+                turnkey_plan: None, needs_clarify: None,
             });
         }
 
@@ -1826,7 +1852,7 @@ pub async fn send_plan_and_execute_streaming(
             pending_confirmations: vec![],
             meeting_experts: None,
             auto_fallback_chat: None,
-            turnkey_plan: None,
+            turnkey_plan: None, needs_clarify: None,
         })
     };
 
@@ -1867,6 +1893,7 @@ fn parse_task_list(llm_output: &str, _goal: &str) -> Vec<abacus_orchestrator::te
             priority: i as u32,
             depends_on: vec![],
             required_role: None,
+            needs_review: false,
         });
     }
     // Fallback: if no structured tasks found, create single task from full output
@@ -1879,6 +1906,7 @@ fn parse_task_list(llm_output: &str, _goal: &str) -> Vec<abacus_orchestrator::te
             priority: 0,
             depends_on: vec![],
             required_role: None,
+            needs_review: false,
         });
     }
     tasks
@@ -2014,6 +2042,14 @@ pub struct EngineResponse {
     /// 生命周期: 随 EngineResponse 创建; state 持有直到下一次 plan / execute / clear
     /// 设计: 可选 — 仅 Turnkey 路径填充, 不污染普通 chat 路径
     pub turnkey_plan: Option<abacus_types::sandbox::TaskSpec>,
+    /// 2026-05-27: Meeting 路由失败信号 — 需要用户澄清
+    ///
+    /// ## 引用关系
+    /// - 生产者: send_meeting_message_streaming 路由预检返回 NoMatch 时填充
+    /// - 消费者: run.rs response 处理 → switch_mode(Clarify) + toast + 保留用户输入
+    /// ## 生命周期
+    /// 单条 response 消费；非 Meeting 路径恒为 None
+    pub needs_clarify: Option<String>,
 }
 
 impl Default for EngineResponse {
@@ -2029,6 +2065,7 @@ impl Default for EngineResponse {
             meeting_experts: None,
             auto_fallback_chat: None,
             turnkey_plan: None,
+            needs_clarify: None,
         }
     }
 }
@@ -2068,7 +2105,7 @@ impl EngineResponse {
             pending_confirmations: result.pending_confirmations,
             meeting_experts: None,  // 非 meeting 路径恒 None；Meeting 路径在 send_meeting_message 内单独填充
             auto_fallback_chat: None,  // V28.7: 默认无兜底，send_meeting_message 失败 fallback 时单独设置
-            turnkey_plan: None,  // V29.10: 非 turnkey 路径恒 None；TurnkeyPlan 分支在 execute_slash_command 内填充
+            turnkey_plan: None, needs_clarify: None,  // V29.10: 非 turnkey 路径恒 None；TurnkeyPlan 分支在 execute_slash_command 内填充
         }
     }
 }

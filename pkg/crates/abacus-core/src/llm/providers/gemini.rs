@@ -227,12 +227,38 @@ impl GeminiProvider {
             .find(|(_, m)| matches!(m.role, crate::llm::provider::MessageRole::User))
             .map(|(i, _)| i);
 
+        // 2026-05-28: 收集中间 System 消息，追加到 systemInstruction
+        let mut extra_system_parts: Vec<String> = Vec::new();
+
         for (idx, msg) in req.messages.iter().enumerate() {
             let role = match msg.role {
                 crate::llm::provider::MessageRole::User => "user",
                 crate::llm::provider::MessageRole::Assistant => "model",
-                crate::llm::provider::MessageRole::Tool => continue,    // 工具结果暂以 user 形式包装（待补）
-                crate::llm::provider::MessageRole::System => continue,  // system 走顶层 systemInstruction
+                crate::llm::provider::MessageRole::Tool => {
+                    // 2026-05-28: Tool results 包装为 user message（Gemini 不支持 tool role）
+                    // 格式：[Tool Result: tool_name] content
+                    let tool_name = msg.name.as_deref().unwrap_or("tool");
+                    let text = match &msg.content {
+                        Some(crate::llm::provider::MessageContent::Text(t)) => t.clone(),
+                        _ => "{}".to_string(),
+                    };
+                    let wrapped = format!("[Tool Result: {}] {}", tool_name, text);
+                    contents.push(GeminiContent {
+                        role: "user".into(),
+                        parts: vec![GeminiPart { text: Some(wrapped) }],
+                    });
+                    continue;
+                }
+                crate::llm::provider::MessageRole::System => {
+                    // 2026-05-28: 中间 System 消息收集后追加到 systemInstruction
+                    // Gemini 不支持 system role 在 contents 中间
+                    if let Some(crate::llm::provider::MessageContent::Text(t)) = &msg.content {
+                        if !t.is_empty() {
+                            extra_system_parts.push(t.clone());
+                        }
+                    }
+                    continue;
+                }
             };
             let mut text = match &msg.content {
                 Some(crate::llm::provider::MessageContent::Text(t)) => t.clone(),
@@ -257,10 +283,22 @@ impl GeminiProvider {
             });
         }
 
-        let system_instruction = req.system.as_ref().map(|s| GeminiContent {
-            role: "system".into(),
-            parts: vec![GeminiPart { text: Some(s.clone()) }],
-        });
+        // 2026-05-28: systemInstruction = 顶层 system prompt + 中间注入的 System 消息
+        let system_instruction = {
+            let mut sys_text = req.system.clone().unwrap_or_default();
+            if !extra_system_parts.is_empty() {
+                sys_text.push_str("\n\n--- Runtime Context ---\n");
+                sys_text.push_str(&extra_system_parts.join("\n"));
+            }
+            if sys_text.is_empty() {
+                None
+            } else {
+                Some(GeminiContent {
+                    role: "system".into(),
+                    parts: vec![GeminiPart { text: Some(sys_text) }],
+                })
+            }
+        };
 
         // L1 后：thinking_intent 单通道
         let thinking_config = req.thinking_intent.clone()
