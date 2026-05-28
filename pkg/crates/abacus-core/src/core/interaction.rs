@@ -596,9 +596,9 @@ mod tests {
     fn test_tool_chain_milestone() {
         let map = InteractionMap::new();
         let chain = vec![
-            make_tc("filengine_fs_search"),
-            make_tc("filengine_fs_read"),
-            make_tc("filengine_fs_edit"),
+            make_tc("fs_search"),
+            make_tc("fs_read"),
+            make_tc("fs_edit"),
         ];
         let r = MapAnalyzer::analyze_turn("edit file", "done", &chain, 1, &map);
         assert!(r.is_some());

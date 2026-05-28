@@ -319,9 +319,9 @@ const PLANNER_SYSTEM_PROMPT: &str = "## 你的角色：Planner（规划师）\n\
 fn planner_tool_whitelist() -> Vec<abacus_types::ToolId> {
     use abacus_types::ToolId;
     vec![
-        ToolId("filengine_fs_read".into()),
-        ToolId("filengine_fs_read_multiple".into()),
-        ToolId("filengine_fs_search".into()),
+        ToolId("fs_read".into()),
+        ToolId("fs_read_multiple".into()),
+        ToolId("fs_search".into()),
         ToolId("filengine_dir_list".into()),
         ToolId("filengine_dir_tree".into()),
         ToolId("filengine_file_kb_query".into()),

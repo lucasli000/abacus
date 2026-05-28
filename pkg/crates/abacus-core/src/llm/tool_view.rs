@@ -17,7 +17,7 @@
 //! ## 命名约定（去 sanitize 化）
 //! schema.name == ToolId.0 == LLM 调用名 == 内部 dispatch 键，全部使用
 //! `[a-zA-Z0-9_-]` 字符集（OpenAI/DeepSeek 工具名协议要求）。注册 builtin 时
-//! 直接用下划线（`filengine_fs_read`），MCP/Plugin/Skill 在 ingest 时一次性
+//! 直接用下划线（`fs_read`），MCP/Plugin/Skill 在 ingest 时一次性
 //! sanitize（仅一次）。下游 dispatch 不再做 O(N) 反查。
 //!
 //! ## 引用关系
@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn builtin_no_prefix() {
-        let h = mk_handle("filengine_fs_read", "read file", None, ToolProvider::BuiltIn, ToolState::Loaded);
+        let h = mk_handle("fs_read", "read file", None, ToolProvider::BuiltIn, ToolState::Loaded);
         let spec = tool_handle_to_llm_spec(&h);
         assert_eq!(spec.description.as_deref(), Some("read file"));
     }
@@ -168,9 +168,9 @@ mod tests {
     #[test]
     fn llm_spec_name_passthrough() {
         // schema.name 已是合规形态 → 直接传递，不再消毒。
-        let h = mk_handle("filengine_fs_read", "x", None, ToolProvider::BuiltIn, ToolState::Loaded);
+        let h = mk_handle("fs_read", "x", None, ToolProvider::BuiltIn, ToolState::Loaded);
         let spec = tool_handle_to_llm_spec(&h);
-        assert_eq!(spec.name, "filengine_fs_read");
+        assert_eq!(spec.name, "fs_read");
     }
 
     #[test]

@@ -2798,9 +2798,30 @@ fn is_cjk(c: char) -> bool {
 }
 
 fn path_is_allowed(path: &str) -> bool {
-    let canonical = std::path::Path::new(path).canonicalize().ok();
+    let p = std::path::Path::new(path);
+    // 2026-05-28: 路径不存在时（fs_write 创建新文件），向上找最近存在的祖先 canonicalize
+    // 修复：原来 canonicalize 失败直接返回 false → 新文件被拒
+    let canonical = if p.exists() {
+        p.canonicalize().ok()
+    } else {
+        // 沿祖先链向上找存在的目录
+        let mut cursor = p;
+        loop {
+            match cursor.parent() {
+                Some(parent) if parent.exists() => {
+                    break parent.canonicalize().ok().map(|base| {
+                        // 将不存在的尾部路径拼接回去
+                        let suffix = p.strip_prefix(parent).unwrap_or(p);
+                        base.join(suffix)
+                    });
+                }
+                Some(parent) => cursor = parent,
+                None => break None,
+            }
+        }
+    };
     let canonical = match canonical {
-        Some(p) => p.to_string_lossy().to_string(),
+        Some(c) => c.to_string_lossy().to_string(),
         None => return false,
     };
     allowed_roots().iter().any(|root| canonical.starts_with(root))
@@ -3639,13 +3660,13 @@ mod tests {
             summary: "truncated".into(),
             recover_id: Some("rs_xxx".into()),
             turn_range: Some((3, 7)),
-            origin: Some("filengine_fs_read".into()),
+            origin: Some("fs_read".into()),
         };
         let json = s.to_json_line();
         assert!(json.contains("\"kind\":\"tool_result\""));
         assert!(json.contains("\"recover_id\":\"rs_xxx\""));
         assert!(json.contains("\"turn_range\":[3,7]"));
-        assert!(json.contains("\"origin\":\"filengine_fs_read\""));
+        assert!(json.contains("\"origin\":\"fs_read\""));
     }
 
     /// Z3: auto_compress 接 Detailed 档位输出更长 snippet

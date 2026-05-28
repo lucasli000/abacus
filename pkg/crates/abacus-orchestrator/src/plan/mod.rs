@@ -456,9 +456,9 @@ mod tests {
     #[test]
     fn test_plan_ready_steps() {
         let mut plan = PlanModel::new("p1", "test");
-        plan.add_step(make_step("a", StepKind::ToolCall { tool_id: "filengine_fs_read".into(), params: serde_json::json!({}) }, vec![]));
+        plan.add_step(make_step("a", StepKind::ToolCall { tool_id: "fs_read".into(), params: serde_json::json!({}) }, vec![]));
         plan.add_step(make_step("b", StepKind::LlmReason { prompt: "think".into() }, vec!["a"]));
-        plan.add_step(make_step("c", StepKind::ToolCall { tool_id: "filengine_fs_write".into(), params: serde_json::json!({}) }, vec!["a"]));
+        plan.add_step(make_step("c", StepKind::ToolCall { tool_id: "fs_write".into(), params: serde_json::json!({}) }, vec!["a"]));
 
         // 初始：只有 a 就绪
         let ready = plan.ready_steps();
@@ -489,7 +489,7 @@ mod tests {
     async fn test_plan_executor_simple() {
         let executor = PlanExecutor::new();
         let mut plan = PlanModel::new("p3", "simple exec");
-        plan.add_step(make_step("s1", StepKind::ToolCall { tool_id: "filengine_fs_read".into(), params: serde_json::json!({}) }, vec![]));
+        plan.add_step(make_step("s1", StepKind::ToolCall { tool_id: "fs_read".into(), params: serde_json::json!({}) }, vec![]));
         plan.add_step(make_step("s2", StepKind::LlmReason { prompt: "analyze".into() }, vec!["s1"]));
 
         let result = executor.run(&mut plan).await;

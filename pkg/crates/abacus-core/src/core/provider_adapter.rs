@@ -246,7 +246,7 @@ mod tests {
     fn test_anthropic_tool_wrap() {
         let a = AnthropicAdapter;
         let desc = "Read a file";
-        let out = a.tool_description_wrap("filengine_fs_read", desc);
+        let out = a.tool_description_wrap("fs_read", desc);
         assert!(out.starts_with("Use this tool when:"));
     }
 

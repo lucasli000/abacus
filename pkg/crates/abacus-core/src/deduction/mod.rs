@@ -663,13 +663,13 @@ mod tests {
     async fn test_collect_post_turn() {
         let engine = DeductionEngine::new(Some(PathBuf::from(":memory:"))).unwrap();
         let mut stats = HashMap::new();
-        stats.insert(ToolId("filengine_fs_read".into()), make_stats(0.8, 0.95, 50.0, 20));
+        stats.insert(ToolId("fs_read".into()), make_stats(0.8, 0.95, 50.0, 20));
         engine.collect_post_turn(
             1, "s1", &stats, 50.0, 128_000, 64_000,
             false, 6, 14, 0x1234, true,
         ).await.unwrap();
 
-        let tool_history = engine.store.load_tool_history("filengine_fs_read", 10).await.unwrap();
+        let tool_history = engine.store.load_tool_history("fs_read", 10).await.unwrap();
         assert_eq!(tool_history.len(), 1);
         let p = &tool_history[0];
         assert!((p.adoption_rate - 0.8).abs() < 0.01, "adoption={}", p.adoption_rate);
@@ -682,7 +682,7 @@ mod tests {
 
         for i in 0..10 {
             let mut stats = HashMap::new();
-            stats.insert(ToolId("filengine_fs_read".into()), make_stats(0.7, 0.85, 30.0, 10));
+            stats.insert(ToolId("fs_read".into()), make_stats(0.7, 0.85, 30.0, 10));
             engine.collect_post_turn(
                 i, "s1", &stats, 40.0 + i as f64 * 3.0,
                 128_000, (40000 + i * 3000) as usize,

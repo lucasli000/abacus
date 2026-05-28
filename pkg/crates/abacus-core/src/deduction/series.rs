@@ -418,7 +418,7 @@ mod tests {
     async fn test_store_and_retrieve_tool_metrics() {
         let store = MetricStore::in_memory().unwrap();
         let points = vec![ToolMetricPoint {
-            tool_id: ToolId("filengine_fs_read".into()),
+            tool_id: ToolId("fs_read".into()),
             turn_number: 1,
             session_id: "s1".into(),
             timestamp_ms: 1000,
@@ -434,7 +434,7 @@ mod tests {
         }];
         store.record_tool_metrics(&points).await.unwrap();
 
-        let history = store.load_tool_history("filengine_fs_read", 10).await.unwrap();
+        let history = store.load_tool_history("fs_read", 10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].adoption_rate, 0.8);
     }
@@ -474,7 +474,7 @@ mod tests {
         let store = MetricStore::in_memory().unwrap();
         store.record_tool_metrics(&[
             ToolMetricPoint {
-                tool_id: ToolId("filengine_fs_read".into()), turn_number: 1, session_id: "s1".into(),
+                tool_id: ToolId("fs_read".into()), turn_number: 1, session_id: "s1".into(),
                 timestamp_ms: 1000, adoption_rate: 0.8, success_rate: 0.9, trend: 0.0,
                 composite_score: 0.7, visibility_tier: "A".into(),
                 opportunities: 10, invocations: 8, successes: 7, avg_latency_ms: 10.0,

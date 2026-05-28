@@ -331,7 +331,8 @@ impl DbToolExecutor {
         let db_param = params.get("db").and_then(|v| v.as_str());
 
         if conditions.is_empty() {
-            return Err(KernelError::Other("conditions must not be empty (prevents full-table update)".into()));
+            return Err(KernelError::Other(
+                "conditions 不能为空（防止全表更新）。如需更新全表请使用 db_query 执行原始 SQL".into()));
         }
         if data.is_empty() {
             return Err(KernelError::Other("data must not be empty".into()));
@@ -398,7 +399,8 @@ impl DbToolExecutor {
         let db_param = params.get("db").and_then(|v| v.as_str());
 
         if conditions.is_empty() {
-            return Err(KernelError::Other("conditions must not be empty (prevents full-table delete)".into()));
+            return Err(KernelError::Other(
+                "conditions 不能为空（防止全表删除）。如需清空表请使用 db_query 执行 DELETE FROM table".into()));
         }
 
         let conn = self.get_conn(db_param).await?;

@@ -227,12 +227,13 @@ impl McipHmac {
 ///
 /// ## 命名规则
 /// 单一命名约定：ToolId.0 == schema.name == LLM 调用名，全部下划线形态
-/// （`filengine_fs_read` / `db_query` / `lsp_hover` / `mcp_srv_tool` 等）。
+/// （`fs_read` / `bash_exec` / `web_fetch` / `db_query` / `lsp_hover` 等）。
 /// 前缀匹配 ToolId.0 开头。
 const BUILTIN_EXEMPT_PREFIXES: &[&str] = &[
     // —— 单一命名约定：所有工具 ToolId 用下划线分隔形态 ——
-    "filengine_",    // filengine_fs_read / filengine_bash_exec
-    "web_",          // web_fetch / web_search (独立子系统，不含 filengine_ 前缀)
+    "fs_",           // fs_read / fs_write / fs_edit / fs_search / fs_grep / fs_ls
+    "bash_",         // bash_exec
+    "web_",          // web_fetch / web_search
     "env_",          // env_status
     "deduction_",    // deduction_status / deduction_analyze
     "context_",      // context_declare / context_keep / context_compress
@@ -573,7 +574,7 @@ mod tests {
     fn test_hmac_sign_verify() {
         let key = McipHmac::generate_key();
         let hmac = McipHmac::new(&key);
-        let payload = r#"{"tool":"filengine_fs_read","path":"/tmp/test"}"#;
+        let payload = r#"{"tool":"fs_read","path":"/tmp/test"}"#;
         let sig = hmac.sign(payload);
         assert!(hmac.verify(payload, &sig));
         assert!(!hmac.verify(payload, &(sig[..sig.len()-1].to_string() + "0")));

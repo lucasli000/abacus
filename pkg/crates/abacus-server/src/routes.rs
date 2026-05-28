@@ -791,6 +791,10 @@ async fn chat_stream_handler(
                     let data = serde_json::json!({"tool": tool, "approved": approved}).to_string();
                     yield Ok(Event::default().event("auth_result").data(data));
                 }
+                StreamChunk::StreamRetryReset { partial_text } => {
+                    let data = serde_json::json!({"partial_text": partial_text}).to_string();
+                    yield Ok(Event::default().event("stream_retry_reset").data(data));
+                }
             }
         }
 

@@ -43,8 +43,8 @@ pub struct ToolSchema {
     /// Phase β-G: 是否幂等（多次调用同参数 → 同结果，无副作用）
     ///
     /// 默认 `false`（保守）。pipeline 检查多个 idempotent 工具时可以并行执行
-    /// 加速 latency。filengine_fs_read / db_read_records 等读操作典型 idempotent；
-    /// filengine_fs_write / filengine_bash_exec 等写操作必须 false。
+    /// 加速 latency。fs_read / db_read_records 等读操作典型 idempotent；
+    /// fs_write / bash_exec 等写操作必须 false。
     #[serde(default)]
     pub idempotent: bool,
 }
@@ -361,7 +361,7 @@ pub struct ToolOutput {
     pub failure_kind: Option<String>,
     /// Phase α-H: 失败时建议的替代工具列表
     ///
-    /// 例：filengine_bash_exec 失败可建议 ["filengine_fs_read", "filengine_fs_write"]
+    /// 例：bash_exec 失败可建议 ["fs_read", "fs_write"]
     /// 默认空——执行器主动填写时 LLM 看到「Try X instead」直接换工具不抖动。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub try_instead: Vec<String>,

@@ -106,8 +106,8 @@ pub mod user_profile {
                 "full" => false,
                 "manual" | "confirm_all" => true,
                 _ => {
-                    let s = matches!(tool_id, "filengine_fs_write" | "filengine_fs_move"
-                        | "filengine_fs_mkdir" | "filengine_bash_exec" | "web_fetch");
+                    let s = matches!(tool_id, "fs_write" | "fs_move"
+                        | "fs_mkdir" | "bash_exec" | "web_fetch");
                     s && !self.safe_operations.contains(tool_id)
                 }
             }
@@ -259,8 +259,8 @@ mod tests {
 
     #[test]
     fn test_tool_id_display() {
-        let id = ToolId("filengine_fs_read".to_string());
-        assert_eq!(id.0, "filengine_fs_read");
+        let id = ToolId("fs_read".to_string());
+        assert_eq!(id.0, "fs_read");
     }
 
     #[test]

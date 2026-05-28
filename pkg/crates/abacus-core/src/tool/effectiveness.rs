@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn test_new_tool_default_a() {
         let tracker = EffectivenessTracker::new();
-        let eff = tracker.evaluate(&ToolId("filengine_fs_read".into()));
+        let eff = tracker.evaluate(&ToolId("fs_read".into()));
         assert_eq!(eff.tier, VisibilityTier::A);
         assert!(eff.insufficient_data);
     }
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn test_after_enough_data() {
         let mut tracker = EffectivenessTracker::new();
-        let tid = ToolId("filengine_fs_read".into());
+        let tid = ToolId("fs_read".into());
         for i in 0..15 {
             tracker.record_opportunity(&tid);
             if i < 12 {
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn test_user_favorite_always_s() {
         let mut tracker = EffectivenessTracker::new();
-        let tid = ToolId("filengine_fs_read".into());
+        let tid = ToolId("fs_read".into());
         tracker.add_favorite(tid.clone());
         let eff = tracker.evaluate(&tid);
         assert_eq!(eff.tier, VisibilityTier::S);
@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn test_reset_clears_stats() {
         let mut tracker = EffectivenessTracker::new();
-        let tid = ToolId("filengine_fs_read".into());
+        let tid = ToolId("fs_read".into());
         tracker.record_opportunity(&tid);
         tracker.record_invocation(&tid, true, 5);
         tracker.reset(&tid);

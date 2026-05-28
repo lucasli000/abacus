@@ -850,7 +850,7 @@ impl DualPalaceMemory {
     ///
     /// ## V29.13 命名约定修复
     /// 旧实现：`tool_id.split('.').next()`——依赖 dot 分隔，当工具名从 `filengine.fs.read`
-    /// 改成 `filengine_fs_read` 后整个 tool_id 被当 domain，导致 BehaviorPalace tag 错乱。
+    /// 改成 `fs_read` 后整个 tool_id 被当 domain，导致 BehaviorPalace tag 错乱。
     /// 新实现：兼容 dot+underscore 两种分隔（先 split('.')，无 dot 时再 split('_')）。
     pub async fn record_tool_behavior(&self, tool_id: &str, success: bool) {
         let domain = extract_tool_domain(tool_id);
@@ -1101,12 +1101,12 @@ pub enum SmartRetrieveResult {
 ///
 /// ## 历史 bug
 /// 旧实现仅 `split('.').next()`——命名约定从 dot 改为 underscore 后，
-/// `"filengine_fs_read".split('.').next() == "filengine_fs_read"`（整段当 domain），
+/// `"fs_read".split('.').next() == "fs_read"`（整段当 domain），
 /// 导致 BehaviorPalace tag 全部错位 + bridge 桥接拉不到正确 KnowledgeEntry。
 ///
 /// ## 新策略
 /// - 优先 dot 分隔（向后兼容外部 MCP `mcp__filengine__file_read` 等少数 dot 名）
-/// - 无 dot 时 underscore 分隔取首段（filengine_fs_read → "filengine"）
+/// - 无 dot 时 underscore 分隔取首段（fs_read → "filengine"）
 /// - 都无分隔时整段当 domain（短工具名如 "code"）
 pub(crate) fn extract_tool_domain(tool_id: &str) -> &str {
     if let Some(idx) = tool_id.find('.') {
@@ -1512,8 +1512,8 @@ mod tests {
     #[test]
     fn extract_tool_domain_underscore_form() {
         // V29.13 命名约定：所有内部工具用下划线
-        assert_eq!(extract_tool_domain("filengine_fs_read"), "filengine");
-        assert_eq!(extract_tool_domain("filengine_bash_exec"), "filengine");
+        assert_eq!(extract_tool_domain("fs_read"), "filengine");
+        assert_eq!(extract_tool_domain("bash_exec"), "filengine");
         assert_eq!(extract_tool_domain("db_query"), "db");
         assert_eq!(extract_tool_domain("kb_search"), "kb");
         assert_eq!(extract_tool_domain("orchestrate_assess"), "orchestrate");
@@ -1575,7 +1575,7 @@ mod tests {
     async fn record_tool_behavior_extracts_domain_from_underscore_name() {
         // 验证 V29.13 修复：旧 bug 是整个 tool_id 当 domain
         let palace = DualPalaceMemory::new();
-        palace.record_tool_behavior("filengine_fs_read", true).await;
+        palace.record_tool_behavior("fs_read", true).await;
         let memories = palace.behavior.search(&["filengine".to_string()]).await;
         assert!(!memories.is_empty(), "应能按 'filengine' domain 搜到 behavior");
     }

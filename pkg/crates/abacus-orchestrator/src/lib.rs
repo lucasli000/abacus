@@ -36,7 +36,7 @@ mod tests {
             max_steps: 10,
             max_tokens: 4096,
             max_duration: std::time::Duration::from_secs(60),
-            allowed_tools: vec![abacus_types::ToolId("filengine_fs_read".into())],
+            allowed_tools: vec![abacus_types::ToolId("fs_read".into())],
             forbidden_tools: vec![],
             context_scope: subagent::ContextScope::Isolated,
             allow_nesting: false,
@@ -60,7 +60,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let step = PlanStep {
             id: "step_1".into(),
-            kind: StepKind::ToolCall { tool_id: "filengine_fs_read".into(), params: serde_json::json!({}) },
+            kind: StepKind::ToolCall { tool_id: "fs_read".into(), params: serde_json::json!({}) },
             description: "read file".into(),
             depends_on: vec![],
             status: StepStatus::Pending,

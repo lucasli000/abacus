@@ -57,8 +57,16 @@ static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 pub fn shared_http_client() -> &'static reqwest::Client {
     SHARED_HTTP_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // 连接超时：防止 DNS 解析/TCP 握手卡住（默认无限等待）
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // 整体请求超时：非流式请求的最大等待时间
+            // 流式请求由 provider 层自行设 timeout，此处为兜底
+            .timeout(std::time::Duration::from_secs(300))
+            // 连接池
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(32)
+            // TCP keepalive：及时发现断连（防止长时间挂起在死连接上）
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default()
     })
@@ -82,7 +90,7 @@ pub fn shared_http_client() -> &'static reqwest::Client {
 // 2. provider 调用 to_provider_specific() → 各厂商自有格式
 // 3. 所有 provider 不再自己解码 thinking 语义
 
-use abacus_types::{EffortLevel, ModelSpec, ThinkingCapabilities, ThinkingIntent};
+use abacus_types::{EffortLevel, ThinkingCapabilities, ThinkingIntent};
 
 /// 最终思考请求参数（Provider 只需序列化此结构）
 #[derive(Debug, Clone)]

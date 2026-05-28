@@ -531,22 +531,22 @@ mod tests {
     #[test]
     fn test_contamination_detection() {
         let history = vec![
-            make_metric("filengine_fs_read", 1, 0.9, 0.5, 0.70),
-            make_metric("filengine_fs_read", 2, 0.9, 0.4, 0.70),
-            make_metric("filengine_fs_read", 3, 0.9, 0.5, 0.70),
-            make_metric("filengine_fs_read", 4, 0.9, 0.4, 0.70),
+            make_metric("fs_read", 1, 0.9, 0.5, 0.70),
+            make_metric("fs_read", 2, 0.9, 0.4, 0.70),
+            make_metric("fs_read", 3, 0.9, 0.5, 0.70),
+            make_metric("fs_read", 4, 0.9, 0.4, 0.70),
         ];
         let alerts = detect_contamination(&history);
-        let has_fs = alerts.iter().any(|a| a.tool_id == "filengine_fs_read" && a.severity == ContaminationSeverity::Critical);
+        let has_fs = alerts.iter().any(|a| a.tool_id == "fs_read" && a.severity == ContaminationSeverity::Critical);
         assert!(has_fs, "should detect critical contamination: adoption={}, success={}", 0.9, 0.45);
     }
 
     #[test]
     fn test_no_contamination_when_aligned() {
         let history = vec![
-            make_metric("filengine_fs_read", 1, 0.8, 0.85, 0.75),
-            make_metric("filengine_fs_read", 2, 0.8, 0.82, 0.75),
-            make_metric("filengine_fs_read", 3, 0.8, 0.83, 0.75),
+            make_metric("fs_read", 1, 0.8, 0.85, 0.75),
+            make_metric("fs_read", 2, 0.8, 0.82, 0.75),
+            make_metric("fs_read", 3, 0.8, 0.83, 0.75),
         ];
         let alerts = detect_contamination(&history);
         assert!(alerts.is_empty(), "should not alert when adoption ≈ success");
@@ -580,9 +580,9 @@ mod tests {
     #[test]
     fn test_cross_session_patterns() {
         let all = vec![
-            make_metric("filengine_fs_read", 1, 0.8, 0.9, 0.7),
-            make_metric("filengine_fs_read", 2, 0.8, 0.9, 0.7),
-            make_metric("filengine_fs_read", 3, 0.8, 0.9, 0.7),
+            make_metric("fs_read", 1, 0.8, 0.9, 0.7),
+            make_metric("fs_read", 2, 0.8, 0.9, 0.7),
+            make_metric("fs_read", 3, 0.8, 0.9, 0.7),
             make_metric("web_fetch", 1, 0.9, 0.5, 0.6),
             make_metric("web_fetch", 2, 0.9, 0.4, 0.6),
             make_metric("web_fetch", 3, 0.9, 0.5, 0.6),
@@ -596,10 +596,10 @@ mod tests {
     #[test]
     fn test_extract_invariants() {
         let history = vec![
-            make_metric("filengine_fs_read", 1, 0.8, 0.95, 0.75),
-            make_metric("filengine_fs_read", 2, 0.8, 0.93, 0.75),
-            make_metric("filengine_fs_read", 3, 0.8, 0.94, 0.75),
-            make_metric("filengine_fs_read", 4, 0.8, 0.95, 0.75),
+            make_metric("fs_read", 1, 0.8, 0.95, 0.75),
+            make_metric("fs_read", 2, 0.8, 0.93, 0.75),
+            make_metric("fs_read", 3, 0.8, 0.94, 0.75),
+            make_metric("fs_read", 4, 0.8, 0.95, 0.75),
         ];
         let inv = extract_invariants(&history);
         let has_high = inv.iter().any(|i| i.contains("success_high"));

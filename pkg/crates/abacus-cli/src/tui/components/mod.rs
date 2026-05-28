@@ -1645,11 +1645,11 @@ mod tool_diff_render_tests {
 
     #[test]
     fn fully_qualified_filengine_prefix_matches() {
-        // 单一命名约定后：注册名直接是 filengine_fs_edit / filengine_fs_write
+        // 单一命名约定后：注册名直接是 fs_edit / fs_write
         let args = r#"{"path": "/tmp/x.rs", "old_string": "a", "new_string": "b"}"#;
-        assert!(try_render_edit_diff("filengine_fs_edit", args, &theme(), 0).is_some());
+        assert!(try_render_edit_diff("fs_edit", args, &theme(), 0).is_some());
         let args_w = r#"{"path": "/tmp/y.rs", "content": "c"}"#;
-        assert!(try_render_edit_diff("filengine_fs_write", args_w, &theme(), 0).is_some());
+        assert!(try_render_edit_diff("fs_write", args_w, &theme(), 0).is_some());
     }
 
     #[test]

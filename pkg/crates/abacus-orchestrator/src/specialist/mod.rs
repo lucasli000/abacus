@@ -393,7 +393,7 @@ impl SpecialistInstance {
 ///     anti_pattern: "禁止在未确认时修改生产文件..."
 ///     capabilities: [code_implementation]
 ///     tags: ["代码", "编程"]
-///     allowed_tools: ["filengine_fs_*"]
+///     allowed_tools: ["fs_*"]
 ///     engagement:
 ///       max_speeches_per_round: 50
 ///       max_thinking_tokens: 100000

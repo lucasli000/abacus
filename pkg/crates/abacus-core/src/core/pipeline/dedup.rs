@@ -176,14 +176,14 @@ mod tests {
     #[test]
     fn dedup_lookup_then_record_roundtrip() {
         let dedup = ToolResultDedup::new(64 * 1024, 60);
-        let tool = ToolId("filengine_fs_read".into());
+        let tool = ToolId("fs_read".into());
         let args = json!({ "path": "/tmp/x" });
 
         // 初始 miss
         assert!(dedup.lookup(&tool, &args).is_none());
 
         // 写入后命中
-        let out = mk_output("filengine_fs_read", "hello");
+        let out = mk_output("fs_read", "hello");
         dedup.record(&tool, &args, &out);
         let hit = dedup.lookup(&tool, &args).expect("should hit");
         assert_eq!(hit.output, out.output);
@@ -209,8 +209,8 @@ mod tests {
     #[test]
     fn dedup_field_order_independent_hit() {
         let dedup = ToolResultDedup::new(64 * 1024, 60);
-        let tool = ToolId("filengine_fs_read".into());
-        let out = mk_output("filengine_fs_read", "x");
+        let tool = ToolId("fs_read".into());
+        let out = mk_output("fs_read", "x");
         dedup.record(&tool, &json!({ "path": "/p", "limit": 100 }), &out);
         // LLM 第二次给的字段顺序变了，仍应命中
         assert!(dedup.lookup(&tool, &json!({ "limit": 100, "path": "/p" })).is_some());

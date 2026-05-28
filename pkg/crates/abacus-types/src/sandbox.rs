@@ -169,9 +169,9 @@ impl Default for SandboxConfig {
             max_retries_per_step: 2,
             default_timeout_secs: 120,
             global_tool_whitelist: vec![
-                "filengine_fs_read".into(),
-                "filengine_fs_info".into(),
-                "filengine_fs_cwd".into(),
+                "fs_read".into(),
+                "fs_info".into(),
+                "fs_cwd".into(),
             ],
         }
     }

@@ -39,7 +39,7 @@ pub enum RegistrationMode {
 pub struct SubsystemDecl {
     pub name: &'static str,
     pub mode: RegistrationMode,
-    /// 子系统含的工具 prefix（如 "filengine_fs_", "lsp."）
+    /// 子系统含的工具 prefix（如 "fs_", "lsp."）
     pub tool_prefix: &'static str,
     /// 简短描述（audit 报告用）
     pub description: &'static str,
@@ -54,7 +54,7 @@ pub fn builtin_subsystems() -> Vec<SubsystemDecl> {
         SubsystemDecl {
             name: "filengine.fs",
             mode: RegistrationMode::Always,
-            tool_prefix: "filengine_fs_",
+            tool_prefix: "fs_",
             description: "filesystem ops (read/write/grep/etc.) — core capability",
         },
         SubsystemDecl {
@@ -66,7 +66,7 @@ pub fn builtin_subsystems() -> Vec<SubsystemDecl> {
         SubsystemDecl {
             name: "filengine.bash",
             mode: RegistrationMode::Always,
-            tool_prefix: "filengine_bash_",
+            tool_prefix: "bash_",
             description: "bash execution — core capability",
         },
         SubsystemDecl {
@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn always_subsystem_registers() {
         let enabled = HashSet::new();
-        assert!(should_register("filengine_fs_", &enabled));
+        assert!(should_register("fs_", &enabled));
         assert!(should_register("db_", &enabled));
     }
 
@@ -277,7 +277,7 @@ mod tests {
 
     #[test]
     fn subsystem_of_lookups() {
-        assert_eq!(subsystem_of(&ToolId("filengine_fs_read".into())), Some("filengine.fs"));
+        assert_eq!(subsystem_of(&ToolId("fs_read".into())), Some("filengine.fs"));
         assert_eq!(subsystem_of(&ToolId("lsp_hover".into())), Some("lsp"));
         assert_eq!(subsystem_of(&ToolId("unknown_x".into())), None);
     }
@@ -299,7 +299,7 @@ mod tests {
     fn should_register_legacy_matches_noop_provider() {
         let enabled = HashSet::new();
         let p = NoopHeatProvider;
-        for prefix in &["filengine_fs_", "lsp_", "kb_", "unknown_"] {
+        for prefix in &["fs_", "lsp_", "kb_", "unknown_"] {
             assert_eq!(
                 should_register(prefix, &enabled),
                 should_register_with_heat(prefix, &enabled, &p),
@@ -401,7 +401,7 @@ mod tests {
         let enabled = HashSet::new();
         // 给一个永远 0 的 provider，但 Always 子系统仍应注册
         let p = NoopHeatProvider;
-        assert!(should_register_with_heat("filengine_fs_", &enabled, &p));
+        assert!(should_register_with_heat("fs_", &enabled, &p));
         assert!(should_register_with_heat("kb_", &enabled, &p));
     }
 

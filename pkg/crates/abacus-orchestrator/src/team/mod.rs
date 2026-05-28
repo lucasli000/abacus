@@ -914,13 +914,13 @@ mod tests {
         let task_a = TaskSpec {
             id: "impl_auth".into(), description: "实现登录功能".into(),
             required_capabilities: vec!["rust".into()],
-            allowed_tools: vec!["filengine_fs_read".into(), "filengine_fs_write".into()],
+            allowed_tools: vec!["fs_read".into(), "fs_write".into()],
             priority: 0, depends_on: vec![], required_role: Some(AgentRole::Member), needs_review: false,
         };
         let task_b = TaskSpec {
             id: "test_auth".into(), description: "编写登录测试".into(),
             required_capabilities: vec!["testing".into()],
-            allowed_tools: vec!["filengine_fs_read".into(), "filengine_fs_write".into()],
+            allowed_tools: vec!["fs_read".into(), "fs_write".into()],
             priority: 1, depends_on: vec!["impl_auth".into()], required_role: Some(AgentRole::PM), needs_review: false,
         };
 

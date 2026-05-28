@@ -171,14 +171,12 @@ impl SemanticParser {
                 ("文件", 6, 0.7), ("file", 6, 0.7), ("目录", 6, 0.8),
                 ("directory", 6, 0.8), ("路径", 6, 0.7), ("path", 6, 0.6),
             ],
-            // ToolId 命名空间约定：filengine.* 前缀（fs/web/bash 子系统）必须保留——
-            // subsystem_policy.rs / sandbox.rs / mag_chain.rs 都按 filengine.fs. 等
-            // prefix 反查；裸名 fs.read 在 registry 里不存在，路由 hit miss。
-            // 其他 builtin（code/db/kb）按裸名注册，保持原样。
+            // 2026-05-28: 工具直接用原始名注册（fs_read / bash_exec / web_fetch）
+            // subsystem_policy 按前缀 fs_ / bash_ / web_ 分组匹配
             tool_domain_map: vec![
-                (ToolId("filengine_fs_read".into()), vec![6, 0]),
-                (ToolId("filengine_fs_write".into()), vec![6, 0]),
-                (ToolId("filengine_fs_search".into()), vec![6]),
+                (ToolId("fs_read".into()), vec![6, 0]),
+                (ToolId("fs_write".into()), vec![6, 0]),
+                (ToolId("fs_search".into()), vec![6]),
                 (ToolId("code_exec".into()), vec![0, 1]),
                 (ToolId("web_fetch".into()), vec![5]),
                 (ToolId("web_search".into()), vec![5]),
@@ -186,9 +184,9 @@ impl SemanticParser {
                 (ToolId("kb_search".into()), vec![3, 2]),
             ],
             tool_action_map: vec![
-                (ToolId("filengine_fs_read".into()), vec![ActionType::Read, ActionType::Analyze]),
-                (ToolId("filengine_fs_write".into()), vec![ActionType::Create, ActionType::Update]),
-                (ToolId("filengine_fs_search".into()), vec![ActionType::Search]),
+                (ToolId("fs_read".into()), vec![ActionType::Read, ActionType::Analyze]),
+                (ToolId("fs_write".into()), vec![ActionType::Create, ActionType::Update]),
+                (ToolId("fs_search".into()), vec![ActionType::Search]),
                 (ToolId("code_exec".into()), vec![ActionType::Execute, ActionType::Fix]),
                 (ToolId("web_fetch".into()), vec![ActionType::Read, ActionType::Search]),
                 (ToolId("web_search".into()), vec![ActionType::Search]),
@@ -272,12 +270,12 @@ impl SemanticParser {
             }
 
             // File path boost for fs tools
-            if features.has_file_path && tool_id.0.starts_with("filengine_fs_") {
+            if features.has_file_path && tool_id.0.starts_with("fs_") {
                 score += 0.2;
             }
 
             // Code block boost for code tools
-            if features.has_code_block && (tool_id.0.contains("code") || tool_id.0 == "filengine_fs_read") {
+            if features.has_code_block && (tool_id.0.contains("code") || tool_id.0 == "fs_read") {
                 score += 0.15;
             }
 
@@ -549,7 +547,7 @@ mod tests {
         assert!(sig.features.has_file_path);
         assert_eq!(sig.features.action, ActionType::Read);
         // fs.read should have high score
-        assert!(sig.tool_scores.iter().any(|(t, s)| t.0 == "filengine_fs_read" && *s > 0.5));
+        assert!(sig.tool_scores.iter().any(|(t, s)| t.0 == "fs_read" && *s > 0.5));
     }
 
     #[test]
@@ -564,7 +562,7 @@ mod tests {
     fn test_fusion_semantic_wins_on_conflict() {
         let gate = FusionGate::new();
         let exp = ExperienceSignal {
-            tool_scores: vec![(ToolId("filengine_fs_read".into()), 0.9)],
+            tool_scores: vec![(ToolId("fs_read".into()), 0.9)],
             data_points: 50,
         };
         let sem = SemanticSignal {
@@ -596,7 +594,7 @@ mod tests {
             data_points: 2, // insufficient
         };
         let sem = SemanticSignal {
-            tool_scores: vec![(ToolId("filengine_fs_search".into()), 0.7)],
+            tool_scores: vec![(ToolId("fs_search".into()), 0.7)],
             features: FeatureVec {
                 action: ActionType::Search,
                 domain_scores: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.8],
@@ -619,11 +617,11 @@ mod tests {
     fn test_fusion_both_agree_boost() {
         let gate = FusionGate::new();
         let exp = ExperienceSignal {
-            tool_scores: vec![(ToolId("filengine_fs_read".into()), 0.8)],
+            tool_scores: vec![(ToolId("fs_read".into()), 0.8)],
             data_points: 30,
         };
         let sem = SemanticSignal {
-            tool_scores: vec![(ToolId("filengine_fs_read".into()), 0.6)],
+            tool_scores: vec![(ToolId("fs_read".into()), 0.6)],
             features: FeatureVec {
                 action: ActionType::Read,
                 domain_scores: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.7],

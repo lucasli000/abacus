@@ -829,27 +829,27 @@ mod tests {
     #[test]
     fn test_boundary_tool_check() {
         let boundary = SubAgentBoundary {
-            allowed_tools: vec![ToolId("filengine_fs_read".into()), ToolId("filengine_fs_write".into())],
-            forbidden_tools: vec![ToolId("filengine_bash_exec".into())],
+            allowed_tools: vec![ToolId("fs_read".into()), ToolId("fs_write".into())],
+            forbidden_tools: vec![ToolId("bash_exec".into())],
             ..Default::default()
         };
 
-        assert!(boundary.is_tool_allowed(&ToolId("filengine_fs_read".into())));
+        assert!(boundary.is_tool_allowed(&ToolId("fs_read".into())));
         assert!(!boundary.is_tool_allowed(&ToolId("web_search".into()))); // not in allowed
-        assert!(!boundary.is_tool_allowed(&ToolId("filengine_bash_exec".into()))); // explicitly forbidden
+        assert!(!boundary.is_tool_allowed(&ToolId("bash_exec".into()))); // explicitly forbidden
     }
 
     #[test]
     fn test_boundary_empty_allowed_means_all() {
         let boundary = SubAgentBoundary {
             allowed_tools: vec![], // empty = allow all
-            forbidden_tools: vec![ToolId("filengine_bash_exec".into())],
+            forbidden_tools: vec![ToolId("bash_exec".into())],
             ..Default::default()
         };
 
-        assert!(boundary.is_tool_allowed(&ToolId("filengine_fs_read".into())));
+        assert!(boundary.is_tool_allowed(&ToolId("fs_read".into())));
         assert!(boundary.is_tool_allowed(&ToolId("web_search".into())));
-        assert!(!boundary.is_tool_allowed(&ToolId("filengine_bash_exec".into()))); // still forbidden
+        assert!(!boundary.is_tool_allowed(&ToolId("bash_exec".into()))); // still forbidden
     }
 
     #[test]
@@ -879,14 +879,14 @@ mod tests {
     #[test]
     fn test_boundary_tracker_tool_denied() {
         let boundary = SubAgentBoundary {
-            forbidden_tools: vec![ToolId("filengine_bash_exec".into())],
+            forbidden_tools: vec![ToolId("bash_exec".into())],
             ..Default::default()
         };
         let tracker = BoundaryTracker::new(boundary);
 
-        assert!(tracker.check_tool(&ToolId("filengine_fs_read".into())).is_none());
+        assert!(tracker.check_tool(&ToolId("fs_read".into())).is_none());
         assert!(matches!(
-            tracker.check_tool(&ToolId("filengine_bash_exec".into())),
+            tracker.check_tool(&ToolId("bash_exec".into())),
             Some(AbortReason::ToolDenied { .. })
         ));
     }

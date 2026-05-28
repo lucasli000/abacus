@@ -275,15 +275,15 @@ mod tests {
 
     #[test]
     fn test_compute_result_id_stable() {
-        let a = compute_result_id("s1", "filengine_fs_read", "hello");
-        let b = compute_result_id("s1", "filengine_fs_read", "hello");
+        let a = compute_result_id("s1", "fs_read", "hello");
+        let b = compute_result_id("s1", "fs_read", "hello");
         assert_eq!(a, b, "same inputs → same id");
     }
 
     #[test]
     fn test_compute_result_id_distinguishes_sessions() {
-        let a = compute_result_id("s1", "filengine_fs_read", "hello");
-        let b = compute_result_id("s2", "filengine_fs_read", "hello");
+        let a = compute_result_id("s1", "fs_read", "hello");
+        let b = compute_result_id("s2", "fs_read", "hello");
         assert_ne!(a, b, "different session → different id");
     }
 
@@ -301,7 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_executor_returns_stored_value() {
         let store: ResultStore = Arc::new(RwLock::new(BoundedResultStore::new()));
-        store.write().await.insert("rs_test".into(), (json!({"big": "content"}), "filengine_fs_read".to_string()));
+        store.write().await.insert("rs_test".into(), (json!({"big": "content"}), "fs_read".to_string()));
         let exec = ResultExpandExecutor::new(store);
         let ctx = crate::tool::ExecutionContext::noop("test");
         let res = exec.execute(
@@ -310,7 +310,7 @@ mod tests {
             &ctx,
         ).await.unwrap();
         assert_eq!(res["expanded"]["big"], "content");
-        assert_eq!(res["source_tool"], "filengine_fs_read");
+        assert_eq!(res["source_tool"], "fs_read");
     }
 
     #[tokio::test]
@@ -330,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn test_executor_records_to_palace_on_expand() {
         let store: ResultStore = Arc::new(RwLock::new(BoundedResultStore::new()));
-        store.write().await.insert("rs_x".into(), (json!({}), "filengine_fs_read".to_string()));
+        store.write().await.insert("rs_x".into(), (json!({}), "fs_read".to_string()));
         let palace = Arc::new(RwLock::new(DualPalaceMemory::new()));
         let exec = ResultExpandExecutor::new(store).with_palace(palace.clone());
         let ctx = crate::tool::ExecutionContext::noop("test");
@@ -339,10 +339,10 @@ mod tests {
             json!({"result_id": "rs_x"}),
             &ctx,
         ).await.unwrap();
-        // palace 应该有 "expanded:filengine_fs_read" pattern
+        // palace 应该有 "expanded:fs_read" pattern
         let p = palace.read().await;
         let snapshot = p.behavior.snapshot().await;
-        assert!(snapshot.contains_key("expanded:filengine_fs_read"),
+        assert!(snapshot.contains_key("expanded:fs_read"),
             "expand 后 palace 应记录 expanded:{{tool}} pattern");
     }
 }

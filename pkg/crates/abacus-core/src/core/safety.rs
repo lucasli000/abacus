@@ -38,10 +38,10 @@ impl SafetyGuard {
             max_input_length: 100_000,
             max_total_tool_calls: 500,
             sensitive_operations: vec![
-                "filengine_fs_write".into(),
-                "filengine_fs_move".into(),
-                "filengine_fs_mkdir".into(),
-                "filengine_bash_exec".into(),
+                "fs_write".into(),
+                "fs_move".into(),
+                "fs_mkdir".into(),
+                "bash_exec".into(),
                 "web_fetch".into(),
             ],
         }
@@ -92,8 +92,8 @@ impl SafetyGuard {
 
     /// 检查是否为敏感操作
     ///
-    /// 使用精确相等匹配而非 `contains()`，防止 `filengine_fs_write` 误匹配
-    /// `filengine_fs_write_batch` 等名称前缀相似的未来工具。
+    /// 使用精确相等匹配而非 `contains()`，防止 `fs_write` 误匹配
+    /// `fs_write_batch` 等名称前缀相似的未来工具。
     pub fn is_sensitive_operation(&self, tool_id: &str) -> bool {
         self.sensitive_operations.iter().any(|s| tool_id == s)
     }
@@ -158,8 +158,8 @@ mod tests {
     #[test]
     fn test_sensitive_operation() {
         let guard = SafetyGuard::new();
-        assert!(guard.is_sensitive_operation("filengine_fs_write"));
-        assert!(guard.is_sensitive_operation("filengine_bash_exec"));
-        assert!(!guard.is_sensitive_operation("filengine_fs_read"));
+        assert!(guard.is_sensitive_operation("fs_write"));
+        assert!(guard.is_sensitive_operation("bash_exec"));
+        assert!(!guard.is_sensitive_operation("fs_read"));
     }
 }

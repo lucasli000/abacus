@@ -41,9 +41,8 @@ pub(super) fn try_render_bash_exec<'a>(
     _max_total_lines: usize,
 ) -> Option<Vec<Line<'a>>> {
     let lower = name.to_lowercase();
-    // ToolId 单一命名：注册时已是 "filengine_bash_exec"（无 sanitize 链路）。
-    // 保留无前缀 "bash_exec" 作 demo 模式兜底；不再容忍带 . 的旧形态。
-    if !matches!(lower.as_str(), "filengine_bash_exec" | "bash_exec") {
+    // 2026-05-28: ToolId 直接用原始名 "bash_exec"（去掉了 filengine_ 前缀）
+    if lower.as_str() != "bash_exec" {
         return None;
     }
     let json: serde_json::Value = serde_json::from_str(args_json).ok()?;
@@ -515,10 +514,9 @@ pub(super) fn try_render_edit_diff_with_output(
     max_total_lines: usize,
 ) -> Option<Vec<Line<'static>>> {
     let lower = name.to_lowercase();
-    // ToolId 单一命名：filengine register 直接产 "filengine_fs_edit"/"filengine_fs_write"
-    // 保留无前缀 "fs_edit"/"fs_write" 作 demo / 测试 fixture 兜底
-    let is_edit = matches!(lower.as_str(), "filengine_fs_edit" | "fs_edit");
-    let is_write = matches!(lower.as_str(), "filengine_fs_write" | "fs_write");
+    // 2026-05-28: ToolId 直接用原始名（fs_edit / fs_write）
+    let is_edit = lower.as_str() == "fs_edit";
+    let is_write = lower.as_str() == "fs_write";
     if !is_edit && !is_write { return None; }
 
     let json: serde_json::Value = serde_json::from_str(args_json).ok()?;

@@ -783,7 +783,7 @@ impl EpistemicPostCheck {
         if has_signal_words(llm_output)
             && !llm_output.contains("[training_snapshot]")
             && !llm_output.contains("[来源")
-            && !tools_called.iter().any(|t| t.starts_with("web_") || t.starts_with("kb_") || t.starts_with("filengine_fs_"))
+            && !tools_called.iter().any(|t| t.starts_with("web_") || t.starts_with("kb_") || t.starts_with("fs_"))
         {
             violations.push(EpistemicViolation::UnmarkedFactualClaim);
         }
@@ -1055,7 +1055,7 @@ mod tests {
         // violations=0 + cold_start=false → 不注入 _active_hooks（避免污染普通工具）
         let guard = Arc::new(EpistemicGuard::new());
         let mw = HookVisibilityMiddleware { guard };
-        let tool_id = ToolId("filengine_fs_read".into());
+        let tool_id = ToolId("fs_read".into());
         let mut out = ToolOutput {
             tool_id: tool_id.clone(), success: true,
             output: serde_json::json!({"content": "hello"}),
@@ -1071,7 +1071,7 @@ mod tests {
         let guard = Arc::new(EpistemicGuard::new());
         guard.record_violation().await;
         let mw = HookVisibilityMiddleware { guard: guard.clone() };
-        let tool_id = ToolId("filengine_fs_read".into());
+        let tool_id = ToolId("fs_read".into());
         let mut out = ToolOutput {
             tool_id: tool_id.clone(), success: true,
             output: serde_json::json!({"content": "hello"}),
@@ -1172,7 +1172,7 @@ mod tests {
     #[tokio::test]
     async fn test_epistemic_guard_ignores_non_kb() {
         let guard = EpistemicGuard::new();
-        let tool_id = ToolId("filengine_fs_read".into());
+        let tool_id = ToolId("fs_read".into());
 
         let mut out = ToolOutput {
             tool_id: tool_id.clone(), success: true,

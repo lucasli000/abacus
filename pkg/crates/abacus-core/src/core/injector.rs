@@ -1297,7 +1297,7 @@ mod tests {
         let mut injector = DynamicInjector::new();
         injector.register_defaults();
 
-        let ctx = serde_json::json!({"tool_results": [{"tool": "filengine_fs_read", "status": "ok"}]});
+        let ctx = serde_json::json!({"tool_results": [{"tool": "fs_read", "status": "ok"}]});
         let segments = injector.inject("check the file", &ctx);
         assert!(!segments.is_empty());
         // 大小写按 stable 文本来——KV cache 修复后改成 "Tool results available..."（无 count）
@@ -1314,9 +1314,9 @@ mod tests {
         let mut injector = DynamicInjector::new();
         injector.register_defaults();
 
-        let ctx_a = serde_json::json!({"tool_results": [{"tool": "filengine_fs_read"}]});
+        let ctx_a = serde_json::json!({"tool_results": [{"tool": "fs_read"}]});
         let ctx_b = serde_json::json!({"tool_results": [
-            {"tool": "filengine_fs_read"}, {"tool": "filengine_fs_write"}, {"tool": "kb_query"},
+            {"tool": "fs_read"}, {"tool": "fs_write"}, {"tool": "kb_query"},
             {"tool": "code_execute"}, {"tool": "db_query"}
         ]});
 

@@ -123,6 +123,16 @@ pub enum StreamChunk {
     },
     /// 错误（非致命，pipeline 继续；致命错误通过 channel drop 信号）
     Error(String),
+    /// 流中断后重试——TUI 收到后清除当前 iteration 的已渲染流式内容
+    ///
+    /// ## 引用关系
+    /// - 生产者: TurnPipeline::execute_loop 流式错误重试前
+    /// - 消费者: TUI run loop → 清空 streaming_timeline 中当前 iteration 的 TextDelta/Thinking
+    ///
+    /// ## 设计
+    /// 重试意味着 LLM 将重新生成完整响应，之前部分接收的内容不可用。
+    /// partial_text: 中断前已收到的文本（TUI 可选择性保留为"已中断"标记）
+    StreamRetryReset { partial_text: String },
 
     // ─── 预留事件（已定义接口，逐步接入生产者）─────────────────────────
 

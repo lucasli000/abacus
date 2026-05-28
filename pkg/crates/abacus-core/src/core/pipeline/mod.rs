@@ -1319,6 +1319,9 @@ impl<'a> TurnPipeline<'a> {
                     (String, String), // (name, accumulated_args)
                 > = std::collections::HashMap::new();
 
+                // 2026-05-28: 追踪已发送到 TUI 的文本内容（用于流中断重试时通知 TUI 清除部分内容）
+                let mut streamed_text_acc = String::new();
+
                 // BLOCK-1 fix: 用 select! 将 cancel_token 并入事件消费循环
                 // 防止 provider 后台 task 挂起（TCP half-open）导致 event_rx.recv() 永久阻塞
                 loop {
@@ -1339,6 +1342,7 @@ impl<'a> TurnPipeline<'a> {
                     let Some(event) = event else { break };
                     match event {
                         crate::llm::stream::StreamEvent::TextDelta(t) => {
+                            streamed_text_acc.push_str(&t);
                             let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(t));
                         }
                         crate::llm::stream::StreamEvent::ThinkingDelta(t) => {
@@ -1361,25 +1365,39 @@ impl<'a> TurnPipeline<'a> {
                     }
                 }
 
-                let mut response = handle.await
+                let stream_result = handle.await
                     .map_err(|e| KernelError::Other(format!("stream task panicked: {e}")))
-                    .and_then(|r| r)?;
+                    .and_then(|r| r);
 
-                // 如果 streaming 收集到了 structured tool_calls 且 response 中为空，注入组装结果
-                if !stream_tool_buf.is_empty() && response.message.tool_calls.as_ref().map_or(true, |v| v.is_empty()) {
-                    let assembled: Vec<crate::llm::provider::ToolCall> = stream_tool_buf
-                        .into_iter()
-                        .map(|(id, (name, arguments))| crate::llm::provider::ToolCall {
-                            id,
-                            type_: "function".into(),
-                            function: crate::llm::provider::ToolFunction { name, arguments },
-                        })
-                        .collect();
-                    tracing::debug!(n = assembled.len(), "streaming: assembled tool_calls from SSE deltas");
-                    response.message.tool_calls = Some(assembled);
+                // 2026-05-28: 流中断时通知 TUI 清除已渲染的部分内容
+                // 如果 stream 返回错误且已有内容发送到 TUI，发 StreamRetryReset
+                // 让 TUI 知道之前的内容即将因重试被重新生成
+                match stream_result {
+                    Ok(mut response) => {
+                        // 如果 streaming 收集到了 structured tool_calls 且 response 中为空，注入组装结果
+                        if !stream_tool_buf.is_empty() && response.message.tool_calls.as_ref().map_or(true, |v| v.is_empty()) {
+                            let assembled: Vec<crate::llm::provider::ToolCall> = stream_tool_buf
+                                .into_iter()
+                                .map(|(id, (name, arguments))| crate::llm::provider::ToolCall {
+                                    id,
+                                    type_: "function".into(),
+                                    function: crate::llm::provider::ToolFunction { name, arguments },
+                                })
+                                .collect();
+                            tracing::debug!(n = assembled.len(), "streaming: assembled tool_calls from SSE deltas");
+                            response.message.tool_calls = Some(assembled);
+                        }
+                        Ok(response)
+                    }
+                    Err(e) => {
+                        if !streamed_text_acc.is_empty() {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::StreamRetryReset {
+                                partial_text: streamed_text_acc,
+                            });
+                        }
+                        Err(e)
+                    }
                 }
-
-                Ok(response)
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
                 // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
@@ -2094,21 +2112,54 @@ impl<'a> TurnPipeline<'a> {
                     };
 
                     // V30: Bash command-level classification (finer than tool-level MCIP)
-                    // 即使 filengine_bash_exec 工具级别已授权，仍检查具体命令的安全等级
+                    // 即使 bash_exec 工具级别已授权，仍检查具体命令的安全等级
                     // 依赖：classify_bash_command() from tool::builtin::filengine
                     // 生命周期：per-invocation 分类，无持久状态
+                    //
+                    // 2026-05-28: bash_policy 执行从工具层上移到此处（pipeline 是唯一门控点）
+                    // ReadOnly: 非 Allow 命令 → NeedsConfirm（用户可授权覆盖）
+                    // DevTools: 保持 classify 原始决策
+                    // Full: Dangerous 降级为 NeedsConfirm
                     let decision = if matches!(decision, McipDecision::Allowed)
-                        && tool_id.0.as_str() == "filengine_bash_exec"
+                        && tool_id.0.as_str() == "bash_exec"
                     {
                         let cmd_str = params.get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        match crate::tool::builtin::filengine::classify_bash_command(cmd_str) {
-                            crate::tool::builtin::filengine::BashDecision::Allow => decision,
-                            crate::tool::builtin::filengine::BashDecision::NeedsConfirm(reason)
-                            | crate::tool::builtin::filengine::BashDecision::Dangerous(reason) => {
+                        let raw_decision = crate::tool::builtin::filengine::classify_bash_command(cmd_str);
+
+                        // 应用 bash_policy
+                        let bash_policy = {
+                            let s = self.session.read().await;
+                            let fs = s.filengine_session.read().await;
+                            fs.bash_policy
+                        };
+                        use crate::tool::builtin::filengine::BashDecision;
+                        use abacus_types::BashPolicyLevel;
+                        let policy_decision = match bash_policy {
+                            BashPolicyLevel::ReadOnly => {
+                                if matches!(raw_decision, BashDecision::Allow) {
+                                    raw_decision
+                                } else {
+                                    BashDecision::NeedsConfirm(
+                                        "bash_policy=ReadOnly: 此命令需要确认".into())
+                                }
+                            }
+                            BashPolicyLevel::DevTools => raw_decision,
+                            BashPolicyLevel::Full => {
+                                if let BashDecision::Dangerous(reason) = raw_decision {
+                                    BashDecision::NeedsConfirm(format!("[full-policy] {}", reason))
+                                } else {
+                                    raw_decision
+                                }
+                            }
+                        };
+
+                        match policy_decision {
+                            BashDecision::Allow => decision,
+                            BashDecision::NeedsConfirm(reason)
+                            | BashDecision::Dangerous(reason) => {
                                 // 检查此命令是否已在本 session 被用户单次授权过
-                                // （通过 "bash:<cmd> <subcmd>" 格式匹配）
                                 let cmd_prefix: String = cmd_str.split_whitespace()
                                     .take(2).collect::<Vec<_>>().join(" ");
                                 let bash_granted = {
@@ -2259,7 +2310,7 @@ impl<'a> TurnPipeline<'a> {
                                 }
                                 // V30: bash 命令级 session grant——同类命令本 session 不再弹窗
                                 // 格式 "bash:{cmd} {subcmd}"，如 "bash:git push"
-                                if tool_id.0.as_str() == "filengine_bash_exec" {
+                                if tool_id.0.as_str() == "bash_exec" {
                                     if let Some(cmd_str) = params.get("command").and_then(|v| v.as_str()) {
                                         let prefix: String = cmd_str.split_whitespace()
                                             .take(2).collect::<Vec<_>>().join(" ");

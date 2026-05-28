@@ -566,7 +566,7 @@ pub struct CoreConfig {
     /// **Default: false**（保守开关，遵循 default-off 原则保 KV cache）
     ///
     /// 启用后对 `idempotent=true` 的工具按 `(tool_id, args_canonical_hash)` 缓存结果，
-    /// 短 TTL 内重复调用直接复用——典型场景：LLM 反复 `filengine_fs_read` 同一文件、
+    /// 短 TTL 内重复调用直接复用——典型场景：LLM 反复 `fs_read` 同一文件、
     /// 反复 `db_read_records` 同条记录。
     ///
     /// ## 引用关系
@@ -2128,7 +2128,7 @@ impl CoreLoop {
             ("session_request_permission", "Request user authorization for a permission-gated tool. User picks once/always/deny; turn auto-reruns on approval.", json!({
                 "type": "object",
                 "properties": {
-                    "tool_id": {"type": "string", "description": "The exact tool ID you need permission for (e.g. 'filengine_bash_exec')"},
+                    "tool_id": {"type": "string", "description": "The exact tool ID you need permission for (e.g. 'bash_exec')"},
                     "reason":  {"type": "string", "description": "Why you need this tool — shown to the user in the authorization dialog"}
                 },
                 "required": ["tool_id", "reason"]
@@ -4459,14 +4459,14 @@ Output JSON:
 /// - 返回 &'static 切片，无分配
 fn scene_active_prefixes(task_kind: &str) -> &'static [&'static str] {
     match task_kind {
-        "code_writing" | "code_reading" => &["filengine_fs", "filengine_file", "filengine_dir", "code", "cargo"],
-        "debugging" => &["filengine_fs", "filengine_file", "code", "cargo", "test"],
+        "code_writing" | "code_reading" => &["fs_", "file_", "dir_", "code", "cargo"],
+        "debugging" => &["fs_", "file_", "code", "cargo", "test"],
         "web_search" => &["web", "fetch", "search", "browse"],
-        "file_edit" => &["filengine_fs", "filengine_file", "filengine_dir"],
-        "data_analysis" => &["filengine_fs", "filengine_file", "code", "db", "data"],
+        "file_edit" => &["fs_", "file_", "dir_"],
+        "data_analysis" => &["fs_", "file_", "code", "db", "data"],
         "mathematics" => &["code", "math", "calculate"],
-        "architecture" => &["filengine_fs", "filengine_file", "filengine_dir", "code", "diagram"],
-        "review" => &["filengine_fs", "filengine_file", "code", "lint", "test"],
+        "architecture" => &["fs_", "file_", "dir_", "code", "diagram"],
+        "review" => &["fs_", "file_", "code", "lint", "test"],
         "knowledge_query" => &["kb", "search", "web", "fetch"],
         // general_chat, linguistics 等 → 空前缀列表（仅最近调用 / 显式 task_kind 命中可保留）
         _ => &[],
@@ -4655,7 +4655,7 @@ mod tests {
                         name: None,
                         tool_calls: Some(vec![crate::llm::provider::ToolCall {
                             id: "call_1".into(), type_: "function".into(),
-                            function: crate::llm::provider::ToolFunction { name: "filengine_fs_read".into(), arguments: r#"{"path":"Cargo.toml"}"#.into() },
+                            function: crate::llm::provider::ToolFunction { name: "fs_read".into(), arguments: r#"{"path":"Cargo.toml"}"#.into() },
                         }]),
                         tool_call_id: None, reasoning_content: None, prefix: false,
                     },

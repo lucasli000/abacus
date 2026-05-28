@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// ```yaml
 /// lint:
 ///   allowed:
-///     - tool: "filengine_fs_grep"
+///     - tool: "fs_grep"
 ///       rules: ["params_too_many_props"]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -151,7 +151,7 @@ impl LintRuleSet {
     /// ```yaml
     /// lint:
     ///   allowed:
-    ///     - tool: "filengine_fs_grep"
+    ///     - tool: "fs_grep"
     ///       rules: ["params_too_many_props"]
     ///     - tool: "lsp_find_references"
     ///       rules: ["desc_too_long"]

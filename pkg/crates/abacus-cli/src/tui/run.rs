@@ -1396,6 +1396,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let is_net = e.starts_with("NETWORK_ERROR:");
                             let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
 
+                            // 2026-05-28: 保留已流式的部分内容（fatal 时不丢弃）
+                            let partial_text = if is_fatal_net && !state.streaming_text.is_empty() {
+                                Some(std::mem::take(&mut state.streaming_text))
+                            } else {
+                                None
+                            };
+
                             state.reset_streaming();
                             if state.input_state != InputState::Editor {
                                 state.input_state = InputState::Ready;
@@ -1420,12 +1427,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     // 继续处理下一个 chunk（等待重试结果），不 break
                                     continue;
                                 };
+                                // 2026-05-28: 如果有部分内容，保留为系统消息（不丢弃用户已看到的内容）
+                                if let Some(partial) = partial_text {
+                                    state.push_system_note(&format!(
+                                        "--- 输出中断（已接收部分内容）---\n{}\n\n⚠ {}",
+                                        partial, msg
+                                    ));
+                                } else {
+                                    state.push_system_note(&format!("--- 网络异常 ---\n{}", msg));
+                                }
                                 state.add_event(&ts, "network", &msg, crate::tui::state::EventLevel::Warning);
                                 state.add_toast(
                                     format!("⚠ {}", msg),
                                     Duration::from_secs(8),
                                 );
-                                state.push_system_note(&format!("--- 网络异常 ---\n{}", msg));
                             } else {
                                 // API / 其他错误
                                 state.add_event(&ts, "llm", &format!("错误: {}", e), crate::tui::state::EventLevel::Warning);
@@ -1433,6 +1448,25 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                             while stream_rx.try_recv().is_ok() {}
                             break;
+                        }
+                        // 2026-05-28: 流中断后重试——清除已渲染的部分内容，等待重新生成
+                        StreamChunk::StreamRetryReset { partial_text } => {
+                            // 清除当前 iteration 的流式输出（TextDelta + Thinking）
+                            // 保留 ToolStart/ToolEnd（已执行的工具不会重做）
+                            state.streaming_text.clear();
+                            state.streaming_thinking.clear();
+                            // 在 timeline 中标注中断点
+                            if !partial_text.is_empty() {
+                                let truncated = if partial_text.len() > 60 {
+                                    format!("{}...", &partial_text[..60])
+                                } else {
+                                    partial_text
+                                };
+                                state.add_event(&ts, "stream", &format!("输出中断({}字符)，重试中...", truncated.len()),
+                                    crate::tui::state::EventLevel::Warning);
+                            }
+                            state.processing_phase = "流中断，重试中...".to_string();
+                            had_streaming_update = true;
                         }
                         StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
                             state.processing_phase = format!("重试 {}/{}: {}", attempt, max_attempts, reason);
@@ -2496,40 +2530,38 @@ fn always_allow_path() -> std::path::PathBuf {
 /// 默认允许列表 — 首次启动时(文件不存在)自动注入
 ///
 /// 设计原则:
-///   - 只含 confirm_required=false 的只读/非破坏性工具 + filengine_bash_exec(最常用，Medium 级)
-///   - filengine_fs_write / filengine_fs_move / filengine_fs_mkdir 保留弹窗(有副作用，首次需用户确认)
-///   - MCP 外部工具按命名空间约定匹配——如果使用方注册了 filengine MCP server，
-///     其工具名形如 "mcp__filengine__file_read" 等，此列表不预判外部命名
+///   - 只含 confirm_required=false 的只读/非破坏性工具 + bash_exec(最常用，Medium 级)
+///   - fs_write / fs_move / fs_mkdir 保留弹窗(有副作用，首次需用户确认)
 ///   - 用户可通过 /allow revoke 随时收紧
 ///
-/// 格式: 与 pipeline MCIP 的 tool_id 一致 = ToolId.0 = "filengine_{schema_name}"（全下划线）
+/// 格式: ToolId.0 = schema_name（全下划线，如 fs_read / bash_exec / web_fetch）
 const DEFAULT_ALLOW: &[&str] = &[
     // ─── 文件读取 (只读, 无副作用) ───
-    "filengine_fs_read",
-    "filengine_fs_read_multiple",
-    "filengine_fs_info",
-    "filengine_fs_ls",
-    "filengine_fs_tree",
-    "filengine_fs_search",
-    "filengine_fs_grep",
+    "fs_read",
+    "fs_read_multiple",
+    "fs_info",
+    "fs_ls",
+    "fs_tree",
+    "fs_search",
+    "fs_grep",
     // ─── 文件编辑 (精确替换, confirm=false) ───
-    "filengine_fs_edit",
+    "fs_edit",
     // ─── 网络 (只读) ───
     "web_fetch",
     "web_search",
     // ─── Shell (最常用, Medium 级 — 默认允许避免每条命令弹窗) ───
-    "filengine_bash_exec",
+    "bash_exec",
     // ─── 文件写入/移动 (有副作用, 但高频且非破坏性) ───
-    "filengine_fs_write",
-    "filengine_fs_move",
-    "filengine_fs_mkdir",
+    "fs_write",
+    "fs_move",
+    "fs_mkdir",
 ];
 
 /// 从系统文件加载 always_allow 列表
 ///
 /// 文件不存在(首次启动) → 自动写入 DEFAULT_ALLOW 并返回
 /// 文件存在但损坏 → 空集(容错)
-/// V29.11 迁移: 旧点号名 "filengine.fs.read" → 下划线 "filengine_fs_read"
+/// V29.11 迁移: 旧点号名 "filengine.fs.read" → 下划线 "fs_read"
 pub(crate) fn load_always_allow() -> std::collections::HashSet<String> {
     let path = always_allow_path();
     if !path.exists() {
@@ -2542,7 +2574,7 @@ pub(crate) fn load_always_allow() -> std::collections::HashSet<String> {
     match std::fs::read_to_string(&path) {
         Ok(json) => {
             let raw: Vec<String> = serde_json::from_str(&json).unwrap_or_default();
-            // 一次性迁移: "filengine.fs.read" → "filengine_fs_read"
+            // 一次性迁移: "filengine.fs.read" → "fs_read"
             let mut set: std::collections::HashSet<String> = raw.into_iter()
                 .map(|s| s.replace('.', "_"))
                 .collect();

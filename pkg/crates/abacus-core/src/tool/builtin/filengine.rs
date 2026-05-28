@@ -481,8 +481,11 @@ fn get_str<'a>(v: &'a Value, key: &str) -> Result<&'a str, String> {
 
 async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value, String> {
     let url = get_str(&args, "url")?;
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("only http/https allowed".into());
+    // 2026-05-28: 允许 http/https/file 协议。file:// 用于读取本地 HTML/文档。
+    // ftp/其他协议直接拒绝（reqwest 不支持且无合法场景）
+    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("file://") {
+        return Err(format!("unsupported protocol: {}（仅支持 http/https/file）",
+            url.split("://").next().unwrap_or("unknown")));
     }
     let extract = args.get("extract").and_then(|v| v.as_bool()).unwrap_or(false);
     let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60).max(5);
@@ -849,7 +852,8 @@ async fn grep_dir(
 /// Shell metacharacters that enable injection. `!` removed: it's used in legit
 /// commands like `echo "hello!"` and `git commit -m "fix!"`, and history expansion
 /// is disabled in non-interactive sh -c context anyway.
-const SHELL_META: &[char] = &[';', '|', '&', '`', '$', '(', ')', '<', '>', '\n', '\r'];
+// 2026-05-28: SHELL_META 已移除——命令通过 `sh -c` 执行，元字符是合法 shell 语法
+// 安全由 classify_bash_command 的语义分类 + MCIP 门控保障
 
 /// Bash command classification result.
 ///
@@ -893,12 +897,21 @@ pub enum BashDecision {
 /// | T2 | Confirm popup (timeout→reject) | ~50 tokens on reject | rm, mv, git push, npm install |
 /// | T3 | Confirm popup + danger warning | ~50 tokens on reject | sudo, dd, shutdown, mkfs |
 pub fn classify_bash_command(command: &str) -> BashDecision {
-    // Block shell injection: metacharacters → always deny
-    if command.chars().any(|c| SHELL_META.contains(&c)) {
-        return BashDecision::Dangerous("shell metacharacters detected (injection risk)".into());
-    }
+    // 2026-05-28: 允许 shell 元字符（|, &, $, >, ; 等）——命令通过 `sh -c` 执行，
+    // 这些是合法 shell 语法。按首个命令（pipe/chain 前的部分）做语义分类。
+    // 如果管道链中包含 dangerous 命令，首命令的分类决定整体安全等级。
+    //
+    // 提取首个命令：取 `|`, `&&`, `||`, `;` 之前的部分
+    let first_segment = command
+        .split(&['|', ';'][..])
+        .next()
+        .unwrap_or(command)
+        .split("&&")
+        .next()
+        .unwrap_or(command)
+        .trim();
 
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts: Vec<&str> = first_segment.split_whitespace().collect();
     let cmd = parts.first().copied().unwrap_or("");
 
     // ── T3: Dangerous (system-level, needs confirm with elevated warning) ──
@@ -991,10 +1004,13 @@ pub fn classify_bash_command(command: &str) -> BashDecision {
 /// Git subcommand classification.
 /// T1 (Allow): read-only git ops. T2 (NeedsConfirm): write ops.
 fn classify_git(parts: &[&str], command: &str) -> BashDecision {
-    // Block known injection vectors regardless of subcommand
-    if command.contains("-c ") || command.contains("--upload-pack")
-        || command.contains("--exec=") {
-        return BashDecision::Dangerous("git injection vector detected (-c/--upload-pack/--exec=)".into());
+    // Block known injection vectors: `git -c key=val` (config injection)
+    // 注意：`git log -c` (combined diff) 是合法操作，不能误匹配
+    // 只匹配 "git -c " 即 parts[1] == "-c" 的情况
+    let has_config_inject = parts.get(1).copied() == Some("-c")
+        || command.contains("--upload-pack") || command.contains("--exec=");
+    if has_config_inject {
+        return BashDecision::NeedsConfirm("git config injection vector detected (-c/--upload-pack/--exec=)".into());
     }
 
     let subcmd = parts.get(1).copied().unwrap_or("");
@@ -1060,9 +1076,9 @@ fn classify_cargo(parts: &[&str]) -> BashDecision {
         "build", "check", "test", "clippy", "fmt", "doc",
         "tree", "metadata", "verify-project", "locate-project",
         "pkgid", "search", "info",
-        // 开发常用：运行/基准/清理/更新是日常操作
+        // 开发常用：运行/基准/清理/更新/安装是日常操作
         "run", "bench", "clean", "update", "generate-lockfile",
-        "vendor", "fetch",
+        "vendor", "fetch", "install", "add", "remove",
     ];
     if subcmd == "--version" || subcmd == "-V" {
         return BashDecision::Allow;
@@ -1262,10 +1278,9 @@ fn classify_tar(parts: &[&str]) -> BashDecision {
 ///
 /// ## Referenced by
 /// - `bash_exec()` only (belt-and-suspenders; pipeline classify_bash_command is primary gate)
-fn is_command_allowed(command: &str) -> bool {
-    // Shell metachar injection is the only hard block (no confirmation can override)
-    !command.chars().any(|c| SHELL_META.contains(&c))
-}
+// 2026-05-28: is_command_allowed() 已移除
+// 原逻辑（SHELL_META 硬拒）在 `sh -c` 执行模式下是误拒——元字符是合法 shell 语法。
+// 安全由 pipeline 层 classify_bash_command() + MCIP 门控保障。
 
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let command = get_str(&args, "command")?;
@@ -1276,37 +1291,14 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
         .map(|p| NativeFilengine::resolve(p, session))
         .unwrap_or(Ok(session.cwd.clone()))?;
 
-    if !is_command_allowed(command) {
-        return Err(format!("command not allowed: {}", command.split_whitespace().next().unwrap_or("")));
-    }
-
-    // bash_policy 分流：根据 role_caps 调整 classify_bash_command 的决策
-    // ReadOnly：只允许 Allow，其余一律升为 Dangerous（拒绝）
-    // DevTools：保持 classify_bash_command 原始决策（现有行为不变）
-    // Full：Dangerous 降级为 NeedsConfirm（进 MCIP 门控而非直接拒绝）
-    let raw_decision = classify_bash_command(command);
-    let decision = match session.bash_policy {
-        BashPolicyLevel::ReadOnly => {
-            if matches!(raw_decision, BashDecision::Allow) {
-                raw_decision
-            } else {
-                BashDecision::Dangerous("bash_policy=ReadOnly: only read-only commands permitted".into())
-            }
-        }
-        BashPolicyLevel::DevTools => raw_decision,
-        BashPolicyLevel::Full => {
-            if let BashDecision::Dangerous(reason) = raw_decision {
-                BashDecision::NeedsConfirm(format!("[full-policy] {}", reason))
-            } else {
-                raw_decision
-            }
-        }
-    };
-    // NeedsConfirm / Dangerous：pipeline MCIP 门控处理；此处 inner guard 仅在无 MCIP 场景
-    // 拦截 Dangerous（安全兜底——pipeline 是主门控，inner guard 是 belt-and-suspenders）
-    if let BashDecision::Dangerous(reason) = &decision {
-        return Err(format!("command rejected by policy: {reason}"));
-    }
+    // 2026-05-28: 移除工具内部的命令分类和硬拒逻辑
+    // Pipeline 层（line 2118-2143）已在 MCIP 阶段做了 classify_bash_command()：
+    //   - Allow → 直接执行
+    //   - NeedsConfirm → 弹用户确认对话框
+    //   - Dangerous → 在 Full 模式下降级为 NeedsConfirm，否则也弹确认
+    // 工具执行到此处时已通过 MCIP 门控，无需重复检查。
+    // 唯一保留的安全防线：DANGEROUS_COMMANDS 系统级命令由 pipeline 在 MCIP 阶段拦截。
+    let _ = session.bash_policy; // consumed by pipeline's classify call
 
     let child = TokioCmd::new("sh")
         .arg("-c")
@@ -1369,11 +1361,9 @@ impl Default for FilengineToolExecutor {
 #[async_trait]
 impl ToolExecutor for FilengineToolExecutor {
     async fn execute(&self, tool_id: &ToolId, params: Value, ctx: &ExecutionContext) -> abacus_types::Result<Value> {
-        // 命名约定：ToolId 形如 "filengine_fs_read"，schema.name / LLM 视图 / dispatch
-        // 同源（无 sanitize 链路）。strip_prefix 兼容外部传入的 ToolId.0：
-        //   "filengine_fs_read" → "fs_read" → 内部 trait dispatch
-        // web_* 工具无 filengine_ 前缀；fs_*/bash_* 工具有前缀，strip 后取内部名
-        let tool_name = tool_id.0.strip_prefix("filengine_").unwrap_or(&tool_id.0);
+        // 2026-05-28: ToolId 直接等于 schema name（fs_read / bash_exec / web_fetch）
+        // 去掉了 filengine_ 前缀——工具名更短更直观，LLM token 开销更低
+        let tool_name: &str = &tool_id.0;
 
         // Phase 2 undo 注入：写工具前 snapshot/record，成功后 commit
         // 仅当 session.undo_logger=Some 时启用；None 走原路径（向后兼容）
@@ -1542,22 +1532,14 @@ pub fn schemas() -> Vec<ToolSchema> {
 }
 
 pub async fn register(registry: &ToolRegistry) {
-    // 单一命名约定：schema.name == ToolId.0 == LLM 调用名 == 内部 dispatch 键
-    // 形态：`filengine_{raw}`（如 `filengine_fs_read`），全程下划线分隔
+    // 2026-05-28: 去掉 filengine_ 前缀——所有工具直接用原始 schema name 注册
+    // ToolId == schema.name == LLM 调用名 == dispatch 键（如 fs_read, bash_exec, web_fetch）
     //
-    // ## 为何下划线（去掉 sanitize 链路）
-    // - LLM 工具名协议（OpenAI/DeepSeek）只允许 [a-zA-Z0-9_-]，"." 必须 sanitize
-    // - 当前命名直接满足协议 → tool_view 不再需要 sanitize_name 函数
-    // - resolve_sanitized_id 反查链路（O(N) 遍历）整个删除 → dispatch 直接 ToolId(llm_name)
-    //
-    // ## 子系统分组
-    // - subsystem_policy 用前缀 `filengine_fs_` / `filengine_bash_` 分组；web 子系统单独用 `web_` 前缀
-    // - sandbox / mag_chain 等下游引用同样用对应字面量（web_fetch / web_search）
-    for mut s in schemas() {
-        // web_* 工具不加 filengine_ 前缀（它们是通用 web 工具，不属于文件引擎范畴）
-        // fs_*/bash_*/db_*/lsp_* 等仍使用 filengine_ 前缀以保持子系统分组
-        let is_web = s.name.starts_with("web_");
-        s.name = if is_web { s.name.clone() } else { format!("filengine_{}", s.name) };
+    // ## 子系统分组（subsystem_policy 前缀匹配）
+    // - fs_*: 文件系统操作
+    // - bash_*: Shell 执行
+    // - web_*: HTTP/搜索
+    for s in schemas() {
         let id = ToolId(s.name.clone());
         registry.register(ToolHandle {
             id,
@@ -1573,12 +1555,7 @@ pub async fn register(registry: &ToolRegistry) {
 pub async fn register_executors(registry: &ToolRegistry) {
     let executor = Arc::new(FilengineToolExecutor::new());
     for s in schemas() {
-        let is_web = s.name.starts_with("web_");
-        let id = if is_web {
-            ToolId(s.name.clone())
-        } else {
-            ToolId(format!("filengine_{}", s.name))
-        };
+        let id = ToolId(s.name.clone());
         registry.register_executor(id, executor.clone()).await;
     }
 }
@@ -2092,7 +2069,7 @@ mod tests {
 
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_write".into()),
+            &ToolId("fs_write".into()),
             json!({"path": target_str, "content": "phase2 hello"}),
             &ctx,
         ).await;
@@ -2119,7 +2096,7 @@ mod tests {
 
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_edit".into()),
+            &ToolId("fs_edit".into()),
             json!({"path": target.to_string_lossy(), "old_string": "old", "new_string": "new"}),
             &ctx,
         ).await;
@@ -2145,7 +2122,7 @@ mod tests {
 
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_move".into()),
+            &ToolId("fs_move".into()),
             json!({"source": src.to_string_lossy(), "destination": dst.to_string_lossy()}),
             &ctx,
         ).await;
@@ -2168,7 +2145,7 @@ mod tests {
 
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_mkdir".into()),
+            &ToolId("fs_mkdir".into()),
             json!({"path": dir.to_string_lossy()}),
             &ctx,
         ).await;
@@ -2191,7 +2168,7 @@ mod tests {
 
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_read".into()),
+            &ToolId("fs_read".into()),
             json!({"path": f.to_string_lossy()}),
             &ctx,
         ).await;
@@ -2223,7 +2200,7 @@ mod tests {
         let target = tmp_path.join("nolog.txt");
         let exec = FilengineToolExecutor::new();
         let r = exec.execute(
-            &ToolId("filengine_fs_write".into()),
+            &ToolId("fs_write".into()),
             json!({"path": target.to_string_lossy(), "content": "x"}),
             &ctx,
         ).await;

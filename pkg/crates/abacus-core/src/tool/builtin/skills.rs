@@ -45,7 +45,7 @@ fn skill_search_file() -> SkillDef {
             SkillStep {
                 id: "discover".into(),
                 description: "按 glob 模式发现候选文件（广撒网）".into(),
-                tool: "filengine_fs_search".into(),
+                tool: "fs_search".into(),
                 params: json!({"pattern": "{{pattern}}", "path": "{{root}}"}),
                 depends_on: None,
                 condition: None,
@@ -54,7 +54,7 @@ fn skill_search_file() -> SkillDef {
             SkillStep {
                 id: "locate".into(),
                 description: "在候选文件中按内容模式定位（缩窄范围）".into(),
-                tool: "filengine_fs_grep".into(),
+                tool: "fs_grep".into(),
                 params: json!({"pattern": "{{content_pattern}}", "path": "{{root}}", "mode": "fine"}),
                 depends_on: Some(vec!["discover".into()]),
                 // 只有明确有 content_pattern 且 discover 结果 > 1 时才执行
@@ -64,7 +64,7 @@ fn skill_search_file() -> SkillDef {
             SkillStep {
                 id: "extract".into(),
                 description: "读取目标文件完整内容".into(),
-                tool: "filengine_fs_read".into(),
+                tool: "fs_read".into(),
                 params: json!({"path": "{{locate.file}}"}),
                 depends_on: Some(vec!["locate".into()]),
                 condition: Some("locate.matches.len > 0".into()),
@@ -95,7 +95,7 @@ fn skill_search_code() -> SkillDef {
             SkillStep {
                 id: "discover".into(),
                 description: "按扩展名发现候选源文件".into(),
-                tool: "filengine_fs_search".into(),
+                tool: "fs_search".into(),
                 params: json!({"pattern": "{{ext_pattern}}", "path": "{{root}}"}),
                 depends_on: None,
                 condition: None,
@@ -104,7 +104,7 @@ fn skill_search_code() -> SkillDef {
             SkillStep {
                 id: "locate".into(),
                 description: "在源文件中 grep 符号定义（粒度：行级）".into(),
-                tool: "filengine_fs_grep".into(),
+                tool: "fs_grep".into(),
                 params: json!({"pattern": "{{symbol}}", "path": "{{root}}", "mode": "fine", "context": 3}),
                 depends_on: Some(vec!["discover".into()]),
                 condition: None,
@@ -113,7 +113,7 @@ fn skill_search_code() -> SkillDef {
             SkillStep {
                 id: "extract".into(),
                 description: "读取符号所在文件完整上下文".into(),
-                tool: "filengine_fs_read".into(),
+                tool: "fs_read".into(),
                 params: json!({"path": "{{locate.matches[0].file}}"}),
                 depends_on: Some(vec!["locate".into()]),
                 condition: Some("locate.matches.len > 0".into()),
@@ -144,7 +144,7 @@ fn skill_web_research() -> SkillDef {
             SkillStep {
                 id: "discover".into(),
                 description: "搜索获取摘要列表".into(),
-                tool: "filengine_web_search".into(),
+                tool: "web_search".into(),
                 params: json!({"query": "{{query}}", "count": 10}),
                 depends_on: None,
                 condition: None,
@@ -153,7 +153,7 @@ fn skill_web_research() -> SkillDef {
             SkillStep {
                 id: "extract".into(),
                 description: "抓取高质量结果页面提取可读文本".into(),
-                tool: "filengine_web_search".into(),
+                tool: "web_search".into(),
                 params: json!({"query": "{{query}}", "count": 5, "deep": true}),
                 depends_on: Some(vec!["discover".into()]),
                 // 仅当 discover 有 High 质量结果时执行深度抓取
@@ -275,7 +275,7 @@ fn skill_diagnose() -> SkillDef {
             SkillStep {
                 id: "quick".into(),
                 description: "快速系统状态检查".into(),
-                tool: "filengine_bash_exec".into(),
+                tool: "bash_exec".into(),
                 params: json!({"command": "{{status_cmd}}", "timeout": 10}),
                 depends_on: None,
                 condition: Some("status_cmd != null".into()),
@@ -284,7 +284,7 @@ fn skill_diagnose() -> SkillDef {
             SkillStep {
                 id: "pattern".into(),
                 description: "在日志/源码中 grep 错误模式".into(),
-                tool: "filengine_fs_grep".into(),
+                tool: "fs_grep".into(),
                 params: json!({"pattern": "{{error_pattern}}", "path": "{{log_path}}", "mode": "fine"}),
                 depends_on: Some(vec!["quick".into()]),
                 condition: Some("error_pattern != null".into()),
@@ -293,7 +293,7 @@ fn skill_diagnose() -> SkillDef {
             SkillStep {
                 id: "read".into(),
                 description: "读取问题上下文文件".into(),
-                tool: "filengine_fs_read".into(),
+                tool: "fs_read".into(),
                 params: json!({"path": "{{pattern.matches[0].file}}"}),
                 depends_on: Some(vec!["pattern".into()]),
                 condition: Some("pattern.matches.len > 0".into()),
@@ -324,7 +324,7 @@ fn skill_config_find() -> SkillDef {
             SkillStep {
                 id: "search".into(),
                 description: "搜索 yaml/toml/json/ini 配置文件".into(),
-                tool: "filengine_fs_search".into(),
+                tool: "fs_search".into(),
                 params: json!({"pattern": "*.{yaml,toml,json,ini,conf,cfg}", "path": "{{root}}"}),
                 depends_on: None,
                 condition: None,
@@ -333,7 +333,7 @@ fn skill_config_find() -> SkillDef {
             SkillStep {
                 id: "read".into(),
                 description: "读取匹配的配置文件内容".into(),
-                tool: "filengine_fs_read".into(),
+                tool: "fs_read".into(),
                 params: json!({"path": "{{search.matches[0]}}"}),
                 depends_on: Some(vec!["search".into()]),
                 condition: Some("search.matches.len > 0".into()),
