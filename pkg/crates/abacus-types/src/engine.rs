@@ -392,6 +392,46 @@ pub struct TurnStats {
     pub context_max: Option<u64>,
 }
 
+// ─── Multi-Provider Configuration ──────────────────────────────────────────
+
+/// 供应商配置条目（从 config.yaml `providers` 数组解析）
+///
+/// ## 引用关系
+/// - 生产者: ConfigManager::parse_providers()
+/// - 消费者: engine_init.rs 注册 ProviderGroup
+///
+/// ## 生命周期
+/// - 创建: 启动时从配置文件解析
+/// - 消费: engine_init 一次性读取注册后丢弃（配置值已持久化在 ProviderGroup 中）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderEntry {
+    pub id: String,
+    /// 供应商协议类型
+    #[serde(rename = "type")]
+    pub provider_type: ProviderType,
+    /// API key — 支持 "env:VAR_NAME" 语法从环境变量读取
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// API 端点 URL（可选，各 type 有默认值）
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 该 provider 下可用的模型列表
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+/// 供应商协议类型
+///
+/// 决定使用哪个 Provider 实现（AnthropicProvider / OpenAICompatibleProvider / DeepSeekProvider）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderType {
+    Anthropic,
+    OpenaiCompatible,
+    Deepseek,
+    Gemini,
+}
+
 // ─── Security / Role System ────────────────────────────────────────────────
 
 /// bash 执行策略

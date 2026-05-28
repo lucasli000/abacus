@@ -2249,6 +2249,14 @@ impl CoreLoop {
         self.sandbox_engine.add_provider(id_str, provider).await;
     }
 
+    /// 获取已注册的 provider Arc（按 id 查找）
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs 构建 fallback chain 时
+    pub async fn get_provider(&self, id: &str) -> Option<Arc<dyn LlmProvider>> {
+        self.providers.read().await.get(id).cloned()
+    }
+
     /// 显式覆盖指定 provider 的 PromptAdapter。
     ///
     /// 适用场景：注册 FallbackProvider（id="primary"）时，

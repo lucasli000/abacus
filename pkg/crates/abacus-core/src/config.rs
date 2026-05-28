@@ -110,6 +110,13 @@ pub struct TaggedValue {
 pub struct ConfigManager {
     /// 合并后的配置 (已按优先级排序)
     merged: HashMap<String, TaggedValue>,
+    /// 多供应商配置（从 `providers` 数组解析，不经过 flatten）
+    ///
+    /// ## 引用关系
+    /// - 写入: load_file() 遇到 `providers` 顶级 key 时
+    /// - 读取: parse_providers() 返回给 engine_init
+    /// - 生命周期: 随 ConfigManager 创建和销毁
+    provider_entries: Vec<abacus_types::ProviderEntry>,
 }
 
 impl ConfigManager {
@@ -123,7 +130,7 @@ impl ConfigManager {
             }))
             .collect();
 
-        Self { merged }
+        Self { merged, provider_entries: Vec::new() }
     }
 
     /// 从配置文件加载 (自动检测 JSON/YAML 由扩展名决定)
@@ -160,6 +167,18 @@ impl ConfigManager {
                 source: ConfigSource::File(path.as_ref().to_string_lossy().to_string()),
                 key,
             });
+        }
+
+        // 2026-05-28: 解析 `providers` 数组（独立于 flatten，因为数组对象不适合点分键）
+        // 尝试从 YAML/JSON 中提取 providers 顶级字段
+        if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+            if let Some(providers_val) = raw.get("providers") {
+                if let Ok(entries) = serde_yaml::from_value::<Vec<abacus_types::ProviderEntry>>(providers_val.clone()) {
+                    self.provider_entries = entries;
+                } else {
+                    tracing::warn!("config: `providers` 格式解析失败，跳过");
+                }
+            }
         }
 
         Ok(())
@@ -317,6 +336,54 @@ impl ConfigManager {
     pub fn get_typed<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
         let json = self.merged.get(key)?.value.to_json();
         serde_json::from_value(json).ok()
+    }
+
+    /// 解析多供应商配置（从 config.yaml `providers` 数组加载）
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs — 启动时注册所有 provider
+    /// - 依赖: load_file() 已将 `providers` 数组解析到 self.provider_entries
+    ///
+    /// ## env: 语法
+    /// api_key 支持 "env:VAR_NAME" 前缀——运行时从环境变量读取，配置文件不存密钥。
+    /// 环境变量不存在时该 provider 被跳过并 warn。
+    pub fn parse_providers(&self) -> Vec<abacus_types::ProviderEntry> {
+        self.provider_entries.iter().filter_map(|entry| {
+            // 解析 api_key 的 env: 前缀
+            let resolved_key = match &entry.api_key {
+                Some(k) if k.starts_with("env:") => {
+                    let var_name = &k[4..];
+                    match std::env::var(var_name) {
+                        Ok(val) if !val.is_empty() => Some(val),
+                        _ => {
+                            tracing::warn!(
+                                provider = %entry.id,
+                                env_var = var_name,
+                                "provider api_key env var not found, skipping"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(k) if k.is_empty() => {
+                    tracing::warn!(provider = %entry.id, "empty api_key, skipping");
+                    return None;
+                }
+                Some(k) => Some(k.clone()),
+                None => None, // 允许无 key（如 local ollama）
+            };
+            if entry.models.is_empty() {
+                tracing::warn!(provider = %entry.id, "empty models list, skipping");
+                return None;
+            }
+            Some(abacus_types::ProviderEntry {
+                id: entry.id.clone(),
+                provider_type: entry.provider_type.clone(),
+                api_key: resolved_key,
+                base_url: entry.base_url.clone(),
+                models: entry.models.clone(),
+            })
+        }).collect()
     }
 
     /// Phase 3：统一 thinking 配置入口。

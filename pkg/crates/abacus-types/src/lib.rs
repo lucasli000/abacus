@@ -200,6 +200,9 @@ pub use engine::{
     RoleCapabilities,
     BashPolicyLevel,
     SearchProvider,
+    // Multi-provider configuration
+    ProviderEntry,
+    ProviderType,
 };
 
 // sandbox re-exports
