@@ -889,6 +889,11 @@ pub struct AppState {
     /// 引用：open_picker_model 优先使用此列表，空时退回静态 MODEL_GROUPS
     /// 生命周期：pending_model_fetch 触发 → 拉取 → 填充；/new 不清（模型列表不随会话变）
     pub available_models: Vec<String>,
+    /// 2026-05-28: 按 provider 分组的模型列表（provider_id → models）
+    /// 用于 picker 按实际注册分组显示，而非 infer_provider 静态推断
+    /// 引用：open_picker_model 优先使用此分组
+    /// 生命周期：与 available_models 同步更新
+    pub available_providers: Vec<(String, Vec<String>)>,
     /// 标记需要在下一次 interval tick 拉取模型列表（engine 连接后设 true）
     pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
@@ -2301,6 +2306,7 @@ impl AppState {
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
             available_models: Vec::new(),
+            available_providers: Vec::new(),
             pending_model_fetch: false,
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
@@ -2774,47 +2780,72 @@ impl AppState {
                 ("deepseek-v4-pro",   "最强推理"),
             ];
             // 从模型 ID 推断 provider 名（按前缀匹配）
-            fn infer_provider(id: &str) -> &'static str {
-                let lower = id.to_lowercase();
-                if lower.starts_with("deepseek") { "DeepSeek" }
-                else if lower.starts_with("qwen") { "Qwen" }
-                else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("chatgpt") { "OpenAI" }
-                else if lower.starts_with("claude") { "Anthropic" }
-                else if lower.starts_with("gemini") { "Gemini" }
-                else if lower.starts_with("glm") || lower.starts_with("zhipu") { "智谱" }
-                else if lower.starts_with("moonshot") || lower.starts_with("kimi") { "Moonshot" }
-                else if lower.starts_with("doubao") || lower.starts_with("ark") { "火山引擎" }
-                else { "其他" }
-            }
-            // 按 provider 分组构建 items，保持组间顺序
-            let mut provider_order: Vec<&'static str> = Vec::new();
-            let mut provider_items: std::collections::HashMap<&'static str, Vec<(&str, &str)>> = std::collections::HashMap::new();
-            for id in &self.available_models {
-                let prov = infer_provider(id);
-                let desc = KNOWN_DESCS.iter()
-                    .find(|(k, _)| *k == id.as_str())
-                    .map(|(_, d)| *d)
-                    .unwrap_or("");
-                if !provider_items.contains_key(prov) {
-                    provider_order.push(prov);
-                }
-                provider_items.entry(prov).or_default().push((id.as_str(), desc));
-            }
-            for prov in &provider_order {
-                let start = items.len();
-                if let Some(models) = provider_items.get(prov) {
-                    for (id, desc) in models {
-                        items.push((*id).to_string());
+            // 2026-05-28: 优先用 available_providers 实际分组（配置 id 作为组名）
+            // fallback: 无分组信息时用 infer_provider 静态推断
+            if !self.available_providers.is_empty() {
+                for (provider_id, models) in &self.available_providers {
+                    let start = items.len();
+                    for model_name in models {
+                        if items.contains(model_name) { continue; } // 跨 provider 去重
+                        let desc = KNOWN_DESCS.iter()
+                            .find(|(k, _)| *k == model_name.as_str())
+                            .map(|(_, d)| *d)
+                            .unwrap_or("");
+                        items.push(model_name.clone());
                         labels.push(if desc.is_empty() {
-                            (*id).to_string()
+                            model_name.clone()
                         } else {
-                            format!("{:<22}  {}", id, desc)
+                            format!("{:<22}  {}", model_name, desc)
                         });
                     }
+                    let end = items.len();
+                    if end > start {
+                        groups.push((provider_id.clone(), start..end));
+                    }
                 }
-                let end = items.len();
-                if end > start {
-                    groups.push((prov.to_string(), start..end));
+            } else {
+                // fallback: 从模型名推断 provider（旧逻辑）
+                fn infer_provider(id: &str) -> &'static str {
+                    let lower = id.to_lowercase();
+                    if lower.starts_with("deepseek") { "DeepSeek" }
+                    else if lower.starts_with("qwen") { "Qwen" }
+                    else if lower.starts_with("gpt") || lower.starts_with("o1") || lower.starts_with("o3") || lower.starts_with("chatgpt") { "OpenAI" }
+                    else if lower.starts_with("claude") { "Anthropic" }
+                    else if lower.starts_with("gemini") { "Gemini" }
+                    else if lower.starts_with("glm") || lower.starts_with("zhipu") { "智谱" }
+                    else if lower.starts_with("moonshot") || lower.starts_with("kimi") { "Moonshot" }
+                    else if lower.starts_with("doubao") || lower.starts_with("ark") { "火山引擎" }
+                    else { "其他" }
+                }
+                let mut provider_order: Vec<&'static str> = Vec::new();
+                let mut provider_items: std::collections::HashMap<&'static str, Vec<(&str, &str)>> = std::collections::HashMap::new();
+                for id in &self.available_models {
+                    let prov = infer_provider(id);
+                    let desc = KNOWN_DESCS.iter()
+                        .find(|(k, _)| *k == id.as_str())
+                        .map(|(_, d)| *d)
+                        .unwrap_or("");
+                    if !provider_items.contains_key(prov) {
+                        provider_order.push(prov);
+                    }
+                    provider_items.entry(prov).or_default().push((id.as_str(), desc));
+                }
+                for prov in &provider_order {
+                    let start = items.len();
+                    if let Some(models) = provider_items.get(prov) {
+                        for (id, desc) in models {
+                            items.push((*id).to_string());
+                            labels.push(if desc.is_empty() {
+                                (*id).to_string()
+                            } else {
+                                format!("{:<22}  {}", id, desc)
+                            });
+                        }
+                    }
+                    let end = items.len();
+                    if end > start {
+                        groups.push((prov.to_string(), start..end));
+                    }
                 }
             }
         } else {

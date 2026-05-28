@@ -372,10 +372,8 @@ impl ConfigManager {
                 Some(k) => Some(k.clone()),
                 None => None, // 允许无 key（如 local ollama）
             };
-            if entry.models.is_empty() {
-                tracing::warn!(provider = %entry.id, "empty models list, skipping");
-                return None;
-            }
+            // 2026-05-28: models 为空时不跳过——启动后 discover_models() 会自动填充
+            // 只有完全无效的 provider（无 key 且非 local）才跳过
             Some(abacus_types::ProviderEntry {
                 id: entry.id.clone(),
                 provider_type: entry.provider_type.clone(),

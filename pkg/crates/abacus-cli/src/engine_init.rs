@@ -301,8 +301,12 @@ pub async fn create_engine(
 
         for entry in &provider_entries {
             let api_key = entry.api_key.clone().unwrap_or_default();
-            let models: Vec<ModelId> = entry.models.iter()
-                .map(|m| ModelId(m.name.clone())).collect();
+            // models 为空时用 default_model 作占位——discover_models() 会在后台填充实际列表
+            let models: Vec<ModelId> = if entry.models.is_empty() {
+                vec![ModelId(resolved_model.to_string())]
+            } else {
+                entry.models.iter().map(|m| ModelId(m.name.clone())).collect()
+            };
 
             match entry.provider_type {
                 ProviderType::Anthropic => {

@@ -307,7 +307,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     let (comp_tx, mut comp_rx) = mpsc::unbounded_channel::<(Vec<String>, String)>();
     // T-2 fix: 独立 channel 传递 discover_all_models 结果，防止占用 comp_rx
     // 生命周期：model_list_tx 在 spawn 内发送一次后 drop；model_list_rx 在 tick 分支拥收
-    let (model_list_tx, mut model_list_rx) = mpsc::unbounded_channel::<Vec<String>>();
+    // 2026-05-28: 扩展为 (models, provider_groups) 二元组
+    let (model_list_tx, mut model_list_rx) = mpsc::unbounded_channel::<(Vec<String>, Vec<(String, Vec<String>)>)>();
     // V0.2: Streaming chunk channel
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<abacus_core::llm::stream::StreamChunk>();
     state.engine_tx = Some(res_tx.clone());
@@ -393,8 +394,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                 // T-2 fix: discover_all_models 是网络调用，不能在主循环 tick 里直接 .await
                 // 改为 spawn 异步，结果通过独立的 model_list_rx channel 回传
-                while let Ok(models) = model_list_rx.try_recv() {
+                while let Ok((models, provider_groups)) = model_list_rx.try_recv() {
                     state.available_models = models;
+                    state.available_providers = provider_groups;
                 }
                 if state.pending_model_fetch {
                     state.pending_model_fetch = false;
@@ -403,15 +405,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         let tx = model_list_tx.clone();
                         tokio::spawn(async move {
                             let discovered = engine_clone.core.discover_all_models().await;
+                            // 2026-05-28: 按 provider 分组保留（用于 picker 分组显示）
+                            let providers_grouped: Vec<(String, Vec<String>)> = discovered.iter()
+                                .map(|(id, ms)| (id.clone(), ms.clone()))
+                                .collect();
                             let flat: Vec<String> = discovered.into_values().flatten().collect();
                             let models = if flat.is_empty() {
                                 engine_clone.core.list_models().await
                             } else {
-                                // 2026-05-28: 去重——多 provider 可能注册同名模型（如 deepseek-v4-pro）
                                 let mut seen = std::collections::HashSet::new();
                                 flat.into_iter().filter(|m| seen.insert(m.clone())).collect()
                             };
-                            let _ = tx.send(models);
+                            let _ = tx.send((models, providers_grouped));
                         });
                     }
                 }
