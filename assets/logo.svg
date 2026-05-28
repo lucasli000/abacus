@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="none">
+  <!-- Frame -->
+  <rect x="28" y="28" width="200" height="200" rx="16" stroke="#3B82F6" stroke-width="8" fill="#0F172A"/>
+
+  <!-- Horizontal beam (center divider) -->
+  <rect x="48" y="122" width="160" height="6" rx="3" fill="#3B82F6" opacity="0.6"/>
+
+  <!-- Vertical rods -->
+  <line x1="80" y1="52" x2="80" y2="204" stroke="#475569" stroke-width="3" stroke-linecap="round"/>
+  <line x1="112" y1="52" x2="112" y2="204" stroke="#475569" stroke-width="3" stroke-linecap="round"/>
+  <line x1="144" y1="52" x2="144" y2="204" stroke="#475569" stroke-width="3" stroke-linecap="round"/>
+  <line x1="176" y1="52" x2="176" y2="204" stroke="#475569" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Upper beads (2 per rod, various positions) -->
+  <!-- Rod 1 -->
+  <circle cx="80" cy="68" r="10" fill="#60A5FA"/>
+  <circle cx="80" cy="92" r="10" fill="#60A5FA"/>
+  <!-- Rod 2 -->
+  <circle cx="112" cy="60" r="10" fill="#34D399"/>
+  <circle cx="112" cy="84" r="10" fill="#34D399"/>
+  <!-- Rod 3 -->
+  <circle cx="144" cy="72" r="10" fill="#FBBF24"/>
+  <circle cx="144" cy="96" r="10" fill="#FBBF24"/>
+  <!-- Rod 4 -->
+  <circle cx="176" cy="64" r="10" fill="#F472B6"/>
+  <circle cx="176" cy="88" r="10" fill="#F472B6"/>
+
+  <!-- Lower beads (3 per rod) -->
+  <!-- Rod 1 -->
+  <circle cx="80" cy="148" r="10" fill="#60A5FA"/>
+  <circle cx="80" cy="172" r="10" fill="#60A5FA"/>
+  <circle cx="80" cy="196" r="10" fill="#60A5FA" opacity="0.5"/>
+  <!-- Rod 2 -->
+  <circle cx="112" cy="144" r="10" fill="#34D399"/>
+  <circle cx="112" cy="168" r="10" fill="#34D399"/>
+  <circle cx="112" cy="192" r="10" fill="#34D399" opacity="0.5"/>
+  <!-- Rod 3 -->
+  <circle cx="144" cy="152" r="10" fill="#FBBF24"/>
+  <circle cx="144" cy="176" r="10" fill="#FBBF24"/>
+  <circle cx="144" cy="200" r="10" fill="#FBBF24" opacity="0.5"/>
+  <!-- Rod 4 -->
+  <circle cx="176" cy="140" r="10" fill="#F472B6"/>
+  <circle cx="176" cy="164" r="10" fill="#F472B6"/>
+  <circle cx="176" cy="188" r="10" fill="#F472B6" opacity="0.5"/>
+
+  <!-- Glow effect on frame -->
+  <rect x="28" y="28" width="200" height="200" rx="16" stroke="#3B82F6" stroke-width="2" opacity="0.3" filter="blur(4px)"/>
+</svg>
