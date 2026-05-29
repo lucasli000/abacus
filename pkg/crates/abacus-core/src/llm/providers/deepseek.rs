@@ -292,7 +292,8 @@ impl DeepSeekProvider {
         let is_reasoning_model_pre = model_str_for_decision.contains("reasoner")
             || model_str_for_decision.contains("r1")
             || model_str_for_decision.contains("deepseek-v4")
-            || model_str_for_decision.contains("deepseek-v3");
+            || model_str_for_decision.contains("deepseek-v3")
+            || model_str_for_decision == "deepseek-chat"; // V3 官方 model ID
         let intent_ref = req.thinking_intent.as_ref();
         let effective_thinking_enabled = is_reasoning_model_pre
             && intent_ref.is_some_and(|i| i.is_enabled());
@@ -323,7 +324,8 @@ impl DeepSeekProvider {
         // 否则与 build_messages 中 effective_thinking_enabled=false 不一致 → 400。
         // R1/reasoner thinking 永远 on，发 disabled 会被拒——不在 default-enabled 修复范围。
         let is_v4_default_enabled_series = (model_str_for_decision.contains("deepseek-v4")
-            || model_str_for_decision.contains("deepseek-v3"))
+            || model_str_for_decision.contains("deepseek-v3")
+            || model_str_for_decision == "deepseek-chat") // V3 官方 model ID
             && !model_str_for_decision.contains("reasoner")
             && !model_str_for_decision.contains("r1");
         let thinking = if is_reasoning_model_pre {
