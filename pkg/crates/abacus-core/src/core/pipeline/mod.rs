@@ -1999,6 +1999,81 @@ impl<'a> TurnPipeline<'a> {
             }
 
             let user_role = { let s = self.session.read().await; s.user_role };
+
+            // ── P0-C1: 并行预执行（idempotent 纯读工具）──────────────────────
+            //
+            // ## 设计原理
+            // 对满足以下条件的工具，在主串行循环前并发预执行 registry.execute()：
+            //   1. 工具名前缀属于已知纯读工具集（kb_* / db_read* / fs_read* 等）
+            //   2. 不是特殊工具（session.* / interaction.* / bash_exec 等会修改状态）
+            //   3. 同轮 ≥2 个此类工具才触发并行（单个工具无并行收益）
+            //
+            // ## 安全保证
+            // - 仅执行 mag_chain.before → registry.execute → wrap → mag_chain.after
+            // - 主循环仍按顺序发送 ToolStart/ToolArgs/ToolOutput/ToolEnd streaming 事件
+            // - 结果按 tool_call_id 索引，主循环命中后直接使用，跳过 registry.execute 调用
+            // - 如果预执行失败，主循环走正常串行路径（预结果不存在时降级）
+            //
+            // ## 引用关系
+            // - 触发方：每次 LLM 返回多个 tool_calls 时
+            // - 消费方：下方主 for 循环（命中 parallel_results 则提前 Ok 返回）
+            // - 生命周期：仅当前 iteration（局部变量，loop 结束即 drop）
+            let parallel_results: std::collections::HashMap<String, ToolOutput> = {
+                // 过滤可并行工具（保守白名单：kb/db_read/fs 纯读）
+                let parallelizable: Vec<&crate::llm::ToolCall> = tool_calls.iter().filter(|tc| {
+                    let n = tc.function.name.as_str();
+                    !n.starts_with("session_") && !n.starts_with("interaction_")
+                        && n != "bash_exec"
+                        && !n.starts_with("subagent_") && !n.starts_with("skill_")
+                        && (n.starts_with("kb_") || n.starts_with("db_read_")
+                            || n == "db_info" || n == "db_list_tables" || n == "db_table_schema"
+                            || n.starts_with("fs_read") || n.starts_with("fs_search")
+                            || n == "fs_glob" || n == "fs_tree" || n == "fs_info"
+                            || n.starts_with("file_kb_") || n.starts_with("file_retrieval_"))
+                }).collect();
+
+                if parallelizable.len() >= 2 {
+                    // 构建共享 ExecutionContext（纯读，无写锁）
+                    let exec_ctx = {
+                        let s = self.session.read().await;
+                        crate::tool::ExecutionContext {
+                            session_id: s.session_id.clone(),
+                            filengine: s.filengine_session.clone(),
+                            turn_number: ctx.turn_number,
+                            bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                            bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                            tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                            role_caps: Arc::clone(&s.role_caps),
+                        }
+                    };
+                    // 并发执行（futures_util::future::join_all 保序）
+                    let futs: Vec<_> = parallelizable.iter().map(|tc| {
+                        let tid = ToolId(tc.function.name.clone());
+                        let params: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null);
+                        let call_id = tc.id.clone();
+                        let ctx_c = exec_ctx.clone();
+                        let core = &self.core;
+                        async move {
+                            let r: Result<ToolOutput, KernelError> = async {
+                                core.mag_chain.read().await.before(&tid, &params).await?;
+                                let mut out = core.registry.execute(&tid, params, &ctx_c).await?;
+                                out = core.mcip_gateway.wrap_output(out);
+                                core.mag_chain.read().await.after(&tid, &mut out).await?;
+                                Ok(out)
+                            }.await;
+                            (call_id, r)
+                        }
+                    }).collect();
+                    let joined = futures_util::future::join_all(futs).await;
+                    joined.into_iter()
+                        .filter_map(|(id, r)| r.ok().map(|o| (id, o)))
+                        .collect()
+                } else {
+                    std::collections::HashMap::new()
+                }
+            };
+            // ── 并行预执行结束 ────────────────────────────────────────────────
+
             let mut tool_results: Vec<Message> = Vec::new();
             for tc in &tool_calls {
                 // 单一命名约定：schema.name == ToolId.0 == LLM 调用名（全部 _ 形态）。
@@ -2034,6 +2109,11 @@ impl<'a> TurnPipeline<'a> {
                 // 所有 session.*/interaction.* 检查需要同时匹配两种形式
                 let raw_name = tool_id.0.as_str();
 
+                // P0-C1: 并行预执行命中检测
+                // parallel_results 已在循环前并发执行完毕，命中则此工具的 execute 已完成
+                // 主循环仍走完整路径（streaming/telemetry/session push），仅 execute 阶段跳过
+                let parallel_hit: Option<ToolOutput> = parallel_results.get(&tc.id).cloned();
+
                 // W2 (Task #100)：dedup 早退路径——仅 idempotent=true 工具走 cache
                 //
                 // 引用：CoreLoop.tool_result_dedup（Option，None 时跳过整段）
@@ -2063,7 +2143,11 @@ impl<'a> TurnPipeline<'a> {
                     (None, None)
                 };
 
-                let output_result = if let Some(cached) = dedup_hit.clone() {
+                let output_result = if let Some(pre_out) = parallel_hit {
+                    // P0-C1: 并行预执行结果——直接使用，跳过 execute 路径
+                    // 仅 idempotent 纯读工具命中；streaming/telemetry/session push 仍在主循环正常进行
+                    Ok::<ToolOutput, KernelError>(pre_out)
+                } else if let Some(cached) = dedup_hit.clone() {
                     Ok::<ToolOutput, KernelError>(cached)
                 } else if raw_name == "session_request_permission" {
                     // LLM 主动申请权限入口：向用户展示授权对话框

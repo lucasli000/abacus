@@ -47,6 +47,23 @@ pub struct ToolSchema {
     /// fs_write / bash_exec 等写操作必须 false。
     #[serde(default)]
     pub idempotent: bool,
+    /// P0-C2: schema 是否跨 session 字节稳定（可参与 KV prefix cache）
+    ///
+    /// ## 何时标记为 true
+    /// - schema 的 name / description / parameters 在运行时不会变化
+    /// - 适用于内置稳定工具（db.* / kb.* / filengine.*）
+    ///
+    /// ## 影响路径
+    /// build_tool_definitions_for() 将 schema_stable=true 的工具排在 tools 数组前部，
+    /// 使 Anthropic/DeepSeek prefix cache 能稳定命中这段 schema bytes。
+    /// 对于 schema_stable=false 的工具（lsp.* / mcp.* 等动态工具），排在后部，
+    /// 变化只影响尾部不影响稳定前缀的缓存命中。
+    ///
+    /// ## 引用关系
+    /// - 设置方：builtin 工具的 schemas() 函数（db/kb/filengine 标记为 true）
+    /// - 消费方：CoreLoop::build_tool_definitions_for（排序优化，待实现）
+    #[serde(default)]
+    pub schema_stable: bool,
 }
 
 /// Phase β-C: 工具调用示例

@@ -250,6 +250,8 @@ fn kb_schema(name: &str, desc: &str, props: Value, required: &[&str],
         applicable_task_kinds: None,
         // kb.query/search 是 idempotent；ingest 写入故 false
         idempotent: matches!(name, "kb_query" | "kb_search"),
+        // P0-C2: kb.* schema 在运行时不变，参与 KV prefix cache
+        schema_stable: true,
     }
 }
 

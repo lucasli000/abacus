@@ -258,7 +258,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: true,
-        },
+                        schema_stable: false,        },
         ToolSchema {
             name: "orchestrate_upgrade".into(),
             description: "报告执行级别不足，请求升级".into(),
@@ -280,7 +280,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: false,
-        },
+                        schema_stable: false,        },
     ]
 }
 

@@ -190,7 +190,7 @@ pub async fn register_env_tools(registry: &ToolRegistry, env_map: Arc<RwLock<Env
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: true,
-        },
+                        schema_stable: false,        },
         provider: ToolProvider::BuiltIn,
         state: ToolState::Loaded,
         effectiveness: ToolEffectiveness::default(),

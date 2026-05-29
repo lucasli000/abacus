@@ -234,6 +234,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: true, // 同 id 永远返回相同 store 内容
+            schema_stable: false,
         },
     ]
 }

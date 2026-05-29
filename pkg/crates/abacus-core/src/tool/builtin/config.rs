@@ -329,7 +329,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: true,
-        },
+                        schema_stable: false,        },
         ToolSchema {
             name: "config_set".into(),
             description: "Modify a runtime config parameter. Changes apply immediately.".into(),
@@ -358,7 +358,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: false,
-        },
+                        schema_stable: false,        },
     ]
 }
 

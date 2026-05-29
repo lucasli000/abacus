@@ -32,7 +32,10 @@ futures-util = "0.3"
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 wasmtime = { workspace = true }
-rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "bundled-full"] }
+# CodeGraph 内置工具：代码知识图谱（符号索引 + FTS5 搜索 + 调用图）
+# 引用关系：被 tool/builtin/cg.rs 使用；bundled-full 启用 FTS5 虚拟表支持
+sha1 = "0.10"
 zeroize = { workspace = true }
 lru = { workspace = true }
 dirs = "6.0.0"

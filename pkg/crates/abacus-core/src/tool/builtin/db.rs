@@ -474,6 +474,8 @@ fn db_schema(name: &str, desc: &str, props: Value, required: &[&str],
         // Phase β-G: db.read/info/list_tables/schema 是 idempotent；query 看 SQL 但保守 false
         idempotent: matches!(name,
             "db_read_records" | "db_info" | "db_list_tables" | "db_table_schema"),
+        // P0-C2: db.* schema 在运行时不变，参与 KV prefix cache
+        schema_stable: true,
     }
 }
 

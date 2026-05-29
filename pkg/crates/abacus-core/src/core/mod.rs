@@ -38,6 +38,7 @@ pub mod provider_adapter;
 pub mod workflow_gate;
 pub mod workflow_engine;
 pub mod workflow_checkers;
+pub mod cot_hook;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -373,8 +374,8 @@ impl Default for ThresholdConfig {
             meeting_max_duration_mins: 60,
             confirm_timeout_secs: 15,
             // Quality 级
-            context_compress_ratio: 0.60,
-            tool_prune_after_turns: 20,
+            context_compress_ratio: 0.55,  // P0-C3: 提前压缩，避免 context 堆积后质量骤降
+            tool_prune_after_turns: 10,     // P0-C3: 更积极隐藏长期不用工具，省 token
             max_model_escalations: 10,
             input_max_chars: 100_000,
         }
@@ -1289,6 +1290,18 @@ pub struct CoreLoop {
     /// 旁路表（不改 ToolSchema struct），向后兼容现有所有插件/MCP 工具。
     /// 没注册到 cluster 的工具 render_hint_for 返 None，不破坏 description。
     pub(crate) cluster_registry: Arc<crate::tool::cluster::ClusterRegistry>,
+
+    // ─── P0-A1: ZeroShotCotHook 控制标志 ─────────────────────────────────
+    // 两个 Arc<AtomicBool> 与 ZeroShotCotHook 内部字段共享同一 Arc 实例，
+    // 允许 CoreLoop 在每轮 turn 开始前更新标志而无需锁争用。
+    //
+    // ## 引用关系
+    // - 创建：CoreLoop::new() 构建 ZeroShotCotHook 时同步返回
+    // - 写入：build_system_output() / TurnPipeline 在解析 thinking_intent 后调用
+    // - 读取：ZeroShotCotHook::should_inject()（通过 Arc 共享）
+    // - 生命周期：随 CoreLoop drop（Arc 引用计数归零，AtomicBool 释放）
+    pub(crate) cot_model_supports_native: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cot_thinking_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Context window pressure source — reports usage_pct (0~100 scale) normalized to
@@ -1451,10 +1464,26 @@ impl CoreLoop {
         let injector = Arc::new(RwLock::new(injector));
         let effectiveness = Arc::new(RwLock::new(EffectivenessTracker::new()));
         let mcip_gateway = Arc::new(McipGateway::new());
-        let prompt_assembly = PromptAssembly::new(
+        let mut prompt_assembly = PromptAssembly::new(
             &config.system_prompt,
             "", // auto-load from abacusbr.md
         );
+
+        // P0-A1：注册 ZeroShotCotHook（Zero-shot CoT Fallback）
+        //
+        // ## 触发时机
+        // 当模型不支持 native thinking 但用户有推理意图时，自动注入逐步推理触发词。
+        //
+        // ## 引用关系
+        // - hook 注册到 PromptAssembly，随 prompt_assembly 生命周期存活
+        // - cot_model_flag / cot_thinking_flag：Arc<AtomicBool> 持久化在 CoreLoop，
+        //   每轮 turn 解析 thinking_intent 后由 build_thinking_intent() 调用方更新
+        //   （两个 AtomicBool 通过 Arc 与 hook 内部字段共享同一实例）
+        // - 生命周期：hook 随 prompt_assembly drop；Arc 随 CoreLoop drop
+        let (cot_hook, cot_model_flag, cot_thinking_flag) =
+            crate::core::cot_hook::ZeroShotCotHook::new();
+        prompt_assembly.register_hook(Box::new(cot_hook));
+
         let safety_guard = SafetyGuard::from_profile(&UserProfile::load_default());
 
         // Phase 3 (lint)：在 register_all 之前注入 lint overrides
@@ -1553,7 +1582,7 @@ impl CoreLoop {
         crate::tool::builtin::config::register_executors(
             &registry, runtime_overrides.clone(), config.clone(),
         ).await;
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()) };
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), cot_model_supports_native: cot_model_flag, cot_thinking_enabled: cot_thinking_flag };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -2232,7 +2261,7 @@ impl CoreLoop {
                     examples: Vec::new(),
                     applicable_task_kinds: None,
                     idempotent: false,
-                },
+                                        schema_stable: false,                },
                 provider: ToolProvider::BuiltIn,
                 state: ToolState::Loaded,
                 effectiveness: ToolEffectiveness { tool_id: ToolId(name.to_string()), composite_score: 0.7, tier: abacus_types::VisibilityTier::A, cooldown_remaining: 0, blocked_by_env: false, insufficient_data: true },
@@ -2589,7 +2618,7 @@ impl CoreLoop {
                         examples: Vec::new(),
                         applicable_task_kinds: None,
                         idempotent: false,
-                    },
+                                                schema_stable: false,                    },
                     provider: abacus_types::ToolProvider::Plugin {
                         plugin_id: plugin_id.clone(),
                     },
@@ -5232,6 +5261,7 @@ mod tests {
                     parameters: serde_json::json!({"type": "object"}),
                     returns: None, security: None, cost: None,
                     examples: vec![], applicable_task_kinds: None, idempotent: false,
+                    schema_stable: false,
                 },
                 provider: abacus_types::ToolProvider::BuiltIn,
                 state: abacus_types::ToolState::Loaded,
@@ -5682,7 +5712,7 @@ mod tests {
                     examples: Vec::new(),
                     applicable_task_kinds: None,
                     idempotent: false,
-                },
+                                        schema_stable: false,                },
                 provider: abacus_types::ToolProvider::BuiltIn,
                 state: abacus_types::ToolState::Loaded,
                 effectiveness: abacus_types::ToolEffectiveness::default(),
@@ -5734,7 +5764,7 @@ mod tests {
                     examples: Vec::new(),
                     applicable_task_kinds: None,
                     idempotent: false,
-                },
+                                        schema_stable: false,                },
                 provider: abacus_types::ToolProvider::BuiltIn,
                 state: abacus_types::ToolState::Loaded,
                 effectiveness: eff,
@@ -5772,7 +5802,7 @@ mod tests {
                     examples: Vec::new(),
                     applicable_task_kinds: None,
                     idempotent: false,
-                },
+                                        schema_stable: false,                },
                 provider: abacus_types::ToolProvider::BuiltIn,
                 state: abacus_types::ToolState::Loaded,
                 effectiveness: eff,
@@ -5817,7 +5847,7 @@ mod tests {
                     examples: Vec::new(),
                     applicable_task_kinds: None,
                     idempotent: false,
-                },
+                                        schema_stable: false,                },
                 provider: prov.clone(),
                 state: abacus_types::ToolState::Loaded,
                 effectiveness: Default::default(),
@@ -5859,7 +5889,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: false,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::Mcp { server_id: "svc".into() },
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -5895,7 +5925,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: Some(vec!["debugging".into()]),
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -5928,7 +5958,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: Some(vec!["debugging".into()]),
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -5943,7 +5973,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None, // 全任务可见
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -5977,7 +6007,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: Some(vec!["debugging".into(), "code_writing".into()]),
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -6008,7 +6038,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -6038,7 +6068,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -6053,7 +6083,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -6088,7 +6118,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),
@@ -6119,7 +6149,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: Some(vec!["debugging".into()]),
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: abacus_types::ToolProvider::BuiltIn,
             state: abacus_types::ToolState::Loaded,
             effectiveness: Default::default(),

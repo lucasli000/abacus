@@ -369,7 +369,8 @@ impl PromptAssembly {
 
         // Layer 185: 任务相关子场景——动态内容，放在 Constraints(190) 之后
         // 任务切换时只影响该层和后续动态层，对稳定前缀 607 token 无影响
-        let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind);
+        // clone：task_kind 后续还需用于构建 HookContext
+        let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind.clone());
         if !br_subscenes.is_empty() {
             layers.entry(185).or_default().push(br_subscenes);
         }
@@ -414,6 +415,29 @@ impl PromptAssembly {
         if with_process_layer {
             result.push_str("\n\n<!-- Process Layer (enabled) -->\n");
             result.push_str("Show your reasoning process in <thinking> tags before responding.\n");
+        }
+
+        // ─── PromptHook 注入 ───────────────────────────────────────────────
+        // 遍历已注册 hooks（按 priority 降序），将命中的 hook 输出追加到 result 末尾。
+        // cacheable=true 的 hook 输出在 session 内字节稳定，对 KV cache 无负面影响。
+        // 注意：assemble() 返回单 String，此处追加不区分稳定/动态层——
+        //   如需分层缓存请使用 assemble_segments()。
+        if !self.hooks.is_empty() {
+            let hook_ctx = HookContext {
+                input: String::new(),
+                task_kind: task_kind.as_ref().map(|k| k.label().to_owned()).unwrap_or_default(),
+                turn_number: 0,
+                session_metadata: std::collections::HashMap::new(),
+            };
+            for hook in &self.hooks {
+                if hook.should_inject(&hook_ctx) {
+                    let text = hook.inject(&hook_ctx);
+                    if !text.is_empty() {
+                        result.push_str("\n\n---\n\n");
+                        result.push_str(&text);
+                    }
+                }
+            }
         }
 
         // ═══ PromptConflictDetector ═══════════════════════════════════════
@@ -507,7 +531,8 @@ impl PromptAssembly {
             - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
 
         // Layer 185: 任务相关子场景（动态块，任务切换时内容变化）
-        let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind);
+        // clone：task_kind 后续还需用于构建 HookContext
+        let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind.clone());
         if !br_subscenes.is_empty() {
             layers.entry(185).or_default().push(br_subscenes);
         }
@@ -576,20 +601,60 @@ impl PromptAssembly {
             });
         }
 
+        // ─── PromptHook 注入 ───────────────────────────────────────────────
+        // cacheable=true 的 hook 追加到 Tier 1 稳定块末尾（字节稳定，不破坏 KV cache）；
+        // cacheable=false 的 hook 追加到 dynamic 段（随 turn 变化，不要求字节稳定）。
+        //
+        // 引用关系：hooks 已按 priority 降序排列（register_hook 维护），此处按序遍历。
+        let mut cacheable_hook_parts: Vec<String> = Vec::new();
+        let mut dynamic_hook_parts: Vec<String> = Vec::new();
+        if !self.hooks.is_empty() {
+            let hook_ctx = HookContext {
+                input: String::new(),
+                task_kind: task_kind.as_ref().map(|k| k.label().to_owned()).unwrap_or_default(),
+                turn_number: 0,
+                session_metadata: std::collections::HashMap::new(),
+            };
+            for hook in &self.hooks {
+                if hook.should_inject(&hook_ctx) {
+                    let text = hook.inject(&hook_ctx);
+                    if !text.is_empty() {
+                        if hook.cacheable() {
+                            cacheable_hook_parts.push(text);
+                        } else {
+                            dynamic_hook_parts.push(text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // cacheable hooks：追加到 Tier 1 稳定块（若存在），否则作为新的 cacheable 段
+        if !cacheable_hook_parts.is_empty() {
+            if let Some(last_cacheable) = segments.last_mut().filter(|s| s.cacheable) {
+                last_cacheable.text.push_str("\n\n---\n\n");
+                last_cacheable.text.push_str(&cacheable_hook_parts.join("\n\n---\n\n"));
+            } else {
+                segments.push(SystemSegment {
+                    text: cacheable_hook_parts.join("\n\n---\n\n"),
+                    cacheable: true,
+                });
+            }
+        }
+
         // 动态后缀：retained_context(180) + injector(动态) + preflight(155) + deduction(160) + skills + interaction(20)
-        if !dynamic_parts.is_empty() {
-            let mut dynamic_text = dynamic_parts.join("\n\n---\n\n");
+        // + cacheable=false 的 hooks
+        let has_dynamic = !dynamic_parts.is_empty() || !dynamic_hook_parts.is_empty() || with_process_layer;
+        if has_dynamic {
+            let mut all_dynamic = dynamic_parts;
+            all_dynamic.extend(dynamic_hook_parts);
+            let mut dynamic_text = all_dynamic.join("\n\n---\n\n");
             if with_process_layer {
                 dynamic_text.push_str("\n\n<!-- Process Layer (enabled) -->\n");
                 dynamic_text.push_str("Show your reasoning process in <thinking> tags before responding.\n");
             }
             segments.push(SystemSegment {
                 text: dynamic_text,
-                cacheable: false,
-            });
-        } else if with_process_layer {
-            segments.push(SystemSegment {
-                text: "<!-- Process Layer (enabled) -->\nShow your reasoning process in <thinking> tags before responding.\n".into(),
                 cacheable: false,
             });
         }

@@ -97,7 +97,7 @@ impl CodeExecutorTool {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: false,
-            },
+                                schema_stable: false,            },
             provider: ToolProvider::BuiltIn,
             state: ToolState::Loaded,
             effectiveness: ToolEffectiveness::default(),

@@ -1459,6 +1459,8 @@ fn schema(name: &str, desc: &str, props: Value, required: &[&str],
         examples: Vec::new(),                  // 数据补全后续工程
         applicable_task_kinds: None,           // None = 所有任务可见
         idempotent: read_only,                 // 读类工具可并行
+        // P0-C2: filengine.* schema 在运行时不变，参与 KV prefix cache
+        schema_stable: true,
     }
 }
 

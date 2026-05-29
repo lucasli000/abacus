@@ -180,7 +180,7 @@ pub async fn register(registry: &ToolRegistry) {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: true,
-            },
+                                schema_stable: false,            },
             provider: ToolProvider::BuiltIn,
             state: ToolState::Loaded,
             effectiveness: ToolEffectiveness {

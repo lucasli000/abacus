@@ -122,7 +122,7 @@ mod tests {
                 examples: Vec::new(),
                 applicable_task_kinds: None,
                 idempotent: false,
-            },
+                                schema_stable: false,            },
             provider,
             state,
             effectiveness: ToolEffectiveness {

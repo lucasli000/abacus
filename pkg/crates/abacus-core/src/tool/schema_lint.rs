@@ -113,6 +113,8 @@ impl LintRuleSet {
             Box::new(IdempotentSemanticMismatch),
             // ─── Provenance ───
             Box::new(NoProvenanceInBuiltin),
+            // ─── Description Quality (A5) ───
+            Box::new(DescVague),
         ];
         Self {
             rules,
@@ -486,6 +488,60 @@ impl LintRule for IdempotentSemanticMismatch {
     }
 }
 
+// ─── Description Quality Rules ─────────────────────────────────────────
+
+/// A5: 模糊词检测 —— description 中出现 ≥2 个模糊量词时告警
+///
+/// ## 动机
+/// Prompting Tips 研究：具体性 > 模糊描述。
+/// Tool description 是 LLM 选择工具的主要依据，模糊词会降低 LLM 选择准确率。
+///
+/// ## 规则
+/// 匹配中英文常见模糊量词，≥2 次命中才触发（单次出现可能是合理用法）
+///
+/// ## 引用关系
+/// - 被 LintRuleSet::default_rules() 加入规则集
+/// - 调用方：ToolRegistry::register() → LintRuleSet::lint()
+pub struct DescVague;
+
+/// 中英文模糊量词列表（A5）
+const VAGUE_PATTERNS: &[&str] = &[
+    // 中文
+    "可以", "也许", "通常", "一些", "相关", "各种", "某些", "等等",
+    "大概", "可能", "一般", "有时", "往往", "适当",
+    // English
+    "various", "some", "certain", "usually", "typically", "often",
+    "maybe", "perhaps", "generally", "sometimes",
+];
+
+impl LintRule for DescVague {
+    fn id(&self) -> &'static str { "desc_vague" }
+    fn severity(&self) -> LintSeverity { LintSeverity::Info }
+    fn check(&self, s: &ToolSchema, tid: &ToolId) -> Option<LintIssue> {
+        let desc_lower = s.description.to_lowercase();
+        let hits: Vec<&str> = VAGUE_PATTERNS.iter()
+            .filter(|&&p| desc_lower.contains(p))
+            .copied()
+            .collect();
+        if hits.len() >= 2 {
+            Some(LintIssue {
+                rule: self.id(),
+                severity: self.severity(),
+                field: "description",
+                tool_id: tid.clone(),
+                reason: format!(
+                    "description contains {} vague patterns: {:?} (first 3)",
+                    hits.len(),
+                    hits.iter().take(3).collect::<Vec<_>>()
+                ),
+                suggestion: Some("use specific, action-oriented language; avoid hedging words".into()),
+            })
+        } else {
+            None
+        }
+    }
+}
+
 // ─── Provenance Rules ──────────────────────────────────────────────────
 
 pub struct NoProvenanceInBuiltin;
@@ -631,6 +687,7 @@ mod tests {
             examples: Vec::new(),
             applicable_task_kinds: None,
             idempotent: false,
+            schema_stable: false,
         }
     }
 
@@ -704,6 +761,23 @@ mod tests {
         // 加 allowed 后不再出
         set.allow(tid.clone(), "desc_has_markdown");
         assert!(!set.lint(&s, &tid).iter().any(|i| i.rule == "desc_has_markdown"));
+    }
+
+    #[test]
+    fn desc_vague_caught_on_two_hits() {
+        let s = mk_schema("t", "通常可以用来处理各种任务", serde_json::json!({"type": "object"}));
+        let tid = ToolId("t".into());
+        let r = DescVague;
+        assert!(r.check(&s, &tid).is_some());
+    }
+
+    #[test]
+    fn desc_vague_not_caught_on_one_hit() {
+        let s = mk_schema("t", "通常用来搜索文件内容", serde_json::json!({"type": "object"}));
+        let tid = ToolId("t".into());
+        let r = DescVague;
+        // 只有 "通常" 一个，不触发
+        assert!(r.check(&s, &tid).is_none());
     }
 
     #[test]
