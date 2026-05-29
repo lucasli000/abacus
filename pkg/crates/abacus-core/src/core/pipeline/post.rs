@@ -307,6 +307,18 @@ impl<'a> TurnPipeline<'a> {
                 tool_set_hash,
                 self.core.config.thinking_intent.is_some(),
             ).await;
+
+            // P1-A3 + P1-C5: 正常轮次的 Reflexion（D-tier 工具触发）
+            // 与停滞信号触发互补：这里仅根据工具评分触发（inertia_triggered=false）
+            // 引用：deduction/mod.rs::maybe_reflect()
+            self.core.deduction_engine.maybe_reflect(
+                ctx.turn_number,
+                &s.session_id,
+                ctx.classification.kind.label(),
+                &tool_stats,
+                self.core.knowledge_store.as_ref(),
+                false, // inertia_triggered = false（停滞路径单独处理）
+            ).await;
         }
 
         // ─── Memory Palace 写入 ────────────────────────────────────────────────
@@ -724,6 +736,26 @@ impl<'a> TurnPipeline<'a> {
                             signals: vec![format!("{:?}", signal)],
                             recommendation: "Consider changing approach or breaking the task into smaller steps.".into(),
                         });
+                    }
+                    // P1-C5: 停滞信号触发 Reflexion（将失败模式写入 KnowledgeStore 供未来 kb.search 检索）
+                    // 引用：deduction/mod.rs::maybe_reflect() 
+                    // 触发条件：FlagWarning（重试已达上限）——说明 LLM 持续彺弱
+                    {
+                        let task_kind = ctx.classification.kind.label().to_string();
+                        let tool_stats_snapshot = {
+                            let eff = self.core.effectiveness.read().await;
+                            eff.all_stats_snapshot().clone()
+                        };
+                        let ks_ref = self.core.knowledge_store.as_ref();
+                        let session_id = { self.session.read().await.session_id.clone() };
+                        self.core.deduction_engine.maybe_reflect(
+                            ctx.turn_number,
+                            &session_id,
+                            &task_kind,
+                            &tool_stats_snapshot,
+                            ks_ref,
+                            true, // inertia_triggered
+                        ).await;
                     }
                     ctx.inertia_warning = Some(signal);
                     break;

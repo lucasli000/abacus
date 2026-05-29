@@ -308,6 +308,55 @@ impl KnowledgeStore {
         }))
     }
 
+    // ─── Direct Text Ingest (P1-A3: Reflexion) ──────────────────────────
+
+    /// 直接摄入文本内容（无文件 I/O）
+    ///
+    /// ## 场景
+    /// Reflexion 机制写入反思文本；AutoKnowledge 写入生成的背景知识。
+    /// 不经过 file hash 去重，每次调用都写入新 chunk（幂等性由调用方控制）。
+    ///
+    /// ## 参数
+    /// - `virtual_path`：虚拟文件路径（用于 file_filter 查询；建议用固定前缀区分来源）
+    /// - `content`：文本内容
+    ///
+    /// ## 引用关系
+    /// - 调用方：DeductionEngine::maybe_reflect()（写入失败反思）
+    /// - 调用方：GeneratedKnowledgeHook（写入背景知识）
+    /// - 消费方：kb.query / kb.search 通过 FTS5 检索
+    ///
+    /// ## 生命周期
+    /// 写入后永久保留（随 knowledge.db）；Reflexion 条目可通过 virtual_path 前缀过滤
+    pub async fn ingest_text(&self, virtual_path: &str, content: &str) -> Result<(), String> {
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+
+        let chunks = chunk_text(content, virtual_path);
+        let conn = self.conn.lock().await;
+
+        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+
+        for chunk in &chunks {
+            // INSERT OR REPLACE 让同 id 调用幂等
+            conn.execute(
+                "INSERT OR REPLACE INTO chunks (id, file, chunk_idx, content, heading_path, token_estimate)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![chunk.id, chunk.file, chunk.chunk_idx as i64,
+                        chunk.content, chunk.heading_path, chunk.token_estimate as i64],
+            ).map_err(|e| format!("chunk insert failed: {e}"))?;
+
+            conn.execute(
+                "INSERT OR REPLACE INTO chunks_fts (rowid, content)
+                 SELECT rowid, content FROM chunks WHERE id = ?1",
+                params![chunk.id],
+            ).map_err(|e| format!("fts insert failed: {e}"))?;
+        }
+
+        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     // ─── Query ──────────────────────────────────────────────────────────
 
     /// FTS5 全文搜索

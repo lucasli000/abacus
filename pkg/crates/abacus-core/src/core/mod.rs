@@ -39,6 +39,7 @@ pub mod workflow_gate;
 pub mod workflow_engine;
 pub mod workflow_checkers;
 pub mod cot_hook;
+pub mod knowledge_hook;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2120,6 +2121,13 @@ impl CoreLoop {
     ) -> Self {
         // Phase Ctx-D：注入 KnowledgeStore 让 declare 复用 KB chunking
         self.context_manager.set_kb_store(store.clone()).await;
+        // P1-A2: 注册 GeneratedKnowledgeHook（KnowledgeStore 准备好后才能注册）
+        // 引用：knowledge_hook.rs — 对 KnowledgeQuery/Mathematics 任务首轮注入背景知识
+        // 生命周期：随 prompt_assembly 存活；KnowledgeStore 只读，无写锁竞争
+        let gen_knowledge_hook = crate::core::knowledge_hook::GeneratedKnowledgeHook::new(
+            store.clone(), 3
+        );
+        self.prompt_assembly.register_hook(Box::new(gen_knowledge_hook));
         self.knowledge_store = Some(store);
         self.memory_palace = Some(palace.clone());
         // Phase γ-Palace-D：启用 palace 后重注册 result.expand executor，注入 palace 让 expand 反馈

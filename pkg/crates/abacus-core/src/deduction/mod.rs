@@ -490,6 +490,115 @@ impl DeductionEngine {
         }
     }
 
+    // ─── P1-A3: Reflexion —— 失败轨迹语言反思 ────────────────────────────
+
+    /// 检测并写入语言反思（Reflexion，来自 Shinn et al. 2023）
+    ///
+    /// ## 触发条件
+    /// - `tool_stats` 中存在综合评分 < 0.20（D tier）的工具（至少 5 次机会）
+    /// - 额外触发：`inertia_triggered = true`（InertiaDetector 检测到停滞信号）
+    ///
+    /// ## 写入目标
+    /// 1. KnowledgeStore（FTS5）：virtual_path = "reflexion://failure/{session}/{turn}"
+    ///    → 后续 kb.search 可检索历史失败模式
+    /// 2. BehaviorPalace（tag）：记录失败工具的 pattern，供 palace.search(tags) 快速匹配
+    ///
+    /// ## 语言反思内容（规则生成，无 LLM 调用）
+    /// 结构化文本：失败工具 + 失败率 + 建议替代策略
+    ///
+    /// ## 引用关系
+    /// - 调用方：CoreLoop::post_process()（每轮 collect_post_turn 之后）
+    /// - 调用方：TurnPipeline::detect_inertia()（停滞信号触发）
+    /// - 生命周期：每轮末尾调用一次，不持有状态
+    pub async fn maybe_reflect(
+        &self,
+        turn_number: u32,
+        session_id: &str,
+        task_kind: &str,
+        tool_stats: &HashMap<ToolId, ToolStats>,
+        knowledge_store: Option<&Arc<crate::knowledge_store::KnowledgeStore>>,
+        inertia_triggered: bool,
+    ) {
+        // 找出 D-tier 工具（composite_score < 0.20 且数据足够）
+        let d_tier_tools: Vec<(String, f64)> = tool_stats.iter()
+            .filter_map(|(tid, s)| {
+                if s.opportunities < 5 { return None; } // 数据不足
+                let adoption = s.adoption_rate();
+                let success = s.success_rate();
+                let latency = s.avg_latency_ms();
+                let trend = {
+                    let recent_ok = s.recent_exit_codes.iter().filter(|&&c| c == 0).count() as f64;
+                    let recent_rate = if s.recent_exit_codes.is_empty() { success }
+                        else { recent_ok / s.recent_exit_codes.len() as f64 };
+                    recent_rate - success
+                };
+                let score = 0.50 * adoption + 0.25 * trend + 0.15 * success
+                    + 0.10 * (1.0 - (latency / 5000.0).clamp(0.0, 1.0));
+                if score < 0.20 { Some((tid.0.clone(), score)) } else { None }
+            })
+            .collect();
+
+        // 触发条件：D-tier 工具存在 OR 停滞信号触发
+        if d_tier_tools.is_empty() && !inertia_triggered {
+            return;
+        }
+
+        // 生成结构化反思文本
+        let reflection = if !d_tier_tools.is_empty() {
+            let dominant = &d_tier_tools[0].0;
+            let dom_score = d_tier_tools[0].1;
+            let dom_stats = tool_stats.get(&ToolId(dominant.clone()));
+            let stats_text = dom_stats.map(|s| format!(
+                "调用 {} 次，成功率 {:.0}%，采纳率 {:.0}%",
+                s.invocations, s.success_rate() * 100.0, s.adoption_rate() * 100.0
+            )).unwrap_or_default();
+            format!(
+                "# 工具失败反思 turn={turn_number}\n\
+                 任务类型: {task_kind}\n\
+                 主要失败工具: {dominant} (综合评分={dom_score:.2})\n\
+                 失败统计: {stats_text}\n\
+                 改进建议: 处理 {task_kind} 任务时 {dominant} 效果较差，\
+                 建议先用 kb.search 检索相关上下文，或换用替代工具。"
+            )
+        } else {
+            // inertia_triggered only
+            format!(
+                "# 停滞反思 turn={turn_number}\n\
+                 任务类型: {task_kind}\n\
+                 检测到 LLM 停滞信号（重复行为或过早放弃），\
+                 建议下次遇到此类任务先用 kb.query 检索历史解法，避免重复失败路径。"
+            )
+        };
+
+        // 写入 KnowledgeStore（FTS5 检索）
+        if let Some(ks) = knowledge_store {
+            let vpath = format!("reflexion://failure/{}/{}", session_id, turn_number);
+            if let Err(e) = ks.ingest_text(&vpath, &reflection).await {
+                tracing::warn!(session_id, turn_number, "reflexion kb ingest failed: {e}");
+            }
+        }
+
+        // 写入 BehaviorPalace（tag 精确检索）
+        if let Some(ref palace) = self.palace {
+            let pattern_key = if !d_tier_tools.is_empty() {
+                format!("failure:{}", d_tier_tools[0].0)
+            } else {
+                format!("inertia:{task_kind}")
+            };
+            palace.behavior.record_interaction(
+                &pattern_key,
+                &[task_kind.to_string(), "failure_pattern".to_string()],
+            ).await;
+        }
+
+        tracing::debug!(
+            session_id, turn_number, task_kind,
+            d_tier_count = d_tier_tools.len(),
+            inertia = inertia_triggered,
+            "reflexion: wrote failure reflection to knowledge store"
+        );
+    }
+
     /// 运行所有分析（供 deduction.analyze --all 使用）
     pub async fn analyze_all(&self) -> Vec<AnalysisReport> {
         let kinds = vec![
