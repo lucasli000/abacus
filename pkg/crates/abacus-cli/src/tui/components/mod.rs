@@ -1276,7 +1276,11 @@ pub fn render_messages_in_card(
         // ──
         // P7 优化：所有 streaming 内容直接 push（O(1)）
         // 旧 cursor_line 已移除
-        let content_w = inner.width.saturating_sub(5) as usize;
+        // Phase 1: 宽度与 build_message_lines 对齐（prose=5/7, code=full）
+        let bar_indent_stream = 2usize;
+        let full_usable_stream = (inner.width as usize).saturating_sub(bar_indent_stream + 1);
+        let prose_width = full_usable_stream * 5 / 7;
+        let code_width  = full_usable_stream;
 
         // ── 正文文本推迟到最后渲染，避免被工具调用夹在中间 ──
         let mut pending_text_render = false;
@@ -1416,10 +1420,10 @@ pub fn render_messages_in_card(
             let styled_lines: Vec<crate::tui::markdown::StyledLine> = {
                 let mut smd_ref = state.streaming_md.borrow_mut();
                 if let Some(ref mut smd) = *smd_ref {
-                    smd.all_styled(&state.theme, false, content_w)
+                    smd.all_styled(&state.theme, false, prose_width)
                 } else {
                     crate::tui::markdown::render_markdown_bounded(
-                        &state.streaming_text, &state.theme, false, content_w,
+                        &state.streaming_text, &state.theme, false, prose_width,
                     )
                 }
             };
@@ -1432,7 +1436,12 @@ pub fn render_messages_in_card(
                 let line_w: usize = rline.spans.iter()
                     .map(|s| crate::tui::util::display_width(s.content.as_ref()))
                     .sum();
-                if line_w <= content_w + 4 {
+                // 按行类型选择 wrap 宽度：代码/fence 用全宽，正文用 prose_width
+                let wrap_width = match styled.line_type {
+                    crate::tui::markdown::LineType::Code | crate::tui::markdown::LineType::CodeFence => code_width,
+                    _ => prose_width,
+                };
+                if line_w <= wrap_width {
                     lines.push(rline);
                 } else {
                     let indent_str = match styled.line_type {
@@ -1442,7 +1451,7 @@ pub fn render_messages_in_card(
                     let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                     let text_style = styled.spans.first().map(|s| s.style)
                         .unwrap_or(Style::default().fg(state.theme.text));
-                    let segments = crate::tui::util::word_wrap_segments(&full_text, content_w);
+                    let segments = crate::tui::util::word_wrap_segments(&full_text, wrap_width);
                     for (seg_start, seg_end) in segments {
                         lines.push(Line::from(vec![
                             bar.clone(), Span::raw(indent_str.to_string()),
@@ -1458,10 +1467,10 @@ pub fn render_messages_in_card(
             let styled_lines: Vec<crate::tui::markdown::StyledLine> = {
                 let mut smd_ref = state.streaming_md.borrow_mut();
                 if let Some(ref mut smd) = *smd_ref {
-                    smd.all_styled(&state.theme, false, content_w)
+                    smd.all_styled(&state.theme, false, prose_width)
                 } else {
                     crate::tui::markdown::render_markdown_bounded(
-                        &state.streaming_text, &state.theme, false, content_w,
+                        &state.streaming_text, &state.theme, false, prose_width,
                     )
                 }
             };

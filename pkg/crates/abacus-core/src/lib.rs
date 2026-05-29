@@ -37,6 +37,11 @@ pub mod sandbox;
 pub mod lsp;
 pub mod undo;
 
+// P2-P3: 智能化升级新子系统
+pub mod reasoning;    // Self-Consistency (B3) + Tree of Thoughts (B2)
+pub mod optimization; // OPRO Prompt优化器 (B1)
+pub mod feedback;     // MT-GRPO 轨迹收集器 (B4)
+
 // Local additions (historically in abacus-core facade)
 pub mod config;
 pub mod secrets;
