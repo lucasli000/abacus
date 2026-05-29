@@ -259,7 +259,11 @@ fn build_message_lines(
                             let text_style = styled.spans.first()
                                 .map(|s| s.style)
                                 .unwrap_or(Style::default().fg(theme.text));
-                            let segments = crate::tui::util::word_wrap_segments(&full_text, wrap_width);
+                            // 修复溢出：wrap 段宽须扣除 bar(1) + indent_str 的实际显示宽度
+                            // 否则 segment + bar + indent 之和超出 inner.width，终端截断
+                            let indent_display_w = crate::tui::util::display_width(indent_str);
+                            let seg_max_w = (max_width as usize).saturating_sub(1 + indent_display_w);
+                            let segments = crate::tui::util::word_wrap_segments(&full_text, seg_max_w);
                             for (seg_start, seg_end) in segments {
                                 lines.push(Line::from(vec![
                                     bar.clone(),

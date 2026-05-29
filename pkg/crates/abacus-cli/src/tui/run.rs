@@ -483,7 +483,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             );
                             // Thinking 排在 tool calls 前面(更符合"先思考后行动"的认知顺序)
                             trace_ids.insert(0, tid);
-                            state.thinking_text = thinking_text;
+                            state.thinking_text = thinking_text.clone();
                         }
 
                         // 2. Tool calls 兜底 — 流式路径已在 ToolStart/ToolEnd 创建 trace,
@@ -516,17 +516,36 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                         }
 
-                        // 3. 组装 parts: Trace 在上方（工作报告），Reply 文本在下方（用户焦点）
+                        // 3. 组装 parts: Thinking Block（内联可见）→ Trace（工具）→ Reply
                         let mut parts: Vec<MsgContent> = Vec::new();
-                        if !trace_ids.is_empty() {
-                            // trace 摘要在正文上方，折叠态，用户可 Space 展开
-                            parts.push(MsgContent::Trace {
-                                event_ids: trace_ids,
-                                collapsed: false,
-                // 默认展开显示 thinking 摘要 + tool 列表
-                expanded_event_ids: std::collections::HashSet::new(),
+
+                        // thinking 提升为内联 Block：用户不需要展开 trace 即可看到推理过程
+                        // 引用关系：thinking_text 来自 streaming_thinking 或 response.thinking
+                        // 生命周期：随 Message 持久化，collapsed=true 默认折叠，Space 展开
+                        if !thinking_text.is_empty() {
+                            let line_count = thinking_text.lines().count();
+                            parts.push(MsgContent::Block {
+                                kind: crate::tui::state::BlockKind::Think,
+                                summary: format!("思考过程 · {}行", line_count),
+                                collapsed: true,
+                                detail: thinking_text.clone(),
                             });
                         }
+
+                        // trace 只保留工具调用（thinking 已单独展示，从 trace_ids 中移除）
+                        let tool_trace_ids: Vec<u64> = trace_ids.iter().copied()
+                            .filter(|id| state.trace_events.iter().any(|e|
+                                e.id == *id && matches!(e.kind, crate::tui::state::TraceKind::ToolCall { .. })
+                            ))
+                            .collect();
+                        if !tool_trace_ids.is_empty() {
+                            parts.push(MsgContent::Trace {
+                                event_ids: tool_trace_ids,
+                                collapsed: false,
+                                expanded_event_ids: std::collections::HashSet::new(),
+                            });
+                        }
+
                         parts.push(MsgContent::Stream(response.text.clone()));
 
                         state.add_message(Message::new_session(parts, &ts));
