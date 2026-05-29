@@ -1,16 +1,25 @@
 //! Core module — CoreLoop, SessionState, tool registration
 //!
-//! ## ⚠️ 文件过大（321KB）— 计划拆分边界：
-//! - `loop.rs`：CoreLoop（主循环逻辑）
-//! - `state.rs`：SessionState + TurnResult + RequestContext
-//! - `registration.rs`：工具注册 + module init
-//! - `mod.rs`：mod re-exports + 共享类型
+//! ## ⚠️ 文件过大（>320KB）— 拆分阻塞项（P0-D1 调查结论）
 //!
-//! ## 拆分步骤
-//! 1. 建 loop.rs：移动 CoreLoop + pub use 重导出
-//! 2. 建 state.rs：移动 SessionState + TurnResult + RequestContext
-//! 3. 建 registration.rs：移动工具注册函数
-//! 4. mod.rs 保留 re-exports + 共享 use 声明
+//! **为什么不能直接拆分：**
+//! pipeline/mod.rs 和 pipeline/post.rs 通过 `self.core.xxx()` 调用大量
+//! `CoreLoop` **私有方法**（pub(super) 或 pub(crate)）。如果把 CoreLoop 移
+//! 到子模块（如 `loop.rs`），这些调用路径需要同时调整可见性修饰符——工作量
+//! 等价于重写 pipeline/ 的全部方法签名，风险高于收益。
+//!
+//! **正确拆分路径（留给专项 PR）：**
+//! 1. 先把 pipeline/mod.rs + post.rs 的私有 `self.core.xxx` 调用
+//!    全部改为 `pub(super)` / `pub(crate)` 并加注释
+//! 2. 再建 `core/session.rs`（SessionState + TurnResult）、
+//!    `core/config.rs`（CoreConfig + ThresholdConfig）
+//! 3. 最后建 `core/loop_impl.rs`（impl CoreLoop 主体）
+//! 4. 自由函数（extract_text / scene_active_prefixes / load_role_caps）
+//!    移到 `core/helpers.rs` 并 `pub(crate) use helpers::*;`
+//!
+//! **不拆的代价：**
+//! 仅影响编译缓存命中率（任何改动导致全文重编译）和 PR diff 可读性。
+//! 功能和性能无影响。
 
 pub mod context;
 pub mod compute;

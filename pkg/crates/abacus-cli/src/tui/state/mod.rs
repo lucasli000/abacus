@@ -185,6 +185,52 @@ pub enum TimelineEntry {
     Iteration { number: u32 },
 }
 
+/// Phase 3: 流式内容块 — 按逻辑分组（thinking/tool-group/text/iteration）
+/// 替代 TimelineEntry 的线性渲染，支持折叠/展开和噪音过滤
+#[derive(Clone, Debug)]
+pub enum StreamingBlock {
+    Thinking {
+        id: u64,
+        summary: String,       // 最近 2 行
+        full_text: String,     // 完整内容
+        collapsed: bool,
+        duration_ms: Option<u64>,
+    },
+    ToolGroup {
+        id: u64,
+        tool_name: String,
+        calls: Vec<ToolCallSummary>,
+        collapsed: bool,
+    },
+    Text {
+        id: u64,
+        byte_range: (usize, usize),
+    },
+    Iteration {
+        number: u32,
+    },
+}
+
+impl StreamingBlock {
+    pub fn id(&self) -> u64 {
+        match self {
+            StreamingBlock::Thinking { id, .. }
+            | StreamingBlock::ToolGroup { id, .. }
+            | StreamingBlock::Text { id, .. } => *id,
+            StreamingBlock::Iteration { number } => *number as u64,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ToolCallSummary {
+    pub trace_id: u64,
+    pub context: String,
+    pub status: StreamingToolStatus,
+    pub duration_ms: Option<u64>,
+    pub failure_kind: Option<String>,
+}
+
 /// 块类型
 #[derive(Clone, Serialize, Deserialize)]
 pub enum BlockKind {
@@ -928,6 +974,11 @@ pub struct AppState {
     pub pending_turnkey_plan: Option<abacus_types::sandbox::TaskSpec>,
     pub messages: VecDeque<Message>,
     pub scroll: usize,
+    /// Phase 2: 用户是否主动离开底部浏览历史（streaming 期间不强制拉回）
+    /// - set_scroll(Up/Down) → true
+    /// - set_scroll(ToBottom) → false
+    /// - reset_streaming → false
+    pub(crate) user_scrolled_away: std::cell::Cell<bool>,
     /// V28.6 (PR12-5): 模式切换时保留各自的 scroll 位置, 切回不归零
     /// 引用关系: 被 `set_mode` 写入(切换前) + 读取(切换后), 不进 SessionExport
     /// 生命周期: 进程级, 每个模式各自累积; 不持久化(切会话即重置)
@@ -1220,6 +1271,12 @@ pub struct AppState {
     /// 引用关系：run.rs push → components/mod.rs 遍历渲染
     /// 生命周期：首次 chunk 到达时 push → reset_streaming 清空
     pub streaming_timeline: Vec<TimelineEntry>,
+    // Phase 3: 逻辑分块 — 替代 timeline 的平铺渲染，按 thinking/tool-group/text 分组
+    /// 引用关系：run.rs chunk drain → 聚合 push；components 渲染 → 遍历
+    /// 生命周期：与 streaming_timeline 同步，reset_streaming 清空
+    pub streaming_blocks: std::cell::RefCell<Vec<StreamingBlock>>,
+    // Phase 4: 用户手动展开的 block id 集合（优先级高于 auto_collapse）
+    pub expanded_block_ids: std::cell::RefCell<std::collections::HashSet<u64>>,
     // V40: streaming_parsed_lines / streaming_parsed_len 已移除
     // 旧的增量解析缓存被 timeline + mdstream committed/pending 模型完全替代
     /// 流式 Markdown 增量渲染状态（mdstream committed/pending 模型）
@@ -2320,6 +2377,7 @@ impl AppState {
             pending_turnkey_plan: None,
             messages: VecDeque::new(),
             scroll: 0,
+            user_scrolled_away: std::cell::Cell::new(false),
             scroll_by_mode: std::collections::HashMap::new(),
             // V29.5: 启动时无渲染历史, clamp 退化为"不限制"; 第一帧后即被覆盖为真实值
             last_visible_h: std::cell::Cell::new(0),
@@ -2425,6 +2483,8 @@ impl AppState {
             streaming_thinking_started: false,
             streaming_tools: Vec::new(),
             streaming_timeline: Vec::new(),
+            streaming_blocks: std::cell::RefCell::new(Vec::new()),
+            expanded_block_ids: std::cell::RefCell::new(std::collections::HashSet::new()),
             streaming_md: std::cell::RefCell::new(None),
             flash_state: crate::tui::effects::FlashState::new(),
             anim_tick: std::cell::Cell::new(0),
@@ -2614,6 +2674,20 @@ impl AppState {
     /// state.set_scroll(ScrollAction::ToBottom);
     /// ```
     pub fn set_scroll(&mut self, action: ScrollAction) {
+        // Phase 2: 自动追踪用户是否主动离开底部
+        match &action {
+            ScrollAction::Up(_) | ScrollAction::Down(_) | ScrollAction::Absolute(_) => {
+                // 向上/向下/跳转到非底部 → 标记为离开
+                self.user_scrolled_away.set(true);
+            }
+            ScrollAction::ToBottom => {
+                // 到底 → 恢复跟随
+                self.user_scrolled_away.set(false);
+            }
+            ScrollAction::AnchorAdjust { .. } | ScrollAction::Restore(_) => {
+                // 折叠锚定/恢复 — 不改变意图
+            }
+        }
         let total = self.last_total_lines.get();
         let vis = self.last_visible_h.get();
         let max = if total == 0 { usize::MAX } else { total.saturating_sub(vis) };
@@ -3252,6 +3326,8 @@ impl AppState {
         self.streaming_thinking_started = false;
         self.streaming_tools.clear();
         self.streaming_timeline.clear();
+        self.streaming_blocks.borrow_mut().clear();
+        self.expanded_block_ids.borrow_mut().clear();
         // V28: 防御性兜底 — 正常落档路径已 mem::take 走 streaming_trace_ids,
         // 这里 clear 只在异常退出/异常 reset 时生效,避免悬挂引用。
         self.streaming_trace_ids.clear();
@@ -3261,6 +3337,8 @@ impl AppState {
         self.cached_base_lines.borrow_mut().clear();
         self.cached_base_msg_count.set(0);
         self.streaming_content_dirty.set(false);
+        // Phase 2: 流式结束后恢复自动跟随
+        self.user_scrolled_away.set(false);
     }
 
     pub fn add_message(&mut self, msg: Message) {
