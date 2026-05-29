@@ -328,9 +328,20 @@ impl DeepSeekProvider {
             || model_str_for_decision == "deepseek-chat") // V3 官方 model ID
             && !model_str_for_decision.contains("reasoner")
             && !model_str_for_decision.contains("r1");
+        // DeepSeek 官方限制：thinking 模式与 tool calls 不兼容，同时存在会返回 400。
+        // 有工具时强制 disable thinking；无工具时按 intent 决定。
+        // 引用关系：tools 已在上方计算；effective_thinking_enabled 依赖此 override
+        let has_tools = tools.is_some();
         let thinking = if is_reasoning_model_pre {
             match intent_ref {
-                Some(i) if i.is_enabled() => Some(serde_json::json!({"type": "enabled"})),
+                Some(i) if i.is_enabled() && !has_tools => {
+                    // thinking 启用 + 无工具：正常开启
+                    Some(serde_json::json!({"type": "enabled"}))
+                }
+                Some(i) if i.is_enabled() && has_tools => {
+                    // thinking 启用 + 有工具：降级 disable（避免 400）
+                    Some(serde_json::json!({"type": "disabled"}))
+                }
                 Some(_) => {
                     // intent 是 Off → 显式 disable
                     Some(serde_json::json!({"type": "disabled"}))
@@ -344,6 +355,8 @@ impl DeepSeekProvider {
         } else {
             None
         };
+        // thinking 实际是否启用（工具降级后重新判断，驱动 build_messages 和 reasoning_effort）
+        let effective_thinking_enabled = effective_thinking_enabled && !has_tools;
 
         // D2: client-side clamp。官方文档规则：low/medium→high, xhigh→max。
         // 把规则前移到 client，让 wire 上发的字符串与 server 真实执行档位一致。
