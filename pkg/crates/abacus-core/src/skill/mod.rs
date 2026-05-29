@@ -955,6 +955,9 @@ mod tests {
             workflow: vec![],
             prompt: String::new(),
             knowledge_refs: vec![],
+            palace_tags: vec![],
+            compound: false,
+            template_params: vec![],
         }
     }
 

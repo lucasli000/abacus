@@ -4752,7 +4752,8 @@ mod tests {
     fn make_skill(n: &str) -> SkillDef {
         SkillDef { id: SkillId(n.into()), version: "1.0".into(),
             triggers: SkillTriggers { keywords: vec![n.into()], regex: vec![], domain: vec![] },
-            workflow: vec![], prompt: String::new(), knowledge_refs: vec![] }
+            workflow: vec![], prompt: String::new(), knowledge_refs: vec![],
+            palace_tags: vec![], compound: false, template_params: vec![] }
     }
 
     fn make_hub() -> CapabilityHub {
