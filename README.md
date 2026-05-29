@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Abacus" width="360" />
+</p>
+
 # Abacus
 
 [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/lucasli000/abacus/releases/tag/v1.0.0)
