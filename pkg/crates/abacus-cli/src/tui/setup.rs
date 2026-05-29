@@ -11,6 +11,17 @@ use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+
+/// 4 行半块 logo（配置页顶部展示）
+/// 引用关系：render_setup 内渲染，assets/logo_compact.txt 同源
+const LOGO_ICON: &str = "\
+┌──────────────────────────────┐\n\
+│            ▄     ▄        ▄  │\n\
+│   █  █  ▄  █  █  █  █  ▄  █  │\n\
+│   █  ▀  █  █  █  █  ▀  █  █  │\n\
+│         ▀              ▀     │\n\
+└──────────────────────────────┘\n\
+       A  B  A  C  U  S";
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap};
@@ -509,26 +520,37 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
     let inner = block.inner(card);
     block.render(card, f.buffer_mut());
 
-    // 分区: 条款 | URL | 推荐 | Key | Model | ContextWindow | ContextUse | 提示
+    // 分区: Logo | 条款 | URL | 推荐 | Key | Model | ContextWindow | ContextUse | 提示
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // 0  条款标题
-            Constraint::Min(2),      // 1  条款内容
-            Constraint::Length(1),   // 2  gap
-            Constraint::Length(3),   // 3  API URL
-            Constraint::Length(1),   // 4  provider 推荐提示
-            Constraint::Length(1),   // 5  gap
-            Constraint::Length(3),   // 6  API Key
-            Constraint::Length(1),   // 7  gap
-            Constraint::Length(3),   // 8  默认模型
-            Constraint::Length(1),   // 9  gap
-            Constraint::Length(3),   // 10 模型上下文大小
-            Constraint::Length(1),   // 11 gap
-            Constraint::Length(3),   // 12 实际使用上下文
-            Constraint::Length(2),   // 13 底部提示
+            Constraint::Length(7),   // 0  logo（4行图 + 边框 + wordmark）
+            Constraint::Length(1),   // 1  条款标题
+            Constraint::Min(2),      // 2  条款内容
+            Constraint::Length(1),   // 3  gap
+            Constraint::Length(3),   // 4  API URL
+            Constraint::Length(1),   // 5  provider 推荐提示
+            Constraint::Length(1),   // 6  gap
+            Constraint::Length(3),   // 7  API Key
+            Constraint::Length(1),   // 8  gap
+            Constraint::Length(3),   // 9  默认模型
+            Constraint::Length(1),   // 10 gap
+            Constraint::Length(3),   // 11 模型上下文大小
+            Constraint::Length(1),   // 12 gap
+            Constraint::Length(3),   // 13 实际使用上下文
+            Constraint::Length(2),   // 14 底部提示
         ])
         .split(inner);
+
+    // ── Logo ──
+    // 引用关系：LOGO_ICON 常量，与 assets/logo_compact.txt 同源
+    // 生命周期：配置页初始化时渲染，无持久状态
+    f.render_widget(
+        Paragraph::new(LOGO_ICON)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.gold)),
+        parts[0],
+    );
 
     // ── 条款标题 ──
     f.render_widget(
@@ -536,15 +558,15 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
             " 使用须知",
             Style::default().fg(theme.gold).add_modifier(Modifier::BOLD),
         ))),
-        parts[0],
+        parts[1],
     );
 
     // ── 条款内容 ──
     let terms_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
-    let terms_inner = terms_block.inner(parts[1]);
-    terms_block.render(parts[1], f.buffer_mut());
+    let terms_inner = terms_block.inner(parts[2]);
+    terms_block.render(parts[2], f.buffer_mut());
     f.render_widget(
         Paragraph::new(disclaimer_lines(&theme)).wrap(Wrap { trim: false }),
         terms_inner,
@@ -564,8 +586,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         .border_style(Style::default().fg(
             if state.focus == FocusField::BaseUrl { theme.primary } else { theme.border }
         ));
-    let url_inner = url_block.inner(parts[3]);
-    url_block.render(parts[3], f.buffer_mut());
+    let url_inner = url_block.inner(parts[4]);
+    url_block.render(parts[4], f.buffer_mut());
 
     let placeholder = "例如: https://api.openai.com/v1";
     f.render_widget(
@@ -586,7 +608,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
             suggest_text,
             Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         ))),
-        parts[4],
+        parts[5],
     );
 
     // ── API Key ──
@@ -609,8 +631,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         .border_style(Style::default().fg(
             if state.focus == FocusField::ApiKey { theme.gold } else { theme.border }
         ));
-    let ak_inner = api_key_block.inner(parts[6]);
-    api_key_block.render(parts[6], f.buffer_mut());
+    let ak_inner = api_key_block.inner(parts[7]);
+    api_key_block.render(parts[7], f.buffer_mut());
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -654,8 +676,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         .border_style(Style::default().fg(
             if state.focus == FocusField::ModelName { theme.primary } else { theme.border }
         ));
-    let mn_inner = model_block.inner(parts[8]);
-    model_block.render(parts[8], f.buffer_mut());
+    let mn_inner = model_block.inner(parts[9]);
+    model_block.render(parts[9], f.buffer_mut());
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             model_display,
@@ -675,7 +697,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         use ratatui::widgets::Clear;
         let max_visible: usize = 5;
         let list_h = (state.fetched_models.len().min(max_visible) as u16) + 2; // 边框
-        let model_rect = parts[8];
+        let model_rect = parts[9];
         // 下拉放在 model_block 正下方（绝对坐标）
         let drop_y = model_rect.y + model_rect.height;
         let drop_x = model_rect.x;
@@ -724,8 +746,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         .border_style(Style::default().fg(
             if state.focus == FocusField::ContextWindow { theme.primary } else { theme.border }
         ));
-    let cw_inner = cw_block.inner(parts[10]);
-    cw_block.render(parts[10], f.buffer_mut());
+    let cw_inner = cw_block.inner(parts[11]);
+    cw_block.render(parts[11], f.buffer_mut());
     let cw_display = if state.context_window.is_empty() {
         // 优先用 API 返回的当前选中模型 context_window
         if let Some(&ctx_tokens) = state.model_contexts.get(&state.model_name) {
@@ -756,8 +778,8 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
         .border_style(Style::default().fg(
             if state.focus == FocusField::ContextWindowUse { theme.primary } else { theme.border }
         ));
-    let cwu_inner = cwu_block.inner(parts[12]);
-    cwu_block.render(parts[12], f.buffer_mut());
+    let cwu_inner = cwu_block.inner(parts[13]);
+    cwu_block.render(parts[13], f.buffer_mut());
     let cwu_display = if state.context_window_use.is_empty() {
         "空 = 全用 (等于模型上限)".to_string()
     } else {
@@ -785,7 +807,7 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
                 Style::default().fg(theme.border).add_modifier(Modifier::DIM),
             )),
         ]),
-        parts[13],
+        parts[14],
     );
 }
 

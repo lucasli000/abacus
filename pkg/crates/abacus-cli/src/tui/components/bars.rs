@@ -46,9 +46,9 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     // V34: plan_mode 字段已删除（/plan-prefix 功能已随 plan_mode 字段移除）
 
-    // ABACUS logo
+    // ABACUS logo（braille 单行版）
     left.push(Span::styled(
-        "ABACUS",
+        "⎡⠆⠎⠇⠆⠇⠆⠎⠇⎤",
         Style::default()
             .fg(state.theme.mode)
             .add_modifier(Modifier::BOLD),
@@ -420,9 +420,10 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     };
 
     // 左侧：model · thinking_depth · 百分比 已用/上限
-    let model_short = state.model_name.split('-').next_back().unwrap_or(&state.model_name);
+    let model_style = Style::default().fg(state.theme.primary).add_modifier(Modifier::BOLD);
     let ctx_left = vec![
-        Span::styled(format!("{} · {} · ", model_short, state.thinking_depth), muted),
+        Span::styled(state.model_name.clone(), model_style),
+        Span::styled(format!(" · {} · ", state.thinking_depth), muted),
         Span::styled(format!("{}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" {}/{}", used_str, max_str), muted),
     ];
