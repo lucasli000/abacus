@@ -203,6 +203,50 @@ impl std::fmt::Display for SkillId {
     }
 }
 
+// ─── P1-C4: Skill 模板参数声明 ────────────────────────────────────────────
+
+/// Skill 模板参数声明（P1-C4）
+///
+/// ## 设计
+/// 允许 Skill YAML 声明模板参数，调用时用实际值替换 `{{param_name}}` 占位符。
+/// 替换范围：prompt / SkillStep.params / SkillStep.description
+///
+/// ## YAML 示例
+/// ```yaml
+/// template_params:
+///   - name: language
+///     description: 目标语言（如 rust / python）
+///     required: true
+///   - name: max_issues
+///     description: 最大问题数
+///     required: false
+///     default: "10"
+/// ```
+///
+/// ## 占位符语法
+/// `{{language}}` —— 必填（无默认值）
+/// `{{max_issues}}` —— 可选（有默认值）
+///
+/// ## 引用关系
+/// - 设置方：SkillDef.template_params
+/// - 消费方：SkillEngine::render_with_params()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillParamDecl {
+    /// 参数名（对应 {{param_name}} 占位符）
+    pub name: String,
+    /// 参数描述（用于 LLM 调用建议 和 TUI 提示）
+    pub description: String,
+    /// 是否必填（默认 true）
+    #[serde(default = "bool_true")]
+    pub required: bool,
+    /// 默认值（可选）
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+/// bool 默认值辅助函数（serde default）
+fn bool_true() -> bool { true }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillDef {
     pub id: SkillId,
@@ -211,6 +255,12 @@ pub struct SkillDef {
     pub workflow: Vec<SkillStep>,
     pub prompt: String,
     pub knowledge_refs: Vec<String>,
+    /// P1-C4: Skill 模板参数声明列表
+    ///
+    /// 定义后，调用方可传入 `HashMap<String, String>` 进行占位符替换。
+    /// 存量 YAML 无此字段时默认空 Vec，对应 Skill 直接执行不需要渲染。
+    #[serde(default)]
+    pub template_params: Vec<SkillParamDecl>,
     /// 行为宫殿标签：Skill 执行后向 BehaviorPalace 写入/查询时使用
     /// 引用: SkillExecutor 执行后调用 palace.record_interaction
     /// 生命周期: 随 SkillDef 静态存在

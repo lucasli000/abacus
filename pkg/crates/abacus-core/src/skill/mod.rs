@@ -525,6 +525,98 @@ impl SkillEngine {
     pub fn list_skills(&self) -> Vec<SkillDef> {
         self.skills.values().cloned().collect()
     }
+
+    // ─── P1-C4: Skill 模板参数化 ──────────────────────────────────────────────
+
+    /// 用实际参数渲染 Skill 模板（P1-C4）
+    ///
+    /// ## 功能
+    /// 将 SkillDef.prompt 和每个 SkillStep.params/description 中的
+    /// `{{param_name}}` 占位符替换为实际参数值。
+    ///
+    /// ## 参数
+    /// - `skill_id`：Skill 标识符
+    /// - `params`：实际参数 (name → value)
+    ///
+    /// ## 返回
+    /// - `Ok(SkillDef)`：渲染后的 Skill（新对象，不修改注册表）
+    /// - `Err(String)`：缺少必填参数（无默认值的）
+    ///
+    /// ## 占位符处理规则
+    /// - `{{name}}` 在 params 中 → 替换为实际值
+    /// - `{{name}}` 不在 params 中 → 尝试使用 template_params 中的 default
+    /// - 必填参数缺失（并无 default）→ Err
+    ///
+    /// ## 引用关系
+    /// - 调用方：CoreLoop、API、TUI 调用 Skill 前传入参数
+    /// - 生命周期：每次 Skill 调用时调用一次，返回一个临时渲染副本
+    pub fn render_with_params(
+        &self,
+        skill_id: &SkillId,
+        params: &std::collections::HashMap<String, String>,
+    ) -> Result<SkillDef, String> {
+        let skill = self.skills.get(skill_id)
+            .ok_or_else(|| format!("skill not found: {:?}", skill_id))?;
+
+        // 如果没有模板参数，直接返回原始定义（零成本，存量 Skill 友好）
+        if skill.template_params.is_empty() {
+            return Ok(skill.clone());
+        }
+
+        // 验证必填参数并构建最终替换表
+        let mut resolved: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for decl in &skill.template_params {
+            if let Some(val) = params.get(&decl.name) {
+                resolved.insert(decl.name.clone(), val.clone());
+            } else if let Some(ref default) = decl.default {
+                resolved.insert(decl.name.clone(), default.clone());
+            } else if decl.required {
+                return Err(format!(
+                    "skill '{}': missing required param '{}'",
+                    skill_id.0, decl.name
+                ));
+            }
+        }
+
+        // 渲染工具函数：将 {{name}} 替换为对应值
+        let render = |s: &str| -> String {
+            let mut out = s.to_string();
+            for (k, v) in &resolved {
+                out = out.replace(&format!("{{{{{}}}}}", k), v);
+            }
+            out
+        };
+
+        // 构建渲染后的 SkillDef
+        let mut rendered = skill.clone();
+        rendered.prompt = render(&skill.prompt);
+        rendered.workflow = skill.workflow.iter().map(|step| {
+            let mut s = step.clone();
+            s.description = render(&step.description);
+            // 渲染 params JSON：序列化为字符串后替换，再反序列化
+            // 这样可以替换嵌套在 JSON 字符串字段中的占位符
+            if let Ok(json_str) = serde_json::to_string(&step.params) {
+                let rendered_json = render(&json_str);
+                if let Ok(val) = serde_json::from_str(&rendered_json) {
+                    s.params = val;
+                }
+            }
+            s
+        }).collect();
+
+        Ok(rendered)
+    }
+
+    /// 检查 Skill 是否需要模板参数渲染（P1-C4）
+    ///
+    /// ## 返回
+    /// - `true`：存在未채足的必填参数（需要调用 render_with_params）
+    /// - `false`：无参数或全有默认值（可以直接执行）
+    pub fn needs_params(&self, skill_id: &SkillId) -> bool {
+        self.skills.get(skill_id)
+            .map(|s| s.template_params.iter().any(|p| p.required && p.default.is_none()))
+            .unwrap_or(false)
+    }
 }
 
 // ─── SkillExecutor (Phase 2: workflow 真执行) ───────────────────────────

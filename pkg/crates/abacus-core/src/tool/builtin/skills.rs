@@ -75,6 +75,7 @@ fn skill_search_file() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["file_search".into(), "fs".into(), "discovery".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -124,6 +125,7 @@ fn skill_search_code() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["code_search".into(), "fs".into(), "symbol".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -165,6 +167,7 @@ fn skill_web_research() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["web".into(), "research".into(), "fetch".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -206,6 +209,7 @@ fn skill_knowledge() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["knowledge".into(), "kb".into(), "semantic".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -255,6 +259,7 @@ fn skill_data_query() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["database".into(), "db".into(), "query".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -304,6 +309,7 @@ fn skill_diagnose() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["diagnose".into(), "debug".into(), "error".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
 
@@ -344,5 +350,6 @@ fn skill_config_find() -> SkillDef {
         knowledge_refs: vec![],
         palace_tags: vec!["config".into(), "settings".into(), "file".into()],
         compound: true,
+        template_params: Vec::new(),
     }
 }
