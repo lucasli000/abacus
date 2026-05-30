@@ -414,11 +414,11 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             let label: String = job.label.chars().take(label_max).collect();
 
             // 最近执行时间（相对）
-            let last_run_str = job.last_run.map(|t| {
-                let secs = t.elapsed().as_secs();
-                if secs < 60 { format!("{}s前", secs) }
-                else if secs < 3600 { format!("{}m前", secs / 60) }
-                else { format!("{}h前", secs / 3600) }
+            let last_run_str = job.last_run.map(|instant| {
+                let secs = instant.elapsed().as_secs();
+                if secs < 60 { format!("{}{}", secs, t("time.sec_ago")) }
+                else if secs < 3600 { format!("{}{}", secs / 60, t("time.min_ago")) }
+                else { format!("{}{}", secs / 3600, t("time.hour_ago")) }
             });
             // 耗时展示
             let dur_str = job.last_duration_ms.map(|ms| {

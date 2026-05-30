@@ -225,7 +225,7 @@ fn build_message_lines(
                                         bar.clone(),
                                         Span::raw(" "),
                                         Span::styled(
-                                            format!("↳ +{} 行  Ctrl+E 展开全部", cb_hidden),
+                                            format!("↳ +{}{} {}", cb_hidden, t("msg.more_lines"), t("msg.expand")),
                                             fold_style,
                                         ),
                                     ]));
@@ -381,8 +381,8 @@ fn build_message_lines(
                     //   之前全 Caption 导致视觉权重过低,与 Block summary 不对称
                     // V29.12: summary 只显示非零项,避免 "0行思考" / "0工具" 噪声
                     let mut summary_parts: Vec<String> = Vec::new();
-                    if think_lines > 0 { summary_parts.push(format!("{}行思考", think_lines)); }
-                    if tool_count > 0 { summary_parts.push(format!("{}工具", tool_count)); }
+                    if think_lines > 0 { summary_parts.push(format!("{}{}", think_lines, t("msg.think_lines"))); }
+                    if tool_count > 0 { summary_parts.push(format!("{}{}", tool_count, t("msg.tools"))); }
                     if !dur_part.is_empty() { summary_parts.push(dur_part.trim_start_matches(" · ").to_string()); }
                     let summary_suffix = if summary_parts.is_empty() {
                         String::new()
@@ -453,7 +453,7 @@ fn build_message_lines(
                                     bar.clone(),
                                     Span::raw("  "),
                                     Span::styled(
-                                        format!("▸ {}次历史工具调用", hidden_call_count),
+                                        format!("▸ {}{}", hidden_call_count, t("msg.history_calls")),
                                         theme.text_style(TextRole::Caption),
                                     ),
                                 ]));
@@ -485,7 +485,7 @@ fn build_message_lines(
                                             bar.clone(),
                                             Span::raw("     "),
                                             Span::styled(
-                                                format!("[event #{} 已过期]", id),
+                                                format!("[event #{} {}]", id, t("msg.event_expired")),
                                                 theme.text_style(TextRole::Hint),
                                             ),
                                         ]));
@@ -1526,9 +1526,9 @@ pub fn render_messages_in_card(
             state.last_total_lines.get().min(total_before_slice)
         );
         let hint = if new_count > 0 {
-            format!("↓ {} 行新内容 · End 回到底部", new_count)
+            format!("↓ {}{}", new_count, t("msg.new_content"))
         } else {
-            "已离开底部 · End 回到底部".to_string()
+            t("msg.off_bottom").to_string()
         };
         let hint_line = Line::from(vec![Span::styled(hint, hint_style)]);
         // 在可见行前面插入提示条（如果不在顶部）

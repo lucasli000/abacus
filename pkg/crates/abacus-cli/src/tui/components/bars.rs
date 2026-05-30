@@ -153,7 +153,7 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // 网络异常时在 mode 后追加红色提示
     if state.connection_error {
         left.push(Span::styled(
-            " · 网络异常",
+            t("status.network_error"),
             Style::default().fg(state.theme.error).add_modifier(Modifier::BOLD),
         ));
     }
@@ -404,7 +404,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
             state.plan_phase,
             Some(crate::tui::state::PlanPhase::AwaitingApproval { .. })
         ) {
-            "输入 A/S/T/C 选择策略..."
+            t("status.plan_strategy")
         } else {
             "Ask anything..."
         };

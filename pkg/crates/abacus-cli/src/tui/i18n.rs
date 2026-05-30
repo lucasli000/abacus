@@ -295,6 +295,50 @@ pub fn t(key: &'static str) -> &'static str {
         "focus.concluded" => if zh { "结论完成" } else { "Concluded" },
         "focus.phase" => if zh { "阶段" } else { "Phase" },
 
+        // ── Overlay / Picker ──
+        "picker.mode" => if zh { " 切换模式 " } else { " Switch Mode " },
+        "picker.review" => if zh { " 审查类型 " } else { " Review Type " },
+        "picker.preset" => if zh { " ⚡ 场景预设 " } else { " ⚡ Presets " },
+        "picker.editor" => if zh { " 编辑器 (Ctrl+S 发送 · Esc 取消) " } else { " Editor (Ctrl+S send · Esc cancel) " },
+        "picker.hint_model" => if zh { " ↑↓ 选模型 · ←→ 调思考 · Enter 应用 · Esc 取消" } else { " ↑↓ model · ←→ thinking · Enter · Esc" },
+        "picker.hint_theme" => if zh { " ↑↓ 选主题 · Enter 应用 · Esc 取消" } else { " ↑↓ theme · Enter · Esc" },
+        "picker.hint_thinking" => if zh { " ↑↓ / ←→ 选深度 · Enter 应用 · Esc 取消" } else { " ↑↓/←→ depth · Enter · Esc" },
+        "picker.hint_mode" => if zh { " ↑↓ 选模式 · Enter 切换 · Esc 取消" } else { " ↑↓ mode · Enter · Esc" },
+        "picker.hint_review" => if zh { " ↑↓ 选类型 · Space strict · Enter 执行" } else { " ↑↓ type · Space strict · Enter" },
+        "picker.hint_session" => if zh { " ↑↓ 选会话 · Enter 恢复 · Esc 取消" } else { " ↑↓ session · Enter · Esc" },
+        "picker.hint_history" => if zh { " ↑↓ 选记录 · Enter 重发 · Esc 取消" } else { " ↑↓ history · Enter · Esc" },
+        "picker.hint_generic" => if zh { " ↑↓ 选操作 · Enter 执行 · Esc 取消" } else { " ↑↓ select · Enter · Esc" },
+        "picker.hint_preset" => if zh { " ↑↓ 选预设 · Enter 应用 · Esc 取消" } else { " ↑↓ preset · Enter · Esc" },
+        "confirm.safe" => if zh { " 工具属安全范围" } else { " Tool is safe" },
+        "confirm.risky" => if zh { " 检测到潜在风险" } else { " Potential risk detected" },
+        "confirm.after" => if zh { " 后 " } else { " after " },
+
+        // ── 消息流 ──
+        "msg.expand" => if zh { "Ctrl+E 展开全部" } else { "Ctrl+E expand" },
+        "msg.think_lines" => if zh { "行思考" } else { " think" },
+        "msg.tools" => if zh { "工具" } else { " tools" },
+        "msg.history_calls" => if zh { "次历史工具调用" } else { " prior tool calls" },
+        "msg.event_expired" => if zh { "已过期" } else { "expired" },
+        "msg.new_content" => if zh { "行新内容 · End 回底部" } else { " new · End to bottom" },
+        "msg.off_bottom" => if zh { "已离开底部 · End 回到底部" } else { "Off bottom · End to return" },
+        "msg.more_lines" => if zh { "行更多" } else { " more" },
+        "msg.hidden_expand" => if zh { "行隐藏（按 D 展开）" } else { " hidden (D expand)" },
+        "msg.earlier_calls" => if zh { "个较早调用" } else { " earlier calls" },
+
+        // ── 状态 ──
+        "status.network_error" => if zh { " · 网络异常" } else { " · Network error" },
+        "status.plan_strategy" => if zh { "输入 A/S/T/C 选择策略..." } else { "Type A/S/T/C to pick strategy..." },
+
+        // ── 面板补充 ──
+        "panel.deps" => if zh { "依赖" } else { "Deps" },
+        "panel.waiting_speak" => if zh { "等待发言" } else { "Awaiting" },
+        "panel.meeting_phase" => if zh { "会议阶段" } else { "Phase" },
+
+        // ── 时间相对值 ──
+        "time.sec_ago" => if zh { "s前" } else { "s ago" },
+        "time.min_ago" => if zh { "m前" } else { "m ago" },
+        "time.hour_ago" => if zh { "h前" } else { "h ago" },
+
         // ── 未匹配：返回 key 本身（'static 保证）──
         other => other,
     }
