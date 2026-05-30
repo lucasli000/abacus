@@ -1786,6 +1786,29 @@ impl<'a> TurnPipeline<'a> {
             if tool_calls.is_empty() {
                 let text = super::extract_text(&response.message);
 
+                // V42: 空回复强制重试——LLM 不应空回复
+                // 条件：text 为空 + 有工具输出 + 重试 < 1（防止无限循环）
+                // 动作：注入 system message 要求生成总结
+                if text.is_empty() && !ctx.all_tool_outputs.is_empty() && ctx.recovery_attempts < 1 {
+                    ctx.recovery_attempts += 1;
+                    tracing::warn!("LLM returned empty response after tool calls — requesting summary");
+                    {
+                        let s = self.session.read().await;
+                        let mut msgs = s.messages.write().await;
+                        msgs.push(Message {
+                            role: MessageRole::System,
+                            content: Some(MessageContent::Text(
+                                "[Abacus] You completed tool calls but did not provide a response to the user. \
+                                 Please summarize what you found/did and respond to the user's original request."
+                                    .into()
+                            )),
+                            name: None, tool_calls: None, tool_call_id: None,
+                            reasoning_content: None, prefix: false,
+                        });
+                    }
+                    continue; // 重新调用 LLM
+                }
+
                 // ── V39: Tool-Call-in-Text Detection ──────────────────────────────
                 // DeepSeek 等模型偶尔会在文本中写出工具名/命令而非发起 structured tool_call。
                 // 检测条件：response text 包含已注册工具名 + tool_calls 为空 + 重试 < 1
@@ -3442,7 +3465,9 @@ impl<'a> TurnPipeline<'a> {
     // ─── Phase 7: Persist & Build Result ────────────────────────────────────
 
     async fn persist_and_build_result(self, mut ctx: TurnContext) -> Result<TurnResult, KernelError> {
-        if ctx.final_response.is_empty() {
+        // V42: 空回复 fallback — 有工具输出时不显示误导性的 "max turns"
+        // 如果 LLM 完成了工具调用但没生成文本总结，留空（TUI 不渲染空消息）
+        if ctx.final_response.is_empty() && ctx.all_tool_outputs.is_empty() {
             ctx.final_response = "(max turns reached)".to_string();
         }
 

@@ -243,8 +243,8 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
     // Tab header
     let mut header_spans: Vec<Span> = Vec::new();
     let tabs: &[(DashboardTab, &str)] = &[
-        (DashboardTab::Health, "健康"),
-        (DashboardTab::Auto, "自动化"),
+        (DashboardTab::Health, t("dash.health")),
+        (DashboardTab::Auto, t("dash.auto")),
     ];
     for (i, (tab, label)) in tabs.iter().enumerate() {
         if i > 0 {
@@ -329,7 +329,7 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     let mut ctx_spans = vec![
         Span::styled(" ⬡ ", Style::default().fg(ctx_color)),
         Span::styled(ctx_text, Style::default().fg(ctx_color)),
-        Span::styled(format!("  {}轮", state.turn_count), muted),
+        Span::styled(format!("  {}{}", state.turn_count, t("dash.turns_unit")), muted),
     ];
     // thinking depth 紧凑追加在同一行（节省纵向空间）
     if !state.thinking_depth.is_empty() {
@@ -356,7 +356,7 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         // 未启用状态（紧凑：2行不留空）
         lines.push(Line::from(vec![
             Span::styled(" ⚡ ", muted),
-            Span::styled("未启用", muted),
+            Span::styled(t("dash.auto_disabled"), muted),
         ]));
         lines.push(Line::from(vec![
             Span::styled(" ~/.abacus/auto.yaml", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
@@ -367,12 +367,12 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let active = health.active_count();
         let failed = health.failed_count();
         lines.push(Line::from(vec![
-            Span::styled(" 任务 ", muted),
+            Span::styled(format!(" {} ", t("dash.jobs")), muted),
             Span::styled(format!("{}", total), Style::default().fg(state.theme.text)),
-            Span::styled("  运行 ", muted),
+            Span::styled(format!("  {} ", t("dash.running")), muted),
             Span::styled(format!("{}", active), Style::default().fg(state.theme.success)),
             if failed > 0 {
-                Span::styled(format!("  失败 {}", failed), Style::default().fg(state.theme.error))
+                Span::styled(format!("  {} {}", t("dash.failed"), failed), Style::default().fg(state.theme.error))
             } else {
                 Span::raw("")
             },
@@ -444,7 +444,7 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 format!("{}m", mins)
             };
             lines.push(Line::from(vec![
-                Span::styled("  运行  ", muted),
+                Span::styled(format!("  {}  ", t("dash.uptime")), muted),
                 Span::styled(uptime_str, Style::default().fg(state.theme.text)),
             ]));
         }

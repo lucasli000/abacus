@@ -236,6 +236,28 @@ pub fn t(key: &'static str) -> &'static str {
         "cmd.meeting" => if zh { "切换到 会诊 模式" } else { "Switch to Meeting mode" },
         "cmd.done" => if zh { "标记完成，推进下一阶段" } else { "Mark done, advance to next stage" },
 
+        // ── 仪表盘（Health / Auto dashboard）──
+        "dash.health" => if zh { "健康" } else { "Health" },
+        "dash.auto" => if zh { "自动化" } else { "Auto" },
+        "dash.turns_unit" => if zh { "轮" } else { "t" },
+        "dash.auto_disabled" => if zh { "未启用" } else { "Disabled" },
+        "dash.jobs" => if zh { "任务" } else { "Jobs" },
+        "dash.running" => if zh { "运行" } else { "Run" },
+        "dash.failed" => if zh { "失败" } else { "Fail" },
+        "dash.uptime" => if zh { "运行" } else { "Up" },
+
+        // ── Focus 面板 ──
+        "focus.thinking" => if zh { "思考中" } else { "Thinking" },
+        "focus.outputting" => if zh { "输出中" } else { "Outputting" },
+        "focus.processing" => if zh { "处理中" } else { "Processing" },
+        "focus.collecting" => if zh { "信息收集" } else { "Collecting" },
+        "focus.reasoning" => if zh { "推理分析" } else { "Reasoning" },
+        "focus.planning" => if zh { "规划" } else { "Planning" },
+        "focus.team" => if zh { "团队" } else { "Team" },
+        "focus.meeting" => if zh { "会诊" } else { "Meeting" },
+        "focus.done" => if zh { "完成" } else { "Done" },
+        "focus.thinking_lines" => if zh { "思考" } else { "Think" },
+
         // ── 未匹配：返回 key 本身（'static 保证）──
         other => other,
     }
