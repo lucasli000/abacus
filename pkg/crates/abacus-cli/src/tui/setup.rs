@@ -127,7 +127,7 @@ impl ProviderKind {
             ProviderKind::Yi          => "yi-lightning",
             ProviderKind::Baichuan    => "Baichuan4-Air",
             ProviderKind::Ollama      => "llama3.2",
-            ProviderKind::Generic     => "gpt-4o",
+            ProviderKind::Generic     => "",
         }
     }
 
@@ -212,14 +212,13 @@ enum FocusField {
 
 impl SetupState {
     fn new() -> Self {
-        // 预填默认值：用户只需输入 API Key 即可完成配置
-        let default_url = SUGGESTED_URL.to_string();
-        let default_model = ProviderKind::detect(&default_url).default_model().to_string();
+        // V41: 空白起步——不预填 URL/Model，让用户自行选择 provider
+        // 用户粘贴 URL 后自动识别 provider + 同步默认模型
         Self {
-            focus: FocusField::ApiKey, // 直接聚焦到 API Key（URL 和 Model 已有默认值）
+            focus: FocusField::BaseUrl, // 聚焦到 URL（引导用户先选 provider）
             api_key: String::new(),
-            base_url: default_url,
-            model_name: default_model,
+            base_url: String::new(),
+            model_name: String::new(),
             show_api_key: false,
             show_suggestions: true,
             exit: false,
@@ -1194,6 +1193,63 @@ fn render_features_page(f: &mut Frame, state: &SetupState) {
     );
 }
 
+/// 粘贴文本到当前聚焦的输入字段
+///
+/// 引用关系：run_setup 主循环中 Event::Paste 和 Ctrl+V 触发
+/// 生命周期：一次性执行，无副作用
+fn handle_paste(state: &mut SetupState, text: &str) {
+    // 清理粘贴文本：移除换行、首尾空白
+    let cleaned = text.trim().replace('\n', "").replace('\r', "");
+    if cleaned.is_empty() {
+        return;
+    }
+    match state.focus {
+        FocusField::BaseUrl => state.base_url.push_str(&cleaned),
+        FocusField::ModelName => {
+            state.model_name.push_str(&cleaned);
+            state.model_select_idx = usize::MAX;
+        }
+        FocusField::ApiKey => state.api_key.push_str(&cleaned),
+        FocusField::ContextWindow => state.context_window.push_str(&cleaned),
+        FocusField::ContextWindowUse => state.context_window_use.push_str(&cleaned),
+        FocusField::Features => {}
+    }
+}
+
+/// 从系统剪贴板获取文本（macOS: pbpaste）
+///
+/// 引用关系：Ctrl+V / Cmd+V 时调用
+fn get_clipboard_content() -> Result<String, ()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("pbpaste")
+            .output()
+            .map_err(|_| ())
+            .and_then(|o| {
+                if o.status.success() {
+                    Ok(String::from_utf8_lossy(&o.stdout).to_string())
+                } else {
+                    Err(())
+                }
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux: xclip or xsel
+        std::process::Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+            .map_err(|_| ())
+            .and_then(|o| {
+                if o.status.success() {
+                    Ok(String::from_utf8_lossy(&o.stdout).to_string())
+                } else {
+                    Err(())
+                }
+            })
+    }
+}
+
 fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers) {
     match state.focus {
         FocusField::BaseUrl => {
@@ -1224,7 +1280,7 @@ fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers
                 KeyCode::Backspace => { state.model_name.pop(); }
                 KeyCode::Tab => {
                     if !state.fetched_models.is_empty() {
-                        // M1 fix: 有候选列表时循环选择
+                        // Tab 在模型列表中循环选择（不切换焦点）
                         let next = if state.model_select_idx >= state.fetched_models.len() {
                             0
                         } else {
@@ -1232,11 +1288,16 @@ fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers
                         };
                         state.model_select_idx = next;
                         state.model_name = state.fetched_models[next].clone();
+                    } else if !state.base_url.is_empty() && !state.api_key.is_empty() {
+                        // V41: URL+Key 已填但无模型列表 → 触发获取（而非直接跳走）
+                        trigger_model_fetch(state);
                     } else {
-                        // M1 fix: 无候选时直接切换焦点，不卡死
+                        // 真的没条件获取 → 跳到下一字段
                         state.focus = FocusField::ApiKey;
                     }
                 }
+                // Shift+Tab: 回退到上一个字段
+                KeyCode::BackTab => state.focus = FocusField::BaseUrl,
                 KeyCode::Enter => state.focus = FocusField::ApiKey,
                 _ => {}
             }
@@ -1311,8 +1372,24 @@ pub fn run_setup(
         }
 
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+            // V41: 支持终端粘贴事件（bracketed paste）
+            // crossterm 在 enable_raw_mode 后支持 Event::Paste(String)
+            if let Event::Paste(ref text) = ev {
+                handle_paste(&mut state, text);
+                continue;
+            }
+            if let Event::Key(key) = ev {
                 if key.kind == KeyEventKind::Press {
+                    // Ctrl+V 粘贴（从系统剪贴板）
+                    if key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::SUPER)
+                        || key.code == KeyCode::Char('v') && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        if let Ok(clip) = get_clipboard_content() {
+                            handle_paste(&mut state, &clip);
+                        }
+                        continue;
+                    }
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                         return Ok(false);
                     }
