@@ -25,6 +25,8 @@ use ratatui::layout::Alignment;
 use tokio::sync::mpsc;
 use tracing;
 
+use crate::tui::i18n::t;
+
 use crate::tui::api::{EngineHandle, send_chat_message, send_team_message, send_meeting_message_streaming, send_plan_and_execute_streaming, list_cwd_files, ai_complete, ApiResult, EngineResponse};
 use crate::tui::event::{handle_chat_scroll_key, handle_global_key, handle_input_key, handle_mouse};
 use crate::tui::modes;
@@ -198,10 +200,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     // 首次配置 + 免责声明合并展示
     // 免责声明未接受 或 无 API 配置时 → 进入配置向导
     if !setup::disclaimer_accepted() || !setup::has_api_config() {
-        state.add_toast("首次使用，请完成配置", Duration::from_secs(5));
+        state.add_toast(t("toast.first_setup"), Duration::from_secs(5));
         let configured = setup::run_setup(&mut terminal)?;
         if configured {
-            state.add_toast("配置已保存，正在连接引擎", Duration::from_secs(3));
+            state.add_toast(t("toast.config_saved"), Duration::from_secs(3));
         } else {
             guard.deactivate()?;
             return Ok(());
@@ -237,7 +239,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         EngineHandle::new(abacus_types::ModelId::AUTO, &state.thinking_depth),
     ).await {
         Ok(Ok(e)) => {
-            state.add_toast("引擎已连接，输入消息即可对话", Duration::from_secs(3));
+            state.add_toast(t("toast.engine_connected"), Duration::from_secs(3));
             // V30 复制修复：首次连接提示选中复制路径。
             // 生命周期：仅首次连接出现（随引擎启动一次性提醒）；重连会重发，不频繁。
             // 引用关系：/help 有完整复制节，用户可查体。
@@ -388,7 +390,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 {
                     let pending = state.pending_compress_input.take().unwrap();
                     state.add_toast(
-                        format!("压缩完成，发送: {}", pending.chars().take(20).collect::<String>()),
+                        format!("{}: {}", t("compress.toast_done"), pending.chars().take(20).collect::<String>()),
                         Duration::from_secs(2),
                     );
                     state.input = pending;
@@ -451,7 +453,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                             if new_val != state.context_window {
                                                 state.context_window = new_val;
                                                 state.add_toast(
-                                                    format!("上下文窗口已热加载: {}", format_ctx(new_val)),
+                                                    format!("ctx hot-reload: {}", format_ctx(new_val)),
                                                     std::time::Duration::from_secs(3),
                                                 );
                                             }
@@ -1010,7 +1012,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 // V38: 切换状态指示到 Outputting
                                 state.set_busy_state(InputState::Outputting);
                                 state.processing_phase.clear();
-                                state.add_event(&ts, "llm", "开始输出", crate::tui::state::EventLevel::Info);
+                                state.add_event(&ts, "llm", crate::tui::i18n::t("event.outputting"), crate::tui::state::EventLevel::Info);
                             }
                             // K6：传入实际行内容数组，flash_state 内部计算 hash（避免"底部偏移"漂移）
                             let added: Vec<&str> = t.lines().collect();
@@ -1049,7 +1051,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.streaming_thinking_started = true;
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase.clear();
-                                state.add_event(&ts, "llm", "开始推理", crate::tui::state::EventLevel::Info);
+                                state.add_event(&ts, "llm", crate::tui::i18n::t("event.thinking"), crate::tui::state::EventLevel::Info);
                                 // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
                                 // 存最近 2 行非空内容（\n 分隔），渲染层展示 2 行 live preview
                                 let summary = {
