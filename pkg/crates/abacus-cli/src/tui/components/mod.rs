@@ -48,6 +48,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListDirection, Paragraph, Widget};
 
 use crate::tui::effects;
+use crate::tui::i18n::t;
 use crate::tui::markdown::{self, LineType};
 use crate::tui::state::{
     AppState, BlockKind, Focus, MsgContent, MsgRole, TimelineEntry, StreamingBlock, ToolCallSummary,
@@ -560,14 +561,15 @@ fn build_message_lines(
             badge_text,
             Style::default().fg(theme.session).add_modifier(Modifier::BOLD),
         );
-        let status_badge = Span::styled("输出中", Style::default().fg(theme.success));
+        let status_label = t("event.outputting");
+        let status_badge = Span::styled(status_label, Style::default().fg(theme.success));
         let time_text = " · now";
         let ts = Span::styled(
             time_text,
             theme.text_style(TextRole::Caption),
         );
         let badge_w = crate::tui::util::display_width(badge_text);
-        let status_w = crate::tui::util::display_width("输出中");
+        let status_w = crate::tui::util::display_width(status_label);
         let time_w = crate::tui::util::display_width(time_text);
         let hdr_content_w = (max_width as usize).saturating_sub(4);
         let header_gap = hdr_content_w.saturating_sub(badge_w + status_w + time_w + 2);
@@ -1238,8 +1240,8 @@ pub fn render_messages_in_card(
                 if !state.streaming_tools.iter().any(|(_, s, _, _)| *s == StreamingToolStatus::Running)
                     && state.streaming_text_started
                 {
-                    // TextDelta 输出中
-                    Span::styled("输出中", Style::default().fg(state.theme.success))
+                    // TextDelta outputting
+                    Span::styled(t("event.outputting"), Style::default().fg(state.theme.success))
                 } else if state.streaming_tools.iter().any(|(_, s, _, _)| *s == StreamingToolStatus::Running) {
                     // 工具执行中 — 显示最近运行的工具名
                     let running_name = state.streaming_tools.iter().rev()

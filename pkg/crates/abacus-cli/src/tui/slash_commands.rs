@@ -62,6 +62,7 @@ fn registry() -> &'static [Entry] {
         v.push(Entry { names: &["review"],          handler: cmd_review,   help: "审查 - /review <plan|diff|security> [--strict]" });
         v.push(Entry { names: &["role"],            handler: cmd_role,     help: "调用角色 - /role <fix|summarize|test>" });
         v.push(Entry { names: &["theme"],           handler: cmd_theme,    help: "切换主题" });
+        v.push(Entry { names: &["lang", "language"], handler: cmd_lang,    help: "切换语言 - /lang [zh|en]" });
         v.push(Entry { names: &["undo"],            handler: cmd_undo,     help: "撤销 - /undo [seq|turn|history|timeline]" });
         v.push(Entry { names: &["redo"],            handler: cmd_redo,     help: "重做" });
         v.push(Entry { names: &["search"],          handler: cmd_search,   help: "搜索消息 - /search <query>" });
@@ -531,6 +532,35 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
         });
     }
     s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
+    CmdResult::Consumed
+}
+
+/// /lang [zh|en] — 运行时切换 UI 语言
+/// 无参数时在 zh ↔ en 之间切换
+/// 引用关系：调用 i18n::set_lang()，立即生效（下一帧渲染可见）
+fn cmd_lang(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    use crate::tui::i18n::{Lang, lang, set_lang};
+    let new_lang = match args.first().map(|a| a.to_lowercase()).as_deref() {
+        Some("zh" | "cn" | "chinese") => Lang::Zh,
+        Some("en" | "english") => Lang::En,
+        Some(_) => {
+            s.add_toast("用法: /lang [zh|en]", std::time::Duration::from_secs(3));
+            return CmdResult::Consumed;
+        }
+        None => {
+            // Toggle
+            match lang() {
+                Lang::Zh => Lang::En,
+                Lang::En => Lang::Zh,
+            }
+        }
+    };
+    set_lang(new_lang);
+    s.add_toast(
+        format!("Language: {}", new_lang.display_name()),
+        std::time::Duration::from_secs(2),
+    );
+    s.rendered_lines_dirty.set(true);
     CmdResult::Consumed
 }
 

@@ -1,39 +1,64 @@
-//! TUI 多语言支持 — 中英双语，跟随系统 LANG 环境变量
+//! TUI 多语言支持 — 中英双语，运行时可切换（/lang 命令）
 //!
 //! ## 架构
-//! 轻量静态翻译表 + OnceLock 全局语言选择（进程生命周期内不变）
+//! 轻量静态翻译表 + AtomicU8 全局语言选择（支持运行时热切换）
+//!
+//! ## 规范（底层规范 #1：UI 文本 i18n）
+//! **所有面向用户的 UI 文本必须通过 `t(key)` 或 `tf(key, args)` 获取。**
+//! 禁止在渲染代码中硬编码中文或英文字符串。
+//! 新增 UI 文本时：① 在此文件添加 key → zh/en 映射 ② 渲染处调用 t(key)
 //!
 //! ## 依赖
-//! - `std::sync::OnceLock`: 一次性初始化语言设置
-//! - `std::env`: 读取 LANG/LC_ALL/ABACUS_LANG
+//! - `std::sync::atomic::AtomicU8`: 运行时可切换，零锁开销
+//! - `std::env`: 启动时读取 LANG/LC_ALL/ABACUS_LANG
 //!
 //! ## 引用关系
 //! - 被所有 TUI 组件调用（bars.rs, overlays.rs, extras.rs, panel.rs, run.rs）
 //! - `init_lang()` 在 main.rs 启动时调用一次
+//! - `set_lang()` 由 /lang slash 命令运行时调用
 //!
 //! ## 生命周期
-//! - `init_lang()`: 进程启动时调用一次，写入 OnceLock
+//! - `init_lang()`: 进程启动时检测系统语言
+//! - `set_lang()`: /lang 命令运行时切换（立即生效，下一帧渲染即可见）
 //! - `t(key)`: 任意时刻调用，返回 &'static str（零分配）
-//! - 语言设置进程内不可变
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// 支持的 UI 语言
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     /// 简体中文
-    Zh,
+    Zh = 0,
     /// English
-    En,
+    En = 1,
 }
 
-/// 全局语言设置（进程启动时一次性确定）
-static LANGUAGE: OnceLock<Lang> = OnceLock::new();
+impl Lang {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Lang::Zh,
+            _ => Lang::En,
+        }
+    }
+
+    /// 语言显示名（用于 /lang 命令输出）
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Lang::Zh => "简体中文",
+            Lang::En => "English",
+        }
+    }
+}
+
+/// 全局语言设置（AtomicU8：运行时可切换，零锁）
+/// 引用关系：init_lang 写入；set_lang 运行时切换；lang()/t() 每帧读取
+static LANGUAGE: AtomicU8 = AtomicU8::new(1); // 默认 En
 
 /// 初始化语言设置。检测优先级：
 /// 1. ABACUS_LANG 环境变量（显式覆盖）
-/// 2. LANG / LC_ALL 系统环境变量
-/// 3. 默认 En
+/// 2. config.yaml core.lang 配置
+/// 3. LANG / LC_ALL 系统环境变量
+/// 4. 默认 En
 ///
 /// 调用时机：main.rs 进程启动时调用一次
 pub fn init_lang() {
@@ -48,13 +73,19 @@ pub fn init_lang() {
     } else {
         Lang::En
     };
-    LANGUAGE.set(detected).ok();
+    LANGUAGE.store(detected as u8, Ordering::Relaxed);
+}
+
+/// 运行时切换语言（/lang 命令调用）
+/// 立即生效——下一帧渲染即可见
+pub fn set_lang(lang: Lang) {
+    LANGUAGE.store(lang as u8, Ordering::Relaxed);
 }
 
 /// 获取当前语言设置
 #[inline]
 pub fn lang() -> Lang {
-    LANGUAGE.get().copied().unwrap_or(Lang::En)
+    Lang::from_u8(LANGUAGE.load(Ordering::Relaxed))
 }
 
 /// 翻译查找——返回当前语言对应的静态字符串
@@ -257,6 +288,11 @@ pub fn t(key: &'static str) -> &'static str {
         "focus.meeting" => if zh { "会诊" } else { "Meeting" },
         "focus.done" => if zh { "完成" } else { "Done" },
         "focus.thinking_lines" => if zh { "思考" } else { "Think" },
+        "focus.tools" => if zh { "工具执行" } else { "Tools" },
+        "focus.waiting" => if zh { "等待" } else { "Waiting" },
+        "focus.speaking" => if zh { "发言中" } else { "Speaking" },
+        "focus.concluded" => if zh { "结论完成" } else { "Concluded" },
+        "focus.phase" => if zh { "阶段" } else { "Phase" },
 
         // ── 未匹配：返回 key 本身（'static 保证）──
         other => other,

@@ -439,7 +439,7 @@ fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: R
     } else if done_e == total_e && state.is_streaming {
         ("●", "综合中", state.theme.accent)
     } else if done_e == total_e && done_e > 0 {
-        ("✓", "结论完成", state.theme.success)
+        ("✓", t("focus.concluded"), state.theme.success)
     } else {
         ("○", "等待发言", state.theme.muted)
     };
@@ -1316,12 +1316,12 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         for (mode_label, mstats) in &mode_rows {
             let pct = (mstats.cost_cny / total_cny * 100.0).round() as u32;
             let bar_w = ((pct as usize) * 16 / 100).max(1);
-            // 中文 label 映射（per_mode key 来自 AbacusMode::label() 返回值，是小写）
+            // i18n label 映射（per_mode key 来自 AbacusMode::label() 返回值，是小写）
             let zh = match mode_label.as_str() {
-                "clarify" => "澄清",
-                "meeting" => "会诊",
-                "plan" => "规划",
-                "team" => "执行",
+                "clarify" => t("mode.clarify"),
+                "meeting" => t("mode.meeting"),
+                "plan" => t("mode.plan"),
+                "team" => t("mode.team"),
                 _ => mode_label.as_str(),
             };
             lines.push(Line::from(vec![
@@ -1355,10 +1355,10 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 let cur_label = state.mode.label();
                 if dominant_pct >= 0.80 && dominant_label.as_str() != cur_label {
                     let zh = match dominant_label.as_str() {
-                        "clarify" => "澄清",
-                        "meeting" => "会诊",
-                        "plan" => "规划",
-                        "team" => "执行",
+                        "clarify" => t("mode.clarify"),
+                        "meeting" => t("mode.meeting"),
+                        "plan" => t("mode.plan"),
+                        "team" => t("mode.team"),
                         _ => dominant_label.as_str(),
                     };
                     lines.push(Line::raw(""));
@@ -1642,11 +1642,11 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
 fn resolve_phase(tool_name: &str) -> &'static str {
     if tool_name.starts_with("mcp__octopus__") { return "浏览器操作"; }
-    if tool_name.starts_with("mcp__fetch__") || tool_name.starts_with("web_") { return "信息收集"; }
+    if tool_name.starts_with("mcp__fetch__") || tool_name.starts_with("web_") { return t("focus.collecting"); }
     if tool_name.contains("_search") || tool_name.contains("_fetch")
         || tool_name.contains("kb_query") || tool_name.contains("_read")
         || tool_name.contains("_list") || tool_name.contains("glob")
-        || tool_name.contains("grep") { return "信息收集"; }
+        || tool_name.contains("grep") { return t("focus.collecting"); }
     if tool_name.contains("_write") || tool_name.contains("_edit")
         || tool_name.contains("_create") || tool_name.contains("_delete")
         || tool_name.contains("_move") { return "代码修改"; }
@@ -1681,8 +1681,8 @@ fn compute_timeline_groups(state: &AppState) -> Vec<crate::tui::state::TimelineG
             }
             TraceKind::Thinking { lines: n, .. } => {
                 let line = format!("  ✓ 思考  {} 行", n);
-                if let Some(last) = groups.last_mut() { if last.label == "推理分析" { last.lines.push(line); continue; } }
-                groups.push(TimelineGroup { label: "推理分析".to_string(), timestamp: evt.time.clone(), lines: vec![line], is_active: false });
+                if let Some(last) = groups.last_mut() { if last.label == t("focus.reasoning") { last.lines.push(line); continue; } }
+                groups.push(TimelineGroup { label: t("focus.reasoning").to_string(), timestamp: evt.time.clone(), lines: vec![line], is_active: false });
             }
             _ => {}
         }
@@ -1961,10 +1961,10 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let running_names: Vec<&str> = state.streaming_tools.iter()
             .filter(|(_, s, _, _)| matches!(s, StreamingToolStatus::Running))
             .map(|(n, _, _, _)| n.as_str()).collect();
-        let stage = if !running_names.is_empty() { "工具执行" }
-            else if !state.streaming_thinking.is_empty() && !state.streaming_text_started { "思考中" }
-            else if state.streaming_text_started { "输出中" }
-            else { "处理中" };
+        let stage = if !running_names.is_empty() { t("focus.tools") }
+            else if !state.streaming_thinking.is_empty() && !state.streaming_text_started { t("focus.thinking") }
+            else if state.streaming_text_started { t("focus.outputting") }
+            else { t("focus.processing") };
         render_header(&format!("Focus · {}", stage), &mut lines, w);
 
         // thinking 预览（最新 3 行）
@@ -2021,7 +2021,7 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if state.processing_phase.starts_with("📋") {
         let total = state.tasks.len();
         let done = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
-        render_header(&format!("Focus · 规划 {}/{}", done, total), &mut lines, w);
+        render_header(&format!("Focus · {} {}/{}", t("focus.planning"), done, total), &mut lines, w);
 
         if let Some(ref goal) = state.session_goal {
             lines.push(Line::from(vec![
@@ -2063,7 +2063,7 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if state.processing_phase.starts_with("🤖") {
         let total = state.tasks.len();
         let done = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
-        render_header(&format!("Focus · 团队 {}/{}", done, total), &mut lines, w);
+        render_header(&format!("Focus · {} {}/{}", t("focus.team"), done, total), &mut lines, w);
 
         for task in state.tasks.iter().take(4) {
             let (icon, color) = match task.status {
@@ -2108,12 +2108,12 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 Span::styled(dom, dim),
             ]));
         }
-        let phase = if total == 0 { "等待" }
-            else if active > 0 { "发言中" }
-            else { "完成" };
+        let phase = if total == 0 { t("focus.waiting") }
+            else if active > 0 { t("focus.speaking") }
+            else { t("focus.done") };
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled(format!("阶段: {}", phase), Style::default().fg(state.theme.accent)),
+            Span::styled(format!("{}: {}", t("focus.phase"), phase), Style::default().fg(state.theme.accent)),
         ]));
         f.render_widget(Paragraph::new(lines), area);
         return;
