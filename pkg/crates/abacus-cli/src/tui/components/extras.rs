@@ -331,17 +331,19 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
         Span::styled(ctx_text, Style::default().fg(ctx_color)),
         Span::styled(format!("  {}{}", state.turn_count, t("dash.turns_unit")), muted),
     ];
-    // thinking depth 紧凑追加——根据模型实际能力显示
-    // 判定逻辑：turn_count > 0 且从未收到 thinking chunk → 模型不支持 → 显示 "none"
-    // 否则显示配置的 thinking_depth
-    if state.turn_count > 0 && state.thinking_text.is_empty() && !state.streaming_thinking_started {
-        // 模型不支持 thinking（至少 1 轮对话后从未收到 reasoning_content）
-        ctx_spans.push(Span::styled(
-            format!("  {}:none", t("dash.thinking")),
-            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-        ));
-    } else if !state.thinking_depth.is_empty() {
-        ctx_spans.push(Span::styled(format!("  {}", state.thinking_depth), muted));
+    // thinking 状态：根据模型实际能力显示
+    // turn_count == 0 → 不显示（未对话，无法判断）
+    // turn_count > 0 且从未收到 thinking → "think:none"
+    // turn_count > 0 且收到过 thinking → 显示配置值（如 "high"）
+    if state.turn_count > 0 {
+        if state.thinking_text.is_empty() && !state.streaming_thinking_started {
+            ctx_spans.push(Span::styled(
+                format!("  {}:none", t("dash.thinking")),
+                Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+            ));
+        } else if !state.thinking_depth.is_empty() {
+            ctx_spans.push(Span::styled(format!("  {}", state.thinking_depth), muted));
+        }
     }
     lines.push(Line::from(ctx_spans));
 
