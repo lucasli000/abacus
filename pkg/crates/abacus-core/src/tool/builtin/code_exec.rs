@@ -61,7 +61,7 @@ impl CodeExecutorTool {
     pub async fn register(registry: &ToolRegistry) {
         let handle = ToolHandle {
             id: ToolId("code_execute".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "code_execute".into(),
                 description: "Execute a Rhai script locally for data operations. "
                     .into(),

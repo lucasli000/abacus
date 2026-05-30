@@ -165,7 +165,7 @@ pub async fn register(registry: &ToolRegistry) {
     for (name, desc, params) in tools {
         registry.register(ToolHandle {
             id: ToolId(name.to_string()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: name.to_string(),
                 description: desc.to_string(),
                 parameters: params.clone(),

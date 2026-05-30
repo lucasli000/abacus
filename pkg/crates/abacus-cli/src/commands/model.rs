@@ -106,7 +106,7 @@ pub async fn handle_model(args: &super::ModelArgs, formatter: &mut Box<dyn Outpu
         }
         ModelAction::Discover { path, write_config } => {
             // 用默认 model 初始化 engine（仅为获取注册的 provider 列表）
-            let default_model = "deepseek-v4-flash"; // engine_init 会按已配置 key 自动选择真实 provider
+            let default_model = abacus_types::ModelId::AUTO; // engine_init 按配置链解析真实 provider
             match engine_init::create_engine(default_model, None, "off").await {
                 Ok((core, _session)) => {
                     formatter.format_message("model", "🔍 Discovering models from all registered providers...", None);

@@ -618,7 +618,7 @@ impl AbacusServer {
         cfg_mgr.load_dir(paths::conf_d_dir());
 
         let default_model = cfg_mgr.get_str("core.default_model")
-            .unwrap_or("deepseek-v4-flash");
+            .unwrap_or(abacus_types::ModelId::AUTO);
         let max_turns = cfg_mgr.get_number("core.max_turns")
             .map(|n| n as u32).unwrap_or(50);
         let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls")
@@ -701,6 +701,10 @@ impl AbacusServer {
             lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
             // Task #96：单 session 模型升级预算
             max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
+            // 模型升级目标：从 config 读取；空字符串或缺省视为 None（禁用升级）
+            escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
+                .filter(|s| !s.is_empty())
+                .map(|s| abacus_types::ModelId(s.to_string())),
             // W2 (Task #100)：tool result dedup —— 默认关；运维通过 core.dedup.* 显式开启
             tool_result_dedup_enabled: cfg_mgr.get_bool("core.dedup.enabled").unwrap_or(false),
             tool_result_dedup_ttl_secs: cfg_mgr.get_number("core.dedup.ttl_secs").map(|n| n as u64).unwrap_or(60),

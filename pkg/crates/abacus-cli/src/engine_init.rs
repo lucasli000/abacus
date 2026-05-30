@@ -338,14 +338,20 @@ pub async fn create_engine(
                 }
                 ProviderType::OpenaiCompatible | ProviderType::Gemini => {
                     use abacus_core::llm::providers::openai_compatible::OpenAICompatibleProvider;
+                    let user_configured_url = entry.base_url.is_some();
                     let base = entry.base_url.clone()
                         .unwrap_or_else(|| "https://api.openai.com/v1".into());
                     let default_oai_model = models.first().cloned()
                         .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
-                    let p = Arc::new(OpenAICompatibleProvider::new(
+                    let mut provider = OpenAICompatibleProvider::new(
                         api_key, default_oai_model,
                         base, None, None, None,
-                    ));
+                    );
+                    // 只从用户配置的 URL 检测模型；未配置时用静态列表
+                    if !user_configured_url {
+                        provider.set_discover_enabled(false);
+                    }
+                    let p = Arc::new(provider);
                     core.register_provider_group(&entry.id, models, p).await;
                 }
             }

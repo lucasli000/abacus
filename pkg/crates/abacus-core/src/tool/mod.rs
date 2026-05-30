@@ -465,6 +465,39 @@ impl ToolRegistry {
     pub async fn tool_names(&self) -> Vec<String> {
         self.tools.read().await.keys().map(|k| k.0.clone()).collect()
     }
+
+    /// 检查是否有任何工具的 ID 以给定前缀开头
+    ///
+    /// ## 引用关系
+    /// - 调用方: CoreLoop::reevaluate_adaptive_subsystems()（热重载决策）
+    /// - 读取: self.tools（read lock）
+    ///
+    /// ## 生命周期
+    /// 纯查询，无副作用
+    pub async fn has_prefix(&self, prefix: &str) -> bool {
+        let tools = self.tools.read().await;
+        tools.keys().any(|id| id.0.starts_with(prefix))
+    }
+
+    /// 移除所有 ID 以给定前缀开头的工具（cold-unload）
+    ///
+    /// ## 引用关系
+    /// - 调用方: CoreLoop::cold_unload_subsystem()（自适应卸载）
+    /// - 修改: self.tools + self.tools_cache（write lock，invalidate cache）
+    ///
+    /// ## 副作用
+    /// - 移除匹配的 ToolHandle（schema 不再对 LLM 可见）
+    /// - Executor 保留在 self.executors 中（下次 hot-load 时直接可用，不需重新注册）
+    /// - Invalidate tools_cache
+    ///
+    /// ## KV cache 影响
+    /// 工具列表变化 → system_segments hash 变化 → 自动触发 KV cache invalidation
+    pub async fn remove_by_prefix(&self, prefix: &str) {
+        let mut tools = self.tools.write().await;
+        tools.retain(|id, _| !id.0.starts_with(prefix));
+        // Invalidate cache
+        *self.tools_cache.write().await = None;
+    }
 }
 
 /// True if `tool_tier` meets the minimum `threshold` tier
@@ -706,7 +739,7 @@ mod integration_tests {
         let reg = ToolRegistry::new();
         let tool = ToolHandle {
             id: ToolId("test_tool".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "test_tool".into(),
                 description: "A test tool".into(),
                 parameters: serde_json::json!({}),

@@ -16,8 +16,15 @@ use serde::{Deserialize, Serialize};
 // ─── 模型分配 ───────────────────────────────────────────────────────────────
 
 /// 模型分配策略
+///
+/// ## 引用关系
+/// - 消费方：SandboxConfig.execute_model / verify_model
+/// - 解析方：sandbox executor 在运行时通过 ProviderRegistry 解析 Auto/Fixed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModelAssignment {
+    /// 使用 CoreConfig.default_model / ModelPreference 配置链自动解析
+    /// （推荐——不绑定特定 provider）
+    Auto,
     /// 使用执行模型（贵）
     Execute,
     /// 使用校验模型（便宜）
@@ -163,8 +170,8 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            execute_model: ModelAssignment::Fixed { provider: "deepseek".into(), model: "deepseek-v4-flash".into() },
-            verify_model: ModelAssignment::Fixed { provider: "deepseek".into(), model: "deepseek-chat".into() },
+            execute_model: ModelAssignment::Auto,
+            verify_model: ModelAssignment::Auto,
             work_dir: "/tmp/abacus-sandbox".into(),
             max_retries_per_step: 2,
             default_timeout_secs: 120,

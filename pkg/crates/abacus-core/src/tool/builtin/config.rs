@@ -306,7 +306,7 @@ pub fn read_override_compress_level(overrides: &RuntimeOverrides) -> Option<Comp
 
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
-        ToolSchema {
+        ToolSchema { short_description: None,
             name: "config_get".into(),
             description: "List current runtime config values. Returns all or a specific key.".into(),
             parameters: json!({
@@ -330,7 +330,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             applicable_task_kinds: None,
             idempotent: true,
                         schema_stable: false,        },
-        ToolSchema {
+        ToolSchema { short_description: None,
             name: "config_set".into(),
             description: "Modify a runtime config parameter. Changes apply immediately.".into(),
             parameters: json!({

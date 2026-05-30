@@ -160,7 +160,7 @@ impl McpGrpcTransport {
                     crate::llm::tool_view::sanitize_name(&self.server_id),
                     crate::llm::tool_view::sanitize_name(&t.name),
                 )),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: format!(
                         "mcp_{}_{}",
                         crate::llm::tool_view::sanitize_name(&self.server_id),
@@ -360,7 +360,7 @@ impl McpClient {
             name_map_entries.push((sanitized_id.clone(), name.to_string()));
             Some(ToolHandle {
                 id: ToolId(sanitized_id.clone()),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: sanitized_id,
                     description: description.to_string(),
                     parameters: params,

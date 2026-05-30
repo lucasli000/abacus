@@ -1,4 +1,5 @@
 pub mod model;
+pub mod model_preference;
 pub mod model_registry;
 pub mod abacus_mode;
 pub mod error;
@@ -47,7 +48,7 @@ pub mod user_profile {
         fn default() -> Self {
             Self {
                 display_name: "User".into(),
-                default_model: "deepseek-v4-flash".into(),
+                default_model: "auto".into(),
                 thinking: "off".into(),
                 autonomy: "confirm_sensitive".into(),
                 safe_operations: HashSet::new(),
@@ -125,6 +126,7 @@ pub use collections::BoundedFifo;
 pub use model::{
     ModelId,
     ProviderId,
+    QualifiedModelId,
     CapabilitySet,
     SchemaFormat,
     RateLimits,
@@ -140,6 +142,14 @@ pub use model::{
     Pricing,
     lookup_pricing,
     InlineModelSpec,
+};
+
+// model_preference re-exports
+pub use model_preference::{
+    ModelPreference,
+    preference_file_path,
+    load_from_file as load_model_preference,
+    save_to_file as save_model_preference,
 };
 
 // V31: 新模型注册表（按 model_id 维度的 SSoT）— 价格 / 能力 / 限制 / 生命周期聚合

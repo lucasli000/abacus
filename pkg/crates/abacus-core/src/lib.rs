@@ -35,6 +35,7 @@ pub mod deduction;
 pub mod auto;
 pub mod sandbox;
 pub mod lsp;
+pub mod code_graph;
 pub mod undo;
 
 // P2-P3: 智能化升级新子系统
@@ -46,6 +47,28 @@ pub mod feedback;     // MT-GRPO 轨迹收集器 (B4)
 pub mod config;
 pub mod secrets;
 pub mod validation;
+
+/// SQLite PRAGMA 兼容层（rusqlite 0.32+）
+///
+/// rusqlite 0.32 起 `execute_batch` 不允许返回结果集的语句（如 PRAGMA journal_mode）。
+/// 此模块提供 `apply_standard_pragmas()` 作为统一替代。
+pub mod db_util {
+    use rusqlite::Connection;
+
+    /// 应用标准 WAL 性能 PRAGMA（兼容 rusqlite 0.32+）
+    pub fn apply_standard_pragmas(conn: &Connection) -> Result<(), rusqlite::Error> {
+        let pragmas = [
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=5000",
+        ];
+        for sql in pragmas {
+            let mut stmt = conn.prepare(sql)?;
+            let _ = stmt.raw_execute();
+        }
+        Ok(())
+    }
+}
 
 // Canonical re-exports for downstream consumers — Core types
 pub use core::CoreLoop;

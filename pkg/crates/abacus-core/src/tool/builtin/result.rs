@@ -213,7 +213,7 @@ impl ToolExecutor for ResultExpandExecutor {
 
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
-        ToolSchema {
+        ToolSchema { short_description: None,
             name: "result_expand".into(),
             description: "Retrieve the full content of a previously truncated tool result by its result_id (returned in the _truncated payload).".into(),
             parameters: json!({

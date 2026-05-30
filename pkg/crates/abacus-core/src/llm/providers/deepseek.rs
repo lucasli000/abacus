@@ -209,6 +209,11 @@ pub struct DeepSeekProvider {
     pricing: Pricing,
     reasoning_effort: Option<String>,
     default_max_tokens: u32,
+    /// 是否允许 discover_models() 发网络请求
+    /// true = 用户显式配置了 base_url → 允许打 /v1/models
+    /// false = 使用内置默认 URL → 只返回静态列表
+    /// 引用关系：with_config 根据 base_url 参数设置；discover_models() 消费
+    discover_enabled: bool,
 }
 
 impl DeepSeekProvider {
@@ -255,6 +260,7 @@ impl DeepSeekProvider {
         //       ② 否则查 model.supports_prefix_completion → true 用 BETA_BASE_URL
         //       ③ 否则用 DEFAULT_BASE_URL（主域，全功能）
         // 设计意图：V4-Flash/Pro 走 beta 自动启用 prefix；legacy alias 走主域兼容老路径
+        let discover_enabled = base_url.is_some();
         let resolved_base_url = base_url.unwrap_or_else(|| {
             let supports_prefix = abacus_types::lookup_model(model_str)
                 .map(|m| m.supports_prefix_completion)
@@ -275,6 +281,7 @@ impl DeepSeekProvider {
             pricing,
             reasoning_effort,
             default_max_tokens: 64000,
+            discover_enabled,
         }
     }
 
@@ -1001,7 +1008,11 @@ impl LlmProvider for DeepSeekProvider {
     }
 
     /// GET {base_url}/v1/models — DeepSeek 是 OpenAI-compatible 协议
+    /// 只从用户配置的 URL 检测；未配置时返回静态列表
     async fn discover_models(&self) -> abacus_types::Result<Vec<ModelId>> {
+        if !self.discover_enabled {
+            return Ok(self.supported_models());
+        }
         let resp = self.client
             .get(format!("{}/v1/models", self.base_url))
             .timeout(std::time::Duration::from_secs(15))

@@ -238,7 +238,7 @@ fn compute_confidence(text: &str, level: u8) -> f64 {
 
 pub fn schemas() -> Vec<ToolSchema> {
     vec![
-        ToolSchema {
+        ToolSchema { short_description: None,
             name: "orchestrate_assess".into(),
             description: "评估任务复杂度（L1/L2/L3），推荐 Agent 团队".into(),
             parameters: json!({
@@ -259,7 +259,7 @@ pub fn schemas() -> Vec<ToolSchema> {
             applicable_task_kinds: None,
             idempotent: true,
                         schema_stable: false,        },
-        ToolSchema {
+        ToolSchema { short_description: None,
             name: "orchestrate_upgrade".into(),
             description: "报告执行级别不足，请求升级".into(),
             parameters: json!({

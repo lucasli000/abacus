@@ -40,9 +40,10 @@ impl TaskLogStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
         let conn = Connection::open(&path).map_err(|e| format!("open task_logs: {e}"))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| format!("pragma: {e}"))?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS task_logs (
+            "CREATE TABLE IF NOT EXISTS task_logs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  task_id TEXT NOT NULL,
                  phase_id TEXT NOT NULL,
@@ -66,9 +67,10 @@ impl TaskLogStore {
 
     pub fn in_memory() -> Result<Self, String> {
         let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| e.to_string())?;
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS task_logs (
+            "CREATE TABLE IF NOT EXISTS task_logs (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  task_id TEXT NOT NULL, phase_id TEXT NOT NULL, step_id TEXT NOT NULL,
                  attempt INTEGER NOT NULL DEFAULT 1,

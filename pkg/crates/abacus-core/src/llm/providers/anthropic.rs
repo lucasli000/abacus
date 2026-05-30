@@ -264,6 +264,11 @@ pub struct AnthropicProvider {
     default_max_tokens: u32,
     thinking_budget: u32,
     beta_headers: Vec<(String, String)>,
+    /// 是否允许 discover_models() 发网络请求
+    /// true = 用户显式配置了 base_url → 允许打 /v1/models
+    /// false = 使用内置默认 URL → 只返回静态列表（不发网络请求）
+    /// 引用关系：构造函数根据 base_url 参数是否为 Some 设置；discover_models() 消费
+    discover_enabled: bool,
 }
 
 impl AnthropicProvider {
@@ -299,6 +304,7 @@ impl AnthropicProvider {
             (16384, 32000)
         };
 
+        let discover_enabled = base_url.is_some();
         Self {
             client,
             request_timeout,
@@ -308,6 +314,7 @@ impl AnthropicProvider {
             default_max_tokens: max_tokens,
             thinking_budget: budget,
             beta_headers,
+            discover_enabled,
         }
     }
 
@@ -1039,6 +1046,10 @@ impl LlmProvider for AnthropicProvider {
     /// - 调用方: CoreLoop::discover_all_models()
     /// - 依赖: Anthropic Models API (GET /v1/models, x-api-key header)
     async fn discover_models(&self) -> abacus_types::Result<Vec<ModelId>> {
+        // 只从用户配置的 URL 检测；未配置时返回静态列表，不发网络请求
+        if !self.discover_enabled {
+            return Ok(self.supported_models());
+        }
         let resp = crate::llm::shared_http_client()
             .get(format!("{}/v1/models", self.base_url))
             .timeout(std::time::Duration::from_secs(15))

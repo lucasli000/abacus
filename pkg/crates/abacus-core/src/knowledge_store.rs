@@ -111,11 +111,8 @@ impl KnowledgeStore {
         let conn = Connection::open(&path)
             .map_err(|e| format!("cannot open kb db: {e}"))?;
 
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
-        ).map_err(|e| format!("pragma failed: {e}"))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| format!("pragma failed: {e}"))?;
 
         Self::init_schema(&conn)?;
 

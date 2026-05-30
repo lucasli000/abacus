@@ -327,6 +327,7 @@ User goal: {goal}"#,
 
     fn resolve_model(&self, assignment: &ModelAssignment) -> String {
         match assignment {
+            ModelAssignment::Auto => abacus_types::ModelId::AUTO.to_string(),
             ModelAssignment::Execute => self.format_model(&self.config.execute_model),
             ModelAssignment::Verify => self.format_model(&self.config.verify_model),
             ModelAssignment::Fixed { provider, model } => format!("{provider}:{model}"),
@@ -335,8 +336,9 @@ User goal: {goal}"#,
 
     fn format_model(&self, ma: &ModelAssignment) -> String {
         match ma {
+            ModelAssignment::Auto => abacus_types::ModelId::AUTO.to_string(),
             ModelAssignment::Fixed { provider, model } => format!("{provider}:{model}"),
-            _ => "deepseek:deepseek-chat".into(),
+            _ => abacus_types::ModelId::AUTO.to_string(),
         }
     }
 
@@ -542,7 +544,7 @@ impl SandboxToolExecutor {
         ] {
             let handle = ToolHandle {
                 id: ToolId(desc.0.into()),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: desc.0.into(),
                     description: desc.1.into(),
                     parameters: serde_json::json!({"type": "object", "properties": {

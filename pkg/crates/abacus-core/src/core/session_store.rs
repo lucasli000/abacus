@@ -33,11 +33,8 @@ impl SqliteSessionStore {
             .map_err(|e| KernelError::Other(format!("sqlite open: {e}")))?;
 
         // Enable WAL mode for better concurrent read performance
-        conn.execute_batch("
-            PRAGMA journal_mode=WAL;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA busy_timeout=5000;
-        ").map_err(|e| KernelError::Other(format!("sqlite pragma: {e}")))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| KernelError::Other(format!("sqlite pragma: {e}")))?;
 
         // Create session_snapshots table
         conn.execute(

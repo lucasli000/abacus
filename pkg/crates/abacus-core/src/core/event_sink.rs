@@ -1039,7 +1039,7 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         let archive_count = dir_entries.iter()
-            .filter(|n| n.starts_with("test_session.") && n != "test_session.jsonl")
+            .filter(|n| n.starts_with("test_session.") && n.as_str() != "test_session.jsonl")
             .count();
         assert_eq!(archive_count, 1, "应产生 1 个 archive 文件: {dir_entries:?}");
 

@@ -1146,11 +1146,8 @@ impl SqlitePalaceStore {
         }
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| format!("cannot open palace db: {e}"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
-        ).map_err(|e| format!("pragma: {e}"))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| format!("pragma: {e}"))?;
 
         Self::init_schema(&conn)?;
         Ok(Self { conn: std::sync::Arc::new(tokio::sync::Mutex::new(conn)) })

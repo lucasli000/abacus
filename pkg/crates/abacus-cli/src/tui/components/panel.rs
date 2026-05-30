@@ -1739,7 +1739,6 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
 
     let muted = Style::default().fg(state.theme.muted);
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
     let txt = Style::default().fg(state.theme.text);
     let gold = Style::default().fg(state.theme.gold);
     let mut lines: Vec<Line> = Vec::new();

@@ -23,6 +23,7 @@ pub mod kb;
 pub mod orchestrate;
 pub mod lsp;
 pub mod result;
+pub mod cg;
 /// 内置场景 Skill 定义（由 CoreLoop::load_builtin_skills() 加载）
 pub mod skills;
 

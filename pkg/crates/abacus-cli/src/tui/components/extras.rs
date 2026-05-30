@@ -278,16 +278,30 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
 /// V40 重设计：去掉进度条，纯文本紧凑排列
 /// 第一行：模型名 · 思考档位
 /// 第二行：⬡ 上下文已用/总量 · turns N · cmp N
+/// 健康仪表盘（右下角）— 方案 E 排版
+///
+/// 布局：
+///   ─ Health ─────────────
+///     ● provider  model
+///     ⬡ 17K/128K/1M  5轮
 fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use crate::tui::components::bars::format_ctx;
 
     let mut lines: Vec<Line> = Vec::new();
     let muted = Style::default().fg(state.theme.muted);
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+    let txt = Style::default().fg(state.theme.text);
+    let w = (area.width as usize).saturating_sub(4).max(10);
 
-    // 第一行：provider(状态) · 模型名 · 思考档位
-    // provider 来自 config.yaml providers[].id（真实配置，非推断）
-    // 状态指示：● = 可用（discover 成功），✗ = 不可用，— = 未检测
+    // 标题行
+    let header_fill = w.saturating_sub(8).min(12);
+    lines.push(Line::from(vec![
+        Span::styled("  ─ ", dim),
+        Span::styled("Health", muted),
+        Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
+    ]));
+
+    // Provider + Model（4 格缩进）
     let provider_label = if state.active_provider_id.is_empty() { "—" } else { &state.active_provider_id };
     let (status_icon, status_color) = match state.provider_statuses.iter()
         .find(|(id, _, _)| id == &state.active_provider_id)
@@ -297,46 +311,45 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
         None => ("·", state.theme.muted),
     };
     lines.push(Line::from(vec![
-        Span::styled(format!("  {}{} ", status_icon, provider_label), Style::default().fg(status_color)),
+        Span::styled("    ", dim),
+        Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+        Span::styled(provider_label, Style::default().fg(status_color)),
+        Span::styled("  ", dim),
         Span::styled(&state.model_name, Style::default().fg(state.theme.accent)),
-        Span::styled(" · ", dim),
-        Span::styled(&state.thinking_depth, Style::default().fg(state.theme.text)),
     ]));
 
-    // 第二行：⬡ 已用/系统设定/LLM最大 · turns N · cmp N
+    // Context: ⬡ used/configured/max  turns
     let raw_used = if state.ctx_live_tokens > 0 {
         state.ctx_live_tokens as usize
     } else {
         state.session_tokens.latest_prompt_tokens as usize
     };
-    let configured = state.context_window;       // 系统设定有效窗口
-    let model_max = state.model_max_context;     // LLM 物理最大
-    // 防御性 clamp：显示值不超过系统设定窗口
+    let configured = state.context_window;
+    let model_max = state.model_max_context;
     let used = if configured > 0 { raw_used.min(configured) } else { raw_used };
     let ctx_color = match (used * 100).checked_div(configured).unwrap_or(0) {
         0..=49 => state.theme.success,
         50..=79 => state.theme.gold,
         _ => state.theme.error,
     };
-
-    // 格式：⬡ 19.9K/500K/1M  (已用/设定/最大)
-    // 当 configured == model_max 时省略最后一段（无 ratio 配置）
     let ctx_text = if configured == model_max || model_max == 0 {
         format!("{}/{}", format_ctx(used), format_ctx(configured))
     } else {
         format!("{}/{}/{}", format_ctx(used), format_ctx(configured), format_ctx(model_max))
     };
-
-    let mut row: Vec<Span> = vec![
-        Span::styled("  ⬡ ", Style::default().fg(ctx_color)),
+    lines.push(Line::from(vec![
+        Span::styled("    ⬡ ", Style::default().fg(ctx_color)),
         Span::styled(ctx_text, Style::default().fg(ctx_color)),
-        Span::styled(format!(" · turns {}", state.turn_count), muted),
-    ];
-    let comp = state.session_tokens.compress_count;
-    if comp > 0 {
-        row.push(Span::styled(format!(" · cmp {}", comp), muted));
+        Span::styled(format!("  {}轮", state.turn_count), muted),
+    ]));
+
+    // Thinking depth（如果非空）
+    if !state.thinking_depth.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled(&state.thinking_depth, txt),
+        ]));
     }
-    lines.push(Line::from(row));
 
     let visible = area.height as usize;
     if lines.len() > visible { lines.truncate(visible); }

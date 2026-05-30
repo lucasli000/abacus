@@ -635,7 +635,7 @@ impl DeductionToolExecutor {
         let tools = vec![
             ToolHandle {
                 id: ToolId("deduction_status".into()),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: "deduction_status".into(),
                     description: "查看当前推演引擎的活跃告警".into(),
                     parameters: json!({"type": "object", "properties": {}, "required": []}),
@@ -655,7 +655,7 @@ impl DeductionToolExecutor {
             },
             ToolHandle {
                 id: ToolId("deduction_analyze".into()),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: "deduction_analyze".into(),
                     description: "运行深度推演分析。kind 可选: contamination|patterns|context|prompt".into(),
                     parameters: json!({

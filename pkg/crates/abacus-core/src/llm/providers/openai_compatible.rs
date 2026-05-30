@@ -239,6 +239,11 @@ pub struct OpenAICompatibleProvider {
     auth_header: String,
     auth_prefix: String,
     default_max_tokens: u32,
+    /// 是否允许 discover_models() 发网络请求
+    /// true = 用户显式配置了 base_url → 允许打 /v1/models
+    /// false = 使用内置默认 URL → 只返回静态列表
+    /// 引用关系：new() 设置；discover_models() 消费
+    discover_enabled: bool,
 }
 
 impl OpenAICompatibleProvider {
@@ -272,7 +277,15 @@ impl OpenAICompatibleProvider {
             auth_header: auth_header.unwrap_or_else(|| "Authorization".into()),
             auth_prefix: auth_prefix.unwrap_or_else(|| "Bearer ".into()),
             default_max_tokens: 64000,
+            // 默认启用 discover — 调用方可通过 set_discover_enabled(false) 关闭
+            discover_enabled: true,
         }
+    }
+
+    /// 设置是否允许 discover_models() 发网络请求
+    /// 用于调用方明确知道 base_url 非用户配置时禁用自动检测
+    pub fn set_discover_enabled(&mut self, enabled: bool) {
+        self.discover_enabled = enabled;
     }
 
     fn build_request(&self, req: &LlmRequest) -> ChatRequest {
@@ -808,9 +821,13 @@ impl LlmProvider for OpenAICompatibleProvider {
 
     /// 调用 GET {base_url}/v1/models 拉取可用模型列表（OpenAI 标准协议）
     ///
+    /// 只从用户配置的 URL 检测；未配置时返回静态列表，不发网络请求。
     /// 响应格式：`{"data": [{"id": "...", "object": "model"}, ...]}`
     /// 失败时返回 Err，调用方应 fallback 到 supported_models().
     async fn discover_models(&self) -> abacus_types::Result<Vec<ModelId>> {
+        if !self.discover_enabled {
+            return Ok(self.supported_models());
+        }
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self.client
             .get(format!("{}/v1/models", self.base_url))

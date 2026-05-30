@@ -30,7 +30,7 @@ pub async fn handle_turnkey(args: &super::TurnkeyArgs, formatter: &mut Box<dyn O
 
             // Phase 1: Plan generation
             formatter.format_message("turnkey", "[1/3] Generating execution plan...", None);
-            formatter.format_message("turnkey", "  Model: deepseek-v4-flash (planner)", None);
+            formatter.format_message("turnkey", "  Model: (configured default — planner)", None);
 
             // In full integration: create SandboxOrchestrator + call plan_from_nl
             // For now, demonstrate the flow structure

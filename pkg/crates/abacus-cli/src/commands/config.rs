@@ -14,7 +14,7 @@ pub async fn handle_config(args: &super::ConfigArgs, formatter: &mut Box<dyn Out
                 ("llm.base_url",          "API 服务地址（不改默认即可）"),
                 ("llm.anthropic_api_key", "Anthropic 协议的 API 密钥"),
                 ("llm.openai_api_key",    "OpenAI 兼容接口的 API 密钥"),
-                ("core.default_model",    "对话使用的模型（如 deepseek-v4-flash）"),
+                ("core.default_model",    "对话使用的模型（如 deepseek-v4-flash, auto=走配置链）"),
                 ("core.system_prompt",    "AI 助理的自定义角色设定语"),
                 ("core.temperature",      "回答的随机创意程度，0 = 严谨保守，1 = 天马行空"),
                 ("core.max_tokens",       "单次回复最长长度"),
@@ -77,7 +77,7 @@ pub async fn handle_config(args: &super::ConfigArgs, formatter: &mut Box<dyn Out
             }
             if !config_path.exists() {
                 // V29.13: max_turns 默认 25, 同步 abacus-core/src/config.rs default_config()
-                std::fs::write(&config_path, "# Abacus Configuration\ndefault_model: deepseek-v4-flash\nmax_turns: 25\ntemperature: 0.6\n")?;
+                std::fs::write(&config_path, "# Abacus Configuration\n# default_model: auto  # Set to a specific model like deepseek-v4-flash or provider:model\nmax_turns: 25\ntemperature: 0.6\n")?;
             }
             formatter.format_message("config", &format!("Opening with {}...", editor), None);
             std::process::Command::new(&editor).arg(&config_path).status()?;

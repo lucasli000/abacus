@@ -114,28 +114,14 @@ async fn make_engine(api_key: String) -> EngineHandle {
         default_temperature: 0.6,
         default_max_tokens: 2048,
         system_prompt: "你是 Abacus，一个自主 Agent 内核，使用中文回复。".into(),
-        model_spec: None,
-        thinking_intent: None,
-        silent_router_enabled: true,
-        model_catalog: None, // Phase 1：缺省 → CoreLoop fall back 到 builtin catalog
-        tool_visibility_threshold: abacus_types::VisibilityTier::D,
-        // Task #84/#87：测试场景显式关——避免 routing 误剪测试涉及的工具
-        // （生产 default 已开；这里保 false 让 mock 工具无 applicable_task_kinds 也全可见）
+        // 测试场景显式关——避免 routing 误剪测试涉及的工具
         task_kind_routing_enabled: false,
-        scene_tool_loading_enabled: false, // 测试场景关——避免 scene prefix 误剪 mock 工具
+        scene_tool_loading_enabled: false,
         tool_frequency_pruning_turns: None,
-        lint_overrides: None,  // Phase 3：测试场景默认无白名单
-        palace_sync_interval_turns: None,
-        default_compress_level: abacus_core::core::context::CompressLevel::Brief,
-        max_escalations: 2,  // Task #96
-        tool_result_dedup_enabled: false,
-        tool_result_dedup_ttl_secs: 60,
-        tool_result_dedup_capacity_kb: 256,
+        max_escalations: 2,
         adaptive_d_tier_hide: false,
-        // 测试场景关闭 event sink—— ABACUS_HOME 可能未配置且不需观测层
         event_sink_enabled: false,
-        thresholds: abacus_core::core::ThresholdConfig::default(),
-        policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::default()),
+        ..Default::default()
     };
 
     let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;

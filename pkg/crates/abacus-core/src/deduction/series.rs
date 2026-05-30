@@ -84,11 +84,8 @@ impl MetricStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
         let conn = Connection::open(&path).map_err(|e| format!("open db: {e}"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
-        ).map_err(|e| format!("pragma: {e}"))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| format!("pragma: {e}"))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tool_metrics (
@@ -156,9 +153,8 @@ impl MetricStore {
         // Skip cleanup for in-memory (no persistence)
         let path = PathBuf::from(":memory:");
         let conn = Connection::open(&path).map_err(|e| format!("open db: {e}"))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
-        ).map_err(|e| format!("pragma: {e}"))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| format!("pragma: {e}"))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tool_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, tool_id TEXT NOT NULL,

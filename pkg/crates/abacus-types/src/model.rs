@@ -14,8 +14,42 @@
 //!   (not yet implemented — placeholder for future billing module)
 
 /// Opaque model identifier (e.g. "deepseek-v4-flash", "claude-sonnet-4-6")
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+///
+/// ## AUTO sentinel
+/// `ModelId::AUTO` ("auto") 表示"使用配置链中的默认模型"。调用方不需要知道具体模型名，
+/// 由 `resolve_provider()` 按优先级链解析：
+/// `model_override > ModelPreference.last_selected > ModelPreference.default > CoreConfig.default_model`
+///
+/// ## 引用关系
+/// - CLI `--model` 参数默认值使用 `ModelId::AUTO`
+/// - `engine_init.rs` / `server.rs` 解析时检测 `is_auto()` 后走配置链
+/// - `ProviderRegistry::resolve()` 不接受 AUTO——调用方必须先解析
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelId(pub String);
+
+impl ModelId {
+    /// Sentinel value: "use the configured default model from CoreConfig/ModelPreference".
+    ///
+    /// ## 使用场景
+    /// - CLI `--model` 参数的默认值
+    /// - API 请求未指定模型时的占位符
+    /// - 任何"我不关心具体模型，让配置决定"的调用点
+    ///
+    /// ## 不应出现的场景
+    /// - ProviderRegistry::resolve() 的输入（必须先 resolve 为具体模型）
+    /// - ModelCatalog 的 key（catalog 只存具体模型）
+    pub const AUTO: &'static str = "auto";
+
+    /// 检查此 ModelId 是否为 AUTO sentinel（需要进一步解析为具体模型）
+    pub fn is_auto(&self) -> bool {
+        self.0 == Self::AUTO || self.0.is_empty()
+    }
+
+    /// 创建 AUTO sentinel 实例
+    pub fn auto() -> Self {
+        Self(Self::AUTO.to_string())
+    }
+}
 
 impl From<&str> for ModelId {
     fn from(s: &str) -> Self { Self(s.to_string()) }
@@ -28,7 +62,7 @@ impl std::fmt::Display for ModelId {
 }
 
 /// Opaque provider identifier (e.g. "anthropic", "deepseek", "openai")
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderId(pub String);
 
 impl From<&str> for ProviderId {
@@ -38,6 +72,116 @@ impl From<&str> for ProviderId {
 impl std::fmt::Display for ProviderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// ─── QualifiedModelId: provider-qualified model reference ───────────────────
+
+/// A model identifier optionally qualified with a provider prefix.
+///
+/// Format: `"provider:model"` (qualified) or `"model"` (unqualified).
+///
+/// ## Examples
+/// - `"anthropic:claude-opus-4-7"` — fully qualified
+/// - `"deepseek-v4-flash"` — unqualified (provider resolved by context)
+///
+/// ## Edge cases handled by `parse()`:
+/// - Empty string → unqualified with empty model id
+/// - Multiple colons (e.g. `"host:port:model"`) → first segment is provider, rest is model
+/// - Whitespace → trimmed from both provider and model
+///
+/// ## References
+/// - Created by: CLI `/model` command, config file deserialization, `ModelPreference`
+/// - Consumed by: model router (provider selection), display layer
+///
+/// ## Lifecycle
+/// - Typically per-session or per-config-load; immutable after construction
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct QualifiedModelId {
+    /// Provider portion; `None` means unqualified (provider inferred by context).
+    pub provider: Option<ProviderId>,
+    /// The model identifier itself.
+    pub model: ModelId,
+}
+
+impl QualifiedModelId {
+    /// Parse a string into a `QualifiedModelId`.
+    ///
+    /// Rules:
+    /// - If `input` contains `':'`, the first segment becomes the provider, the rest becomes the model.
+    /// - Whitespace is trimmed from both parts.
+    /// - An empty provider segment (e.g. `":model"`) results in `provider = None`.
+    /// - An input with no `':'` is treated as unqualified (model only).
+    pub fn parse(input: &str) -> Self {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Self {
+                provider: None,
+                model: ModelId(String::new()),
+            };
+        }
+
+        match trimmed.find(':') {
+            Some(pos) => {
+                let provider_str = trimmed[..pos].trim();
+                let model_str = trimmed[pos + 1..].trim();
+                let provider = if provider_str.is_empty() {
+                    None
+                } else {
+                    Some(ProviderId(provider_str.to_string()))
+                };
+                Self {
+                    provider,
+                    model: ModelId(model_str.to_string()),
+                }
+            }
+            None => Self {
+                provider: None,
+                model: ModelId(trimmed.to_string()),
+            },
+        }
+    }
+
+    /// Returns `true` if a provider is specified.
+    pub fn is_qualified(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    /// Returns the model name as a string slice.
+    pub fn model_name(&self) -> &str {
+        &self.model.0
+    }
+
+    /// Returns the provider name if qualified, or `None`.
+    pub fn provider_name(&self) -> Option<&str> {
+        self.provider.as_ref().map(|p| p.0.as_str())
+    }
+}
+
+impl std::fmt::Display for QualifiedModelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.provider {
+            Some(p) => write!(f, "{}:{}", p.0, self.model.0),
+            None => write!(f, "{}", self.model.0),
+        }
+    }
+}
+
+impl From<&str> for QualifiedModelId {
+    fn from(s: &str) -> Self {
+        Self::parse(s)
+    }
+}
+
+impl From<ModelId> for QualifiedModelId {
+    fn from(model: ModelId) -> Self {
+        Self { provider: None, model }
+    }
+}
+
+impl From<(ProviderId, ModelId)> for QualifiedModelId {
+    fn from((provider, model): (ProviderId, ModelId)) -> Self {
+        Self { provider: Some(provider), model }
     }
 }
 

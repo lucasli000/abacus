@@ -287,7 +287,11 @@ impl ModelCatalog {
     /// ## 引用关系
     /// - 调用方: engine_init.rs 注册 provider 时
     /// - 读取: per-model 参数覆盖 ModelCatalog 内置默认值
-    pub fn merge_model_entry(&mut self, entry: &abacus_types::ModelEntry) {
+    ///
+    /// ## 参数
+    /// - `entry`: 模型配置条目
+    /// - `_provider_id`: 所属 provider ID（预留，用于未来按 provider 分组查询）
+    pub fn merge_model_entry(&mut self, entry: &abacus_types::ModelEntry, _provider_id: Option<&str>) {
         let id = ModelId(entry.name.clone());
         let mut spec = self.lookup(&id)
             .map(|arc| (*arc).clone())

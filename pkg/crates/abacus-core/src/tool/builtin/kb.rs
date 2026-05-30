@@ -231,6 +231,7 @@ impl ToolExecutor for KbToolExecutor {
 fn kb_schema(name: &str, desc: &str, props: Value, required: &[&str],
              tokens: u32, latency: &str) -> ToolSchema {
     ToolSchema {
+        short_description: None,
         name: name.into(),
         description: desc.into(),
         parameters: json!({
@@ -256,7 +257,7 @@ fn kb_schema(name: &str, desc: &str, props: Value, required: &[&str],
 }
 
 pub fn schemas() -> Vec<ToolSchema> {
-    vec![
+    let mut v = vec![
         kb_schema("kb_ingest", "摄入文件到知识库（chunk + FTS5 索引）",
             json!({
                 "path": {"type": "string", "description": "文件绝对路径"},
@@ -277,7 +278,17 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "showContent": {"type": "boolean", "description": "是否返回内容片段(默认false)"}
             }),
             &["query"], 96, "100ms"),
-    ]
+    ];
+    // Short-Mode 短描述注入
+    for s in v.iter_mut() {
+        s.short_description = Some(match s.name.as_str() {
+            "kb_ingest" => "Ingest file into knowledge base",
+            "kb_query"  => "BM25 semantic search in KB",
+            "kb_search" => "Multi-source retrieval (KB + Palace)",
+            _ => continue,
+        }.into());
+    }
+    v
 }
 
 // ─── Registration ───────────────────────────────────────────────────────

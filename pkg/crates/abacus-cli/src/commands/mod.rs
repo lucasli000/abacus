@@ -17,8 +17,8 @@ use clap::Parser;
 // Chat command arguments
 #[derive(Parser, Debug)]
 pub struct ChatArgs {
-    /// Model to use
-    #[arg(long = "model", short = 'm', default_value = "deepseek-v4-flash")]
+    /// Model to use ("auto" = use configured default from config/preference)
+    #[arg(long = "model", short = 'm', default_value = "auto")]
     pub model: String,
 
     /// System prompt
@@ -45,8 +45,8 @@ pub struct ExecArgs {
     #[arg(long = "task", short = 't')]
     pub task: String,
 
-    /// Model to use
-    #[arg(long = "model", short = 'm', default_value = "deepseek-v4-flash")]
+    /// Model to use ("auto" = use configured default from config/preference)
+    #[arg(long = "model", short = 'm', default_value = "auto")]
     pub model: String,
 
     /// Session ID

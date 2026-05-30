@@ -688,6 +688,7 @@ mod tests {
             applicable_task_kinds: None,
             idempotent: false,
             schema_stable: false,
+            short_description: None,
         }
     }
 

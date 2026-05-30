@@ -375,7 +375,7 @@ impl SkillEngine {
             let tool_id = ToolId(sanitized);
             let handle = ToolHandle {
                 id: tool_id.clone(),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: tool_id.0.clone(),
                     description: step.description.clone(),
                     parameters: step.params.clone(),
@@ -445,7 +445,7 @@ impl SkillEngine {
 
         let handle = abacus_types::ToolHandle {
             id: tool_id.clone(),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: tool_name.clone(),
                 description: format!("{} [compound skill: {}; params: {}]", def.prompt, id.0, params_desc),
                 parameters: serde_json::json!({
@@ -1170,7 +1170,7 @@ mod tests {
         // 注册底层 echo 工具到 registry
         registry_arc.register(ToolHandle {
             id: ToolId("echo".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "echo".into(),
                 description: "echo".into(),
                 parameters: serde_json::json!({}),

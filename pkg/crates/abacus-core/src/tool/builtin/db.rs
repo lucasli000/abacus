@@ -103,11 +103,8 @@ impl DbToolExecutor {
 
         let conn = Connection::open(&path).map_err(|e|
             KernelError::Other(format!("cannot open db: {e}")))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA busy_timeout=5000;"
-        ).map_err(|e| KernelError::Other(format!("pragma failed: {e}")))?;
+        crate::db_util::apply_standard_pragmas(&conn)
+            .map_err(|e| KernelError::Other(format!("pragma failed: {e}")))?;
 
         let arc = Arc::new(Mutex::new(conn));
 
@@ -115,6 +112,13 @@ impl DbToolExecutor {
         let mut conns = self.connections.lock().await;
         if let Some(existing) = conns.get(&path) {
             return Ok(existing.clone()); // 另一个线程先创建了
+        }
+        // P1: 连接池容量上限（32）——防止长时间运行累积过多 SQLite 连接
+        if conns.len() >= 32 {
+            // LRU-like: 移除第一个非当前路径的连接
+            if let Some(first_key) = conns.keys().find(|k| **k != path).cloned() {
+                conns.remove(&first_key);
+            }
         }
         conns.insert(path, arc.clone());
         Ok(arc)
@@ -454,6 +458,7 @@ impl ToolExecutor for DbToolExecutor {
 fn db_schema(name: &str, desc: &str, props: Value, required: &[&str],
              confirm: bool, tokens: u32, latency: &str, risk: &str) -> ToolSchema {
     ToolSchema {
+        short_description: None,
         name: name.into(),
         description: desc.into(),
         parameters: json!({
@@ -481,7 +486,7 @@ fn db_schema(name: &str, desc: &str, props: Value, required: &[&str],
 
 pub fn schemas() -> Vec<ToolSchema> {
     let db_prop = json!({"type": "string", "description": "数据库文件路径(默认 ~/.abacus/memory.db)"});
-    vec![
+    let mut v = vec![
         db_schema("db_info", "获取数据库元信息（路径/大小/表数量）",
             json!({"db": db_prop.clone()}), &[], false, 16, "5ms", "low"),
         db_schema("db_list_tables", "列出数据库中的所有用户表",
@@ -503,8 +508,6 @@ pub fn schemas() -> Vec<ToolSchema> {
                    "db": db_prop.clone()}),
             &["table"], false, 48, "10ms", "low"),
         // Wrapping-A：合并 create/update/delete → db.mutate(op, ...)
-        // 1 个 schema 替代 3 个，约 -150 tokens；LLM 看一份 description 即知所有写操作。
-        // 注意：op=update|delete 时 conditions 必填（业务校验在 db_mutate 委托的子方法内完成）
         db_schema("db_mutate", "数据库写操作统一入口：op=create(插入) | update(更新，conditions 必填) | delete(删除，conditions 必填)",
             json!({
                 "op": {"type": "string", "enum": ["create", "update", "delete"], "description": "写操作类型"},
@@ -514,7 +517,20 @@ pub fn schemas() -> Vec<ToolSchema> {
                 "db": db_prop.clone()
             }),
             &["op", "table"], true, 48, "10ms", "medium"),
-    ]
+    ];
+    // Short-Mode 短描述注入
+    for s in v.iter_mut() {
+        s.short_description = Some(match s.name.as_str() {
+            "db_info"         => "Database metadata (path/size/tables)",
+            "db_list_tables"  => "List all user tables",
+            "db_table_schema" => "Get table column structure",
+            "db_query"        => "Execute parameterized SQL",
+            "db_read_records" => "Read records by conditions",
+            "db_mutate"       => "Insert/update/delete records",
+            _ => continue,
+        }.into());
+    }
+    v
 }
 
 // ─── Registration ───────────────────────────────────────────────────────

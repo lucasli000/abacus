@@ -89,15 +89,21 @@ pub fn builtin_subsystems() -> Vec<SubsystemDecl> {
         },
         SubsystemDecl {
             name: "orchestrate",
-            mode: RegistrationMode::Always,
+            mode: RegistrationMode::Adaptive { min_hit_rate: 0.15 },
             tool_prefix: "orchestrate_",
-            description: "task assess/upgrade — core",
+            description: "task assess/upgrade — adaptive (热重载)",
         },
         SubsystemDecl {
             name: "result",
-            mode: RegistrationMode::Always,
+            mode: RegistrationMode::Adaptive { min_hit_rate: 0.10 },
             tool_prefix: "result_",
-            description: "result store expand — core",
+            description: "result store expand — adaptive (热重载)",
+        },
+        SubsystemDecl {
+            name: "codegraph",
+            mode: RegistrationMode::Adaptive { min_hit_rate: 0.20 },
+            tool_prefix: "cg_",
+            description: "code graph analysis (tree-sitter) — adaptive (热重载)",
         },
         SubsystemDecl {
             name: "lsp",

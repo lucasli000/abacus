@@ -171,7 +171,7 @@ pub async fn register_env_tools(registry: &ToolRegistry, env_map: Arc<RwLock<Env
 
     let tool = ToolHandle {
         id: ToolId("env_status".into()),
-        schema: ToolSchema {
+        schema: ToolSchema { short_description: None,
             name: "env_status".into(),
             description: "Snapshot local workspace: OS/CWD/git/project/tool activity".into(),
             parameters: serde_json::json!({"type": "object", "properties": {}, "required": []}),

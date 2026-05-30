@@ -114,7 +114,7 @@ mod tests {
     fn mk_handle(name: &str, desc: &str, cost: Option<ToolCost>, provider: ToolProvider, state: ToolState) -> ToolHandle {
         ToolHandle {
             id: ToolId(name.into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: name.into(),
                 description: desc.into(),
                 parameters: serde_json::json!({"type": "object"}),

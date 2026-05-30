@@ -99,7 +99,7 @@ impl MeetingSessionBuilder {
                     domain: "general".into(),
                     name: sp_id.clone(),
                     role: role.clone(),
-                    model: "deepseek-v4-flash".into(),
+                    model: abacus_types::ModelId::AUTO.into(),
                     guide_strategy: format!("You are a domain expert in {}. Analyze the question from your perspective.", sp_id),
                     anti_pattern: "".into(),
                     capabilities: vec![],

@@ -97,7 +97,7 @@ mod tests {
     fn mk_tool(name: &str, provider: ToolProvider) -> ToolHandle {
         ToolHandle {
             id: ToolId(name.into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: name.into(),
                 description: "desc".into(),
                 parameters: serde_json::json!({"type": "object"}),

@@ -744,9 +744,24 @@ pub(super) fn render_block_detail_with_limit<'a>(detail: &str, kind: &BlockKind,
             let truncated = total > 400;
             let mut out: Vec<Line> = all_lines.iter()
                 .take(if truncated { 200 } else { total })
-                .map(|l| Line::from(vec![
-                    Span::styled(l.to_string(), theme.text_style(TextRole::InlineCode)),
-                ]))
+                .map(|l| {
+                    // JSON key-value 着色：key 用 accent，string 用 green，number 用 gold
+                    // 简单启发式：匹配 "key": value 模式
+                    if let Some((key, sep, val)) = split_json_kv(l) {
+                        let val_style = json_val_style(&val, theme);
+                        Line::from(vec![
+                            Span::styled(
+                                format!("{}{}", key, sep),
+                                Style::default().fg(theme.accent),
+                            ),
+                            Span::styled(val, val_style),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::styled(l.to_string(), theme.text_style(TextRole::InlineCode)),
+                        ])
+                    }
+                })
                 .collect();
             if truncated {
                 out.push(Line::from(vec![
@@ -780,4 +795,42 @@ pub(super) fn render_block_detail_with_limit<'a>(detail: &str, kind: &BlockKind,
         return limited;
     }
     lines
+}
+
+// ─── JSON 行 key-value 着色辅助 ─────────────────────────────────────────────
+
+/// 尝试拆分 JSON pretty-print 行中的 "key": value 部分
+///
+/// 匹配模式：缩进 + "key": 分隔符 + 值部分
+/// 返回 (key, sep, val) 三个 String，或 None（非 kv 行）
+fn split_json_kv(line: &str) -> Option<(String, String, String)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('"') {
+        return None;
+    }
+    let key_end = trimmed[1..].find("\":")?;
+    let key = trimmed[..key_end + 2].to_string();
+    let after = trimmed[key_end + 2..].trim_start();
+    let sep_end = if after.starts_with(' ') { 2 } else { 1 };
+    let sep = trimmed[key_end + 2..key_end + 2 + sep_end].to_string();
+    let val = trimmed[key_end + 2 + sep_end..].to_string();
+    Some((key, sep, val))
+}
+
+/// 根据 JSON 值类型返回着色 Style
+fn json_val_style(val: &str, theme: &Theme) -> Style {
+    let trimmed = val.trim_end_matches(',');
+    if trimmed.starts_with('"') {
+        // string value → green
+        Style::default().fg(theme.success)
+    } else if trimmed == "true" || trimmed == "false" || trimmed == "null" {
+        // bool/null → muted
+        Style::default().fg(theme.muted)
+    } else if trimmed.parse::<f64>().is_ok() {
+        // number → gold
+        Style::default().fg(theme.gold)
+    } else {
+        // object/array/other → fallback InlineCode
+        theme.text_style(TextRole::InlineCode)
+    }
 }

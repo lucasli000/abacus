@@ -470,21 +470,24 @@ impl PromptAssembly {
     ///
     /// 每个段标注 cacheable=true 表示跨 turn 稳定，provider 可对其标记缓存。
     ///
-    /// ## W3 (Task #101) 三段式分层
+    /// ## 四段式分层（W3 Task #101 + Tier 2.5 扩展）
     /// | 段 | priority | cacheable | 稳定性 | 内容 |
     /// |----|----------|-----------|--------|------|
-    /// | 0 (Tier 1)  | ≥190 | true  | **永久稳定**——session 内字节不变 | Kernel(255) + abacusbr_core(230) + Strategy(200) + Constraints(190) |
-    /// | 1 (Tier 2)  | =185 | true  | **task-sticky 稳定**——同 task_kind 锁定后字节不变 | abacusbr_subscenes（任务相关行为规范） |
-    /// | 2 (dynamic) | <185 | false | turn-specific | retained_context + injector + deduction + preflight + skills + interaction |
+    /// | 0 (Tier 1)   | ≥190          | true  | **永久稳定**——session 内字节不变 | Kernel(255) + abacusbr_core(230) + Strategy(200) + Constraints(190) |
+    /// | 1 (Tier 2)   | =185          | true  | **task-sticky 稳定**——同 task_kind 锁定后字节不变 | abacusbr_subscenes（任务相关行为规范） |
+    /// | 2 (Tier 2.5) | 180-184 semi  | true  | **task 内稳定**——同 task 执行中多 turn 不变 | retained_context + 活跃 expert_role（consecutive_hits>1） |
+    /// | 3 (Tier 3)   | <185 其余     | false | turn-specific | 非稳定 injector + deduction + preflight + skills + interaction |
     ///
     /// ### 拆分动机
     /// 之前所有 <190 内容（包括稳定的 br_subscenes）混在 dynamic 段，task switching 时整段失效。
-    /// 拆出 Tier 2 后：① 同 task 内连续 turn → Tier 1+2 都命中 ② task 切换 → 仅 Tier 2+dynamic 失效，
-    /// Tier 1（占 token 大头，含 Kernel/abacusbr core）保持命中。
+    /// 拆出 Tier 2 后：① 同 task 内连续 turn → Tier 1+2 都命中 ② task 切换 → 仅 Tier 2+dynamic 失效。
+    /// Tier 2.5 进一步将 retained_context 和已稳定的 expert_role 从 Dynamic 中分出，
+    /// 避免跨 turn 稳定内容因 priority < 185 而被标记为 cacheable=false 浪费 KV cache。
     ///
     /// ## 引用关系
     /// - 被 `TurnPipeline::execute_loop` 调用（当 provider 为 Anthropic 时）
     /// - 替代 `assemble()` 的单一 String 返回
+    /// - Tier 2.5 内容来源：`ContextManager::retained_context_block()`、`DynamicInjector::rebuild_cache()`
     pub fn assemble_segments(
         &self,
         injector_segments: &[PromptSegment],
@@ -537,11 +540,26 @@ impl PromptAssembly {
             layers.entry(185).or_default().push(br_subscenes);
         }
 
+        // ─── Tier 2.5 semi-stable 收集 ─────────────────────────────────────────
+        // retained_context 和 semi_stable=true 的 injector 段归入 Tier 2.5（cacheable=true）。
+        // 这些内容在同一 task 执行中跨 turn 稳定，不应浪费 KV cache 机会。
+        //
+        // 引用关系：
+        // - retained_context：由 ContextManager::retained_context_block() 生产，task 内多 turn 不变
+        // - semi_stable injector 段：由 DynamicInjector::rebuild_cache() 标记（expert_role consecutive_hits>1）
+        let mut tier2_5_parts: Vec<String> = Vec::new();
+
         if !retained_context.is_empty() {
-            layers.entry(180).or_default().push(retained_context.to_string());
+            // retained_context 在 task 执行中跨 turn 稳定，归入 Tier 2.5
+            tier2_5_parts.push(retained_context.to_string());
         }
         for seg in injector_segments {
-            layers.entry(seg.kind.priority()).or_default().push(seg.text.clone());
+            if seg.semi_stable && seg.kind.priority() >= 180 && seg.kind.priority() < 185 {
+                // semi_stable=true 且 priority 180-184 → Tier 2.5
+                tier2_5_parts.push(seg.text.clone());
+            } else {
+                layers.entry(seg.kind.priority()).or_default().push(seg.text.clone());
+            }
         }
 
         // Phase 1 KV cache 删除：session_context / matched_skills / interaction_status 不再注入
@@ -559,11 +577,12 @@ impl PromptAssembly {
             }
         }
 
-        // W3 (Task #101): 三段式拆分
+        // W3 (Task #101) 升级为四段式拆分：
         //
         // Tier 1 stable（永久稳定）：≥190
         // Tier 2 stable（task-sticky）：==185（br_subscenes，同 task_kind 内字节不变）
-        // Dynamic（不可缓存）：<185
+        // Tier 2.5 semi-stable（task 内稳定）：priority 180-184 且 semi_stable=true（retained_context + 活跃 expert_role）
+        // Tier 3 dynamic（不可缓存）：其余 <185
         //
         // 边界条件：BTreeMap.iter().rev() 给出降序 key 顺序——保持收集确定性
         let mut tier1_stable = Vec::new();
@@ -597,6 +616,21 @@ impl PromptAssembly {
         if !tier2_stable.is_empty() {
             segments.push(SystemSegment {
                 text: tier2_stable.join("\n\n---\n\n"),
+                cacheable: true,
+            });
+        }
+
+        // Tier 2.5：retained_context + 活跃 expert_role（semi_stable=true）
+        // task 执行中跨 turn 稳定——provider 端可标记 cache_control
+        // 位置：Tier 2 之后、Dynamic 之前
+        //
+        // 引用关系：
+        // - 生产方：retained_context（ContextManager）、expert_role（DynamicInjector, consecutive_hits>1）
+        // - 消费方：provider 层 cache_control 标记
+        // - 稳定性契约：同 task + 同 retained_context 时字节不变
+        if !tier2_5_parts.is_empty() {
+            segments.push(SystemSegment {
+                text: tier2_5_parts.join("\n\n---\n\n"),
                 cacheable: true,
             });
         }
@@ -642,8 +676,9 @@ impl PromptAssembly {
             }
         }
 
-        // 动态后缀：retained_context(180) + injector(动态) + preflight(155) + deduction(160) + skills + interaction(20)
+        // Tier 3 动态后缀：非 semi_stable 的 injector(动态) + preflight(155) + deduction(160) + skills + interaction(20)
         // + cacheable=false 的 hooks
+        // 注意：retained_context 和 semi_stable injector 段已归入 Tier 2.5（上方）
         let has_dynamic = !dynamic_parts.is_empty() || !dynamic_hook_parts.is_empty() || with_process_layer;
         if has_dynamic {
             let mut all_dynamic = dynamic_parts;
