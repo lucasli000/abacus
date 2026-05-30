@@ -406,7 +406,7 @@ fn build_message_lines(
                         // ── 分组: 连续同名 ToolCall id 归入同一 run ──
                         let runs = group_consecutive_tool_runs(event_ids, trace_events, trace_event_index);
 
-                        // ── 工具调用历史折叠：超过 5 个 run 时只展示最新 5 个，更早的折叠为一行摘要 ──
+                        // ── 工具调用历史折叠：只保留最新 5 次 tool/toolagent，更早的折叠 ──
                         const MAX_VISIBLE_TOOL_RUNS: usize = 5;
                         let mut visible_tool_run_count = 0usize; // 用于 run 间空行断开
 

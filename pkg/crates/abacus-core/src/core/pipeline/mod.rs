@@ -876,13 +876,14 @@ impl<'a> TurnPipeline<'a> {
             if let Some(ref ti) = complexity_thinking {
                 match ti {
                     abacus_types::ThinkingIntent::Effort(e) => match e {
-                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => t = t.max(300),
-                        abacus_types::EffortLevel::Medium => t = t.max(180),
-                        abacus_types::EffortLevel::Low => t = t.max(120),
+                        // V42: 对齐 provider timeout 600s — 复杂 agentic 循环需要足够时间
+                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => t = t.max(600),
+                        abacus_types::EffortLevel::Medium => t = t.max(300),
+                        abacus_types::EffortLevel::Low => t = t.max(180),
                         _ => {}
                     },
-                    abacus_types::ThinkingIntent::Adaptive => t = t.max(240),
-                    abacus_types::ThinkingIntent::Budget(_) => t = t.max(300),
+                    abacus_types::ThinkingIntent::Adaptive => t = t.max(300),
+                    abacus_types::ThinkingIntent::Budget(_) => t = t.max(600),
                     _ => {}
                 }
             }
