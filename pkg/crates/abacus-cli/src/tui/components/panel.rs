@@ -1911,6 +1911,11 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
 
 /// Focus 面板 — 按场景展示关注信息
 /// 检测链：流式 > Plan 执行 > Team 执行 > Meeting > 空闲
+///
+/// V41: 统一排版风格——与 Stockroom 方案 E 对齐
+/// - 标题行：`─ Focus · [状态] ────`（2 格缩进 + dim 填充线）
+/// - 数据行：4 格缩进
+/// - 符号：统一简洁字符（不用 emoji）
 fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
@@ -1918,88 +1923,118 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use crate::tui::state::{ExpertStatus, TaskStatus, StreamingToolStatus};
     let muted = Style::default().fg(state.theme.muted);
     let dim   = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let ab    = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
     let txt   = Style::default().fg(state.theme.text);
     let gold  = Style::default().fg(state.theme.gold);
     let ok    = Style::default().fg(state.theme.success);
+    let w     = (area.width as usize).saturating_sub(4).max(10);
     let mut lines: Vec<Line> = Vec::new();
 
-    // ════════════════════════════════════════════════════════
-    // 场景 A：流式执行中（Thinking / Tool / Text）
-    // ════════════════════════════════════════════════════════
+    // 统一标题行渲染
+    let render_header = |label: &str, lines: &mut Vec<Line>, area_w: usize| {
+        let fill = area_w.saturating_sub(label.len() + 5).min(14);
+        lines.push(Line::from(vec![
+            Span::styled("  ─ ", dim),
+            Span::styled(label.to_string(), muted),
+            Span::styled(format!(" {}", "─".repeat(fill)), dim),
+        ]));
+    };
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 场景 A：流式执行中
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if state.is_streaming {
         let running_names: Vec<&str> = state.streaming_tools.iter()
             .filter(|(_, s, _, _)| matches!(s, StreamingToolStatus::Running))
             .map(|(n, _, _, _)| n.as_str()).collect();
-        let stage = if !running_names.is_empty() {
-            format!("⚙ {}", running_names.join(", "))
-        } else if !state.streaming_thinking.is_empty() && !state.streaming_text_started {
-            "💭 thinking".to_string()
-        } else if state.streaming_text_started {
-            format!("📝 输出中 ({} tok)", state.streaming_text.len() / 4)
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · {}", stage), muted)]));
+        let stage = if !running_names.is_empty() { "工具执行" }
+            else if !state.streaming_thinking.is_empty() && !state.streaming_text_started { "思考中" }
+            else if state.streaming_text_started { "输出中" }
+            else { "处理中" };
+        render_header(&format!("Focus · {}", stage), &mut lines, w);
 
+        // thinking 预览（最新 3 行）
         if !state.streaming_thinking.is_empty() {
-            // 显示 thinking 行数进度 + 最新 3 行内容（让用户跟踪思考方向）
             let think_lines: Vec<&str> = state.streaming_thinking.lines()
                 .filter(|l| !l.trim().is_empty())
                 .collect();
             let total = think_lines.len();
-            // 取最后 3 行（最新内容）而非前 3 行
             let visible = if total > 3 { &think_lines[total-3..] } else { &think_lines[..] };
             for l in visible {
-                let t = crate::tui::util::truncate_to_width(l, (area.width as usize).saturating_sub(6).max(20));
-                lines.push(Line::from(vec![Span::raw("  💭 "), Span::styled(t, Style::default().fg(state.theme.accent))]));
+                let t = crate::tui::util::truncate_to_width(l, w.saturating_sub(2));
+                lines.push(Line::from(vec![
+                    Span::styled("    ", dim),
+                    Span::styled(t, Style::default().fg(state.theme.accent)),
+                ]));
             }
             if total > 3 {
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("… {}行", total), Style::default().fg(state.theme.muted)),
+                    Span::styled("    ", dim),
+                    Span::styled(format!("… {}行", total), dim),
                 ]));
             }
         }
+
+        // 运行中工具
         for (name, status, dur_opt, _) in state.streaming_tools.iter().rev() {
             if matches!(status, StreamingToolStatus::Running) {
-                let d = dur_opt.map(|d| format!(" {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
-                lines.push(Line::from(vec![Span::raw("  ⚙ "), Span::styled(name.clone(), gold), Span::styled(d, muted)]));
+                let d = dur_opt.map(|d| format!("  {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("    ⚙ ", dim),
+                    Span::styled(name.clone(), gold),
+                    Span::styled(d, muted),
+                ]));
                 break;
             }
         }
-        let done = state.streaming_tools.iter().filter(|(_, s, _, _)| matches!(s, StreamingToolStatus::Success | StreamingToolStatus::Failed)).count();
-        if done > 0 { lines.push(Line::from(vec![Span::raw("  ✓ "), Span::styled(format!("{} 工具完成", done), muted)])); }
+
+        // 完成计数
+        let done = state.streaming_tools.iter()
+            .filter(|(_, s, _, _)| matches!(s, StreamingToolStatus::Success | StreamingToolStatus::Failed)).count();
+        if done > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("    ✓ ", dim),
+                Span::styled(format!("{} 完成", done), muted),
+            ]));
+        }
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // 场景 B：Plan 策略执行中（/plan 触发的规划+执行）
-    // ════════════════════════════════════════════════════════
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 场景 B：Plan 执行中
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if state.processing_phase.starts_with("📋") {
         let total = state.tasks.len();
         let done = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
-        lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 规划 {}/{}", done, total), muted)]));
-        if state.session_goal.is_some() {
-            lines.push(Line::from(vec![Span::styled("  目标", muted), Span::styled(state.session_goal.as_deref().unwrap_or(""), txt)]));
+        render_header(&format!("Focus · 规划 {}/{}", done, total), &mut lines, w);
+
+        if let Some(ref goal) = state.session_goal {
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim),
+                Span::styled(goal.chars().take(w).collect::<String>(), txt),
+            ]));
         }
-        for task in state.tasks.iter().take(5) {
+        for task in state.tasks.iter().take(4) {
             let (icon, color) = match task.status {
                 TaskStatus::Done       => ("✓", state.theme.success),
-                TaskStatus::InProgress => ("⟳", state.theme.accent),
-                TaskStatus::Blocked    => ("⚠", state.theme.error),
-                TaskStatus::Pending    => ("○", state.theme.muted),
+                TaskStatus::InProgress => ("›", state.theme.accent),
+                TaskStatus::Blocked    => ("!", state.theme.error),
+                TaskStatus::Pending    => ("·", state.theme.muted),
             };
-            let t: String = task.title.chars().take(20).collect();
-            lines.push(Line::from(vec![Span::styled(format!("  {} ", icon), Style::default().fg(color)), Span::styled(t, txt)]));
+            let t: String = task.title.chars().take(w.saturating_sub(6)).collect();
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {} ", icon), Style::default().fg(color)),
+                Span::styled(t, txt),
+            ]));
         }
+        // 进度条
         if total > 0 {
-            let bw = (area.width as usize).saturating_sub(6).min(10);
+            let bw = w.saturating_sub(8).min(10);
             let filled = (done * bw / total).min(bw);
             lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled("█".repeat(filled), ok), Span::styled("░".repeat(bw - filled), dim),
+                Span::styled("    ", dim),
+                Span::styled("━".repeat(filled), ok),
+                Span::styled("╌".repeat(bw - filled), dim),
                 Span::styled(format!(" {}/{}", done, total), muted),
             ]));
         }
@@ -2007,77 +2042,94 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // 场景 C：Team 策略执行中（/team 触发的多 Agent 执行）
-    // ════════════════════════════════════════════════════════
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 场景 C：Team 执行中
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if state.processing_phase.starts_with("🤖") {
         let total = state.tasks.len();
         let done = state.tasks.iter().filter(|t| t.status == TaskStatus::Done).count();
-        lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 团队 {}/{}", done, total), muted)]));
+        render_header(&format!("Focus · 团队 {}/{}", done, total), &mut lines, w);
+
         for task in state.tasks.iter().take(4) {
             let (icon, color) = match task.status {
                 TaskStatus::Done       => ("✓", state.theme.success),
-                TaskStatus::InProgress => ("⟳", state.theme.accent),
-                TaskStatus::Blocked    => ("⚠", state.theme.error),
-                TaskStatus::Pending    => ("○", state.theme.muted),
+                TaskStatus::InProgress => ("›", state.theme.accent),
+                TaskStatus::Blocked    => ("!", state.theme.error),
+                TaskStatus::Pending    => ("·", state.theme.muted),
             };
-            let t: String = task.title.chars().take(20).collect();
-            let extra = if !task.deps.is_empty() { format!(" 等待{}", task.deps.join(",")) } else { String::new() };
+            let t: String = task.title.chars().take(w.saturating_sub(6)).collect();
+            let extra = if !task.deps.is_empty() {
+                format!(" ← {}", task.deps.join(","))
+            } else { String::new() };
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(t, txt), Span::styled(extra, dim),
+                Span::styled(format!("    {} ", icon), Style::default().fg(color)),
+                Span::styled(t, txt),
+                Span::styled(extra, dim),
             ]));
         }
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // 场景 D：Meeting 会诊模式
-    // ════════════════════════════════════════════════════════
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 场景 D：Meeting 会诊
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if state.mode == crate::tui::state::AbacusMode::Meeting {
         let total = state.experts.len();
         let active = state.experts.iter().filter(|e| matches!(e.status, ExpertStatus::Active)).count();
-        lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 会诊 {}/{}位", active, total), muted)]));
+        render_header(&format!("Focus · 会诊 {}/{}", active, total), &mut lines, w);
+
         for e in &state.experts {
             let (icon, color) = match e.status {
-                ExpertStatus::Active => ("🔊", state.theme.success),
-                ExpertStatus::Done   => ("✓ ", state.theme.success),
-                ExpertStatus::Idle   => ("○ ", state.theme.muted),
+                ExpertStatus::Active => ("▸", state.theme.success),
+                ExpertStatus::Done   => ("✓", state.theme.success),
+                ExpertStatus::Idle   => ("·", state.theme.muted),
             };
-            let nm: String = e.name.chars().take(14).collect();
-            let dom: String = e.domain.chars().take(10).collect();
+            let nm: String = e.name.chars().take(12).collect();
+            let dom: String = e.domain.chars().take(8).collect();
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", icon), Style::default().fg(color)),
-                Span::styled(nm, txt), Span::styled(format!(" ({})", dom), dim),
+                Span::styled(format!("    {} ", icon), Style::default().fg(color)),
+                Span::styled(format!("{:<12}", nm), txt),
+                Span::styled(dom, dim),
             ]));
         }
-        let phase = if total == 0 { "等待开始" }
-            else if active > 0 { "● 发言中" }
-            else if state.is_streaming { "● 综合中" }
-            else { "✓ 结论完成" };
-        lines.push(Line::from(vec![Span::styled("  阶段 ", dim), Span::styled(phase, Style::default().fg(state.theme.accent))]));
+        let phase = if total == 0 { "等待" }
+            else if active > 0 { "发言中" }
+            else { "完成" };
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled(format!("阶段: {}", phase), Style::default().fg(state.theme.accent)),
+        ]));
         f.render_widget(Paragraph::new(lines), area);
         return;
     }
 
-    // ════════════════════════════════════════════════════════
-    // 场景 E：空闲 / 等待输入
-    // ════════════════════════════════════════════════════════
-    lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · 澄清 · {}轮", state.turn_count), muted)]));
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 场景 E：空闲
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    render_header(&format!("Focus · 澄清 · {}轮", state.turn_count), &mut lines, w);
+
     if !state.session_summary.is_empty() {
-        for l in state.session_summary.lines().take(5) {
-            let t: String = l.chars().take((area.width as usize).saturating_sub(4).max(20)).collect();
-            lines.push(Line::styled(format!("  {}", t), txt));
+        for l in state.session_summary.lines().take(3) {
+            let t: String = l.chars().take(w).collect();
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim),
+                Span::styled(t, txt),
+            ]));
         }
     } else {
-        lines.push(Line::styled("  /help 查看命令  ·  输入问题开始对话", dim));
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled("输入问题开始对话", dim),
+        ]));
     }
     if let Some((hint, at)) = &state.transition_hint {
         if at.elapsed().as_secs() < 5 {
-            lines.push(Line::raw(""));
-            let t: String = hint.chars().take((area.width as usize).saturating_sub(4).max(20)).collect();
-            lines.push(Line::from(vec![Span::styled("  → ", Style::default().fg(state.theme.accent)), Span::styled(t, txt)]));
+            let t: String = hint.chars().take(w).collect();
+            lines.push(Line::from(vec![
+                Span::styled("    → ", Style::default().fg(state.theme.accent)),
+                Span::styled(t, txt),
+            ]));
         }
     }
     f.render_widget(Paragraph::new(lines), area);
