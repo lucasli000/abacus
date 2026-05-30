@@ -1760,24 +1760,29 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
 
-        // 进度条 + 百分比 + token 明细（单行紧凑但有空格）
-        let bw = (area.width as usize).saturating_sub(16).min(10);
+        // 行 1：进度条 + 百分比（简短）
+        let bw = (area.width as usize).saturating_sub(8).min(12);
         let filled = (pct * bw / 100).min(bw);
         let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
-        let mut row = vec![
+        lines.push(Line::from(vec![
             Span::styled(" ", dim),
             Span::styled(bar_str, Style::default().fg(pc)),
-            Span::styled(format!(" {}% ", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
-        ];
-        if state.is_streaming {
-            row.push(Span::styled(format!("{}↑", format_ctx(inp as usize)), muted));
-        } else {
-            row.push(Span::styled(format!("{}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), muted));
+            Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+        ]));
+
+        // 行 2：token 明细（in · out · cache · cost 各有空间）
+        let mut detail = vec![Span::styled(" ", dim)];
+        detail.push(Span::styled(format!("in {}", format_ctx(inp as usize)), muted));
+        if !state.is_streaming {
+            detail.push(Span::styled(format!(" · out {}", format_ctx(out as usize)), muted));
+        }
+        if cpct > 0 {
+            detail.push(Span::styled(format!(" · c{}%", cpct), Style::default().fg(state.theme.success)));
         }
         if state.session_tokens.cost_cny > 0.001 {
-            row.push(Span::styled(format!(" ¥{:.2}", state.session_tokens.cost_cny), gold));
+            detail.push(Span::styled(format!(" · ¥{:.2}", state.session_tokens.cost_cny), gold));
         }
-        lines.push(Line::from(row));
+        lines.push(Line::from(detail));
     }
 
 
