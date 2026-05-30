@@ -1821,9 +1821,10 @@ impl<'a> TurnPipeline<'a> {
                     // 跳过描述性语境：精确短语避免过度匹配
                     // “可以”过宽（中文回复几乎都含此词）——改用具体动词短语
                     let skip_patterns = ["i'll use", "i can use", "let me", "using ", "let's",
-                                         "you can use", "you could use",
+                                         "you can use", "you could use", "call ", "should call",
                                          "我来使用", "让我使用", "可以使用", "我会使用",
-                                         "你可以使用", "我需要使用", "调用", "执行"];
+                                         "你可以使用", "我需要使用", "调用", "执行",
+                                         "必须先", "然后才能", "再响应用户"];
                     if !skip_patterns.iter().any(|p| text_lower.contains(p)) {
                         let registered_names: Vec<String> = self.core.registry
                             .tool_names()
@@ -1831,6 +1832,26 @@ impl<'a> TurnPipeline<'a> {
                         if let Some(tool_name) = registered_names.iter().find(|name| {
                             name.len() >= 4 && text_lower.contains(name.as_str())
                         }) {
+                        // 额外检查：工具名在反引号内 → 描述性引用，跳过
+                        let in_backticks = {
+                            let name_pos = text_lower.find(tool_name.as_str());
+                            name_pos.map_or(false, |pos| {
+                                let before = &text[..pos];
+                                let after = &text[pos + tool_name.len()..];
+                                // 检查前后是否有反引号或代码块标记
+                                before.ends_with('`') || before.contains("``") ||
+                                after.starts_with('`') || after.contains("``") ||
+                                // 检查是否在行内代码格式中
+                                before.contains("`") && after.contains("`")
+                            })
+                        };
+                        if in_backticks {
+                            tracing::debug!(
+                                tool = %tool_name,
+                                "tool name in backtick-quoted text — skipping false positive"
+                            );
+                            // 不注入纠正消息，继续正常处理
+                        } else {
                         ctx.tool_text_fallback_retries += 1;
                         tracing::warn!(
                             tool = %tool_name,
@@ -1861,6 +1882,7 @@ impl<'a> TurnPipeline<'a> {
                             });
                         }
                         continue; // 重试本轮
+                        } // end else: in_backticks
                     }
                 }
                 } // if ctx.tool_text_fallback_retries < 1
@@ -3466,11 +3488,7 @@ impl<'a> TurnPipeline<'a> {
     // ─── Phase 7: Persist & Build Result ────────────────────────────────────
 
     async fn persist_and_build_result(self, mut ctx: TurnContext) -> Result<TurnResult, KernelError> {
-        // V42: 空回复 fallback — 有工具输出时不显示误导性的 "max turns"
-        // 如果 LLM 完成了工具调用但没生成文本总结，留空（TUI 不渲染空消息）
-        if ctx.final_response.is_empty() && ctx.all_tool_outputs.is_empty() {
-            ctx.final_response = "(max turns reached)".to_string();
-        }
+        // V42: 空回复不再注入 "(max turns reached)" — 空就是空，TUI 不渲染空消息
 
         let latency = ctx.start_time.elapsed().as_millis() as u64;
         let session_id = { let s = self.session.read().await; s.session_id.clone() };

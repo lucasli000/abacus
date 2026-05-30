@@ -1365,6 +1365,40 @@ pub fn render_messages_in_card(
                     }
                 }
             }
+            // V42: streaming 工具折叠——只保留最新 5 个 ToolGroup，更早的合并为一行摘要
+            const MAX_STREAM_TOOL_GROUPS: usize = 5;
+            let tool_group_indices: Vec<usize> = blocks.iter().enumerate()
+                .filter_map(|(i, b)| matches!(b, StreamingBlock::ToolGroup { .. }).then_some(i))
+                .collect();
+            let hidden_count = tool_group_indices.len().saturating_sub(MAX_STREAM_TOOL_GROUPS);
+            if hidden_count > 0 {
+                // 计算被折叠的工具调用总数
+                let hidden_calls: usize = tool_group_indices[..hidden_count].iter()
+                    .filter_map(|&i| match &blocks[i] {
+                        StreamingBlock::ToolGroup { calls, .. } => Some(calls.len()),
+                        _ => None,
+                    }).sum();
+                // 移除被折叠的 blocks（从后往前移除避免索引偏移）
+                for &idx in tool_group_indices[..hidden_count].iter().rev() {
+                    blocks.remove(idx);
+                }
+                // 在剩余 blocks 最前面插入摘要行
+                blocks.insert(0, StreamingBlock::Text {
+                    id: 0,
+                    byte_range: (0, 0), // 特殊标记：由下方渲染时检测
+                });
+                // 直接渲染摘要行
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("▸ {}{}", hidden_calls, t("msg.history_calls")),
+                        state.theme.text_style(TextRole::Caption),
+                    ),
+                ]));
+                // 移除刚插入的占位 block（摘要已直接渲染）
+                blocks.remove(0);
+            }
             let block_lines = render_streaming_blocks(&blocks, state, &bar, prose_width, code_width);
             lines.extend(block_lines);
         }

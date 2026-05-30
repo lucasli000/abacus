@@ -250,13 +250,57 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
             cancel_completion(state);
         }
         EscAction::CancelOperation => {
+            // V42: 保留已有 streaming 内容为部分回复（用户打断不丢数据）
+            // 条件：streaming_text 或 streaming_trace_ids 非空 = 已收到内容
+            if !state.streaming_text.is_empty() || !state.streaming_trace_ids.is_empty() {
+                let ts = chrono::Local::now().format("%H:%M").to_string();
+                let text = std::mem::take(&mut state.streaming_text);
+                let thinking = std::mem::take(&mut state.streaming_thinking);
+                let trace_ids = std::mem::take(&mut state.streaming_trace_ids);
+
+                let mut parts = Vec::new();
+                // 保留 thinking trace
+                if !thinking.is_empty() {
+                    let line_count = thinking.lines().count();
+                    let tid = state.push_trace_full(
+                        ts.clone(), "llm".into(),
+                        crate::tui::state::EventLevel::Info,
+                        crate::tui::state::TraceKind::Thinking { text: thinking, lines: line_count },
+                        None,
+                    );
+                    let mut ids = vec![tid];
+                    ids.extend(trace_ids);
+                    parts.push(crate::tui::state::MsgContent::Trace {
+                        event_ids: ids, collapsed: false,
+                        expanded_event_ids: std::collections::HashSet::new(),
+                    });
+                } else if !trace_ids.is_empty() {
+                    parts.push(crate::tui::state::MsgContent::Trace {
+                        event_ids: trace_ids, collapsed: false,
+                        expanded_event_ids: std::collections::HashSet::new(),
+                    });
+                }
+                // 保留已生成的文本
+                if !text.is_empty() {
+                    parts.push(crate::tui::state::MsgContent::Stream(
+                        format!("{}\n\n_[cancelled]_", text)
+                    ));
+                }
+                if !parts.is_empty() {
+                    state.add_message(crate::tui::state::Message {
+                        role: crate::tui::state::MsgRole::Session,
+                        time: ts,
+                        parts,
+                    });
+                }
+            }
             state.input_state = InputState::Ready;
             state.op_started_at = None;
             state.accumulated_elapsed = Duration::ZERO;
             // TT18: 走 SSoT helper（reset_streaming 是唯一 streaming 状态清理入口）
             state.reset_streaming();
             state.rendered_lines_dirty.set(true);
-            state.add_toast("已取消当前请求", Duration::from_secs(2));
+            state.add_toast("Cancelled", Duration::from_secs(2));
         }
         EscAction::CancelSelection => {
             // V30 复制修复：丢弃选中区间、不复制。
