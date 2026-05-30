@@ -1760,38 +1760,26 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
 
-        // 第一行：进度条 + 百分比
-        let bw = (area.width as usize).saturating_sub(8).min(16);
+        // 进度条 + 百分比 + token 明细（单行紧凑但有空格）
+        let bw = (area.width as usize).saturating_sub(16).min(10);
         let filled = (pct * bw / 100).min(bw);
         let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(" ", dim),
             Span::styled(bar_str, Style::default().fg(pc)),
-            Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
-        ]));
-
-        // 第二行：token 明细（宽裕排列）
-        let mut detail = vec![
-            Span::styled(" ", dim),
+            Span::styled(format!(" {}% ", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
         ];
         if state.is_streaming {
-            detail.push(Span::styled(format!("{}↑ ", format_ctx(inp as usize)), muted));
-            detail.push(Span::styled("...↓", dim));
+            row.push(Span::styled(format!("{}↑", format_ctx(inp as usize)), muted));
         } else {
-            detail.push(Span::styled(format!("{}↑ ", format_ctx(inp as usize)), muted));
-            detail.push(Span::styled(format!("{}↓", format_ctx(out as usize)), muted));
-        }
-        if cpct > 0 {
-            detail.push(Span::styled(format!("  c{}%", cpct), Style::default().fg(state.theme.success)));
+            row.push(Span::styled(format!("{}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), muted));
         }
         if state.session_tokens.cost_cny > 0.001 {
-            detail.push(Span::styled(format!("  ¥{:.2}", state.session_tokens.cost_cny), gold));
+            row.push(Span::styled(format!(" ¥{:.2}", state.session_tokens.cost_cny), gold));
         }
-        lines.push(Line::from(detail));
+        lines.push(Line::from(row));
     }
 
-    // 空行间隔
-    lines.push(Line::raw(""));
 
     // ── 工具 + 记忆（各占一行，有间距）──
     {
