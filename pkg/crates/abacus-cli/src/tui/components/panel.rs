@@ -1760,107 +1760,84 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
 
-        // 行 1：进度条 + 百分比（简短）
-        let bw = (area.width as usize).saturating_sub(8).min(12);
+        // 行 1：进度条
+        let bw = (area.width as usize).saturating_sub(7).min(14);
         let filled = (pct * bw / 100).min(bw);
         let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
         lines.push(Line::from(vec![
-            Span::styled(" ", dim),
+            Span::styled("  ", dim),
             Span::styled(bar_str, Style::default().fg(pc)),
             Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
         ]));
 
-        // 行 2：token 明细（in · out · cache · cost 各有空间）
-        let mut detail = vec![Span::styled(" ", dim)];
-        detail.push(Span::styled(format!("in {}", format_ctx(inp as usize)), muted));
-        if !state.is_streaming {
-            detail.push(Span::styled(format!(" · out {}", format_ctx(out as usize)), muted));
-        }
-        if cpct > 0 {
-            detail.push(Span::styled(format!(" · c{}%", cpct), Style::default().fg(state.theme.success)));
-        }
-        if state.session_tokens.cost_cny > 0.001 {
-            detail.push(Span::styled(format!(" · ¥{:.2}", state.session_tokens.cost_cny), gold));
-        }
-        lines.push(Line::from(detail));
+        // 行 2-3：两列对齐（label 暗色 + value 亮色）
+        let in_str = format_ctx(inp as usize);
+        let out_str = if state.is_streaming { "...".to_string() } else { format_ctx(out as usize) };
+        lines.push(Line::from(vec![
+            Span::styled("  in  ", dim),
+            Span::styled(format!("{:<6}", in_str), txt),
+            Span::styled("out  ", dim),
+            Span::styled(out_str, txt),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  c   ", dim),
+            Span::styled(format!("{:<6}", if cpct > 0 { format!("{}%", cpct) } else { "—".into() }),
+                if cpct > 50 { Style::default().fg(state.theme.success) } else { muted }),
+            Span::styled("cost ", dim),
+            Span::styled(
+                if state.session_tokens.cost_cny > 0.001 { format!("¥{:.2}", state.session_tokens.cost_cny) } else { "—".into() },
+                gold,
+            ),
+        ]));
     }
 
 
-    // ── 工具统计 ──
+    // ── 工具 + 效率（统一 2 空格缩进 + label/value 对齐）──
     {
         let hc = state.tool_health.len();
         let tc = state.tool_records.len();
-        if hc > 0 || tc > 0 {
-            let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
-            let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
-            let rate = if tc > 0 { sc * 100 / tc } else { 0 };
-            lines.push(Line::from(vec![
-                Span::styled(" ⚙ ", txt),
-                Span::styled(format!("{}/{}", avail, hc), muted),
-                Span::styled(format!("  {}次", tc), dim),
-                Span::styled(format!("  {}%✓", rate), if rate >= 80 {
-                    Style::default().fg(state.theme.success)
-                } else {
-                    Style::default().fg(state.theme.gold)
-                }),
-            ]));
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(" ⚙ ", txt),
-                Span::styled("就绪", muted),
-            ]));
-        }
-    }
-
-    // ── 响应延迟 + 压缩次数 ──
-    {
+        let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
+        let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
+        let rate = if tc > 0 { sc * 100 / tc } else { 100 };
         let comp = state.session_tokens.compress_count;
-        let avg_latency = if state.turn_count > 0 {
-            let total_ms = state.accumulated_elapsed.as_millis() as u64;
-            total_ms / state.turn_count as u64
-        } else { 0 };
-        let mut parts = vec![Span::styled(" ◇ ", txt)];
-        if avg_latency > 0 {
-            let latency_str = if avg_latency > 1000 {
-                format!("{:.1}s/轮", avg_latency as f64 / 1000.0)
-            } else {
-                format!("{}ms/轮", avg_latency)
-            };
-            parts.push(Span::styled(latency_str, muted));
-        }
-        if comp > 0 {
-            parts.push(Span::styled(format!("  压缩{}次", comp), dim));
-        }
-        // 预估剩余轮数（基于当前 token 消耗速率）
-        if state.turn_count > 0 && state.context_window > 0 {
-            let tok_per_turn = state.session_tokens.total_tokens as usize / state.turn_count as usize;
+
+        lines.push(Line::from(vec![
+            Span::styled("  tool ", dim),
+            Span::styled(format!("{:<6}", format!("{}/{}", avail, hc.max(1))), txt),
+            Span::styled("rate ", dim),
+            Span::styled(format!("{}%", rate), if rate >= 80 {
+                Style::default().fg(state.theme.success)
+            } else { Style::default().fg(state.theme.gold) }),
+        ]));
+
+        // 预估剩余轮数
+        let est_turns = if state.turn_count > 0 && state.context_window > 0 {
+            let tok_per_turn = (state.session_tokens.total_tokens as usize).max(1) / (state.turn_count as usize).max(1);
             if tok_per_turn > 0 {
-                let remaining_tok = state.context_window.saturating_sub(
-                    state.ctx_live_tokens as usize
-                );
-                let est_turns = remaining_tok / tok_per_turn;
-                if est_turns < 50 { // 只在接近上限时显示
-                    parts.push(Span::styled(
-                        format!("  ~{}轮余", est_turns),
-                        if est_turns < 5 { Style::default().fg(state.theme.error) }
-                        else { dim }
-                    ));
-                }
-            }
-        }
-        if !parts.is_empty() && parts.len() > 1 {
-            lines.push(Line::from(parts));
-        }
+                let remaining = state.context_window.saturating_sub(state.ctx_live_tokens as usize);
+                Some(remaining / tok_per_turn)
+            } else { None }
+        } else { None };
+
+        lines.push(Line::from(vec![
+            Span::styled("  cmp  ", dim),
+            Span::styled(format!("{:<6}", comp), muted),
+            Span::styled("left ", dim),
+            Span::styled(
+                est_turns.map(|t| format!("~{}轮", t)).unwrap_or_else(|| "—".into()),
+                if est_turns.unwrap_or(99) < 5 { Style::default().fg(state.theme.error) } else { muted },
+            ),
+        ]));
     }
 
-    // ── 记忆宫殿 ──
+    // ── 记忆（仅有数据时）──
     if let Some(ref snap) = state.palace_data {
         let domains = snap.knowledge_domains.len();
         let behaviors = snap.behavior_count;
         if domains > 0 || behaviors > 0 {
             lines.push(Line::from(vec![
-                Span::styled(" △ ", txt),
-                Span::styled(format!("{} 知识域  {} 行为", domains, behaviors), muted),
+                Span::styled("  mem  ", dim),
+                Span::styled(format!("{}域 {}行为", domains, behaviors), muted),
             ]));
         }
     }
