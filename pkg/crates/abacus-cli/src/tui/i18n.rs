@@ -276,6 +276,7 @@ pub fn t(key: &'static str) -> &'static str {
         "dash.running" => if zh { "运行" } else { "Run" },
         "dash.failed" => if zh { "失败" } else { "Fail" },
         "dash.uptime" => if zh { "运行" } else { "Up" },
+        "dash.thinking" => if zh { "思考" } else { "think" },
 
         // ── Focus 面板 ──
         "focus.thinking" => if zh { "思考中" } else { "Thinking" },
