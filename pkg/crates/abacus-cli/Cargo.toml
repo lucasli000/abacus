@@ -9,6 +9,7 @@ homepage = "https://github.com/lucasli000/abacus"
 license = "MIT"
 keywords = ["llm", "agent", "cli", "abacus"]
 categories = ["command-line-interface", "artificial-intelligence"]
+readme = "../../README.md"
 
 [[bin]]
 name = "abacus"

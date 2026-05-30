@@ -19,7 +19,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use crate::tui::i18n::t;
 use crate::tui::markdown;
 use crate::tui::state::{
-    AppState, ExpertStatus, Focus, MsgContent, MsgRole, PanelTab, TaskStatus,
+    AppState, ExpertStatus, Focus, MsgContent, MsgRole, TaskStatus,
 };
 use crate::tui::theme::{SemanticIntent, TextRole};
 

@@ -1,0 +1,22 @@
+<svg width="400" height="200" viewBox="0 0 400 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="400" height="200" fill="white" stroke="black" stroke-width="2"/>
+
+  <!-- 第1: 矮, 偏下 -->
+  <rect x="40"  y="65"  width="12" height="80"  fill="#000000" />
+  <!-- 第2: 中, 偏上 -->
+  <rect x="80"  y="55"  width="12" height="70"  fill="#000000" />
+  <!-- 第3: 矮, 最下 -->
+  <rect x="120" y="75"  width="12" height="80"  fill="#000000" />
+  <!-- 第4: 高, 最上 -->
+  <rect x="160" y="40"  width="12" height="100" fill="#000000" />
+  <!-- 第5: 矮, 偏下 -->
+  <rect x="200" y="65"  width="12" height="80"  fill="#000000" />
+  <!-- 第6: 高, 偏上 -->
+  <rect x="240" y="45"  width="12" height="100" fill="#000000" />
+  <!-- 第7: 中, 偏上 -->
+  <rect x="280" y="55"  width="12" height="70"  fill="#000000" />
+  <!-- 第8: 矮, 最下 -->
+  <rect x="320" y="75"  width="12" height="80"  fill="#000000" />
+  <!-- 第9: 高, 最上 -->
+  <rect x="360" y="40"  width="12" height="100" fill="#000000" />
+</svg>

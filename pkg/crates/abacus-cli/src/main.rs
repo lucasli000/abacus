@@ -47,8 +47,18 @@ use pipe::*;
 /// Abacus - LLM Agent Kernel CLI
 #[derive(Parser, Debug)]
 #[command(name = "abacus")]
-#[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "CLI interface for Abacus LLM Agent kernel", long_about = None)]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), " ", env!("BUILD_DATE"), ")"))]
+#[command(about = "Production-grade LLM Agent kernel")]
+#[command(long_about = concat!(
+    "\n",
+    "   ╭━━━━━━━━━━━━━━━━━━━━━━━━━━╮\n",
+    "   │  A B A C U S              │\n",
+    "   │  LLM Agent Kernel v", env!("CARGO_PKG_VERSION"), "   │\n",
+    "   ╰━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n",
+    "\n",
+    "Multi-mode orchestration: Clarify · Plan · Team · Meeting\n",
+    "Built-in safety, progressive gate, mathematical compression.\n",
+))]
 struct Cli {
     /// Output format
     #[arg(long = "format", short = 'f', value_enum, default_value = "markdown")]
