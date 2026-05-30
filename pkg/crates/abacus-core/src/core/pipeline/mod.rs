@@ -1387,11 +1387,19 @@ impl<'a> TurnPipeline<'a> {
                 // 2026-05-28: 追踪已发送到 TUI 的文本内容（用于流中断重试时通知 TUI 清除部分内容）
                 let mut streamed_text_acc = String::new();
 
-                // BLOCK-1 fix: 用 select! 将 cancel_token 并入事件消费循环
-                // 防止 provider 后台 task 挂起（TCP half-open）导致 event_rx.recv() 永久阻塞
+                // P0 修复: streaming 路径增加总超时保护
+                // 问题：CDN keepalive/server 心跳可绕过 45s idle timeout → 无限期卡死
+                // 解决：pipeline 级 total timeout 包裹整个事件消费循环
+                // 引用关系：dynamic_timeout_secs 由 complexity + tool_bonus 综合计算
+                let stream_total_timeout = std::time::Duration::from_secs(
+                    ctx.dynamic_timeout_secs.saturating_add(60).min(900) // +60s 余量
+                );
+                let stream_deadline = tokio::time::Instant::now() + stream_total_timeout;
+
                 loop {
                     let event = {
                         let recv_fut = event_rx.recv();
+                        let timeout_fut = tokio::time::sleep_until(stream_deadline);
                         if let Some(ref ct) = self.cancel {
                             tokio::select! {
                                 evt = recv_fut => evt,
@@ -1399,9 +1407,32 @@ impl<'a> TurnPipeline<'a> {
                                     handle.abort();
                                     break;
                                 }
+                                _ = timeout_fut => {
+                                    // P0-1: streaming 总超时触发
+                                    handle.abort();
+                                    if let Some(ref stx2) = self.stream_tx {
+                                        let _ = stx2.send(crate::llm::stream::StreamChunk::Error(
+                                            format!("⚠️ streaming timeout: {}s (no complete response)", stream_total_timeout.as_secs())
+                                        ));
+                                    }
+                                    tracing::warn!(timeout_secs = stream_total_timeout.as_secs(), "streaming total timeout hit");
+                                    break;
+                                }
                             }
                         } else {
-                            recv_fut.await
+                            // P0-3: cancel=None 时也有 fallback timeout（防永久阻塞）
+                            tokio::select! {
+                                evt = recv_fut => evt,
+                                _ = timeout_fut => {
+                                    handle.abort();
+                                    if let Some(ref stx2) = self.stream_tx {
+                                        let _ = stx2.send(crate::llm::stream::StreamChunk::Error(
+                                            format!("⚠️ streaming timeout: {}s", stream_total_timeout.as_secs())
+                                        ));
+                                    }
+                                    break;
+                                }
+                            }
                         }
                     };
                     let Some(event) = event else { break };

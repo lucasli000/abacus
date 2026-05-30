@@ -261,7 +261,7 @@ impl OpenAICompatibleProvider {
     ) -> Self {
         // H8: 复用进程级共享 Client
         let client = crate::llm::shared_http_client().clone();
-        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(600));
 
         Self {
             client,
@@ -687,7 +687,17 @@ impl LlmProvider for OpenAICompatibleProvider {
         // V30：流式末 chunk 解析的 reasoning_tokens（completion 子集）
         let mut thinking_tokens_stream = 0u64;
 
-        while let Some(chunk) = byte_stream.next().await {
+        // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
+        loop {
+            let chunk = match tokio::time::timeout(std::time::Duration::from_secs(45), byte_stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break, // stream 正常结束
+                Err(_) => {
+                    tracing::warn!("stream idle timeout (45s), treating as complete");
+                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    break;
+                }
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {

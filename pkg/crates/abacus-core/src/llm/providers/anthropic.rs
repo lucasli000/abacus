@@ -288,7 +288,7 @@ impl AnthropicProvider {
     ) -> Self {
         // H8 修复：复用进程级共享 Client（连接池/DNS/TLS state 跨 provider 共享）
         let client = crate::llm::shared_http_client().clone();
-        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(600));
 
         let model_id: ModelId = model.into();
         let (budget, max_tokens) = if model_id.0.contains("sonnet") || model_id.0.contains("haiku") {
@@ -897,7 +897,17 @@ impl LlmProvider for AnthropicProvider {
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
 
-        while let Some(chunk) = byte_stream.next().await {
+        // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
+        loop {
+            let chunk = match tokio::time::timeout(Duration::from_secs(45), byte_stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break, // stream 正常结束
+                Err(_) => {
+                    tracing::warn!("stream idle timeout (45s), treating as complete");
+                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    break;
+                }
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {

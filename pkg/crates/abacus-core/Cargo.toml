@@ -28,6 +28,7 @@ hmac = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 getrandom = "0.3"
+libc = "0.2"
 futures-util = "0.3"
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
@@ -39,6 +40,19 @@ sha1 = "0.10"
 zeroize = { workspace = true }
 lru = { workspace = true }
 dirs = "6.0.0"
+
+# ─── CodeGraph：tree-sitter 多语言解析 + 文件监听 + 并行索引 ───
+# 引用关系：被 code_graph/lang/*.rs 使用
+# 生命周期：CodeGraphManager 初始化时创建 Parser 实例池
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"
+# 文件监听（code_graph/watcher.rs — 长 daemon 模式增量索引）
+notify = { version = "7", features = ["macos_kqueue"] }
+# 并行索引（code_graph/indexer.rs — spawn_blocking 内 rayon 并行解析）
+rayon = "1.10"
 
 # ─── Phase Stability-1：稳定性补强 ───
 parking_lot = { workspace = true }
@@ -59,6 +73,12 @@ insta = { version = "1", features = ["yaml", "json"] }
 wiremock = "0.6"
 # Property-based testing —— 给 canonical_hash / importance_score 等纯函数补强不变量验证
 proptest = "1"
+# CodeGraph 基准测试
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "codegraph_bench"
+harness = false
 
 [lints]
 workspace = true

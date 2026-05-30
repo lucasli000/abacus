@@ -240,7 +240,7 @@ impl DeepSeekProvider {
     ) -> Self {
         // H8: 复用进程级共享 Client（pool/keepalive 配置已在 shared_http_client 中合并）
         let client = crate::llm::shared_http_client().clone();
-        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(120));
+        let request_timeout = Duration::from_secs(timeout_secs.unwrap_or(600));
 
         let model_id: ModelId = model.into();
         let model_str = model_id.0.as_str();
@@ -793,7 +793,17 @@ impl LlmProvider for DeepSeekProvider {
         // 导致 TUI 出现重复的 Running 条目
         let mut tc_index_started: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-        while let Some(chunk) = byte_stream.next().await {
+        // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
+        loop {
+            let chunk = match tokio::time::timeout(std::time::Duration::from_secs(45), byte_stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break, // stream 正常结束
+                Err(_) => {
+                    tracing::warn!("stream idle timeout (45s), treating as complete");
+                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    break;
+                }
+            };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
