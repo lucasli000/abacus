@@ -311,7 +311,9 @@ pub fn t(key: &'static str) -> &'static str {
         "picker.hint_preset" => if zh { " ↑↓ 选预设 · Enter 应用 · Esc 取消" } else { " ↑↓ preset · Enter · Esc" },
         "confirm.safe" => if zh { " 工具属安全范围" } else { " Tool is safe" },
         "confirm.risky" => if zh { " 检测到潜在风险" } else { " Potential risk detected" },
-        "confirm.after" => if zh { " 后 " } else { " after " },
+        "confirm.after" => if zh { " 后 " } else { " in " },
+        "picker.resume" => if zh { "恢复会话" } else { "Resume" },
+        "picker.history" => if zh { "输入历史" } else { "History" },
 
         // ── 消息流 ──
         "msg.expand" => if zh { "Ctrl+E 展开全部" } else { "Ctrl+E expand" },
@@ -333,6 +335,12 @@ pub fn t(key: &'static str) -> &'static str {
         "panel.deps" => if zh { "依赖" } else { "Deps" },
         "panel.waiting_speak" => if zh { "等待发言" } else { "Awaiting" },
         "panel.meeting_phase" => if zh { "会议阶段" } else { "Phase" },
+
+        // ── 记忆宫殿 ──
+        "palace.behavior" => if zh { "行为" } else { "Behavior" },
+        "palace.knowledge" => if zh { "知识" } else { "Knowledge" },
+        "palace.this_turn" => if zh { "本轮" } else { "This turn" },
+        "palace.loading" => if zh { "启动后加载" } else { "Loading..." },
 
         // ── 时间相对值 ──
         "time.sec_ago" => if zh { "s前" } else { "s ago" },

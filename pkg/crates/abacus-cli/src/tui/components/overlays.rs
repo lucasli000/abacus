@@ -153,9 +153,9 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
     if has_more {
         let remaining = dialog.details.len() - visible_count;
         let hint = if dialog.details_expanded {
-            format!("  … +{} 行更多（已超 8 行上限）", remaining)
+            format!("  … +{}{}", remaining, t("msg.more_lines"))
         } else {
-            format!("  … +{} 行隐藏（按 D 展开）", remaining)
+            format!("  … +{}{}", remaining, t("msg.hidden_expand"))
         };
         lines.push(Line::from(Span::styled(
             hint,
@@ -177,7 +177,7 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
                         .bg(state.theme.success)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" 工具属安全范围", Style::default().fg(state.theme.muted)),
+                Span::styled(t("confirm.safe"), Style::default().fg(state.theme.muted)),
             ]));
         }
         Some(false) => {
@@ -190,7 +190,7 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
                         .bg(state.theme.error)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" 检测到潜在风险", Style::default().fg(state.theme.muted)),
+                Span::styled(t("confirm.risky"), Style::default().fg(state.theme.muted)),
             ]));
         }
         None => {} // 系统无法判断，不加辅助行，保持简洁
@@ -199,9 +199,9 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
     // 倒计时行：剩余秒数 + 超时后的默认动作（颜色与动作语义一致）
     let remaining = dialog.remaining_secs();
     let (timeout_label, timeout_color) = if dialog.risk == ConfirmRisk::High {
-        ("自动拒绝", state.theme.error)
+        (t("confirm.deny"), state.theme.error)
     } else {
-        ("自动允许", state.theme.success)
+        (t("confirm.allow"), state.theme.success)
     };
     let countdown_color = if remaining <= 3 {
         state.theme.error
@@ -217,7 +217,7 @@ pub fn render_confirm_dialog(f: &mut ratatui::Frame, state: &AppState, input_are
             format!("{}s", remaining),
             Style::default().fg(countdown_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" 后 ", Style::default().fg(countdown_color)),
+        Span::styled(t("confirm.after"), Style::default().fg(countdown_color)),
         Span::styled(timeout_label, Style::default().fg(timeout_color).add_modifier(Modifier::BOLD)),
     ]));
 
@@ -540,12 +540,12 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         PickerKind::Model    => format!("{} ({})", t("overlay.model_picker"), p.items.len()),
         PickerKind::Theme    => format!("{} ({})", t("overlay.theme_picker"), p.items.len()),
         PickerKind::Thinking => t("overlay.thinking_picker").to_string(),
-        PickerKind::Mode     => " 切换模式 ".to_string(),
-        PickerKind::Review   => " 审查类型 ".to_string(),
-        PickerKind::Resume   => format!(" 恢复会话 ({}) ", p.items.len()),
-        PickerKind::History  => format!(" 输入历史 ({}) ", p.items.len()),
-        PickerKind::Meeting  => " 🧠 Meeting 会诊 ".to_string(),
-        PickerKind::Preset   => " ⚡ 场景预设 ".to_string(),
+        PickerKind::Mode     => t("picker.mode").to_string(),
+        PickerKind::Review   => t("picker.review").to_string(),
+        PickerKind::Resume   => format!(" {} ({}) ", t("picker.resume"), p.items.len()),
+        PickerKind::History  => format!(" {} ({}) ", t("picker.history"), p.items.len()),
+        PickerKind::Meeting  => format!(" 🧠 {} ", t("mode.meeting")),
+        PickerKind::Preset   => t("picker.preset").to_string(),
     };
     let frame = f.area();
 
@@ -728,15 +728,15 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
 
     // 底部键位提示行（所有 picker）— 让用户发现隐藏操作
     let hint = match p.kind {
-        PickerKind::Model    => " ↑↓ 选模型 · ←→ 调思考深度 · Enter 应用 · Esc 取消",
-        PickerKind::Theme    => " ↑↓ 选主题 · Enter 应用 · Esc 取消",
-        PickerKind::Thinking => " ↑↓ / ←→ 选深度 · Enter 应用 · Esc 取消",
-        PickerKind::Mode     => " ↑↓ 选模式 · Enter 切换 · Esc 取消",
-        PickerKind::Review   => " ↑↓ 选类型 · Space 切换 strict · Enter 执行",
-        PickerKind::Resume   => " ↑↓ 选会话 · Enter 恢复 · Esc 取消",
-        PickerKind::History  => " ↑↓ 选记录 · Enter 重发 · Esc 取消",
-        PickerKind::Meeting  => " ↑↓ 选操作 · Enter 执行 · Esc 取消",
-        PickerKind::Preset   => " ↑↓ 选预设 · Enter 应用 · Esc 取消",
+        PickerKind::Model    => t("picker.hint_model"),
+        PickerKind::Theme    => t("picker.hint_theme"),
+        PickerKind::Thinking => t("picker.hint_thinking"),
+        PickerKind::Mode     => t("picker.hint_mode"),
+        PickerKind::Review   => t("picker.hint_review"),
+        PickerKind::Resume   => t("picker.hint_session"),
+        PickerKind::History  => t("picker.hint_history"),
+        PickerKind::Meeting  => t("picker.hint_generic"),
+        PickerKind::Preset   => t("picker.hint_preset"),
     };
     lines.push(Line::from(vec![
         Span::styled(hint, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
@@ -781,11 +781,11 @@ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rec
         .split(inner);
 
     let fields: [(&str, String, String); 5] = [
-        ("1. API Key", if std::env::var("ABACUS_API_KEY").is_ok() || std::env::var("DEEPSEEK_API_KEY").is_ok() { "✓ 已配置".into() } else { "✗ 未配置".into() }, "只读 · 改 ~/.abacus/config.yaml".into()),
-        ("2. Model", state.model_name.clone(), "Enter 循环 (4 内置)".into()),
+        ("1. API Key", if std::env::var("ABACUS_API_KEY").is_ok() || std::env::var("DEEPSEEK_API_KEY").is_ok() { t("overlay.configured").into() } else { t("overlay.not_configured").into() }, "~/.abacus/config.yaml".into()),
+        ("2. Model", state.model_name.clone(), t("overlay.model_cycle").into()),
         ("3. Thinking", state.thinking_depth.clone(), "off→low→med→high".into()),
-        ("4. Theme", state.theme.name.into(), "Enter 循环 (12 主题)".into()),
-        ("5. 关闭", "".into(), "[Esc]".into()),
+        ("4. Theme", state.theme.name.into(), t("overlay.theme_cycle").into()),
+        ("5. Close", "".into(), "[Esc]".into()),
     ];
 
     for (i, (label, value, hint)) in fields.iter().enumerate() {
@@ -835,7 +835,7 @@ fn render_fullscreen_editor(f: &mut ratatui::Frame, state: &AppState) {
     };
 
     // 外框
-    let title = " 编辑器 (Ctrl+S 发送 · Esc 取消) ";
+    let title = t("picker.editor");
     let total_lines = state.input.matches('\n').count() + 1;
     let total_chars = state.input.chars().count();
     let bottom_info = format!(

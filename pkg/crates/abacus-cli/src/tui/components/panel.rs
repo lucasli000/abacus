@@ -441,10 +441,10 @@ fn render_panel_meeting_agenda(f: &mut ratatui::Frame, state: &AppState, area: R
     } else if done_e == total_e && done_e > 0 {
         ("✓", t("focus.concluded"), state.theme.success)
     } else {
-        ("○", "等待发言", state.theme.muted)
+        ("○", t("panel.waiting_speak"), state.theme.muted)
     };
     lines.push(Line::from(vec![
-        Span::styled("会议阶段", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(t("panel.meeting_phase"), Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("  {} {}", phase_icon, phase_label),
             Style::default().fg(phase_color),
@@ -2367,34 +2367,34 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     // 🧠 记忆宫殿 — palace 本体结构 + 本轮调用记录
     // ════════════════════════════════════════════════════════════
-    lines.push(Line::from(Span::styled("🧠 记忆宫殿", ab)));
+    lines.push(Line::from(Span::styled(format!("🧠 {}", t("panel.knowledge")), ab)));
     if let Some(ref snap) = state.palace_data {
         if snap.behavior_count > 0 {
-            lines.push(Line::from(vec![Span::styled("  行为", Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD)), Span::styled(format!("  {} 条", snap.behavior_count), txt)]));
+            lines.push(Line::from(vec![Span::styled(format!("  {}", t("palace.behavior")), Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD)), Span::styled(format!("  {}", snap.behavior_count), txt)]));
         }
         if !snap.knowledge_domains.is_empty() {
-            lines.push(Line::from(Span::styled("  知识宫殿", Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD))));
+            lines.push(Line::from(Span::styled(format!("  {}", t("palace.knowledge")), Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD))));
             for (domain, cnt) in snap.knowledge_domains.iter().take(5) {
                 let d: String = domain.chars().take(16).collect();
-                lines.push(Line::from(vec![Span::styled(format!("    {}", d), Style::default().fg(state.theme.accent)), Span::styled(format!("  {} 条", cnt), txt)]));
+                lines.push(Line::from(vec![Span::styled(format!("    {}", d), Style::default().fg(state.theme.accent)), Span::styled(format!("  {}", cnt), txt)]));
             }
             if snap.knowledge_domains.len() > 5 {
-                lines.push(Line::styled(format!("    +{} 领域", snap.knowledge_domains.len() - 5), muted));
+                lines.push(Line::styled(format!("    +{}", snap.knowledge_domains.len() - 5), muted));
             }
         }
-        // 本轮调用
+        // This-turn calls
         let mem: Vec<_> = state.knowledge_calls.iter().filter(|k| k.palace.starts_with("记忆/")).collect();
         if !mem.is_empty() {
-            lines.push(Line::styled("  本轮调用", dim));
+            lines.push(Line::styled(format!("  {}", t("palace.this_turn")), dim));
             use std::collections::BTreeMap;
             let mut tree: BTreeMap<&str, u32> = BTreeMap::new();
             for kc in &mem { *tree.entry(kc.domain.as_str()).or_insert(0) += kc.count; }
             for (domain, cnt) in &tree {
-                lines.push(Line::from(vec![Span::styled(format!("    {}", domain), Style::default().fg(state.theme.muted)), Span::styled(format!("  {}次", cnt), txt)]));
+                lines.push(Line::from(vec![Span::styled(format!("    {}", domain), Style::default().fg(state.theme.muted)), Span::styled(format!("  ×{}", cnt), txt)]));
             }
         }
     } else {
-        lines.push(Line::styled("  — 启动后自动加载", muted));
+        lines.push(Line::styled(format!("  — {}", t("palace.loading")), muted));
     }
 
     // ════════════════════════════════════════════════════════════
