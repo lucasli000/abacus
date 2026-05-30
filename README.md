@@ -1,176 +1,215 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="Abacus" width="360" />
+  <img src="assets/icon-256.png" width="120" alt="Abacus Logo" />
 </p>
 
-# Abacus
+<h1 align="center">Abacus</h1>
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/lucasli000/abacus/releases/tag/v1.0.0)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
-[![CI](https://github.com/lucasli000/abacus/actions/workflows/ci.yml/badge.svg)](https://github.com/lucasli000/abacus/actions/workflows/ci.yml)
+<p align="center">
+  <strong>Production-grade LLM Agent Kernel</strong><br>
+  Multi-mode orchestration · Mathematical context compression · Built-in safety
+</p>
 
-LLM Agent Kernel — 模块化 Agent 运行时，TUI 内置 Clarify → Plan → Team → Meeting 四阶交互模式 DAG。
+<p align="center">
+  <a href="https://github.com/lucasli000/abacus/releases/latest"><img src="https://img.shields.io/github/v/release/lucasli000/abacus?style=flat-square&color=blue" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/rust-1.75+-orange?style=flat-square&logo=rust" alt="Rust">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
+</p>
 
-## Quick Start
+---
 
-已装好 abacus（见 [Installation](#installation)）后：
+## What is Abacus?
+
+Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning across four collaborative modes. It provides a rich TUI experience with real-time streaming, tool execution, and multi-expert consultation — all from your terminal.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  ⠋ ABACUS ▸ Refactor auth module · 澄清                     │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  User: 帮我把 session 认证改成 JWT                            │
+│                                                              │
+│  Session:                                                    │
+│  ## 方案确认                                                  │
+│  我决定使用 JWT token 替代 session cookie。                    │
+│  原因：无状态、易扩展、前后端解耦。                              │
+│                                                              │
+│  ```rust                                                     │
+│  impl AuthService {                                          │
+│      pub fn verify_token(&self, token: &str) -> Result<...>  │
+│  }                                                           │
+│  ```                                                         │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│  ╭─────────────────────────────────────────────────────╮     │
+│  │ ● Ready · 澄清                            ⏎ Enter │     │
+│  ╰─────────────────────────────────────────────────────╯     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+## Install
+
+### Quick Install (macOS / Linux)
 
 ```bash
-export ABACUS_API_KEY=sk-xxx        # 或 DEEPSEEK_API_KEY=sk-xxx
-abacus                              # 进入 TUI（默认 Clarify 模式）
+curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
 ```
 
-零起点首次安装请直接看下方 Installation 节。
-
-## Features
-
-### TUI 交互模式（4 阶 DAG）
-
-| 模式 | 功能 |
-|------|------|
-| **Clarify** | 默认入口——澄清需求，agent 通过提问消除歧义 |
-| **Plan** | 规划任务——Planner agent 将需求拆解为 TaskSpec[] |
-| **Team** | 执行任务——多 agent 并行执行，消费上阶段产出 |
-| **Meeting** | 专家会诊——多专家并行发言，综合得出讨论结论 |
-
-### 系统能力
-
-| 模块 | 功能 |
-|------|------|
-| **CLI** | Rustyline 行编辑、Shell 补全、消息复制、`abacus chat/team/meeting` 子命令 |
-| **HTTP Server** | REST API + SSE 流式推送，Bearer token 认证 |
-| **Config** | 首次配置向导、config.yaml、环境变量覆盖 |
-
-## Architecture
-
-```
-abacus-core       — Agent kernel: CoreLoop, LLM providers, tools, skills
-abacus-types      — Shared types: models, errors, sandbox, progressive
-abacus-orchestrator — Team/Meeting engine: specialists, sub-agents, sessions
-abacus-server     — HTTP REST + SSE server (axum)
-abacus-cli        — CLI + TUI (ratatui + crossterm)
-```
-
-## Installation
-
-### 1. 前置依赖
-
-Rust 1.75+。未装：
+Custom install path:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
 ```
 
-### 2. 从源码编译
+### Manual Download
+
+Download from [Releases](https://github.com/lucasli000/abacus/releases/latest):
+
+| Platform | File |
+|----------|------|
+| macOS Apple Silicon | `abacus-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` |
+
+```bash
+tar -xzf abacus-aarch64-apple-darwin.tar.gz
+sudo mv abacus /usr/local/bin/
+abacus --version
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/lucasli000/abacus.git
 cd abacus/pkg
-cargo build --release
-# 产物：./target/release/{abacus, abacus-server}
+cargo install --path crates/abacus-cli
 ```
 
-### 3. 入 PATH（可选）
+### Verify
 
 ```bash
-cargo install --path crates/abacus-cli      # abacus（CLI + TUI）
-cargo install --path crates/abacus-server   # abacus-server（HTTP）
-# 或直接复制：cp ./target/release/abacus ~/.local/bin/
+$ abacus --version
+abacus 1.0.0 (3b43be7d 2026-05-30)
 ```
 
-### 4. 首次启动 — TUI 配置向导
+### Shell Completions
 
 ```bash
+eval "$(abacus completions zsh)"    # Zsh
+eval "$(abacus completions bash)"   # Bash
+abacus completions fish | source    # Fish
+```
+
+### Uninstall
+
+```bash
+rm /usr/local/bin/abacus
+rm -rf ~/.abacus  # Config + data (optional)
+```
+
+## Features
+
+### Four Orchestration Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **Clarify** | Single-agent deep reasoning with progressive gate | Default — ask questions, write code, debug |
+| **Plan** | Two-phase: Research → Approval → Execute | Complex multi-step tasks, user selects strategy (A/S/T) |
+| **Team** | Multi-agent parallel with ToolAgent delegation | Large refactoring, parallel tool operations |
+| **Meeting** | Multi-expert weighted consultation | Cross-domain problems needing diverse expertise |
+
+### Core Engine
+
+- **Mathematical Context Compression** — Information Bottleneck + H2O Heavy-Hitter + ARC + Greedy Knapsack. 38% message reduction, 100% key decision retention.
+- **ToolActionClassifier** — Rule-based safety (hard_deny/soft_deny/allow). Zero LLM overhead.
+- **ToolAgent** — Batch delegation for read-only ops. 4 built-in types: Explorer, Researcher, Coder, Mathematician.
+- **MCIP** — Multi-level permission gate (role → confirm → capability).
+- **ProgressiveGate** — Complexity-aware output strategy.
+- **Dynamic Timeout** — Complexity + tool count + LLM self-extension.
+
+### TUI
+
+- Real-time streaming with thinking visualization
+- Soft-wrap input with cursor tracking
+- Right panel: dashboard + timeline + focus
+- 12 built-in themes
+- Inline suggestions (Tab)
+
+## Quick Start
+
+```bash
+# Interactive TUI (default)
 abacus
+
+# Single query
+abacus ask "explain this error"
+
+# Specific model
+abacus --model deepseek-v4 ask "optimize this"
+
+# Mode switching inside TUI
+/clarify          # Single-agent (default)
+/plan <goal>      # Two-phase planning
+/team <task>      # Multi-agent parallel
+/meeting          # Multi-expert consultation
+@expert msg       # Auto-route to Meeting
 ```
 
-首次运行检测无配置文件，自动进入「首次配置」卡片：
+### First Run — Setup Wizard
 
 ```
-┌─ 首次配置 ────────────────────────────────────┐
-│ 使用须知（数据安全 / 人工审查 / 合规 / 免责）  │
+┌─ Abacus Setup ──────────────────────────────┐
 │                                              │
-│ API URL    https://api.deepseek.com         │
-│ API Key    sk-···                            │
-│ Model      deepseek-v4-flash                 │
+│  1. Choose LLM provider                     │
+│     → OpenAI / Anthropic / DeepSeek / ...   │
 │                                              │
-│ Enter 接受条款 + 保存 · Esc 退出               │
+│  2. Enter API key                           │
+│                                              │
+│  3. Select default model                    │
+│                                              │
 └──────────────────────────────────────────────┘
 ```
 
-- URL 自动识别 9 种 provider：DeepSeek / OpenAI / Anthropic / 通义千问 / Moonshot / 智谱 / SiliconFlow / Groq / OpenAI-Compatible
-- 配置写入 `~/.abacus/config.yaml`（权限 0o600）
-- Enter 后直接进入 TUI 主界面（默认 Clarify 模式）
+Auto-detects 9 providers from URL. Config: `~/.abacus/config.yaml`
 
-#### 跳过向导（CI / 无头部署）
+Skip wizard (CI): `export ABACUS_API_KEY=sk-xxx`
 
-```bash
-export ABACUS_API_KEY=sk-xxx                # 或 DEEPSEEK_API_KEY=sk-xxx
+## Architecture
+
+```
+abacus/pkg/
+├── crates/
+│   ├── abacus-cli/          TUI + CLI (ratatui + clap)
+│   ├── abacus-core/         Engine kernel (pipeline, context, tools, safety)
+│   ├── abacus-orchestrator/ Meeting/Team orchestration
+│   ├── abacus-types/        Shared types
+│   └── abacus-server/       HTTP/SSE server (axum)
+├── assets/                  Logo + icons
+└── scripts/                 Install script
 ```
 
-### 5. 验证安装
+### Multi-Provider Support
 
-```bash
-abacus --version                            # 1.0.0
-abacus chat -m "ping"                       # 端到端冒烟
-```
-
-### Shell 补全（可选）
-
-```bash
-eval "$(abacus completions bash)"           # bash
-abacus completions zsh > ~/.zsh/completions/_abacus
-abacus completions fish > ~/.config/fish/completions/abacus.fish
-```
-
-### Docker（HTTP server 场景）
-
-```bash
-git clone https://github.com/lucasli000/abacus.git
-cd abacus
-docker compose up -d
-curl http://localhost:8080/api/v1/health    # 验证
-```
-
-### 卸载
-
-```bash
-cargo uninstall abacus-cli abacus-server
-rm -rf ~/.abacus/                           # 清理配置 + sessions + sqlite
-```
-
-## Configuration
-
-| 方式 | 示例 |
-|------|------|
-| 环境变量 | `ABACUS_API_KEY=sk-xxx` `ABACUS_SERVER_TOKEN=secret` |
-| config.yaml | `~/.abacus/config.yaml`（首次启动 TUI 向导生成，权限 0o600） |
-| CLI | `abacus config list-keys` / `abacus config set key val` |
-
-完整配置模板见 [`config.example.toml`](config.example.toml)。
-
-**必配项**：`ABACUS_API_KEY` 或 `DEEPSEEK_API_KEY`（二选一）
-
-## CoreLoop API
-
-```rust
-let (core, session) = create_engine("deepseek-v4-flash", None, "high").await?;
-let result = core.process_turn("Write a Rust quick sort", &session).await?;
-println!("{}", result.response);
-```
+| Provider | Models | Status |
+|----------|--------|--------|
+| OpenAI | GPT-4o, o1, o3 | ✅ |
+| Anthropic | Claude Sonnet/Opus | ✅ |
+| DeepSeek | V3, V4, R1 | ✅ |
+| Google | Gemini 2.x | ✅ |
+| Moonshot / 智谱 / 通义 / SiliconFlow / Groq | Various | ✅ |
+| Any OpenAI-compatible | Custom | ✅ |
 
 ## Development
 
 ```bash
-# Full check
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-
-# Run single crate
-cargo run -p abacus-cli -- chat -m "hello"
+cargo check --workspace        # Type check
+cargo test --workspace         # Run tests
+make build                     # Release build
+make package                   # Create .tar.gz
+make universal                 # macOS universal binary
 ```
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
