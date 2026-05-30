@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon-256.png" width="120" alt="Abacus Logo" />
+  <img src="assets/logo.svg" width="360" alt="Abacus Logo" />
 </p>
 
 <h1 align="center">Abacus</h1>
