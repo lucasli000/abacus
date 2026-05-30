@@ -59,9 +59,9 @@ pub fn shared_http_client() -> &'static reqwest::Client {
         reqwest::Client::builder()
             // 连接超时：防止 DNS 解析/TCP 握手卡住（默认无限等待）
             .connect_timeout(std::time::Duration::from_secs(10))
-            // 整体请求超时：非流式请求的最大等待时间
-            // 流式请求由 provider 层自行设 timeout，此处为兜底
-            .timeout(std::time::Duration::from_secs(300))
+            // 不设 Client-level timeout — 让 provider per-request timeout 生效
+            // 原 300s 硬限导致 thinking 模型（需 600s）被提前截断
+            // 兜底由 pipeline dynamic_timeout_secs + select! deadline 保障
             // 连接池
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(32)

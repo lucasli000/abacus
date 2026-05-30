@@ -3320,12 +3320,13 @@ impl<'a> TurnPipeline<'a> {
         let escalation_result = match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(escalated_req, self.cancel_token())).await {
             Ok(result) => result,
             Err(_elapsed) => {
+                let secs = provider_timeout.as_secs();
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                        "LLM escalation request timed out after 300s".into()
+                        format!("LLM escalation request timed out after {}s", secs)
                     ));
                 }
-                Err(KernelError::Provider("escalation request timeout: 300s".into()))
+                Err(KernelError::Provider(format!("escalation request timeout: {}s", secs)))
             }
         };
         match escalation_result {
