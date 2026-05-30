@@ -162,48 +162,67 @@ pub(super) fn render_single_trace_event<'a>(
                 ToolStatus::Running => ("⟳", theme.gold),
             };
             let dur_str = ev.duration_ms.map(|ms| format_duration_ms_padded(ms)).unwrap_or_default();
-            lines.push(Line::from(vec![
-                bar.clone(),
-                Span::raw("  "),
-                Span::styled("⚙ ", Style::default().fg(theme.gold)),
-                Span::styled(name.clone(), Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)),
-                Span::raw(" · "),
-                Span::styled(status_icon, Style::default().fg(status_color)),
-                Span::styled(dur_str, theme.text_style(TextRole::Caption)),
-            ]));
-            if !args.is_empty() {
-                // V29.11: 工具特化视图链
-                // 将 output 传入 diff 渲染以提取 start_line（文件实际行号）
+
+            // V42: Claude Code 风格——单行紧凑展示
+            // 编辑类工具（fs_edit/fs_write）仍展开 diff 视图
+            // 其他工具：`⚙ name ✓ context  dur` 一行搞定
+            let is_edit = name.contains("edit") || name.contains("write");
+
+            if is_edit && !args.is_empty() && max_lines_tool > 0 {
+                // 编辑类：标题行 + diff 展开（需要看到变更内容）
+                lines.push(Line::from(vec![
+                    bar.clone(),
+                    Span::raw("  "),
+                    Span::styled("⚙ ", Style::default().fg(theme.gold)),
+                    Span::styled(name.clone(), Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(status_icon, Style::default().fg(status_color)),
+                    Span::styled(dur_str, theme.text_style(TextRole::Caption)),
+                ]));
                 let output_ref = output.as_deref();
                 let arg_lines = try_render_edit_diff_with_output(
                     name, args, output_ref, theme, max_lines_tool,
-                ).or_else(|| try_render_bash_exec(
-                    name, args, theme, max_lines_tool,
-                )).unwrap_or_else(|| render_block_detail_with_limit(
+                ).unwrap_or_else(|| render_block_detail_with_limit(
                     args, &BlockKind::ToolCall, theme, max_lines_tool, max_width.saturating_sub(3),
                 ));
                 for dl in arg_lines {
-                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
+                    let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("    ")];
                     spans.extend(dl.spans);
                     lines.push(Line::from(spans));
                 }
-            }
-            if let Some(out) = output {
-                if !out.is_empty() {
-                    lines.push(Line::from(vec![
-                        bar.clone(),
-                        Span::raw("  "),
-                        Span::styled("→", theme.text_style(TextRole::Caption)),
-                    ]));
-                    let out_lines = render_block_detail_with_limit(
-                        out, &BlockKind::ToolCall, theme, max_lines_tool, max_width.saturating_sub(3),
-                    );
-                    for dl in out_lines {
-                        let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
-                        spans.extend(dl.spans);
-                        lines.push(Line::from(spans));
-                    }
+            } else {
+                // 非编辑类：单行（args 摘要内联）
+                // 格式：⚙ name ✓ context  dur
+                let context = if !args.is_empty() {
+                    extract_tool_param_summary(args)
+                } else {
+                    String::new()
+                };
+                // 截断 context 到可用宽度
+                // bar(1) + "  "(2) + "⚙ "(2) + name + " "(1) + icon(1) + dur(~6) = ~13 + name.len
+                let avail = max_width.saturating_sub(13 + name.len() + dur_str.len());
+                let ctx_display: String = if context.len() > avail {
+                    context.chars().take(avail.saturating_sub(1)).collect::<String>() + "…"
+                } else {
+                    context
+                };
+
+                let mut spans = vec![
+                    bar.clone(),
+                    Span::raw("  "),
+                    Span::styled("⚙ ", Style::default().fg(theme.gold)),
+                    Span::styled(name.clone(), Style::default().fg(theme.gold).add_modifier(Modifier::BOLD)),
+                    Span::raw(" "),
+                    Span::styled(status_icon, Style::default().fg(status_color)),
+                ];
+                if !ctx_display.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(ctx_display, theme.text_style(TextRole::Caption)));
                 }
+                if !dur_str.is_empty() {
+                    spans.push(Span::styled(format!("  {}", dur_str.trim()), theme.text_style(TextRole::Hint)));
+                }
+                lines.push(Line::from(spans));
             }
         }
         TraceKind::Generic { content } => {
