@@ -400,7 +400,16 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 while let Ok((models, provider_groups, provider_statuses)) = model_list_rx.try_recv() {
                     state.available_models = models;
                     state.available_providers = provider_groups;
-                    state.provider_statuses = provider_statuses;
+                    state.provider_statuses = provider_statuses.clone();
+                    // 启动时 active_provider_id 为空（仅在首次 Complete 回传后填充）
+                    // 从 discover 结果中取第一个 available provider 作初始值
+                    if state.active_provider_id.is_empty() {
+                        if let Some((id, _, _)) = provider_statuses.iter().find(|(_, avail, _)| *avail) {
+                            state.active_provider_id = id.clone();
+                        } else if let Some((id, _, _)) = provider_statuses.first() {
+                            state.active_provider_id = id.clone();
+                        }
+                    }
                 }
                 if state.pending_model_fetch {
                     state.pending_model_fetch = false;
