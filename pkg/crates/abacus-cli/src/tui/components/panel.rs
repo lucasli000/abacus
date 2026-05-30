@@ -1744,7 +1744,7 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
     let gold = Style::default().fg(state.theme.gold);
     let mut lines: Vec<Line> = Vec::new();
 
-    // ── 统计标题行（ctx% + in/out + cost）──
+    // ── 上下文进度条（2 行：bar + 明细）──
     {
         let raw_used = if state.ctx_live_tokens > 0 {
             state.ctx_live_tokens as usize
@@ -1755,38 +1755,45 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
         let pct = if max_ctx > 0 && used > 0 { used * 100 / max_ctx } else { 0 };
         let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };
-        // V41: streaming 期间用稳定值（latest_prompt_tokens）防止闪烁
-        // 只有 turn 完成后才更新 inp/out（Complete 事件写入 session_tokens）
         let inp = state.session_tokens.prompt_tokens;
         let out = state.session_tokens.completion_tokens;
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
 
-        // 紧凑单行：📊 [====--------] 38% 415K↑5K↓ c78 ¥0.08
-        let bw = 12usize;
+        // 第一行：进度条 + 百分比
+        let bw = (area.width as usize).saturating_sub(8).min(16);
         let filled = (pct * bw / 100).min(bw);
-        let bar_str = format!("[{}{}]", "=".repeat(filled), "-".repeat(bw - filled));
-        let mut row = vec![
-            Span::styled("📊 ", ab),
+        let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
+        lines.push(Line::from(vec![
+            Span::styled(" ", dim),
             Span::styled(bar_str, Style::default().fg(pc)),
             Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+        ]));
+
+        // 第二行：token 明细（宽裕排列）
+        let mut detail = vec![
+            Span::styled(" ", dim),
         ];
-        // streaming 期间只显示 inp（稳定），out 用 "..." 占位防止长度跳变
         if state.is_streaming {
-            row.push(Span::styled(format!(" {}↑...↓", format_ctx(inp as usize)), dim));
+            detail.push(Span::styled(format!("{}↑ ", format_ctx(inp as usize)), muted));
+            detail.push(Span::styled("...↓", dim));
         } else {
-            row.push(Span::styled(format!(" {}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), dim));
+            detail.push(Span::styled(format!("{}↑ ", format_ctx(inp as usize)), muted));
+            detail.push(Span::styled(format!("{}↓", format_ctx(out as usize)), muted));
         }
         if cpct > 0 {
-            row.push(Span::styled(format!(" c{}%", cpct), Style::default().fg(state.theme.success)));
+            detail.push(Span::styled(format!("  c{}%", cpct), Style::default().fg(state.theme.success)));
         }
         if state.session_tokens.cost_cny > 0.001 {
-            row.push(Span::styled(format!(" ¥{:.2}", state.session_tokens.cost_cny), gold));
+            detail.push(Span::styled(format!("  ¥{:.2}", state.session_tokens.cost_cny), gold));
         }
-        lines.push(Line::from(row));
+        lines.push(Line::from(detail));
     }
 
-    // ── 工具健康摘要（一行）──
+    // 空行间隔
+    lines.push(Line::raw(""));
+
+    // ── 工具 + 记忆（各占一行，有间距）──
     {
         let hc = state.tool_health.len();
         let tc = state.tool_records.len();
@@ -1794,51 +1801,23 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
             let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
             let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
             let mut parts = vec![
-                Span::styled("🔧 ", ab),
-                Span::styled(format!("{}/{}", avail, hc), txt),
+                Span::styled(" ⚙ ", txt),
+                Span::styled(format!("{}/{} 可用", avail, hc), muted),
             ];
             if tc > 0 {
-                parts.push(Span::styled(format!(" · 调{}✓{}", tc, sc), muted));
-                // 最频繁工具
-                let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
-                for r in &state.tool_records { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
-                if let Some((tn, cnt)) = freq.iter().max_by_key(|(_, c)| *c) {
-                    let t: String = tn.rsplitn(2, "__").next().unwrap_or(tn).chars().take(12).collect();
-                    parts.push(Span::styled(format!(" · {}{}", t, cnt), dim));
-                }
+                parts.push(Span::styled(format!("  {}调用 {}成功", tc, sc), dim));
             }
             lines.push(Line::from(parts));
         }
     }
 
-    // ── 记忆宫殿摘要（一行）──
     if let Some(ref snap) = state.palace_data {
         let domains = snap.knowledge_domains.len();
         let behaviors = snap.behavior_count;
         if domains > 0 || behaviors > 0 {
             lines.push(Line::from(vec![
-                Span::styled("🧠 ", ab),
-                Span::styled(format!("{}域 {}行为", domains, behaviors), txt),
-            ]));
-        }
-    }
-
-    // ── 技能摘要（一行，仅有调用时）──
-    {
-        let skills: Vec<_> = state.tool_records.iter()
-            .filter(|r| !r.name.contains("__") && !r.name.starts_with("mcp_"))
-            .collect();
-        if !skills.is_empty() {
-            let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
-            for r in &skills { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
-            let top: Vec<String> = freq.iter()
-                .max_by_key(|(_, c)| *c)
-                .map(|(n, c)| format!("{} {}×", n, c))
-                .into_iter().collect();
-            lines.push(Line::from(vec![
-                Span::styled("⚡ ", ab),
-                Span::styled(format!("{}次", skills.len()), txt),
-                Span::styled(if top.is_empty() { String::new() } else { format!(" · {}", top.join("")) }, dim),
+                Span::styled(" ◇ ", txt),
+                Span::styled(format!("{} 知识域  {} 行为", domains, behaviors), muted),
             ]));
         }
     }
