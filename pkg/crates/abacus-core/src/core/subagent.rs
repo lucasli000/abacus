@@ -106,7 +106,7 @@ impl ToolAgentRegistry {
         self.register(ToolAgentDef {
             id: "explorer".into(),
             name: "Explorer".into(),
-            icon: "🔍".into(),
+            icon: "▸".into(),
             tool_filter: [
                 "fs_read", "fs_list", "fs_search", "fs_tree", "fs_info",
                 "grep", "cg_query", "cg_search", "cg_list",
@@ -124,7 +124,7 @@ impl ToolAgentRegistry {
         self.register(ToolAgentDef {
             id: "researcher".into(),
             name: "Researcher".into(),
-            icon: "🌐".into(),
+            icon: "◆".into(),
             tool_filter: [
                 "web_search", "web_fetch", "web_readable",
             ].iter().map(|s| s.to_string()).collect(),
@@ -138,7 +138,7 @@ impl ToolAgentRegistry {
         self.register(ToolAgentDef {
             id: "coder".into(),
             name: "Coder".into(),
-            icon: "💻".into(),
+            icon: "⚙".into(),
             tool_filter: [
                 "fs_write", "fs_edit", "fs_read", "fs_search", "fs_list",
                 "bash_exec", "grep",
@@ -154,7 +154,7 @@ impl ToolAgentRegistry {
         self.register(ToolAgentDef {
             id: "mathematician".into(),
             name: "Math".into(),
-            icon: "🧮".into(),
+            icon: "∑".into(),
             tool_filter: [
                 "compute_eval", "compute_symbolic", "compute_matrix",
                 "db_query",  // SQL 统计计算
@@ -380,7 +380,7 @@ mod tests {
         reg.register(ToolAgentDef {
             id: "analyzer".into(),
             name: "Analyzer".into(),
-            icon: "📊".into(),
+            icon: "◇".into(),
             tool_filter: ["ast_parse", "metrics"].iter().map(|s| s.to_string()).collect(),
             priority: 2,
             summarize_results: true,
