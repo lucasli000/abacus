@@ -24,23 +24,27 @@ Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning acro
 │  ⠋ ABACUS ▸ Refactor auth module · 澄清                       deepseek-v4     │
 ├──────────────────────────────────────────────────────────┬──────────────────────┤
 │                                                          │ 📊 [====------] 38% │
-│  User: 帮我把 session 认证改成 JWT                        │ 🔧 12/14 · 调8✓7    │
-│                                                          │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
-│  Session:                                                │ 现场                 │
-│  ## 方案确认                                              │ ▸ 12:03 分析代码     │
-│  我决定使用 JWT token 替代 session cookie。                │   ⚙ fs_read auth.rs │
-│  原因：无状态、易扩展、前后端解耦。                          │ ▸ 12:04 方案生成     │
-│                                                          │   ✓ 2 工具完成       │
-│  ```rust                                                 │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
-│  impl AuthService {                                      │ Focus · 澄清 · 3轮  │
-│      pub fn verify_token(&self, token: &str)             │   JWT 认证重构       │
-│          -> Result<Claims, AuthError>                     │   → 方案已确认       │
-│  }                                                       │                      │
-│  ```                                                     │                      │
-│                                                          │                      │
+│  User: 帮我把 session 认证改成 JWT                        │    415K↑ 5K↓ c78%   │
+│                                                          │ 🔧 12/14 · 调8✓7    │
+│  Session:                                                │ 🧠 3域 12行为        │
+│  ## 方案确认                                              │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
+│  我决定使用 JWT token 替代 session cookie。                │ 现场                 │
+│  原因：无状态、易扩展、前后端解耦。                          │ ▸ 12:03 分析代码     │
+│                                                          │   ⚙ fs_read auth.rs │
+│  ```rust                                                 │ ▸ 12:04 方案生成     │
+│  impl AuthService {                                      │   ✓ 2 工具完成       │
+│      pub fn verify_token(&self, token: &str)             │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
+│          -> Result<Claims, AuthError>                     │ Focus · 澄清 · 3轮  │
+│  }                                                       │   JWT 认证重构       │
+│  ```                                                     │   → 方案已确认       │
+│                                                          ├──────────────────────┤
+│                                                          │ deepseek(✓) · v4     │
+│                                                          │ ⬡ 52K/128K/1M · 3轮 │
+│                                                          │ thinking · ¥0.08     │
 ├──────────────────────────────────────────────────────────┴──────────────────────┤
 │  ╭───────────────────────────────────────────────────────────────────────────╮  │
-│  │ ● Ready · 澄清                                                 ⏎ Enter │  │
+│  │ ⠋ Thinking 澄清 · 分析认证模块结构  3.2s                                 │  │
+│  │ Ask anything...                                                 ⏎ Enter │  │
 │  ╰───────────────────────────────────────────────────────────────────────────╯  │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │  ● 澄清                                          1.2K tok  Cmd+↑↓ Ctrl+B Esc │
