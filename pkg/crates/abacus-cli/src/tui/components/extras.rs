@@ -289,19 +289,8 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
 
     let mut lines: Vec<Line> = Vec::new();
     let muted = Style::default().fg(state.theme.muted);
-    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let txt = Style::default().fg(state.theme.text);
-    let w = (area.width as usize).saturating_sub(4).max(10);
 
-    // 标题行
-    let header_fill = w.saturating_sub(8).min(12);
-    lines.push(Line::from(vec![
-        Span::styled("  ─ ", dim),
-        Span::styled("Health", muted),
-        Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
-    ]));
-
-    // Provider + Model（4 格缩进）
+    // 第一行：● provider  model（无标题行——tab header 已标识）
     let provider_label = if state.active_provider_id.is_empty() { "—" } else { &state.active_provider_id };
     let (status_icon, status_color) = match state.provider_statuses.iter()
         .find(|(id, _, _)| id == &state.active_provider_id)
@@ -311,14 +300,13 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
         None => ("·", state.theme.muted),
     };
     lines.push(Line::from(vec![
-        Span::styled("    ", dim),
-        Span::styled(format!("{} ", status_icon), Style::default().fg(status_color)),
+        Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
         Span::styled(provider_label, Style::default().fg(status_color)),
-        Span::styled("  ", dim),
+        Span::styled("  ", muted),
         Span::styled(&state.model_name, Style::default().fg(state.theme.accent)),
     ]));
 
-    // Context: ⬡ used/configured/max  turns
+    // 第二行：⬡ used/configured  N轮  [thinking]
     let raw_used = if state.ctx_live_tokens > 0 {
         state.ctx_live_tokens as usize
     } else {
@@ -337,19 +325,16 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     } else {
         format!("{}/{}/{}", format_ctx(used), format_ctx(configured), format_ctx(model_max))
     };
-    lines.push(Line::from(vec![
-        Span::styled("    ⬡ ", Style::default().fg(ctx_color)),
+    let mut ctx_spans = vec![
+        Span::styled(" ⬡ ", Style::default().fg(ctx_color)),
         Span::styled(ctx_text, Style::default().fg(ctx_color)),
         Span::styled(format!("  {}轮", state.turn_count), muted),
-    ]));
-
-    // Thinking depth（如果非空）
+    ];
+    // thinking depth 紧凑追加在同一行（节省纵向空间）
     if !state.thinking_depth.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("    ", dim),
-            Span::styled(&state.thinking_depth, txt),
-        ]));
+        ctx_spans.push(Span::styled(format!("  {}", state.thinking_depth), muted));
     }
+    lines.push(Line::from(ctx_spans));
 
     let visible = area.height as usize;
     if lines.len() > visible { lines.truncate(visible); }
@@ -367,25 +352,23 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     if !health.runner_active || health.jobs.is_empty() {
-        // 未启用状态
-        lines.push(Line::raw(""));
+        // 未启用状态（紧凑：2行不留空）
         lines.push(Line::from(vec![
-            Span::styled("  ⚡ ", muted),
+            Span::styled(" ⚡ ", muted),
             Span::styled("未启用", muted),
         ]));
-        lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("  配置 ~/.abacus/auto.yaml", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+            Span::styled(" ~/.abacus/auto.yaml", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
         ]));
     } else {
-        // 概览行
+        // 概览行（紧凑）
         let total = health.total_count();
         let active = health.active_count();
         let failed = health.failed_count();
         lines.push(Line::from(vec![
-            Span::styled("  任务  ", muted),
+            Span::styled(" 任务 ", muted),
             Span::styled(format!("{}", total), Style::default().fg(state.theme.text)),
-            Span::styled("  运行  ", muted),
+            Span::styled("  运行 ", muted),
             Span::styled(format!("{}", active), Style::default().fg(state.theme.success)),
             if failed > 0 {
                 Span::styled(format!("  失败 {}", failed), Style::default().fg(state.theme.error))
@@ -393,7 +376,6 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
                 Span::raw("")
             },
         ]));
-        lines.push(Line::raw(""));
 
         // 任务列表（最多显示 area.height - 3 条）
         let max_jobs = area.height.saturating_sub(3) as usize;
