@@ -1849,60 +1849,76 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// Timeline — 现场时间线
+///
+/// V41: 统一方案 E 排版
+/// - 标题行: `─ Timeline ────`
+/// - 阶段行: 4 格缩进 `▸ 12:03 分析代码`（活跃=accent，历史=muted）
+/// - 工具行: 6 格缩进 `✓ fs_read  0.3s`
 fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
     use ratatui::style::{Style, Modifier};
-    let w = (area.width as usize).saturating_sub(3).max(10);
+    let w = (area.width as usize).saturating_sub(4).max(10);
     let muted = Style::default().fg(state.theme.muted);
     let dim   = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let _ab    = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
     let txt   = Style::default().fg(state.theme.text);
     let mut lines: Vec<Line> = Vec::new();
-    // ── 标题行 ──
-    lines.push(Line::from(Span::styled("现场", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD))));
+
+    // 标题行（与 Stockroom/Focus 统一格式）
+    let header_fill = w.saturating_sub(10).min(12);
+    lines.push(Line::from(vec![
+        Span::styled("  ─ ", dim),
+        Span::styled("Timeline", muted),
+        Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
+    ]));
 
     let groups = compute_timeline_groups(state);
     if groups.is_empty() {
         if state.messages.is_empty() {
-            lines.push(Line::styled(" 输入问题开始对话", dim));
-            lines.push(Line::styled(" /help 查看命令", dim));
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim),
+                Span::styled("输入问题开始对话", dim),
+            ]));
         } else {
-            lines.push(Line::styled(" ⏸ 等待输入", muted));
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim),
+                Span::styled("· 等待输入", muted),
+            ]));
         }
     } else {
         let gl = groups.len();
         for (gi, g) in groups.iter().enumerate() {
             let is_last = gi == gl - 1;
             let tc = if g.is_active && is_last { state.theme.accent } else { state.theme.muted };
-            let ts = if g.timestamp.is_empty() { String::new() } else { format!(" {} ", g.timestamp) };
-            // 阶段名：▸ 标识 + time + label
+            let ts = if g.timestamp.is_empty() { String::new() } else { format!("{} ", g.timestamp) };
+            // 阶段行（4 格缩进）
             lines.push(Line::from(vec![
-                Span::styled("▸", Style::default().fg(tc)),
+                Span::styled("    ", dim),
+                Span::styled("▸ ", Style::default().fg(tc)),
                 Span::styled(ts, dim),
-                Span::styled(g.label.clone(), Style::default().fg(tc).add_modifier(Modifier::BOLD)),
+                Span::styled(g.label.clone(), Style::default().fg(tc)),
             ]));
-            // 工具行：保持紧凑，填满宽度
+            // 工具行（6 格缩进）
             for l in &g.lines {
-                let fill = w.saturating_sub(crate::tui::util::display_width(l));
-                let padding = if fill > 0 { " ".repeat(fill) } else { String::new() };
+                let t: String = l.chars().take(w.saturating_sub(4)).collect();
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(l.clone(), txt),
-                    Span::styled(padding, dim),
+                    Span::styled("      ", dim),
+                    Span::styled(t, txt),
                 ]));
             }
-            // 阶段间空行（紧凑：仅1行）
-            if gi + 1 < gl { lines.push(Line::raw("")); }
         }
-        // 滚动指示
+        // 滚动处理
         let vis = area.height as usize;
         if lines.len() > vis {
             let end = lines.len().saturating_sub(state.timeline_scroll_offset);
             let start = end.saturating_sub(vis);
             lines = lines[start..end].to_vec();
             if state.timeline_scroll_offset > 0 && !lines.is_empty() {
-                lines[0] = Line::styled(format!(" ↑ {} 更新", state.timeline_scroll_offset), dim);
+                lines[0] = Line::from(vec![
+                    Span::styled("    ", dim),
+                    Span::styled(format!("↑ {} 更多", state.timeline_scroll_offset), dim),
+                ]);
             }
         }
     }
