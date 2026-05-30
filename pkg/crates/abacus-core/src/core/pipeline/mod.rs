@@ -422,16 +422,17 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-        let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
+        let timeout_secs = self.core.config.thresholds.turn_provider_timeout_secs;
+        let provider_timeout = std::time::Duration::from_secs(timeout_secs);
         let response = match tokio::time::timeout(provider_timeout, provider.complete_cancellable(req, self.cancel_token())).await {
             Ok(result) => result?,
             Err(_elapsed) => {
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                        "LLM request timed out after 300s".into()
+                        format!("⚠️ request timed out after {}s", timeout_secs)
                     ));
                 }
-                return Err(KernelError::Provider(format!("request timeout: {}s", self.core.config.thresholds.turn_provider_timeout_secs)));
+                return Err(KernelError::Provider(format!("request timeout: {}s", timeout_secs)));
             }
         };
         let final_response = super::extract_text(&response.message);

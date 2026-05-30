@@ -455,7 +455,8 @@ impl Default for ThresholdConfig {
             turn_max_tool_calls: 50, // 2026-05-27: 从 100 降至 50，对齐 Claude Code 量级
             turn_max_iterations: 200,
             turn_max_recovery: 5,
-            turn_provider_timeout_secs: 300,
+            // V41: 300→600s — thinking model (R1/o3) 首 token 时间可达 2-5 分钟
+            turn_provider_timeout_secs: 600,
             turn_premature_stop_retries: 3,
             // Execution 级
             tool_bash_timeout_secs: 120,
