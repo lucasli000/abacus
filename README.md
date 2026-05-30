@@ -10,10 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/lucasli000/abacus/releases/latest"><img src="https://img.shields.io/github/v/release/lucasli000/abacus?style=flat-square&color=blue" alt="Release"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  <img src="https://img.shields.io/badge/rust-1.75+-orange?style=flat-square&logo=rust" alt="Rust">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform">
+  <code>v1.0.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
 </p>
 
 ---
