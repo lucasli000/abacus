@@ -1,6 +1,6 @@
 //! Abacus TUI — 运行逻辑 (库函数，供 binary 和 CLI 共同使用)
 
-use std::io;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,6 +47,10 @@ impl TermGuard {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        // OSC 0: 设置终端窗口/tab 标题（Warp/iTerm2/Terminal.app 通用）
+        // OSC 1: 设置 tab 图标文本（iTerm2 专属，其他终端静默忽略）
+        let _ = write!(stdout, "\x1b]0;⬡ Abacus\x07");
+        let _ = write!(stdout, "\x1b]1;⬡\x07");
         // V29 (P4): 启用 FocusGained/FocusLost 事件(用于 ConfirmDialog 后台暂停 timer)
         //   不支持的终端忽略此 escape sequence, 不破坏其它功能 — 安全降级
         let _ = execute!(stdout, EnableFocusChange);
