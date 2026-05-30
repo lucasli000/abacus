@@ -1707,11 +1707,11 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ratatui::style::Style::default().fg(state.theme.muted).add_modifier(ratatui::style::Modifier::DIM),
     ));
 
-    // 动态分配：streaming 时 Focus 占更多空间（Timeline 让位）
+    // Stockroom 固定高度——填满有价值的统计信息（不留白）
     let dyn_focus = if state.is_streaming { Constraint::Fill(2) } else { Constraint::Fill(1) };
     let secs = Layout::default().direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(6),         // Stockroom + inline 统计
+            Constraint::Min(6),         // Stockroom（6行统计数据）
             Constraint::Length(1),      // 分隔线
             Constraint::Fill(1),        // Timeline
             Constraint::Length(1),      // 分隔线
@@ -1781,30 +1781,80 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
     }
 
 
-    // ── 工具 + 记忆（各占一行，有间距）──
+    // ── 工具统计 ──
     {
         let hc = state.tool_health.len();
         let tc = state.tool_records.len();
         if hc > 0 || tc > 0 {
             let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
             let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
-            let mut parts = vec![
+            let rate = if tc > 0 { sc * 100 / tc } else { 0 };
+            lines.push(Line::from(vec![
                 Span::styled(" ⚙ ", txt),
-                Span::styled(format!("{}/{} 可用", avail, hc), muted),
-            ];
-            if tc > 0 {
-                parts.push(Span::styled(format!("  {}调用 {}成功", tc, sc), dim));
+                Span::styled(format!("{}/{}", avail, hc), muted),
+                Span::styled(format!("  {}次", tc), dim),
+                Span::styled(format!("  {}%✓", rate), if rate >= 80 {
+                    Style::default().fg(state.theme.success)
+                } else {
+                    Style::default().fg(state.theme.gold)
+                }),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(" ⚙ ", txt),
+                Span::styled("就绪", muted),
+            ]));
+        }
+    }
+
+    // ── 响应延迟 + 压缩次数 ──
+    {
+        let comp = state.session_tokens.compress_count;
+        let avg_latency = if state.turn_count > 0 {
+            let total_ms = state.accumulated_elapsed.as_millis() as u64;
+            total_ms / state.turn_count as u64
+        } else { 0 };
+        let mut parts = vec![Span::styled(" ◇ ", txt)];
+        if avg_latency > 0 {
+            let latency_str = if avg_latency > 1000 {
+                format!("{:.1}s/轮", avg_latency as f64 / 1000.0)
+            } else {
+                format!("{}ms/轮", avg_latency)
+            };
+            parts.push(Span::styled(latency_str, muted));
+        }
+        if comp > 0 {
+            parts.push(Span::styled(format!("  压缩{}次", comp), dim));
+        }
+        // 预估剩余轮数（基于当前 token 消耗速率）
+        if state.turn_count > 0 && state.context_window > 0 {
+            let tok_per_turn = state.session_tokens.total_tokens as usize / state.turn_count as usize;
+            if tok_per_turn > 0 {
+                let remaining_tok = state.context_window.saturating_sub(
+                    state.ctx_live_tokens as usize
+                );
+                let est_turns = remaining_tok / tok_per_turn;
+                if est_turns < 50 { // 只在接近上限时显示
+                    parts.push(Span::styled(
+                        format!("  ~{}轮余", est_turns),
+                        if est_turns < 5 { Style::default().fg(state.theme.error) }
+                        else { dim }
+                    ));
+                }
             }
+        }
+        if !parts.is_empty() && parts.len() > 1 {
             lines.push(Line::from(parts));
         }
     }
 
+    // ── 记忆宫殿 ──
     if let Some(ref snap) = state.palace_data {
         let domains = snap.knowledge_domains.len();
         let behaviors = snap.behavior_count;
         if domains > 0 || behaviors > 0 {
             lines.push(Line::from(vec![
-                Span::styled(" ◇ ", txt),
+                Span::styled(" △ ", txt),
                 Span::styled(format!("{} 知识域  {} 行为", domains, behaviors), muted),
             ]));
         }
