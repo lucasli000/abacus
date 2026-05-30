@@ -482,19 +482,53 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     }
 
     // 默认分支: 切换模型
+    // PR4: Resolve through ModelPreference aliases first, then legacy shortcuts.
+    // Priority: preference alias > hardcoded shortcut > raw input
+    let input_str = args[0];
     let name = match lower.as_str() {
         "pro" | "deepseek-v4-pro" => "deepseek-v4-pro",
         "flash" | "deepseek-v4-flash" => "deepseek-v4-flash",
         "qwen" | "qwen-plus" => "qwen-plus",
-        _ => args[0],
+        "list" | "ls" => {
+            // PR4: `/model list` → delegate to engine for ProviderRegistry listing
+            return engine_or(s, SlashCommand::ModelList);
+        }
+        _ => input_str,
     };
     s.model_name = name.to_string();
     s.theme.apply_model_brand(name);
-    // 热切换：下达到 CoreLoop（async 方法，需 spawn）
+    // 热切换：同步等待 CoreLoop 完成 model override + preference persistence
+    // 修复：原 tokio::spawn 存在竞态——toast 显示"已生效"时 override 可能尚未写入，
+    // 导致紧接的用户输入仍用旧模型。block_in_place + block_on 确保写入完成后才继续。
+    //
+    // PR4: Additionally resolve through preference aliases and persist selection.
+    // ## 引用关系
+    // - core.model_preference() → read alias → resolve QualifiedModelId
+    // - core.set_model_override() → write effective model
+    // - save_model_preference() → persist to ~/.abacus/model_preference.json
     if let Some(ref engine) = s.engine_handle {
         let core = engine.core.clone();
-        let model_name = name.to_string();
-        tokio::spawn(async move { core.set_model_override(&model_name).await; });
+        let model_input = name.to_string();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                // Resolve alias through preference
+                let qid = {
+                    let preference = core.model_preference().read().await;
+                    preference.resolve_alias(&model_input)
+                };
+                // Set override using the resolved model name
+                core.set_model_override(qid.model_name()).await;
+                // Persist selection
+                {
+                    let mut pref = core.model_preference().write().await;
+                    pref.set_last_selected(qid.clone());
+                }
+                // Fire-and-forget save to disk
+                let pref_snapshot = core.model_preference().read().await.clone();
+                let pref_path = abacus_types::preference_file_path();
+                let _ = abacus_types::save_model_preference(&pref_snapshot, &pref_path);
+            });
+        });
     }
     s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
     CmdResult::Consumed
@@ -817,6 +851,12 @@ fn cmd_set(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
 /// 引用关系：cmd_clarify/meeting 入口；abacus_types::AbacusMode::can_transit_to 判定
 /// 失败行为：toast 提示合法路径 + 不切换
 /// 设计意图：仅保留 Clarify ⇄ Meeting 双向转移（V34: Plan/Team 已降级为执行策略）
+/// 公开入口 — 供 event/mod.rs 的 @ 自动路由调用
+/// 引用关系：event/mod.rs submit_message → 此函数
+pub fn try_switch_mode_pub(s: &mut AppState, target: AbacusMode) {
+    try_switch_mode(s, target);
+}
+
 fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
     if s.mode == target {
         s.add_toast(
@@ -875,9 +915,16 @@ fn try_switch_mode(s: &mut AppState, target: AbacusMode) {
             }
 
             // 2026-05-27: 如果提取到行动项 → 设置执行提案，等待用户确认
+            // V41: 接入 TaskAnalyzer 7 维复杂度分析，替代硬编码 len()>3
             if !action_items.is_empty() {
                 let items_text: Vec<String> = action_items.iter().map(|a| a.text.clone()).collect();
-                let suggest_team = items_text.len() > 3;
+                let complexity = abacus_core::core::task_analyzer::TaskAnalyzer::analyze_complexity(
+                    &items_text.join("\n")
+                );
+                // /team 触发条件: 高复杂度 / 多领域 / 有决策且多任务
+                let suggest_team = complexity.score > 0.5
+                    || complexity.domain_count > 2
+                    || (complexity.has_decisions && items_text.len() > 2);
                 let cmd_hint = if suggest_team { "/team" } else { "/plan" };
                 s.pending_meeting_execution = Some(crate::tui::state::MeetingExecutionPrompt {
                     action_items: items_text.clone(),
@@ -2384,6 +2431,12 @@ fn cmd_expert(s: &mut AppState, _raw: &str, args: &[&str]) -> CmdResult {
                 domain: domain.clone(),
                 model: model.clone(),
                 hint_tags: vec![domain.clone()],
+                role: String::new(),
+                guide_strategy: String::new(),
+                anti_pattern: String::new(),
+                capabilities: vec![],
+                allowed_tools: vec![],
+                engagement: ec::ExpertEngagement::default(),
             };
             let mut experts = ec::load_experts();
             if experts.iter().any(|e| e.id == id) {

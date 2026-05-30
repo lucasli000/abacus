@@ -185,14 +185,17 @@ impl SessionCheckpoint {
 /// 自适应压缩阈值序列
 ///
 /// compress_count = 已完成的压缩次数（0-based）
-/// 序列：70→80→85→90→75（稳态循环）
+/// 序列：70→80→85→90→75（compress_count>=4 稳态）
+///
+/// 设计意图：前几次逐步提高阈值（给 LLM 更多空间积累上下文），
+/// 第 4 次及之后回落到 75%（稳态，确保不会过于频繁触发压缩）。
 pub fn compress_threshold_pct(compress_count: u32) -> f64 {
     match compress_count {
         0 => 70.0,
         1 => 80.0,
         2 => 85.0,
         3 => 90.0,
-        _ => 75.0, // 第 5 次及后续稳态
+        _ => 75.0, // compress_count >= 4: 稳态
     }
 }
 
@@ -821,6 +824,15 @@ pub struct ContextManager {
     /// - 读取：`auto_compress_messages` 压缩时检查
     /// - 清理：session 结束时随 ContextManager 销毁
     pub pinned_turns: RwLock<std::collections::HashSet<u32>>,
+    /// V41: 数学压缩引擎追踪器（引用计数 + MinHash + ARC + 自适应阈值）
+    ///
+    /// 引用关系：
+    /// - 写入：pipeline turn 结束时更新 references + register_message
+    /// - 读取：auto_compress_messages_inner 评分时查 reference_counts + adaptive_threshold
+    /// - 清理：压缩后同步 remove_indices
+    ///
+    /// 生命周期：随 ContextManager 创建，session 级
+    pub compress_tracker: RwLock<crate::core::compress_math::MessageTracker>,
     /// Phase Z3：auto_compress 使用的默认档位
     pub default_compress_level: RwLock<CompressLevel>,
     /// Phase Z2：消息压缩 archive（recover_id → 原始 messages 副本）
@@ -936,6 +948,7 @@ impl ContextManager {
             shed_pending: std::sync::atomic::AtomicBool::new(false),
             kb_store: RwLock::new(None),
             pinned_turns: RwLock::new(std::collections::HashSet::new()),
+            compress_tracker: RwLock::new(crate::core::compress_math::MessageTracker::new()),
             default_compress_level: RwLock::new(CompressLevel::Brief),
             message_archive: RwLock::new(abacus_types::BoundedFifo::new(MAX_ARCHIVE_ENTRIES)),
             summarizer: RwLock::new(Arc::new(DeterministicSummarizer::brief())),
@@ -1017,30 +1030,13 @@ impl ContextManager {
         messages: &mut Vec<Message>,
         checkpoint: &SessionCheckpoint,
     ) -> Vec<CompressedMessage> {
-        // 1. 临时降低触发阈值至 1%，确保 auto_compress_messages 内部守卫通过
-        //    （pipeline 已在外层验证 usage_pct >= adaptive threshold，此处无需重复判断）
-        //    保存原始值，完成后恢复，防止影响其他并发路径
-        let orig_trigger = {
-            let mut window = self.window.write().await;
-            let orig = window.compression_trigger_pct;
-            window.compression_trigger_pct = 1;
-            orig
-        };
-
-        // 2. 临时覆盖压缩档位（按 phase 决定精度）
+        // V41: 不再临时修改共享状态（消除竞态窗口）。
+        // 改为通过 bypass_threshold + override_level 参数传递，
+        // 任何并发压缩路径读到的 window/default_level 始终是原始值。
         let level = checkpoint.compression_level();
-        let prev_level = *self.default_compress_level.read().await;
-        *self.default_compress_level.write().await = level;
 
-        // 3. 执行压缩
-        let result = self.auto_compress_messages(messages).await;
-
-        // 4. 恢复档位 + 触发阈值
-        *self.default_compress_level.write().await = prev_level;
-        {
-            let mut window = self.window.write().await;
-            window.compression_trigger_pct = orig_trigger;
-        }
+        // 执行压缩（bypass_threshold=true: 外部已验证阈值；override_level=Some: 按 phase 精度）
+        let result = self.auto_compress_messages_inner(messages, true, Some(level)).await;
 
         // 4. 注入 checkpoint 历史块（在 early_keep=2 之后，作为背景上下文）
         if !result.is_empty() {
@@ -1822,14 +1818,37 @@ impl ContextManager {
     ///
     /// 3. **二阶段策略**：
     ///    - normal (85%~95%)：仅压缩"non-tool 中间段连续区间"
-    ///    - force_discard (>=95%)：保留 early=1 + late=2，丢弃中间段（含 tool 序列），
-    ///      接受 cache miss 换取存活
+    ///    - force_discard (>=95%)：保留 early=2 + late=3 + tool_protocol，丢弃中间段非 tool 消息，
+    ///      注入 emergency summary 保留关键决策点，接受 cache miss 换取存活
     pub async fn auto_compress_messages(
         &self,
         messages: &mut Vec<Message>,
     ) -> Vec<CompressedMessage> {
+        self.auto_compress_messages_inner(messages, false, None).await
+    }
+
+    /// 内部压缩实现——接受覆盖参数，消除共享状态竞态
+    ///
+    /// ## 参数
+    /// - `bypass_threshold`: true = 跳过 should_compress() 检查（由外部调用方保证阈值）
+    /// - `override_level`: 覆盖 default_compress_level（不修改共享状态）
+    ///
+    /// ## 引用关系
+    /// - 公开接口: auto_compress_messages（bypass=false, level=None）
+    /// - Checkpoint 接口: auto_compress_with_checkpoint（bypass=true, level=Some）
+    ///
+    /// ## V41 设计意图
+    /// 消除 auto_compress_with_checkpoint 临时修改 window.compression_trigger_pct 和
+    /// default_compress_level 的竞态窗口。改为参数传递，任何并发压缩路径读到的
+    /// 共享状态始终是原始值。
+    async fn auto_compress_messages_inner(
+        &self,
+        messages: &mut Vec<Message>,
+        bypass_threshold: bool,
+        override_level: Option<CompressLevel>,
+    ) -> Vec<CompressedMessage> {
         let window = self.window.read().await;
-        if !window.should_compress() {
+        if !bypass_threshold && !window.should_compress() {
             return Vec::new();
         }
         let force = window.should_force_discard();
@@ -1848,11 +1867,21 @@ impl ContextManager {
                 || matches!(m.role, MessageRole::Tool)
         }
 
-        /// 消息重要性评分（0.0-1.0）——高分消息在压缩时保留更多内容
-        /// 关键信息保护：决策、结论、错误、用户确认不会被简单压缩掉
+        /// 消息重要性评分（0.0-1.0）——旧版启发式评分（V41 后仅作为 fallback 保留）
+        ///
+        /// V41: normal 路径已切换到 CompositeScorer（数学引擎），
+        /// 此函数仅在 extract_key_points 等辅助逻辑中保留。
+        #[allow(dead_code)]
         fn importance_score(m: &Message) -> f64 {
-            let text = match &m.content {
+            let owned_text: String;
+            let text: &str = match &m.content {
                 Some(MessageContent::Text(t)) => t.as_str(),
+                Some(MessageContent::MultiPart(parts)) => {
+                    owned_text = parts.iter().filter_map(|p| {
+                        if let crate::llm::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join(" ");
+                    &owned_text
+                }
                 _ => return 0.3, // 无文本内容，低分
             };
             let lower = text.to_lowercase();
@@ -1867,10 +1896,12 @@ impl ContextManager {
             }
 
             // 错误/警告 → 高保护（诊断信息不能丢）
+            // V41: 权重从 0.2 提升到 0.3——防止短 assistant 错误消息被压缩
+            // （原 0.2 导致 base0.3+err0.2=0.5 < threshold0.7，错误信息丢失后 LLM 重复失败操作）
             let error_markers = ["error", "failed", "panic", "bug", "issue",
                 "错误", "失败", "异常", "问题"];
             for marker in &error_markers {
-                if lower.contains(marker) { score += 0.2; break; }
+                if lower.contains(marker) { score += 0.3; break; }
             }
 
             // 用户角色消息 → 中等保护（用户意图）
@@ -1888,9 +1919,17 @@ impl ContextManager {
         }
 
         /// 从消息中提取关键结论（保护核心信息不丢失）
+        /// V41: 支持 MultiPart 消息
         fn extract_key_points(m: &Message) -> Option<String> {
-            let text = match &m.content {
-                Some(MessageContent::Text(t)) => t,
+            let owned: String;
+            let text: &str = match &m.content {
+                Some(MessageContent::Text(t)) => t.as_str(),
+                Some(MessageContent::MultiPart(parts)) => {
+                    owned = parts.iter().filter_map(|p| {
+                        if let crate::llm::ContentPart::Text { text } = p { Some(text.as_str()) } else { None }
+                    }).collect::<Vec<_>>().join("\n");
+                    &owned
+                }
                 _ => return None,
             };
 
@@ -1930,8 +1969,11 @@ impl ContextManager {
         // Phase Z2：archive 写入缓冲——flush 时一并写入 message_archive
         let mut archive_writes: Vec<(String, Vec<Message>, ArchiveMeta)> = Vec::new();
 
-        // Phase Z3：取默认压缩档位决定 snippet 长度
-        let compress_level = *self.default_compress_level.read().await;
+        // Phase Z3：取压缩档位决定 snippet 长度（V41: 优先用 override，消除竞态）
+        let compress_level = match override_level {
+            Some(level) => level,
+            None => *self.default_compress_level.read().await,
+        };
         let snippet_lines = match compress_level {
             CompressLevel::Detailed => 2,
             CompressLevel::Brief => 1,
@@ -2007,7 +2049,7 @@ impl ContextManager {
             };
 
             let summary = format!(
-                "[Compressed: {count} msgs, ~{total_tok} tok, id={recover_id}]{key_section}\n{}",
+                "[Compressed: {count} msgs, ~{total_tok} tok, recover_id={recover_id}]{key_section}\n{}",
                 role_summary.join("\n")
             );
             let compressed_tok = estimate_tokens(&summary);
@@ -2040,6 +2082,14 @@ impl ContextManager {
             buf.clear();
         };
 
+        // V41: force_discard 路径——累积被丢弃消息的元数据，循环后注入 summary
+        let mut force_discarded_count: usize = 0;
+        let mut force_discarded_tokens: usize = 0;
+        let mut force_discarded_key_points: Vec<String> = Vec::new();
+
+        // V41: normal 路径——收集非 tool 中间消息，循环后由 GreedyKnapsack 统一决策
+        let mut knapsack_candidates: Vec<(usize, &Message)> = Vec::new();
+
         let mut current_turn_num: u32 = 0;
         for (i, msg) in original.iter().enumerate() {
             // 跟踪 turn 编号（每条 User 消息 = 新 turn）
@@ -2069,61 +2119,211 @@ impl ContextManager {
                 // force_discard：丢弃中间段释放空间。
                 // 2026-05-28: tool 协议消息必须成组保留——找到完整的
                 // assistant(tool_calls)→tool→...→tool 组，整组保留或整组丢弃。
-                // 策略：跳过单独的 tool 协议消息（由下方整组检测处理），
-                //       非 tool 消息直接丢弃。
+                // 策略：tool 协议消息保留（防 API 400），非 tool 消息丢弃但提取 key_points。
+                //
+                // V41 修复：丢弃的非 tool 消息不再静默消失——循环结束后注入 emergency summary，
+                // 包含被丢弃消息的 key_points + token 统计，防止 LLM 因历史空白产生幻觉。
+                // summary 注入逻辑在 force 循环结束后的 `force_summary_injection` 块中。
                 if is_tool_protocol(msg) {
                     // Tool 协议消息在 force 模式下也整组保留（防 400）
-                    // 代价：force 压缩率略低，但不会触发 API 协议违规
                     new_messages.push(msg.clone());
                 } else {
-                    let role = format!("{:?}", msg.role);
+                    // 提取 key_points（在丢弃前保存决策信息）
+                    if let Some(kp) = extract_key_points(msg) {
+                        force_discarded_key_points.push(kp);
+                    }
                     let text = match &msg.content {
                         Some(MessageContent::Text(t)) => t.clone(),
+                        Some(MessageContent::MultiPart(parts)) => {
+                            parts.iter().filter_map(|p| {
+                                if let crate::llm::ContentPart::Text { text } = p { Some(text.clone()) } else { None }
+                            }).collect::<Vec<_>>().join(" ")
+                        }
                         _ => String::new(),
                     };
+                    let tok = estimate_tokens(&text);
+                    force_discarded_tokens += tok;
+                    force_discarded_count += 1;
                     compressed_records.push(CompressedMessage {
-                        original_role: role,
-                        summary: format!("[Force-discarded: {} tok]", estimate_tokens(&text)),
-                        original_tokens: estimate_tokens(&text),
+                        original_role: format!("{:?}", msg.role),
+                        summary: format!("[Force-discarded: {} tok]", tok),
+                        original_tokens: tok,
                         compressed_tokens: 0,
                     });
                 }
-                continue; // 不写入 new_messages (tool 已在上面 push)
+                continue;
             }
-
-            let score = importance_score(msg);
 
             if is_tool_protocol(msg) {
                 // 2026-05-28: Tool 协议消息必须成组保留或成组丢弃。
-                // 单独压缩 tool response 会破坏 assistant→tool 配对 → API 400。
                 // 策略：tool 协议消息无条件保留（不进 pending 压缩）。
-                // 空间代价可控：tool results 通常短（JSON output），不是主要 token 消耗源。
                 flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
                 new_messages.push(msg.clone());
-            } else if score >= 0.7 {
-                // 高重要性非 tool 消息（决策/结论/错误）→ 保留原文但截断到前 300 chars
+            } else {
+                // V41: 收集非 tool 中间消息为候选——稍后由 GreedyKnapsack 统一决策
+                // 先 flush 前面累积的 pending（保持工具消息与非工具消息的交错顺序）
                 flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+                knapsack_candidates.push((i, msg));
+            }
+        }
+        // 末尾 flush（理论上不会触发因为 late 阶段会先 flush，但保险）
+        flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+
+        // ══════════════════════════════════════════════════════════════
+        // V41: GreedyKnapsack 选择——对收集的非 tool 中间消息统一做背包决策
+        // ══════════════════════════════════════════════════════════════
+        //
+        // 算法流程：
+        //   1. 对每条候选计算复合分数 + MinHash 签名
+        //   2. 构造 SelectionCandidate 列表
+        //   3. GreedyKnapsackSelector::select() — MinHash 去重 + value_density 贪心
+        //   4. retained → 保留（Rate-Distortion 截断）；compressed → 批量合并
+        //
+        // Token 预算计算：target = (当前 used - 需要释放的量)中分配给中间消息的份额
+        // 简化：预算 = 中间消息总 token × (1 - 压缩目标比例)
+        if !force && !knapsack_candidates.is_empty() {
+            use crate::core::compress_math::{
+                CompositeScorer, MessageType, MinHashSig,
+                SelectionCandidate, GreedyKnapsackSelector, SnippetOptimizer,
+            };
+
+            let decay_lambda = match compress_level {
+                CompressLevel::Detailed => 0.8,
+                CompressLevel::Brief => 1.2,
+                CompressLevel::Minimal => 2.0,
+            };
+            let scorer = CompositeScorer::new(decay_lambda);
+            let tracker = self.compress_tracker.read().await;
+
+            // 构建候选列表
+            let mut candidates: Vec<SelectionCandidate> = Vec::with_capacity(knapsack_candidates.len());
+            let mut candidate_msgs: Vec<&Message> = Vec::with_capacity(knapsack_candidates.len());
+            let mut total_candidate_tokens: usize = 0;
+
+            for &(orig_idx, msg) in &knapsack_candidates {
+                let text = match &msg.content {
+                    Some(MessageContent::Text(t)) => t.clone(),
+                    Some(MessageContent::MultiPart(parts)) => {
+                        parts.iter().filter_map(|p| {
+                            if let crate::llm::ContentPart::Text { text } = p { Some(text.clone()) } else { None }
+                        }).collect::<Vec<_>>().join(" ")
+                    }
+                    _ => String::new(),
+                };
+                let role_str = format!("{:?}", msg.role);
+                let msg_type = MessageType::classify(&role_str, &text);
+                let token_count = estimate_tokens(&text);
+                let unique_ratio = CompositeScorer::compute_unique_ratio(&text);
+                let distance = if total_len > 0 {
+                    (total_len - 1 - orig_idx) as f64 / total_len as f64
+                } else { 0.0 };
+                let ref_count = tracker.reference_counts.get(&orig_idx).copied().unwrap_or(0);
+
+                let score = scorer.score(msg_type, token_count, unique_ratio, distance, ref_count);
+                let value_density = if token_count > 0 { score / token_count as f64 } else { score };
+                let signature = Some(MinHashSig::from_text(&text));
+
+                total_candidate_tokens += token_count;
+                candidates.push(SelectionCandidate {
+                    index: candidates.len(), // 在 candidates vec 内的 index
+                    score,
+                    tokens: token_count,
+                    value_density,
+                    signature,
+                    redundant: false,
+                });
+                candidate_msgs.push(msg);
+            }
+            drop(tracker);
+
+            // Token 预算：保留中间消息总量的一定比例
+            // Detailed=60%, Brief=40%, Minimal=20%
+            let retain_ratio = match compress_level {
+                CompressLevel::Detailed => 0.60,
+                CompressLevel::Brief => 0.40,
+                CompressLevel::Minimal => 0.20,
+            };
+            let token_budget = (total_candidate_tokens as f64 * retain_ratio) as usize;
+
+            // 执行贪心背包选择
+            let (retained_indices, compressed_indices) =
+                GreedyKnapsackSelector::select(&mut candidates, token_budget);
+
+            // 处理 retained：保留原文（可能 Rate-Distortion 截断）
+            let snippet_opt = SnippetOptimizer::new(0.85);
+            for &ci in &retained_indices {
+                let msg = candidate_msgs[ci];
                 let mut preserved = msg.clone();
                 if let Some(MessageContent::Text(ref text)) = preserved.content {
-                    if text.len() > 300 {
-                        // 截断但保留关键点
+                    let opt_len = snippet_opt.optimal_length(text);
+                    if text.len() > opt_len + 50 {
                         let key_points = extract_key_points(msg);
                         let truncated = format!(
                             "{}...\n[Key: {}]",
-                            text.chars().take(250).collect::<String>(),
+                            text.chars().take(opt_len).collect::<String>(),
                             key_points.unwrap_or_else(|| "truncated".into())
                         );
                         preserved.content = Some(MessageContent::Text(truncated));
                     }
                 }
                 new_messages.push(preserved);
-            } else {
-                // 中低重要性 → 进入 pending 批量压缩
-                pending_summary.push(msg);
+            }
+
+            // 处理 compressed：批量合并为摘要
+            if !compressed_indices.is_empty() {
+                let to_compress: Vec<&Message> = compressed_indices.iter()
+                    .map(|&ci| candidate_msgs[ci])
+                    .collect();
+                // 复用 flush_pending 逻辑
+                let mut batch: Vec<&Message> = to_compress;
+                flush_pending(&mut batch, &mut new_messages, &mut compressed_records, &mut archive_writes);
             }
         }
-        // 末尾 flush（理论上不会触发因为 late 阶段会先 flush，但保险）
-        flush_pending(&mut pending_summary, &mut new_messages, &mut compressed_records, &mut archive_writes);
+
+        // V41: force_discard 路径——在 early 之后注入 emergency summary
+        // 设计意图：LLM 不再看到"从 early 直接跳到 late"的空白历史，
+        // 而是看到明确的上下文丢失通知 + 被保留的关键决策点。
+        // 引用关系：此 summary 被 LLM 作为 context 消费，不参与 recover 流程。
+        // 生命周期：注入后随 messages 存在，下次压缩时可被进一步压缩。
+        if force && force_discarded_count > 0 {
+            let key_section = if force_discarded_key_points.is_empty() {
+                String::new()
+            } else {
+                // 限制 key_points 总长度防止注入本身占用过多 token
+                let mut combined = force_discarded_key_points.join(" | ");
+                if combined.len() > 500 {
+                    combined = format!("{}...", combined.chars().take(500).collect::<String>());
+                }
+                format!("\n[Preserved decisions: {}]", combined)
+            };
+            let emergency_summary = format!(
+                "[CONTEXT LOSS: {} messages (~{} tokens) emergency-discarded due to context overflow (>=95%)]{}\n\
+                 WARNING: Information above may be incomplete. If you need prior context, ask the user to clarify.",
+                force_discarded_count, force_discarded_tokens, key_section
+            );
+            // 插入位置：early_keep 之后（在 tool_protocol 消息和 late 消息之前）
+            let insert_pos = early_keep.min(new_messages.len());
+            new_messages.insert(insert_pos, Message {
+                role: MessageRole::User,
+                content: Some(MessageContent::Text(format!(
+                    "[SYSTEM: Emergency Context Compression - not user input]\n{}",
+                    emergency_summary
+                ))),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+                prefix: false,
+            });
+            // 记录压缩 summary 的 token 消耗
+            let summary_tok = estimate_tokens(&emergency_summary);
+            compressed_records.push(CompressedMessage {
+                original_role: "EmergencySummary".into(),
+                summary: format!("[Injected emergency summary: {} tok]", summary_tok),
+                original_tokens: 0,
+                compressed_tokens: summary_tok,
+            });
+        }
 
         *messages = new_messages;
 
@@ -3073,7 +3273,7 @@ pub async fn register_context_tools(
     let tools = vec![
         ToolHandle {
             id: ToolId("context_declare".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_declare".into(),
                 description: "Declare intent to load large content. Returns a GeneralizedIndex (segment skeleton, token count). Call FIRST before reading large files/sessions.".into(),
                 parameters: serde_json::json!({
@@ -3107,7 +3307,7 @@ pub async fn register_context_tools(
         },
         ToolHandle {
             id: ToolId("context_keep".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_keep".into(),
                 description: "Keep selected segments at full or summarized fidelity. Unmentioned segments auto-dropped.".into(),
                 parameters: serde_json::json!({
@@ -3140,7 +3340,7 @@ pub async fn register_context_tools(
         },
         ToolHandle {
             id: ToolId("context_compress".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_compress".into(),
                 description: "Compress context to free tokens. mode='messages': compress old conversation history (output your summary FIRST, then call this — recent 8 messages are preserved). mode='segments': compress declared segments by ID.".into(),
                 parameters: serde_json::json!({
@@ -3174,7 +3374,7 @@ pub async fn register_context_tools(
         // Phase Z1：session.recall——从持久化 cold tier 召回历史 SessionSnapshot
         ToolHandle {
             id: ToolId("session_recall".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "session_recall".into(),
                 description: "Search the persistent cold-tier session archive by keyword to recall historical session summaries (use when recover_id has been LRU-evicted).".into(),
                 parameters: serde_json::json!({
@@ -3208,7 +3408,7 @@ pub async fn register_context_tools(
         // Phase Z2：messages.recover——按 recover_id 取回压缩前的原始 messages
         ToolHandle {
             id: ToolId("messages_recover".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "messages_recover".into(),
                 description: "Retrieve the original messages from a compressed history block by its recover_id (returned in the [Compressed history: recover_id=...] hint).".into(),
                 parameters: serde_json::json!({
@@ -3242,7 +3442,7 @@ pub async fn register_context_tools(
         // LLM 感知压缩决策：pin 指定 turn（压缩时保留原文）
         ToolHandle {
             id: ToolId("context_pin".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_pin".into(),
                 description: "Pin a conversation turn to protect it from compression. Pinned turns are never compressed — use for critical decisions, error diagnostics, or user confirmations you need to reference later.".into(),
                 parameters: serde_json::json!({
@@ -3266,7 +3466,7 @@ pub async fn register_context_tools(
         },
         ToolHandle {
             id: ToolId("context_unpin".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_unpin".into(),
                 description: "Remove pin from a previously pinned turn (allow it to be compressed).".into(),
                 parameters: serde_json::json!({
@@ -3289,7 +3489,7 @@ pub async fn register_context_tools(
         },
         ToolHandle {
             id: ToolId("context_pinned".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_pinned".into(),
                 description: "List all currently pinned turns (protected from compression).".into(),
                 parameters: serde_json::json!({"type": "object"}),
@@ -3307,7 +3507,7 @@ pub async fn register_context_tools(
         // LLM 主动查询上下文占用状态（双层决策 Layer 1 的基础）
         ToolHandle {
             id: ToolId("context_status".into()),
-            schema: ToolSchema {
+            schema: ToolSchema { short_description: None,
                 name: "context_status".into(),
                 description: "Query current context window usage: tokens used/max, compression history, and pressure status. Use to decide when to proactively compress.".into(),
                 parameters: serde_json::json!({
@@ -3337,7 +3537,7 @@ pub async fn register_context_tools(
 }
 
 #[cfg(test)]
-mod tests {
+mod context_manager_tests {
     use super::*;
     use crate::llm::MessageContent;
 
@@ -4038,7 +4238,9 @@ mod tests {
         assert_eq!(evicted, 1, "distance > 2*evict_distance 强制 evict 即使 ref_count 高");
     }
 
-    /// Ctx-B: force_discard (>=95%) 时丢弃中间含 tool 序列
+    /// Ctx-B: force_discard (>=95%) 时丢弃中间段
+    /// - tool_protocol 消息保留（防 API 400）
+    /// - 非 tool 消息丢弃 + emergency summary 注入
     #[tokio::test]
     async fn test_force_discard_drops_middle() {
         let mgr = ContextManager::new(Arc::new(NoopStore));
@@ -4052,15 +4254,53 @@ mod tests {
         // force mode: early_keep=2, keep_count=3 → need > 6 msgs
         msgs.push(mk_msg("EARLY1"));
         msgs.push(mk_msg("EARLY2"));
+        // 10 条 tool_protocol 消息（is_tool_protocol=true → 保留）
         for _ in 0..10 {
             msgs.push(mk_assistant_with_tool_call("tool call"));
         }
         msgs.push(mk_msg("late 1"));
         msgs.push(mk_msg("late 2"));
         msgs.push(mk_msg("late 3"));
-        // total=15, early=2, tail_start=15-3=12, middle=index 2..12 (10 msgs, all force-discarded)
+        // total=15, early=2, tail_start=15-3=12, middle=index 2..12 (10 tool msgs, all preserved)
+        // V41: 无非 tool 消息被丢弃 → 不注入 emergency summary
         let _ = mgr.auto_compress_messages(&mut msgs).await;
-        assert_eq!(msgs.len(), 5, "force_discard：2 early + 3 late = 5");
+        assert_eq!(msgs.len(), 15, "force_discard：2 early + 10 tool(preserved) + 3 late = 15");
+    }
+
+    /// Ctx-B2: force_discard 丢弃非 tool 消息 + 注入 emergency summary
+    #[tokio::test]
+    async fn test_force_discard_injects_emergency_summary() {
+        let mgr = ContextManager::new(Arc::new(NoopStore));
+        {
+            let mut w = mgr.window.write().await;
+            w.max_tokens = 100;
+            w.current_tokens = 96; // >= 95% → force_discard
+            w.compression_trigger_pct = 85;
+        }
+        let mut msgs = Vec::new();
+        msgs.push(mk_msg("EARLY1"));
+        msgs.push(mk_msg("EARLY2"));
+        // 10 条非 tool 中间消息（将被丢弃）
+        for i in 0..10 {
+            msgs.push(mk_msg(&format!("middle content {}", i)));
+        }
+        msgs.push(mk_msg("late 1"));
+        msgs.push(mk_msg("late 2"));
+        msgs.push(mk_msg("late 3"));
+        // total=15, early=2, tail=3, middle 10 条非 tool → 全丢弃 + 注入 1 条 emergency summary
+        let records = mgr.auto_compress_messages(&mut msgs).await;
+        // 2 early + 1 emergency_summary + 3 late = 6
+        assert_eq!(msgs.len(), 6, "force_discard：2 early + 1 summary + 3 late = 6");
+        // 验证 emergency summary 内容
+        let summary_msg = &msgs[2]; // insert_pos = early_keep = 2
+        let text = match &summary_msg.content {
+            Some(MessageContent::Text(t)) => t.clone(),
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("CONTEXT LOSS"), "应包含 CONTEXT LOSS 标记");
+        assert!(text.contains("10 messages"), "应记录 10 条被丢弃");
+        // 验证有 compressed_records（10 条 Force-discarded + 1 条 EmergencySummary）
+        assert_eq!(records.len(), 11);
     }
 
     // ─── W4 (Task #102) Selective History Retention ────────────────────────
@@ -4206,5 +4446,124 @@ mod tests {
         assert_eq!(d.current_turn, 20);
         assert!(d.total_tokens > 0);
         assert!(d.max_importance > d.avg_importance || (d.max_importance - d.avg_importance).abs() < 1e-9);
+    }
+
+    // ─── V41: 压缩效率基准测试 ────────────────────────────────────────
+
+    /// 模拟真实 session：混合消息类型 + 重复 + 决策内容
+    /// 验证数学引擎的压缩率、信息保留率、去重效果
+    #[tokio::test]
+    async fn benchmark_compression_efficiency() {
+        let mgr = ContextManager::new(Arc::new(NoopStore));
+        {
+            let mut w = mgr.window.write().await;
+            w.max_tokens = 1000;
+            w.current_tokens = 880; // 88% → 触发压缩（Brief 模式）
+            w.compression_trigger_pct = 85;
+        }
+
+        let mut msgs = Vec::new();
+
+        // Early: 2 条系统上下文
+        msgs.push(mk_msg("You are a helpful coding assistant."));
+        msgs.push(mk_msg("请帮我修改 auth 模块的认证逻辑"));
+
+        // 中间段：模拟真实对话（30 条）
+        // 类型 1: 决策消息（应保留）
+        msgs.push(mk_assistant("## 方案确认\n我决定使用 JWT token 替代 session cookie。\n原因：无状态、易扩展、前后端解耦。"));
+        // 类型 2: 普通分析（中等价值）
+        msgs.push(mk_assistant("让我先看看当前的认证代码结构..."));
+        msgs.push(mk_msg("好的，继续"));
+        // 类型 3: 重复内容（应去重）
+        msgs.push(mk_assistant("git status 显示 3 个文件修改：auth.rs, config.rs, test.rs"));
+        msgs.push(mk_assistant("git status 显示 3 个文件修改：auth.rs, config.rs, test.rs"));
+        msgs.push(mk_assistant("git status 显示 3 个文件修改：auth.rs, config.rs, test.rs"));
+        // 类型 4: 错误消息（应保留）
+        msgs.push(mk_assistant("Error: cannot borrow `self.tokens` as mutable because it is also borrowed as immutable\n  --> src/auth.rs:42:5"));
+        // 类型 5: 长代码（高密度，应截断保留）
+        msgs.push(mk_assistant("```rust\nimpl AuthService {\n    pub fn verify_token(&self, token: &str) -> Result<Claims, AuthError> {\n        let key = self.signing_key.as_bytes();\n        let data = decode::<Claims>(token, &DecodingKey::from_secret(key), &Validation::default())?;\n        if data.claims.exp < Utc::now().timestamp() as usize {\n            return Err(AuthError::Expired);\n        }\n        Ok(data.claims)\n    }\n}\n```"));
+        // 类型 6: 普通确认（低价值，但有一定长度模拟真实 session）
+        for i in 0..15 {
+            msgs.push(mk_assistant(&format!(
+                "好的，正在处理第 {} 步。我会先检查相关文件的依赖关系，然后逐步修改代码，确保每一步都不破坏现有功能。这个过程可能需要查看多个模块的接口定义。",
+                i
+            )));
+        }
+        // 类型 7: 最终结论（应保留）
+        msgs.push(mk_assistant("## 结论\n已完成 JWT 认证模块重构：\n1. 新增 verify_token() 方法\n2. 替换了 session 中间件\n3. 添加了 token 刷新逻辑"));
+
+        // Late: 3 条最近消息
+        msgs.push(mk_msg("测试一下"));
+        msgs.push(mk_assistant("所有测试通过 ✓"));
+        msgs.push(mk_msg("提交吧"));
+
+        let total_before = msgs.len();
+        let tokens_before: usize = msgs.iter().map(|m| {
+            match &m.content {
+                Some(MessageContent::Text(t)) => estimate_tokens(t),
+                _ => 0,
+            }
+        }).sum();
+
+        let records = mgr.auto_compress_messages(&mut msgs).await;
+        let total_after = msgs.len();
+        let tokens_after: usize = msgs.iter().map(|m| {
+            match &m.content {
+                Some(MessageContent::Text(t)) => estimate_tokens(t),
+                _ => 0,
+            }
+        }).sum();
+
+        // 计算指标
+        let compression_ratio = 1.0 - (tokens_after as f64 / tokens_before as f64);
+        let message_reduction = 1.0 - (total_after as f64 / total_before as f64);
+
+        // 验证关键信息保留
+        let all_text: String = msgs.iter().filter_map(|m| {
+            match &m.content {
+                Some(MessageContent::Text(t)) => Some(t.clone()),
+                _ => None,
+            }
+        }).collect::<Vec<_>>().join("\n");
+
+        let decision_preserved = all_text.contains("JWT token") || all_text.contains("方案确认");
+        let error_preserved = all_text.contains("cannot borrow") || all_text.contains("Error:");
+        let conclusion_preserved = all_text.contains("结论") || all_text.contains("verify_token");
+
+        // 输出效率报告
+        println!("═══════════════════════════════════════════");
+        println!("  压缩效率基准测试报告");
+        println!("═══════════════════════════════════════════");
+        println!("  消息数: {} → {} (减少 {:.0}%)", total_before, total_after, message_reduction * 100.0);
+        println!("  Token:  {} → {} (压缩率 {:.0}%)", tokens_before, tokens_after, compression_ratio * 100.0);
+        println!("  压缩记录数: {}", records.len());
+        println!("  决策保留: {}", if decision_preserved { "✓" } else { "✗" });
+        println!("  错误保留: {}", if error_preserved { "✓" } else { "✗" });
+        println!("  结论保留: {}", if conclusion_preserved { "✓" } else { "✗" });
+        println!("═══════════════════════════════════════════");
+
+        // 断言：消息数压缩率（更有意义的指标，因为 token 压缩受消息长度影响大）
+        assert!(message_reduction > 0.20, "消息数压缩率应 > 20%, 实际 {:.1}%", message_reduction * 100.0);
+        assert!(message_reduction < 0.80, "消息数压缩率应 < 80%, 实际 {:.1}%", message_reduction * 100.0);
+
+        // 断言：关键信息保留
+        assert!(decision_preserved, "决策消息（JWT token）必须保留");
+        assert!(error_preserved, "错误消息必须保留");
+        assert!(conclusion_preserved, "结论消息必须保留");
+
+        // 断言：重复消息应被去重
+        // MinHash 将 3 条相同 git status 识别为 redundant → 保留 1 条原文
+        // 另外 1 条可能出现在压缩摘要中（snippet），所以检查原始保留数 ≤ 2
+        let git_status_count = msgs.iter().filter(|m| {
+            match &m.content {
+                Some(MessageContent::Text(t)) => t.contains("git status 显示 3 个文件"),
+                _ => false,
+            }
+        }).count();
+        assert!(git_status_count <= 2, "重复消息应被去重: 3→{}", git_status_count);
+
+        // 断言：early + late 完整保留
+        assert!(all_text.contains("helpful coding assistant"), "early 消息完整保留");
+        assert!(all_text.contains("提交吧"), "late 消息完整保留");
     }
 }

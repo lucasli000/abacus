@@ -138,6 +138,16 @@ struct TurnContext {
     turn_started_at: std::time::Instant,
     /// 时长 warning 是否已发出（确保单轮只触发一次）
     time_warning_emitted: bool,
+    /// 2026-06-02: 动态超时——根据任务难度估算的 LLM 请求超时秒数
+    /// 替代硬编码 300s：简单任务 60s，复杂推理+多工具任务可达 600s
+    /// 写入：setup() 阶段根据 thinking 模式和工具数量估算
+    /// 读取：execute_loop / handle_model_escalation 中构建 timeout
+    dynamic_timeout_secs: u64,
+    /// V41: 安全分类器连续拦截计数
+    /// 引用：工具执行前 ToolActionClassifier 返回 NeedsConfirm/Deny 时递增
+    /// 效果：达到 3 次时自动重新开启 progressive gate（降级到逐步确认）
+    /// 生命周期：turn 级别，每轮重置
+    consecutive_blocks: u32,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -443,6 +453,8 @@ impl<'a> TurnPipeline<'a> {
         let turn_number = {
             let mut s = self.session.write().await;
             s.turn_count += 1;
+            // V41: 每 turn 开始时重置 LLM 申请的超时延长（防止跨 turn 累积）
+            s.timeout_extension_secs = 0;
             s.turn_count
         };
         // W4 (Task #102)：把当前 turn 推送到 ContextManager，让 compress / evict_by_importance
@@ -473,6 +485,7 @@ impl<'a> TurnPipeline<'a> {
                     skills_matched: vec![],
                     context_tokens: Some(ctx_window.current_tokens as u64),
                     context_max: Some(ctx_window.max_tokens as u64),
+                    model_limit: Some(ctx_window.model_limit as u64),
                 }
             },
             tool_outputs: vec![],
@@ -842,6 +855,55 @@ impl<'a> TurnPipeline<'a> {
         let complexity_thinking = map_complexity_to_thinking(&complexity);
         let complexity_temperature = Some(task_temperature(&classification.kind, &complexity));
 
+        // 动态超时：在 complexity_thinking 被 move 前估算
+        // V41: 动态超时——综合 thinking 深度 + ComplexityProfile + 工具数量
+        //
+        // ## 计算公式
+        // base = config.turn_provider_timeout_secs (clamp 60-600)
+        // + thinking 深度加成 (0-180s)
+        // + 复杂度加成: score * 120s (0-120s)
+        // + 工具数量加成: tool_count * 10s (上限 100s)
+        // 总上限: 900s (15 分钟，防止无限等待)
+        //
+        // ## 引用关系
+        // - 消费: execute_loop tokio::time::timeout + 时长预警
+        // - 数据源: classification.complexity (TaskAnalyzer) + tool_defs.len()
+        let estimated_timeout = {
+            let mut t = self.core.config.thresholds.turn_provider_timeout_secs.max(60).min(600);
+
+            // Factor 1: thinking 深度
+            if let Some(ref ti) = complexity_thinking {
+                match ti {
+                    abacus_types::ThinkingIntent::Effort(e) => match e {
+                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => t = t.max(300),
+                        abacus_types::EffortLevel::Medium => t = t.max(180),
+                        abacus_types::EffortLevel::Low => t = t.max(120),
+                        _ => {}
+                    },
+                    abacus_types::ThinkingIntent::Adaptive => t = t.max(240),
+                    abacus_types::ThinkingIntent::Budget(_) => t = t.max(300),
+                    _ => {}
+                }
+            }
+
+            // Factor 2: ComplexityProfile 加成（高复杂度任务需要更长推理时间）
+            // 使用 setup() 中已计算的 complexity（TaskAnalyzer::analyze_complexity 结果）
+            let complexity_bonus = (complexity.score * 120.0) as u64;
+            t += complexity_bonus;
+
+            // Factor 3: 工具数量加成（多工具 turn 可能有多轮 tool_call → LLM 调用）
+            let tool_bonus = (tool_defs.len() as u64 * 10).min(100);
+            t += tool_bonus;
+
+            // 上限取 config（默认 1800s = 30 分钟）
+            // 可通过 config.yaml `core.max_turn_timeout_secs` 覆盖
+            // Claude Code 允许 2h，但实际 >15min 有 tool_result 丢失风险
+            // 30min 是安全与灵活的平衡点
+            let max_timeout = self.core.config.thresholds.max_turn_timeout_secs
+                .unwrap_or(1800);
+            t.min(max_timeout)
+        };
+
         Ok(TurnContext {
             turn_number,
             total_tool_calls: 0,
@@ -872,6 +934,8 @@ impl<'a> TurnPipeline<'a> {
             tool_warning_emitted: false,
             turn_started_at: std::time::Instant::now(),
             time_warning_emitted: false,
+            dynamic_timeout_secs: estimated_timeout,
+            consecutive_blocks: 0,
         })
     }
 
@@ -1408,17 +1472,22 @@ impl<'a> TurnPipeline<'a> {
                 }
             } else {
                 // Blocking path: 有 tools 或未启用 streaming
-                // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-                let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
+                // V41: 叠加 LLM 主动申请的 timeout extension
+                let extension = {
+                    let s = self.session.read().await;
+                    s.timeout_extension_secs
+                };
+                let effective_timeout = ctx.dynamic_timeout_secs.saturating_add(extension).min(900);
+                let provider_timeout = std::time::Duration::from_secs(effective_timeout);
                 match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(req.clone(), self.cancel_token())).await {
                     Ok(result) => result,
                     Err(_elapsed) => {
                         if let Some(ref stx) = self.stream_tx {
                             let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                "LLM request timed out after 300s".into()
+                                format!("LLM request timed out after {}s", ctx.dynamic_timeout_secs)
                             ));
                         }
-                        Err(KernelError::Provider(format!("request timeout: {}s", self.core.config.thresholds.turn_provider_timeout_secs)))
+                        Err(KernelError::Provider(format!("request timeout: {}s", ctx.dynamic_timeout_secs)))
                     }
                 }
             };
@@ -1900,13 +1969,11 @@ impl<'a> TurnPipeline<'a> {
             }
 
             // ── 2026-05-27: 时长预算感知 ──
-            // 在 turn 时间消耗达到 provider timeout 的 60% 时注入提示（仅一次）
-            // 让 LLM 感知剩余时间，优先完成关键步骤
+            // 在 turn 时间消耗达到动态超时的 60% 时注入提示（仅一次）
+            // V41 修复: 使用 ctx.dynamic_timeout_secs（综合因子）而非静态 config 值
             if !ctx.time_warning_emitted {
                 let elapsed = ctx.turn_started_at.elapsed();
-                let budget = std::time::Duration::from_secs(
-                    self.core.config.thresholds.turn_provider_timeout_secs
-                );
+                let budget = std::time::Duration::from_secs(ctx.dynamic_timeout_secs);
                 if elapsed > budget.mul_f64(0.6) {
                     ctx.time_warning_emitted = true;
                     let remaining_secs = budget.saturating_sub(elapsed).as_secs();
@@ -2074,6 +2141,153 @@ impl<'a> TurnPipeline<'a> {
             };
             // ── 并行预执行结束 ────────────────────────────────────────────────
 
+            // V41: ToolAgent 批次检测 — 如果所有 tool_calls 匹配某个 ToolAgent，
+            // 则走批量隔离执行（不逐个发 ToolStart/ToolEnd），只推送一条 ToolAgentResult
+            let tool_ids_for_match: Vec<&str> = tool_calls.iter()
+                .map(|tc| tc.function.name.as_str())
+                .collect();
+            let toolagent_match = self.core.subagent_registry.match_batch(&tool_ids_for_match);
+
+            if let Some(agent_def) = toolagent_match {
+                // ── ToolAgent 批量执行路径 ──
+                let agent_id = agent_def.id.clone();
+                let agent_icon = agent_def.icon.clone();
+                let agent_name = agent_def.name.clone();
+                let mut batch_outputs: Vec<ToolOutput> = Vec::new();
+                let mut batch_details: Vec<String> = Vec::new();
+
+                // 预构建 exec_ctx（避免在循环内反复获取 session read lock）
+                let batch_exec_ctx = {
+                    let s = self.session.read().await;
+                    crate::tool::ExecutionContext {
+                        session_id: s.session_id.clone(),
+                        filengine: s.filengine_session.clone(),
+                        turn_number: ctx.turn_number,
+                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                        tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                        role_caps: Arc::clone(&s.role_caps),
+                    }
+                };
+
+                for tc in &tool_calls {
+                    // P1 修复：batch 执行中检查取消（避免用户 Esc 后仍执行剩余工具）
+                    if self.is_cancelled() {
+                        let tool_id = ToolId(tc.function.name.clone());
+                        batch_details.push(format!("⏹ {} → cancelled", tool_id.0));
+                        batch_outputs.push(ToolOutput {
+                            tool_id,
+                            success: false,
+                            output: serde_json::json!({"error": "cancelled by user"}),
+                            latency_ms: 0,
+                            failure_kind: Some("Cancelled".into()),
+                            try_instead: Vec::new(),
+                        });
+                        continue;
+                    }
+                    let tool_id = ToolId(tc.function.name.clone());
+                    let params: Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or(Value::Null);
+                    match self.core.registry.execute(&tool_id, params, &batch_exec_ctx).await {
+                        Ok(output) => {
+                            let preview: String = output.output.to_string().chars().take(120).collect();
+                            let status = if output.success { "✓" } else { "✗" };
+                            batch_details.push(format!("{} {} → {}", status, tool_id.0, preview));
+                            batch_outputs.push(output);
+                        }
+                        Err(e) => {
+                            batch_details.push(format!("✗ {} → error: {}", tool_id.0, e));
+                            batch_outputs.push(ToolOutput {
+                                tool_id: tool_id.clone(),
+                                success: false,
+                                output: serde_json::json!({"error": e.to_string()}),
+                                latency_ms: 0,
+                                failure_kind: Some("ExecutionError".into()),
+                                try_instead: Vec::new(),
+                            });
+                        }
+                    }
+                    // P0 修复：不再在此递增——L1911 已统一计数 batch_size
+                    // 旧代码 ctx.total_tool_calls += 1 导致双计 → 预算提前耗尽
+                }
+
+                // 汇总摘要：首个成功输出的前 80 字符
+                let summary: String = batch_outputs.iter()
+                    .find(|o| o.success)
+                    .map(|o| o.output.to_string().chars().take(80).collect())
+                    .unwrap_or_else(|| "执行完成".into());
+
+                // 推送 ToolAgentResult 到 TUI（替代多个 ToolStart/ToolEnd）
+                if let Some(ref stx) = self.stream_tx {
+                    let _ = stx.send(crate::llm::stream::StreamChunk::ToolAgentResult {
+                        agent_id: agent_id.clone(),
+                        icon: agent_icon,
+                        name: agent_name,
+                        call_count: batch_outputs.len(),
+                        summary,
+                        details: batch_details,
+                    });
+                }
+
+                // 构建 tool results 消息返回给 LLM
+                // V41: summarize_results=true 时压缩为一条摘要（省 token）
+                let summarize = agent_def.summarize_results;
+                let mut batch_tool_msgs: Vec<Message> = Vec::new();
+
+                if summarize {
+                    // 摘要模式：每个 tool_call_id 仍需有对应 tool_result（LLM 协议要求）
+                    // 内容经结构化提取后返回有效 JSON（不盲目截断）
+                    //
+                    // 重要：不能合并为 1 条！DeepSeek/OpenAI 要求 tool_calls 与 tool_results 1:1 匹配
+                    for (i, tc) in tool_calls.iter().enumerate() {
+                        if let Some(output) = batch_outputs.get(i) {
+                            ctx.all_tool_outputs.push(output.clone());
+                            // 结构化摘要：保持 JSON 合法性，按工具类型提取关键信息
+                            let summarized = summarize_tool_output(
+                                &tc.function.name, &output.output, output.success
+                            );
+                            batch_tool_msgs.push(Message {
+                                role: MessageRole::Tool,
+                                content: Some(MessageContent::Text(summarized)),
+                                name: Some(tc.function.name.clone()),
+                                tool_calls: None,
+                                tool_call_id: Some(tc.id.clone()),
+                                reasoning_content: None,
+                                prefix: false,
+                            });
+                        }
+                    }
+                } else {
+                    // 完整模式：每条 tool_result 独立返回（推理精度最高）
+                    for (i, tc) in tool_calls.iter().enumerate() {
+                        if let Some(output) = batch_outputs.get(i) {
+                            let content_json = serde_json::to_string(&output.output).unwrap_or_default();
+                            batch_tool_msgs.push(Message {
+                                role: MessageRole::Tool,
+                                content: Some(MessageContent::Text(content_json)),
+                                name: Some(tc.function.name.clone()),
+                                tool_calls: None,
+                                tool_call_id: Some(tc.id.clone()),
+                                reasoning_content: None,
+                                prefix: false,
+                            });
+                            ctx.all_tool_outputs.push(output.clone());
+                        }
+                    }
+                }
+
+                // 写入 session 历史（仅 tool results——assistant 消息已在 L1713 写入）
+                // P0 修复：删除 response.message.clone() 的重复 push
+                // 引用关系：L1713 无条件写入 assistant msg（含 tool_calls 字段），此处仅追加 tool results
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    msgs.extend(batch_tool_msgs);
+                }
+
+                continue; // 跳过下方的逐个 dispatch 循环，进入下一轮 LLM 调用
+            }
+
             let mut tool_results: Vec<Message> = Vec::new();
             for tc in &tool_calls {
                 // 单一命名约定：schema.name == ToolId.0 == LLM 调用名（全部 _ 形态）。
@@ -2190,6 +2404,22 @@ impl<'a> TurnPipeline<'a> {
                     // 段 J2: tool_compass 也走 inline（依赖 CoreLoop.cluster_registry）
                     self.core.handle_interaction_tool(&tool_id, &params, self.session).await
                 } else {
+                    // V41: ToolActionClassifier 安全预检（在 MCIP 之前）
+                    // 决策优先级：hard_deny → soft_deny → allow_rules → MCIP → user_grant
+                    use crate::core::action_classifier::ClassifyResult;
+                    let safety_result = self.core.action_classifier.classify(tool_id.0.as_str(), &params);
+                    if let ClassifyResult::Deny(ref reason) = safety_result {
+                        ctx.consecutive_blocks += 1;
+                        Ok(ToolOutput {
+                            tool_id: tool_id.clone(),
+                            success: false,
+                            output: serde_json::json!({"error": format!("Safety denied: {}", reason)}),
+                            latency_ms: 0,
+                            failure_kind: Some("SafetyDenied".into()),
+                            try_instead: Vec::new(),
+                        })
+                    } else {
+
                     // 授权检查：优先于session 永久授权和本 turn 单次授权，匹配则跳过 MCIP 策略
                     let is_user_granted = {
                         let s = self.session.read().await;
@@ -2197,8 +2427,20 @@ impl<'a> TurnPipeline<'a> {
                         grants.contains(tool_id.0.as_str())
                     } || self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str());
 
+                    // V41: safety NeedsConfirm 升级为 MCIP NeedsConfirm（复用已有确认通道）
                     let decision = if is_user_granted {
                         McipDecision::Allowed
+                    } else if let ClassifyResult::NeedsConfirm(reason) = &safety_result {
+                        ctx.consecutive_blocks += 1;
+                        // 连续 3 次拦截 → 通知用户降级（实际行为：后续走 MCIP confirm 通道）
+                        if ctx.consecutive_blocks == 3 {
+                            if let Some(ref stx) = self.stream_tx {
+                                let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(
+                                    format!("\n⚠️ 连续 {} 次操作被安全策略拦截\n", ctx.consecutive_blocks)
+                                ));
+                            }
+                        }
+                        McipDecision::NeedsConfirm(reason.clone())
                     } else {
                         self.core.mcip_gateway.check(&tool_id, &params, user_role)
                     };
@@ -2538,6 +2780,7 @@ impl<'a> TurnPipeline<'a> {
                             }
                         }
                     }
+                    } // close V41 safety else block
                 };
                 // tool_end_sent 标记：应对 Err 路径在内部已发 ToolEnd 的情况，避免行 2249 次发
                 let mut tool_end_sent = false;
@@ -3054,6 +3297,7 @@ impl<'a> TurnPipeline<'a> {
                     skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
                     context_tokens: Some(ctx_window.current_tokens as u64),
                     context_max: Some(ctx_window.max_tokens as u64),
+                    model_limit: Some(ctx_window.model_limit as u64),
                 }
             },
             tool_outputs: ctx.all_tool_outputs.clone(),
@@ -3118,6 +3362,7 @@ impl<'a> TurnPipeline<'a> {
                     skills_matched: ctx.matched_skills.iter().map(|s| s.id.0.clone()).collect(),
                     context_tokens: Some(ctx_window.current_tokens as u64),
                     context_max: Some(ctx_window.max_tokens as u64),
+                    model_limit: Some(ctx_window.model_limit as u64),
                 }
             },
             tool_outputs: ctx.all_tool_outputs,
@@ -3248,6 +3493,112 @@ fn sanitize_provider_error(raw: impl std::fmt::Display) -> String {
     let no_url = SANITIZE_URL_RE.replace_all(&s, "[url]");
     let no_auth = SANITIZE_AUTH_RE.replace_all(&no_url, "[redacted]");
     no_auth.chars().take(200).collect()
+}
+
+/// V41: 结构化摘要工具输出——保持 JSON 合法性，按工具类型提取关键信息
+///
+/// ## 设计意图
+/// 替代盲目字符截断（会产生非法 JSON）。按工具类型语义提取：
+/// - fs_read: 行数 + 首尾几行
+/// - grep: 匹配数 + 首 3 条结果
+/// - db_query: 行数 + 列名 + 首行
+/// - 其他: 按 JSON 结构安全截断（保留顶层 key）
+///
+/// ## 引用关系
+/// - 调用方: ToolAgent batch summarize=true 路径
+/// - 设计: 输出永远是合法 JSON 字符串（LLM 可解析）
+fn summarize_tool_output(tool_name: &str, output: &serde_json::Value, success: bool) -> String {
+    if !success {
+        // 失败输出通常很短，直接返回
+        return serde_json::to_string(output).unwrap_or_else(|_| "{}".into());
+    }
+
+    let full = serde_json::to_string(output).unwrap_or_default();
+
+    // 短输出直接返回（<600 bytes 不需要摘要）
+    if full.len() <= 600 {
+        return full;
+    }
+
+    // 按工具类型提取结构化摘要
+    match tool_name {
+        // 文件读取：提取行数 + 首尾行
+        name if name.contains("read") || name == "fs_read" => {
+            if let Some(content) = output.as_str()
+                .or_else(|| output.get("content").and_then(|v| v.as_str()))
+            {
+                let lines: Vec<&str> = content.lines().collect();
+                let total = lines.len();
+                let head: Vec<&str> = lines.iter().take(5).copied().collect();
+                let tail: Vec<&str> = if total > 8 { lines.iter().rev().take(3).copied().collect() } else { vec![] };
+                return serde_json::json!({
+                    "_summarized": true,
+                    "total_lines": total,
+                    "head": head.join("\n"),
+                    "tail": tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+                    "total_chars": content.len(),
+                }).to_string();
+            }
+        }
+        // 搜索/grep：提取匹配数 + 首几条
+        name if name.contains("grep") || name.contains("search") => {
+            if let Some(arr) = output.as_array() {
+                let total = arr.len();
+                let preview: Vec<&serde_json::Value> = arr.iter().take(3).collect();
+                return serde_json::json!({
+                    "_summarized": true,
+                    "total_matches": total,
+                    "preview": preview,
+                }).to_string();
+            }
+            if let Some(matches) = output.get("matches").and_then(|v| v.as_array()) {
+                let total = matches.len();
+                let preview: Vec<&serde_json::Value> = matches.iter().take(3).collect();
+                return serde_json::json!({
+                    "_summarized": true,
+                    "total_matches": total,
+                    "preview": preview,
+                }).to_string();
+            }
+        }
+        // DB 查询：行数 + 列名 + 首行
+        name if name.contains("db_query") || name.contains("db_read") => {
+            if let Some(rows) = output.as_array() {
+                let total = rows.len();
+                let columns: Vec<String> = rows.first()
+                    .and_then(|r| r.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                return serde_json::json!({
+                    "_summarized": true,
+                    "total_rows": total,
+                    "columns": columns,
+                    "first_row": rows.first(),
+                }).to_string();
+            }
+        }
+        _ => {}
+    }
+
+    // 通用回退：保留顶层 JSON 结构，截断长 value
+    if let Some(obj) = output.as_object() {
+        let mut summary = serde_json::Map::new();
+        summary.insert("_summarized".into(), serde_json::json!(true));
+        summary.insert("_keys".into(), serde_json::json!(obj.keys().collect::<Vec<_>>()));
+        for (k, v) in obj.iter().take(5) {
+            let v_str = v.to_string();
+            if v_str.len() > 100 {
+                summary.insert(k.clone(), serde_json::json!(format!("{}...[{}chars]", &v_str[..80], v_str.len())));
+            } else {
+                summary.insert(k.clone(), v.clone());
+            }
+        }
+        return serde_json::Value::Object(summary).to_string();
+    }
+
+    // 最终回退：安全截断（按换行符切割，保证不破坏 JSON 结构）
+    let lines: Vec<&str> = full.lines().take(10).collect();
+    format!("{}\n...[truncated from {} bytes]", lines.join("\n"), full.len())
 }
 
 /// 判断是否为网络层错误（连接/DNS/TLS/超时），区别于 API 业务错误（401/429/400）

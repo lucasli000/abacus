@@ -83,12 +83,17 @@ impl MeetingRouter {
         None
     }
 
-    /// 词袋语义评分 (v0.1)
+    /// 词袋语义评分 (v0.1 → v0.2: 增加 capability 匹配)
     ///
     /// ## 评分规则
     /// - 每个 hint_tag 匹配: +0.3
     /// - domain 匹配: +0.4
+    /// - capability 匹配: +0.2（V41 新增：增强自然语言覆盖）
     /// - 封顶 1.0
+    ///
+    /// ## 设计意图
+    /// V41: 降低准入门槛——用户自然语言不一定包含精确 tag，
+    /// 但常常会提及 capability 描述词（如 "优化" 命中 "optimization"）
     fn semantic_score(&self, input: &str, specialty: &Specialty) -> f64 {
         let lower = input.to_lowercase();
         let mut score = 0.0f64;
@@ -99,6 +104,12 @@ impl MeetingRouter {
         }
         if lower.contains(&specialty.domain.to_lowercase()) {
             score += 0.4;
+        }
+        // V41: capability 模糊匹配
+        for cap in &specialty.key_capabilities {
+            if lower.contains(&cap.to_lowercase()) {
+                score += 0.2;
+            }
         }
         score.min(1.0)
     }
@@ -137,17 +148,36 @@ impl MeetingRouter {
             participants.keys().any(|k| k.starts_with(&format!("sp-{}", reg_id)))
         };
         let all_matched = self.match_specialists(input);
+        // V41: 阈值从 0.3 降到 0.15（命中单个 capability 即可进入）
         let mut participant_scores: Vec<(String, f64)> = all_matched.into_iter()
             .filter(|(id, _)| prefix_match(id))
-            .filter(|(_, s)| *s >= 0.3)
+            .filter(|(_, s)| *s >= 0.15)
             .collect();
         participant_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
         match participant_scores.len() {
-            0 => RoutingDecision::NoMatch {
-                input: input.into(),
-                suggestion: "尝试 @coder 或 @reviewer 指定专家".into(),
-            },
-            1 => RoutingDecision::Direct(SpecialistId(format!("sp-{}", participant_scores[0].0)), RoutingMode::FollowUp),
+            0 => {
+                // V41: NoMatch 降级为 Broadcast——所有专家从各自视角回应
+                // 不再拒绝用户输入，而是让全员参与，host 综合判断
+                let all: Vec<(SpecialistId, f64)> = participants.keys()
+                    .map(|k| (SpecialistId(k.clone()), 0.1))
+                    .collect();
+                if all.is_empty() {
+                    RoutingDecision::NoMatch {
+                        input: input.into(),
+                        suggestion: "无可用专家，请先配置 ~/.abacus/experts.yaml".into(),
+                    }
+                } else {
+                    RoutingDecision::Escalate(all)
+                }
+            }
+            1 => {
+                let prefix = format!("sp-{}", participant_scores[0].0);
+                let actual = participants.keys()
+                    .find(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .unwrap_or(prefix);
+                RoutingDecision::Direct(SpecialistId(actual), RoutingMode::FollowUp)
+            }
             _ => RoutingDecision::Escalate(
                 participant_scores.into_iter()
                     .map(|(id, s)| {
@@ -250,11 +280,29 @@ mod tests {
     }
 
     #[test]
-    fn test_analyze_context_no_match() {
+    fn test_analyze_context_no_tag_match_broadcasts() {
+        // V41: 无精确匹配时不再 NoMatch，而是广播给所有专家
         let registry = make_registry();
         let router = MeetingRouter::new(registry.clone());
         let participants = make_participants(&registry);
         let decision = router.analyze_context("今天的天气怎么样", &participants);
+        match decision {
+            RoutingDecision::Escalate(scores) => {
+                // 所有 participant 都以 0.1 分参与
+                assert_eq!(scores.len(), 2);
+                assert!(scores.iter().all(|(_, s)| *s == 0.1));
+            }
+            _ => panic!("expected Escalate (broadcast), got {:?}", decision),
+        }
+    }
+
+    #[test]
+    fn test_analyze_context_no_match_empty_participants() {
+        // 真正的 NoMatch 只在无 participant 时发生
+        let registry = make_registry();
+        let router = MeetingRouter::new(registry);
+        let empty = BTreeMap::new();
+        let decision = router.analyze_context("任何输入", &empty);
         assert!(matches!(decision, RoutingDecision::NoMatch { .. }));
     }
 

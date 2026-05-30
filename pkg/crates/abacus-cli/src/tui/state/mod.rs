@@ -183,6 +183,14 @@ pub enum TimelineEntry {
     Text { start: usize, end: usize },
     /// 迭代边界（多轮工具调用之间的分隔）
     Iteration { number: u32 },
+    /// V41: ToolAgent 批量执行汇总（替代多个 Tool entry 刷屏）
+    ToolAgent {
+        icon: String,
+        name: String,
+        call_count: usize,
+        summary: String,
+        details: Vec<String>,
+    },
 }
 
 /// Phase 3: 流式内容块 — 按逻辑分组（thinking/tool-group/text/iteration）
@@ -751,6 +759,46 @@ pub enum SlashCommand {
     },
 }
 
+/// V41: Plan 策略两阶段状态机
+///
+/// ## 状态流转
+/// ```text
+/// /plan → Researching → AwaitingApproval → (用户选择) → Executing → None
+/// ```
+///
+/// ## 引用关系
+/// - 写入: api/mod.rs send_plan_and_execute_streaming
+/// - 读取: run.rs 主循环（检测 Approval UI）+ bars.rs 状态指示
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanPhase {
+    /// Phase 1: Planner 研究 + 生成任务计划（期间可限制只读工具）
+    Researching,
+    /// Decision Point: 计划已生成，等待用户选择执行策略
+    AwaitingApproval {
+        /// 计划文本摘要
+        plan_summary: String,
+        /// 解析出的任务列表
+        tasks: Vec<String>,
+    },
+    /// Phase 2: 按用户选定的策略执行中
+    Executing {
+        strategy: PlanExecutionStrategy,
+    },
+}
+
+/// Plan 执行策略（用户在 Approval 时选择）
+///
+/// 对齐 abacus_core::ExecutionStrategy
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanExecutionStrategy {
+    /// 自动执行——工具调用自动放行
+    Auto,
+    /// 逐步确认——每个敏感操作需确认
+    StepByStep,
+    /// 转为 Team 模式多专家并行执行
+    Team,
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // AppState — 集中式状态
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -931,6 +979,15 @@ pub struct AppState {
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
     pub session_id: String,
     pub model_name: String,
+    /// 当前活跃的 provider ID（来自 config.yaml providers[].id）
+    /// 来源：StreamChunk::Complete stats.provider_id
+    /// 用途：健康仪表盘显示实际 provider，切换同名模型到不同 provider 时可区分
+    pub active_provider_id: String,
+    /// 各 provider 的可用性检测结果（启动时及配置变更时自动探测）
+    /// 元组：(provider_id, available, error_msg)
+    /// 来源：discover_all_models_with_status() → channel → tick 分支
+    /// 生命周期：config 热加载时重新探测
+    pub provider_statuses: Vec<(String, bool, Option<String>)>,
     /// 从 engine 动态拉取的可用模型列表（首次打开 /model picker 时延迟拉取）
     /// 引用：open_picker_model 优先使用此列表，空时退回静态 MODEL_GROUPS
     /// 生命周期：pending_model_fetch 触发 → 拉取 → 填充；/new 不清（模型列表不随会话变）
@@ -943,7 +1000,12 @@ pub struct AppState {
     /// 标记需要在下一次 interval tick 拉取模型列表（engine 连接后设 true）
     pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
-    pub context_window: usize,  // tokens (e.g. 1_000_000)
+    /// 系统设定上下文空间 = model_limit * context_window_ratio（有效窗口）
+    /// 来源：Complete stats.context_max / 热加载 config.yaml
+    pub context_window: usize,
+    /// LLM 最大上下文空间（模型物理上限，如 1M）
+    /// 来源：model_spec.context_window（引擎初始化时设置）
+    pub model_max_context: usize,
     /// 配置文件 mtime 快照，用于热加载检测
     pub config_mtime: Option<SystemTime>,
     /// 实时上下文 token 估算（流式期间每 500ms 更新；Complete 后换为真实值）
@@ -1183,6 +1245,10 @@ pub struct AppState {
     pub text_selection: Option<TextSelection>,
     /// 待异步执行的 slash command（由 event handler 设置，run.rs 主循环消费）
     pub pending_slash_command: Option<SlashCommand>,
+    /// V41: Plan 策略两阶段状态机
+    /// 引用关系：/plan 触发 → api/mod.rs Phase 1 设置 → run.rs 监听 Approval → Phase 2 执行
+    /// 生命周期：/plan 创建 → Researching → AwaitingApproval → Executing → None（完成清除）
+    pub plan_phase: Option<PlanPhase>,
     /// 设置面板状态
     pub show_settings: bool,
     /// 设置面板焦点字段索引
@@ -1258,6 +1324,10 @@ pub struct AppState {
     pub streaming_text_started: bool,
     /// V29.5: 本轮 streaming 是否已收到首条非空 Thinking（同上, 用于触发"开始推理"事件）
     pub streaming_thinking_started: bool,
+    /// P1: 标记当前 LLM 调用已 Complete，但尚未收到 EngineResponse
+    /// 引用关系：run.rs StreamChunk::Complete 置 true；reset_streaming 重置 false
+    /// 生命周期：Complete 到达时 true → EngineResponse 到达 reset_streaming 时 false
+    pub streaming_complete: bool,
     /// 流式输出中的工具执行状态
     /// V11: 三元组承载 ToolEnd 已有的 success + duration_ms（之前用 `..` 丢失）
     /// V28 (T3): 元组扩成 4 元 — 末位 trace_id 让 ToolEnd 能按 id 直接定位 trace_events
@@ -1271,10 +1341,7 @@ pub struct AppState {
     /// 引用关系：run.rs push → components/mod.rs 遍历渲染
     /// 生命周期：首次 chunk 到达时 push → reset_streaming 清空
     pub streaming_timeline: Vec<TimelineEntry>,
-    // Phase 3: 逻辑分块 — 替代 timeline 的平铺渲染，按 thinking/tool-group/text 分组
-    /// 引用关系：run.rs chunk drain → 聚合 push；components 渲染 → 遍历
-    /// 生命周期：与 streaming_timeline 同步，reset_streaming 清空
-    pub streaming_blocks: std::cell::RefCell<Vec<StreamingBlock>>,
+    // Phase 3+4: blocks 每帧从 timeline 局部构建（O(timeline_len) 聚合），不持久化
     // Phase 4: 用户手动展开的 block id 集合（优先级高于 auto_collapse）
     pub expanded_block_ids: std::cell::RefCell<std::collections::HashSet<u64>>,
     // V40: streaming_parsed_lines / streaming_parsed_len 已移除
@@ -2362,11 +2429,14 @@ impl AppState {
             // Session UUID 启动生成；恢复 session 时由 apply_session_export 覆盖。
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
+            active_provider_id: String::new(),
+            provider_statuses: Vec::new(),
             available_models: Vec::new(),
             available_providers: Vec::new(),
             pending_model_fetch: false,
             thinking_depth: "high".to_string(),
             context_window: 1_000_000,
+            model_max_context: 1_000_000,
             config_mtime: None,
             ctx_live_tokens: 0,
             ctx_estimate_at: None,
@@ -2452,6 +2522,7 @@ impl AppState {
             pending_ai_completion: None,
             text_selection: None,
             pending_slash_command: None,
+            plan_phase: None,
             show_settings: false,
             settings_focus: 0,
             settings_input: String::new(),
@@ -2481,9 +2552,9 @@ impl AppState {
             // V29.5: 首次 chunk 触发标志（替代 is_empty 判定, 防空 delta 心跳误判）
             streaming_text_started: false,
             streaming_thinking_started: false,
+            streaming_complete: false,
             streaming_tools: Vec::new(),
             streaming_timeline: Vec::new(),
-            streaming_blocks: std::cell::RefCell::new(Vec::new()),
             expanded_block_ids: std::cell::RefCell::new(std::collections::HashSet::new()),
             streaming_md: std::cell::RefCell::new(None),
             flash_state: crate::tui::effects::FlashState::new(),
@@ -3319,6 +3390,7 @@ impl AppState {
     ///   抽 helper 后 res_rx 与 chunk Complete/Error 三路径状态完全一致
     pub fn reset_streaming(&mut self) {
         self.is_streaming = false;
+        self.streaming_complete = false;
         self.streaming_text.clear();
         self.streaming_thinking.clear();
         // V29.5: 重置首次触发标志, 下一轮 streaming 重新激活"开始输出"/"开始推理"事件
@@ -3326,7 +3398,6 @@ impl AppState {
         self.streaming_thinking_started = false;
         self.streaming_tools.clear();
         self.streaming_timeline.clear();
-        self.streaming_blocks.borrow_mut().clear();
         self.expanded_block_ids.borrow_mut().clear();
         // V28: 防御性兜底 — 正常落档路径已 mem::take 走 streaming_trace_ids,
         // 这里 clear 只在异常退出/异常 reset 时生效,避免悬挂引用。

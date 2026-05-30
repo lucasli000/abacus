@@ -35,6 +35,9 @@ pub mod event_sink;
 pub mod session_store;
 pub mod prompt_assembly;
 pub mod safety;
+pub mod action_classifier;
+pub mod subagent;
+pub mod compress_math;
 pub mod preflight;
 pub mod progressive;
 pub mod progressive_gate;
@@ -49,6 +52,7 @@ pub mod workflow_engine;
 pub mod workflow_checkers;
 pub mod cot_hook;
 pub mod knowledge_hook;
+pub mod token_budget;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -217,6 +221,19 @@ pub struct RequestContext {
     /// 写入：planner API 等场景按需设置 → 消费：单次 turn 组装 messages → 销毁：turn 结束随 RequestContext drop
     pub prefix_assistant_content: Option<String>,
 
+    /// V41: 强制 provider — 多 provider 同名 model 时显式指定
+    ///
+    /// ## 格式
+    /// config 中写 `model: "openrouter/deepseek-v4-flash"` → 解析为 provider="openrouter", model="deepseek-v4-flash"
+    ///
+    /// ## 引用关系
+    /// - 设置：api/mod.rs specialist 调用时从 SpecialistRegistration.model 解析
+    /// - 消费：pipeline resolve_provider() 优先匹配 forced_provider 对应的 group
+    ///
+    /// ## 生命周期
+    /// 请求级，turn 结束随 RequestContext drop
+    pub forced_provider: Option<String>,
+
     /// V35-2: 系统 prompt 角色覆盖 — 用于 Planner / Reviewer / Evaluator 等"稳定角色"调用
     ///
     /// ## 引用关系
@@ -266,6 +283,7 @@ impl Default for RequestContext {
             max_tokens: None,
             mcip_once_grants: std::collections::HashSet::new(),
             thinking_intent: None,
+            forced_provider: None,
             // V35-1: 默认不注入 prefix（保持与旧行为一致）
             prefix_assistant_content: None,
             // V35-2: 默认无 system 覆盖（保持与旧行为一致）
@@ -303,6 +321,66 @@ impl RequestContext {
         self.skip_inertia = true;
         self
     }
+
+    /// V41: 根据模式 + 执行策略生成 RequestContext
+    ///
+    /// ## 映射规则
+    /// | Mode    | progressive | inertia | preflight | decay_router |
+    /// |---------|-------------|---------|-----------|--------------|
+    /// | Clarify | ON          | ON      | ON        | OFF(cache)   |
+    /// | Meeting | OFF         | OFF     | OFF       | OFF          |
+    ///
+    /// ## 策略覆盖
+    /// | Strategy    | progressive | inertia | preflight |
+    /// |-------------|-------------|---------|-----------|
+    /// | Auto        | OFF         | OFF     | keep      |
+    /// | StepByStep  | ON          | ON      | ON        |
+    /// | Team        | OFF         | OFF     | OFF       |
+    ///
+    /// ## 引用关系
+    /// - 调用方：run.rs 消息发送前根据 state.mode 构建
+    /// - 设计意图：集中 mode→行为 映射，消除散落各处的 if/else
+    pub fn for_mode(mode: abacus_types::AbacusMode) -> Self {
+        match mode {
+            abacus_types::AbacusMode::Clarify => Self::default(),
+            abacus_types::AbacusMode::Meeting => Self::fast(),
+        }
+    }
+
+    /// 在现有 RequestContext 上叠加执行策略覆盖
+    pub fn with_strategy(mut self, strategy: ExecutionStrategy) -> Self {
+        match strategy {
+            ExecutionStrategy::Auto => {
+                self.skip_progressive = true;
+                self.skip_inertia = true;
+            }
+            ExecutionStrategy::StepByStep => {
+                self.skip_progressive = false;
+                self.skip_inertia = false;
+                self.skip_preflight = false;
+            }
+            ExecutionStrategy::Team => {
+                self.skip_progressive = true;
+                self.skip_inertia = true;
+                self.skip_preflight = true;
+            }
+        }
+        self
+    }
+}
+
+/// 执行策略 — Plan/Team 等策略的执行行为
+///
+/// 引用关系：RequestContext::with_strategy() 消费
+/// 设计：与 AbacusMode 正交——mode 决定"在哪个模式"，strategy 决定"怎么执行"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionStrategy {
+    /// 自动执行——工具调用自动放行，适合已批准的 Plan
+    Auto,
+    /// 逐步确认——每个敏感操作需确认，适合保守执行
+    StepByStep,
+    /// Team 分发——多专家并行，跳过所有门控
+    Team,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -354,6 +432,10 @@ pub struct ThresholdConfig {
     pub meeting_max_duration_mins: u32,
     /// 用户确认等待超时（秒）
     pub confirm_timeout_secs: u64,
+    /// V41: 动态超时的绝对上限（秒）——所有因子叠加后 clamp 到此值
+    /// 默认 1800 (30min)；Claude Code 允许 7200 (2h) 但 >15min 有 tool_result 丢失风险
+    /// 用户可通过 config.yaml `core.max_turn_timeout_secs` 覆盖
+    pub max_turn_timeout_secs: Option<u64>,
 
     // ─── Quality 级（智能优化层）──────────────────────────────────
     /// 上下文压缩触发比例（超过 context_budget × ratio 时触发）
@@ -383,6 +465,7 @@ impl Default for ThresholdConfig {
             specialist_timeout_secs: 900,
             meeting_max_duration_mins: 60,
             confirm_timeout_secs: 15,
+            max_turn_timeout_secs: None, // 默认 None → 使用硬编码 1800s (30min)
             // Quality 级
             context_compress_ratio: 0.55,  // P0-C3: 提前压缩，避免 context 堆积后质量骤降
             tool_prune_after_turns: 10,     // P0-C3: 更积极隐藏长期不用工具，省 token
@@ -629,6 +712,14 @@ pub struct CoreConfig {
     /// 默认：`~/.abacus/subscenes.toml`
     /// 不存在时 fallback 到内置 default_subscene_map()
     pub subscenes_path: Option<std::path::PathBuf>,
+
+    /// 模型升级目标：默认 None（禁用）；由 config `pipeline.escalation_target_model` 注入
+    ///
+    /// ## 引用关系
+    /// - 写入方: engine_init.rs / server.rs 从 ConfigManager 读取
+    /// - 读取方: pipeline handle_model_escalation 决策升级目标模型
+    /// - 生命周期: 进程启动时确定，session 内不变
+    pub escalation_model: Option<ModelId>,
 }
 
 impl Default for CoreConfig {
@@ -684,6 +775,7 @@ impl Default for CoreConfig {
             // 提示词引擎配置路径（默认 ~/.abacus/）
             prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
             subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
+            escalation_model: None,
         }
     }
 }
@@ -871,6 +963,11 @@ pub struct SessionState {
     /// 会话焦点锚 — LLM 通过 session.set_focus 工具写入；每轮注入 system prompt 末尾（recency-adjacent）
     /// 初始为 None（首次调用 set_focus 前不注入）
     pub session_focus: Arc<RwLock<Option<SessionFocus>>>,
+    /// V41: LLM 请求的超时延长秒数（累积）
+    /// 写入: handle_interaction_tool("session_extend_timeout")
+    /// 读取: pipeline execute_loop 构建 provider_timeout 时叠加
+    /// 重置: 每个 turn 开始时清零
+    pub timeout_extension_secs: u64,
     /// MCIP 永久授权工具集合（用户选择「总是允许」后写入）
     ///
     /// ## 生命周期
@@ -1070,6 +1167,7 @@ impl SessionState {
             cache_telemetry: Arc::new(RwLock::new(CacheTelemetry::default())),
             mid_turn_signals: tokio::sync::Mutex::new(Vec::new()),
             role_caps: Arc::new(load_role_caps()),
+            timeout_extension_secs: 0,
         }
     }
 
@@ -1161,6 +1259,12 @@ pub struct CoreLoop {
     injector: Arc<RwLock<DynamicInjector>>,
     effectiveness: Arc<RwLock<EffectivenessTracker>>,
     mcip_gateway: Arc<McipGateway>,
+    /// V41: 规则型安全分类器（工具调用前零 LLM 开销评估）
+    /// 创建：CoreLoop::new()；消费方：TurnPipeline Phase 4 工具分发前
+    pub(crate) action_classifier: action_classifier::ToolActionClassifier,
+    /// V41: SubAgent 自动委托注册表（只读批次 → Explorer, 网络批次 → Researcher 等）
+    /// 创建：CoreLoop::new()；消费方：TurnPipeline Phase 4 tool_calls 批次检测
+    pub(crate) subagent_registry: subagent::ToolAgentRegistry,
     /// 工具执行中间件链（Arc<RwLock> 支持热插拔：Arc::new(core) 后仍可 add_middleware）
     /// 创建：CoreLoop::new()；消费方：TurnPipeline Phase 4（read lock）
     mag_chain: Arc<RwLock<crate::mag_chain::MagChain>>,
@@ -1312,6 +1416,32 @@ pub struct CoreLoop {
     // - 生命周期：随 CoreLoop drop（Arc 引用计数归零，AtomicBool 释放）
     pub(crate) cot_model_supports_native: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) cot_thinking_enabled: Arc<std::sync::atomic::AtomicBool>,
+
+    /// 用户模型偏好（/model 命令选择 + alias 解析）
+    ///
+    /// ## 引用关系
+    /// - 创建: CoreLoop::new()（Default 初始化）
+    /// - 写入: engine_init.rs（加载持久化偏好）、slash_commands.rs /model 命令
+    /// - 读取: resolve_provider() 每轮消费 preference.last_selected
+    /// - 销毁: 随 CoreLoop drop
+    model_preference: Arc<RwLock<abacus_types::ModelPreference>>,
+
+    /// CodeGraph 管理器（可选，由 enable_code_graph() 启用）
+    ///
+    /// ## 引用关系
+    /// - 创建: CoreLoop::new() 时为 None
+    /// - 写入: enable_code_graph() 成功时赋值 Some(mgr)
+    /// - 读取: cg.* 工具 executor（tree-sitter 索引/查询）
+    /// - 销毁: 随 CoreLoop drop
+    code_graph_manager: Arc<RwLock<Option<crate::code_graph::CodeGraphManager>>>,
+
+    /// Token 预算监控器——pipeline 每轮查询压力等级以决定工具裁剪力度
+    ///
+    /// ## 引用关系
+    /// - 创建: CoreLoop::new()（随 CoreConfig 初始化）
+    /// - 读取: TurnPipeline setup() 阶段查询 pressure_level
+    /// - 销毁: 随 CoreLoop drop
+    pub(crate) token_budget: token_budget::TokenBudgetMonitor,
 }
 
 /// Context window pressure source — reports usage_pct (0~100 scale) normalized to
@@ -1474,6 +1604,13 @@ impl CoreLoop {
         let injector = Arc::new(RwLock::new(injector));
         let effectiveness = Arc::new(RwLock::new(EffectivenessTracker::new()));
         let mcip_gateway = Arc::new(McipGateway::new());
+        let cwd_for_classifier = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let action_classifier = action_classifier::ToolActionClassifier::new(cwd_for_classifier);
+        let mut subagent_registry = subagent::ToolAgentRegistry::new();
+        subagent_registry.register_builtins();
+        subagent_registry.load_user_definitions();
         let mut prompt_assembly = PromptAssembly::new(
             &config.system_prompt,
             "", // auto-load from abacusbr.md
@@ -1592,7 +1729,9 @@ impl CoreLoop {
         crate::tool::builtin::config::register_executors(
             &registry, runtime_overrides.clone(), config.clone(),
         ).await;
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), cot_model_supports_native: cot_model_flag, cot_thinking_enabled: cot_thinking_flag };
+        // TokenBudgetMonitor：context window 容量取 default_max_tokens * 2（保守估计）
+        let token_budget_monitor = token_budget::TokenBudgetMonitor::new(config.default_max_tokens as usize * 2);
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), cot_model_supports_native: cot_model_flag, cot_thinking_enabled: cot_thinking_flag, model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -2006,6 +2145,182 @@ impl CoreLoop {
         &self.model_catalog
     }
 
+    /// Token 预算监控器访问器
+    ///
+    /// ## 消费方
+    /// TurnPipeline setup() 查询 pressure_level 以记录到 TurnContext
+    pub fn token_budget(&self) -> &token_budget::TokenBudgetMonitor {
+        &self.token_budget
+    }
+
+    /// 获取 ModelPreference 的 Arc<RwLock<ModelPreference>>
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs（启动加载持久化偏好）、slash_commands.rs（/model 命令读写）
+    /// - 内部: 持有 model_preference 字段的共享引用
+    pub fn model_preference(&self) -> &Arc<RwLock<abacus_types::ModelPreference>> {
+        &self.model_preference
+    }
+
+    /// 启用 CodeGraph 子系统（在 workspace 目录上创建索引）
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs（启动时如果 workspace 存在且 code_graph.enabled=true 则调用）
+    /// - 内部: 创建 CodeGraphManager 并写入 self.code_graph_manager
+    pub async fn enable_code_graph(&self, workspace: &std::path::Path) {
+        let db_path = workspace.join(".abacus/codegraph.db");
+        // 确保父目录存在
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => {
+                // 设置标准 PRAGMA（WAL + 性能优化）
+                if let Err(e) = crate::db_util::apply_standard_pragmas(&conn) {
+                    tracing::warn!(error = %e, "CodeGraph: PRAGMA setup failed, skipping");
+                    return;
+                }
+                let db = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
+                match crate::code_graph::CodeGraphManager::new(db, workspace.to_path_buf()).await {
+                    Ok(mgr) => {
+                        *self.code_graph_manager.write().await = Some(mgr);
+                        tracing::info!(workspace = %workspace.display(), "CodeGraph enabled");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "CodeGraph init failed");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, path = %db_path.display(), "CodeGraph: DB open failed, skipping");
+            }
+        }
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // Adaptive Subsystem Hot-Reload（5-turn 周期重评估）
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// 每 N turn 重评估 Adaptive 子系统的注册状态
+    ///
+    /// ## 触发条件
+    /// turn_count % 5 == 0（由 pipeline post_process 调用）
+    ///
+    /// ## 行为
+    /// - heat >= min_hit_rate 且当前未注册 → 动态注册（hot-load）
+    /// - heat < min_hit_rate * 0.5 且当前已注册 → 动态卸载（cold-unload）
+    /// - 滞后区间 [0.5*threshold, threshold] → 保持现状（避免 KV cache 抖动）
+    ///
+    /// ## 引用关系
+    /// - 调用方: TurnPipeline::post_process()（每轮结束时）
+    /// - 消费: EffectivenessTracker.all_stats_snapshot() + builtin_subsystems()
+    /// - 副作用: 修改 ToolRegistry（添加/移除 schema + executor）
+    ///
+    /// ## KV Cache 安全
+    /// 工具列表变化会改变 system_segments hash → 自动触发 KV cache invalidation
+    pub(crate) async fn reevaluate_adaptive_subsystems(&self, turn: u32) {
+        if turn % 5 != 0 || turn == 0 { return; }
+
+        use crate::tool::subsystem_policy::{
+            builtin_subsystems, RegistrationMode, EffectivenessHeatProvider,
+            SubsystemHeatProvider,
+        };
+
+        let stats = {
+            let eff = self.effectiveness.read().await;
+            eff.all_stats_snapshot().clone()
+        };
+        let heat_provider = EffectivenessHeatProvider::new(&stats);
+
+        for decl in builtin_subsystems() {
+            if let RegistrationMode::Adaptive { min_hit_rate } = decl.mode {
+                let h = heat_provider.heat(decl.name, decl.tool_prefix);
+                let currently_registered = self.registry.has_prefix(decl.tool_prefix).await;
+
+                if h >= min_hit_rate && !currently_registered {
+                    // Hot-load: 动态注册 schema + executor
+                    tracing::info!(
+                        subsystem = decl.name,
+                        heat = h,
+                        threshold = min_hit_rate,
+                        "hot-loading adaptive subsystem"
+                    );
+                    self.hot_load_subsystem(decl.name).await;
+                } else if h < min_hit_rate * 0.5 && currently_registered && turn > 10 {
+                    // Cold-unload: 动态卸载（仅 turn > 10 避免冷启动误判）
+                    tracing::info!(
+                        subsystem = decl.name,
+                        heat = h,
+                        threshold = min_hit_rate,
+                        "cold-unloading adaptive subsystem"
+                    );
+                    self.cold_unload_subsystem(decl.tool_prefix).await;
+                }
+                // 滞后区间 [0.5*threshold, threshold) → 保持现状
+            }
+        }
+    }
+
+    /// 动态注册一个子系统的所有工具（schema + executor）
+    ///
+    /// ## 引用关系
+    /// - 调用方: reevaluate_adaptive_subsystems()（热重载路径）
+    /// - 副作用: 向 ToolRegistry 添加 schema + executor
+    ///
+    /// ## 生命周期
+    /// 仅在 Adaptive 子系统热度达标时调用一次；后续 turn 保持注册直到 cold-unload
+    async fn hot_load_subsystem(&self, name: &str) {
+        match name {
+            "codegraph" => {
+                crate::tool::builtin::cg::register(&self.registry).await;
+                // executor 需要 CodeGraphManager——仅在已启用时注册
+                let mgr = self.code_graph_manager.read().await;
+                if let Some(ref _mgr) = *mgr {
+                    // CodeGraphManager 在 Arc<RwLock<Option<...>>> 中，
+                    // register_executors 需要 Arc<CodeGraphManager>。
+                    // 由于结构限制，这里跳过 executor 注册——
+                    // enable_code_graph() 已负责注册 executor。
+                    // hot-load 仅恢复 schema 可见性。
+                    tracing::debug!("codegraph: schema hot-loaded (executor via enable_code_graph)");
+                } else {
+                    tracing::debug!("codegraph: schema hot-loaded but no CodeGraphManager active");
+                }
+            }
+            "result" => {
+                crate::tool::builtin::result::register(&self.registry).await;
+                // executor 需要 ResultStore + palace 引用
+                crate::tool::builtin::result::register_executors(
+                    &self.registry,
+                    self.result_store.clone(),
+                    self.memory_palace.clone(),
+                ).await;
+            }
+            "orchestrate" => {
+                crate::tool::builtin::orchestrate::register(&self.registry).await;
+                crate::tool::builtin::orchestrate::register_executors(&self.registry).await;
+            }
+            _ => {
+                tracing::warn!(subsystem = name, "unknown subsystem for hot-load");
+            }
+        }
+    }
+
+    /// 动态卸载一个子系统的所有工具（移除 schema，executor 保留但不可见）
+    ///
+    /// ## 引用关系
+    /// - 调用方: reevaluate_adaptive_subsystems()（冷卸载路径）
+    /// - 副作用: 从 ToolRegistry 移除匹配前缀的 ToolHandle
+    ///
+    /// ## 设计
+    /// 只移除 schema（ToolHandle），executor 保留——下次 hot-load 时部分子系统
+    /// 可跳过 register_executors（如 orchestrate）。但为安全起见 hot-load 仍全量注册。
+    ///
+    /// ## KV Cache 影响
+    /// 工具列表缩短 → tools 段 hash 变化 → cache miss（有意为之——减少 LLM 选择噪声）
+    async fn cold_unload_subsystem(&self, prefix: &str) {
+        self.registry.remove_by_prefix(prefix).await;
+    }
+
     /// 获取指定工具列表的 effectiveness 快照（TUI 消费）
     ///
     /// ## 引用关系
@@ -2189,6 +2504,16 @@ impl CoreLoop {
                 },
                 "required": ["goal", "phase"]
             })),
+            // V41: LLM 可主动延长当前 turn 超时（复杂任务需要更多时间）
+            ("session_extend_timeout", "Request more execution time for the current turn. Use when you're in the middle of a complex multi-step operation and sense the time budget may be insufficient. The system will grant up to 300 additional seconds.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "Brief reason why more time is needed (shown to user)"},
+                        "additional_secs": {"type": "integer", "description": "Additional seconds requested (10-300, will be clamped)"}
+                    },
+                    "required": ["reason"]
+                })),
             // V29.13 段3a：MagChain/Hook 透明化——LLM 可主动查询 epistemic 状态 + 已激活的 hook 列表 + 当前 decay tier
             ("magchain_status", "Query MagChain (epistemic guard + decay router + pipeline hooks) status. Use this to (1) check if epistemic violations are accumulated and a declaration may be triggered, (2) understand current decay tier (Fast/Medium/Slow) for the user input, (3) see which pipeline hooks are active. Helps you self-regulate output quality before it gets penalized.",
                 json!({
@@ -2270,7 +2595,7 @@ impl CoreLoop {
         for (name, desc, params) in &entries {
             registry.register(ToolHandle {
                 id: ToolId(name.to_string()),
-                schema: ToolSchema {
+                schema: ToolSchema { short_description: None,
                     name: name.to_string(),
                     description: desc.to_string(),
                     parameters: params.clone(),
@@ -2625,7 +2950,7 @@ impl CoreLoop {
                 let id = abacus_types::ToolId(sanitized_id.clone());
                 let handle = abacus_types::ToolHandle {
                     id: id.clone(),
-                    schema: abacus_types::ToolSchema {
+                    schema: abacus_types::ToolSchema { short_description: None,
                         name: id.0.clone(),
                         description: tool_spec.description.clone(),
                         parameters: tool_spec.parameters.clone(),
@@ -3044,6 +3369,23 @@ impl CoreLoop {
     /// - 使用 provider 内部的 15s timeout（discover 不应阻塞启动）
     /// - 静态 fallback：discover 失败时使用 supported_models()
     pub async fn discover_all_models(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        let (result, _) = self.discover_all_models_with_status().await;
+        result
+    }
+
+    /// discover_models + 返回每个 provider 的可用性状态
+    ///
+    /// ## 返回
+    /// - `BTreeMap<provider_id, models>` — 模型列表（含 fallback）
+    /// - `Vec<(provider_id, available, error_msg)>` — 可用性检测结果
+    ///
+    /// ## 引用关系
+    /// - 消费方：TUI run.rs discover 流程（展示 provider 健康状态）
+    /// - 生命周期：调用后结果通过 channel 传回 TUI state
+    pub async fn discover_all_models_with_status(&self) -> (
+        std::collections::BTreeMap<String, Vec<String>>,
+        Vec<(String, bool, Option<String>)>,
+    ) {
         let providers = self.providers.read().await;
         let provider_list: Vec<(String, std::sync::Arc<dyn crate::llm::LlmProvider>)> = providers.iter()
             .map(|(id, p)| (id.clone(), p.clone()))
@@ -3053,20 +3395,23 @@ impl CoreLoop {
         let mut handles = Vec::with_capacity(provider_list.len());
         for (id, p) in provider_list {
             handles.push(tokio::spawn(async move {
-                let models = match p.discover_models().await {
-                    Ok(m) => m,
+                let discover_result = p.discover_models().await;
+                let (models, available, err_msg) = match discover_result {
+                    Ok(m) => (m, true, None),
                     Err(e) => {
                         tracing::warn!(provider = %id, error = %e, "discover_models failed, fallback to supported_models");
-                        p.supported_models()
+                        (p.supported_models(), false, Some(e.to_string()))
                     }
                 };
-                (id, models.into_iter().map(|m| m.0).collect::<Vec<_>>())
+                (id, models.into_iter().map(|m| m.0).collect::<Vec<_>>(), available, err_msg)
             }));
         }
 
         let mut result = std::collections::BTreeMap::new();
+        let mut statuses: Vec<(String, bool, Option<String>)> = Vec::new();
         for h in handles {
-            if let Ok((id, models)) = h.await {
+            if let Ok((id, models, available, err_msg)) = h.await {
+                statuses.push((id.clone(), available, err_msg));
                 if !models.is_empty() {
                     result.insert(id, models);
                 }
@@ -3089,7 +3434,7 @@ impl CoreLoop {
             }
         }
 
-        result
+        (result, statuses)
     }
 
     /// 一站式 API：discover + 写入 ~/.abacus/models.cache.json。
@@ -3769,6 +4114,27 @@ Output JSON:
                 *focus = Some(SessionFocus { goal, phase, constraints, next_step, updated_at_turn: turn_count.saturating_add(1) });
                 serde_json::json!({"set": true, "message": "Session focus anchor updated. Will appear at top of context starting next turn."})
             }
+            // V41: LLM 主动延长超时——pipeline 读取 session 中的 timeout_extension 字段
+            "session_extend_timeout" => {
+                let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("complex task").to_string();
+                let additional = params.get("additional_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120)
+                    .clamp(10, 300);
+                drop(map);
+                // 写入 session state 的 timeout_extension 字段
+                // pipeline execute_loop 每次 LLM 请求前会读取并叠加到 dynamic_timeout_secs
+                {
+                    let mut s_write = session.write().await;
+                    s_write.timeout_extension_secs += additional;
+                }
+                tracing::info!(additional_secs = additional, reason = %reason, "LLM requested timeout extension");
+                serde_json::json!({
+                    "granted": true,
+                    "additional_secs": additional,
+                    "message": format!("Granted {} additional seconds. Total extension this turn: use wisely.", additional)
+                })
+            }
             // cross-session 段H：列出/汇总 prior sessions（项目内）
             // 引用：core::event_sink::{list_replayable_sessions, build_resume_report}
             // 失败：jsonl 目录不存在 → 空列表；session_id 不存在 → 空 report
@@ -4173,10 +4539,35 @@ Output JSON:
     }
 
     async fn resolve_provider(&self) -> Result<(String, Arc<dyn LlmProvider>), KernelError> {
+        self.resolve_provider_with_hint(None).await
+    }
+
+    /// V41: resolve_provider 支持 forced_provider 强制指定
+    ///
+    /// ## 引用关系
+    /// - 调用方: pipeline execute_loop（传递 req_ctx.forced_provider）
+    /// - 设计: forced_provider 有值时跳过 "primary" fallback，直接查指定 group
+    pub(crate) async fn resolve_provider_with_hint(&self, forced: Option<&str>) -> Result<(String, Arc<dyn LlmProvider>), KernelError> {
         let model: String = self.model_override.read().await
             .as_ref().map(|m| m.0.clone())
             .unwrap_or_else(|| self.config.default_model.0.clone());
         let providers = self.providers.read().await;
+
+        // V41: forced_provider 优先 — 多 provider 同名 model 时直接定位
+        if let Some(forced_id) = forced {
+            // 直接查 provider_groups
+            for group in self.provider_groups.read().await.iter() {
+                if group.id == forced_id {
+                    return Ok((group.id.clone(), group.provider.clone()));
+                }
+            }
+            // fallback: providers map 直接查
+            if let Some(provider) = providers.get(forced_id) {
+                return Ok((forced_id.to_string(), provider.clone()));
+            }
+            // forced 指定的 provider 不存在 → 继续正常流程（降级而非失败）
+            tracing::warn!(forced_provider = %forced_id, "forced_provider not found, falling back to normal resolution");
+        }
 
         // 0. 优先使用 FallbackProvider（双协议自动回退）
         if let Some(provider) = providers.get("primary") {
@@ -4474,8 +4865,44 @@ Output JSON:
         };
 
         let cluster_registry = self.cluster_registry.clone();
+
+        // Short-Mode：工具数 > 12 时，对最近 3 轮未使用的工具切换到 short_description
+        // 节省 token（典型场景 30+ 工具时减少 ~40% description 字节）
+        //
+        // ## 引用关系
+        // - 依赖：self.tool_last_invoked（记录每个工具最近被调用的 turn）
+        // - 依赖：ToolSchema.short_description（各 builtin 模块 schemas() 设置）
+        // - 消费方：LLM 在 ToolDefinition.description 中看到短描述
+        //
+        // ## 生命周期
+        // - short_mode_active 每次 build 重新计算（无持久副作用）
+        // - 不影响 schema_stable 或 KV cache 命中（short 切换本身是 description 字段变化）
+        let total_tools = tools.len();
+        let short_mode_active = total_tools > 12;
+        let last_invoked_for_short = if short_mode_active {
+            Some(self.tool_last_invoked.read().await.clone())
+        } else {
+            None
+        };
+        let cur_turn_for_short = current_turn.unwrap_or(0);
+
         let mut defs: Vec<ToolDefinition> = tools.into_iter()
             .map(|mut t| {
+                // Short-Mode：对冷工具（最近 3 turn 未使用）用 short_description 替代完整描述
+                if short_mode_active {
+                    if let Some(ref last_map) = last_invoked_for_short {
+                        let recently_used = match last_map.get(&t.id) {
+                            Some(&prev) if prev > 0 => cur_turn_for_short.saturating_sub(prev) <= 3,
+                            _ => false, // 从未调用 = 冷工具
+                        };
+                        if !recently_used {
+                            if let Some(ref short) = t.schema.short_description {
+                                t.schema.description = short.clone();
+                            }
+                        }
+                    }
+                }
+
                 // Effectiveness tier badge (before cluster hint so LLM sees quality first)
                 if let Some(tier) = tier_map.get(&t.id) {
                     let label = match tier {
@@ -5273,7 +5700,7 @@ mod tests {
         for n in 0..4 {
             reg.register(abacus_types::ToolHandle {
                 id: ToolId(format!("tiny_{}", n)),
-                schema: abacus_types::ToolSchema {
+                schema: abacus_types::ToolSchema { short_description: None,
                     name: format!("tiny_{}", n),
                     description: "x".into(),
                     parameters: serde_json::json!({"type": "object"}),
@@ -5722,7 +6149,7 @@ mod tests {
         for name in ["zeta_tool", "alpha_tool", "mid_tool"] {
             reg.register(abacus_types::ToolHandle {
                 id: ToolId(name.to_string()),
-                schema: abacus_types::ToolSchema {
+                schema: abacus_types::ToolSchema { short_description: None,
                     name: name.to_string(),
                     description: format!("desc {}", name),
                     parameters: serde_json::json!({"type": "object", "properties": {}}),
@@ -5774,7 +6201,7 @@ mod tests {
             let eff = abacus_types::ToolEffectiveness { tier, ..Default::default() };
             reg.register(abacus_types::ToolHandle {
                 id: ToolId(name.to_string()),
-                schema: abacus_types::ToolSchema {
+                schema: abacus_types::ToolSchema { short_description: None,
                     name: name.to_string(),
                     description: "test".into(),
                     parameters: serde_json::json!({}),
@@ -5812,7 +6239,7 @@ mod tests {
             let eff = abacus_types::ToolEffectiveness { tier, ..Default::default() };
             reg.register(abacus_types::ToolHandle {
                 id: ToolId(name.to_string()),
-                schema: abacus_types::ToolSchema {
+                schema: abacus_types::ToolSchema { short_description: None,
                     name: name.to_string(),
                     description: "test".into(),
                     parameters: serde_json::json!({}),
@@ -5857,7 +6284,7 @@ mod tests {
         for (name, prov, _) in &provider_cases {
             reg.register(abacus_types::ToolHandle {
                 id: ToolId(name.to_string()),
-                schema: abacus_types::ToolSchema {
+                schema: abacus_types::ToolSchema { short_description: None,
                     name: name.to_string(),
                     description: "原始描述".into(),
                     parameters: serde_json::json!({}),
@@ -5899,7 +6326,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("mcp/svc/foo".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "mcp/svc/foo".into(),
                 description: "do something".into(),
                 parameters: serde_json::json!({}),
@@ -5935,7 +6362,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("only_for_debug".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "only_for_debug".into(),
                 description: "debugger".into(),
                 parameters: serde_json::json!({}),
@@ -5968,7 +6395,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("only_for_debug".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "only_for_debug".into(),
                 description: "debugger".into(),
                 parameters: serde_json::json!({}),
@@ -5983,7 +6410,7 @@ mod tests {
         }).await;
         reg.register(abacus_types::ToolHandle {
             id: ToolId("universal_tool".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "universal_tool".into(),
                 description: "all".into(),
                 parameters: serde_json::json!({}),
@@ -6017,7 +6444,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("debug_tool".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "debug_tool".into(),
                 description: "debug".into(),
                 parameters: serde_json::json!({}),
@@ -6048,7 +6475,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("stale_tool".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "stale_tool".into(),
                 description: "old".into(),
                 parameters: serde_json::json!({}),
@@ -6078,7 +6505,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("stale_tool".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "stale_tool".into(),
                 description: "old".into(),
                 parameters: serde_json::json!({}),
@@ -6093,7 +6520,7 @@ mod tests {
         }).await;
         reg.register(abacus_types::ToolHandle {
             id: ToolId("fresh_tool".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "fresh_tool".into(),
                 description: "new".into(),
                 parameters: serde_json::json!({}),
@@ -6128,7 +6555,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("brand_new".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "brand_new".into(),
                 description: "new".into(),
                 parameters: serde_json::json!({}),
@@ -6159,7 +6586,7 @@ mod tests {
         let reg = Arc::new(ToolRegistry::new());
         reg.register(abacus_types::ToolHandle {
             id: ToolId("only_for_debug".into()),
-            schema: abacus_types::ToolSchema {
+            schema: abacus_types::ToolSchema { short_description: None,
                 name: "only_for_debug".into(),
                 description: "debugger".into(),
                 parameters: serde_json::json!({}),

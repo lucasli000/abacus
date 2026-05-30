@@ -122,19 +122,13 @@ pub fn render_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         f.render_widget(top_overlay, top_segment);
     }
 
-    // V35: 统一两 Tab — 带计数 indicator
-    let tool_total = state.tool_records.len();
-    let know_total = state.knowledge_calls.len();
+    // V40: Scene tab 已合并 Stockroom 内容——单 tab 布局
+    // Stockroom 的记忆宫殿/工具仓/技能引擎内嵌到 Scene 顶部
     let labels: Vec<String> = vec![
         label_with_count(t("panel.scene"), state.trace_events.len()),
-        label_with_count(t("panel.stockroom"), know_total + tool_total),
     ];
-    let tab_idx = if matches!(state.panel_tab, PanelTab::Quant) { 1 } else { 0 };
-    let content = render_panel_header(f, state, inner, &labels, tab_idx);
-    match state.panel_tab {
-        PanelTab::Quant => render_tab_stockroom(f, state, content),
-        _ => render_tab_scene(f, state, content),
-    }
+    let content = render_panel_header(f, state, inner, &labels, 0);
+    render_tab_scene(f, state, content)
 }
 
 /// Phase 3 去重：公共 Panel header 渲染（Tab 栏 + 分隔线 + 内容区分割）
@@ -1191,10 +1185,15 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     if state.context_window > 0 {
         lines.push(dotted_sep.clone());
-        // 口径对齐：与 InputBar context% 一致，用 latest_prompt_tokens（最新轮完整 context 大小）
-        // 而非 total_tokens（累加账单，随轮次增长会虚高到 100%+）
-        let used = state.session_tokens.latest_prompt_tokens as usize;
+        // 口径对齐：与 InputBar context% 一致，优先用 ctx_live_tokens（含 context_tokens）
+        // fallback 到 latest_prompt_tokens（仅 prompt，精度较低）
+        let raw_used = if state.ctx_live_tokens > 0 {
+            state.ctx_live_tokens as usize
+        } else {
+            state.session_tokens.latest_prompt_tokens as usize
+        };
         let max_ctx = state.context_window;
+        let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
         let pct = if max_ctx > 0 { (used * 100 / max_ctx).min(100) } else { 0 };
         let pct_color = if pct >= 80 { state.theme.error }
             else if pct >= 50 { state.theme.gold }
@@ -1205,16 +1204,11 @@ fn render_tab_quant(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
         ));
 
-        // 进度条（16 格）
-        let filled = (pct * 16 / 100).min(16);
-        let empty = 16 - filled;
+        // 纯数据行：used / max + 百分比（无进度条）
         lines.push(Line::from(vec![
             Span::styled("    ", Style::default()),
-            Span::styled("█".repeat(filled), Style::default().fg(pct_color)),
-            Span::styled("░".repeat(empty), Style::default().fg(state.theme.muted)),
-            Span::styled(format!(" {}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
-        ]));
-        lines.push(Line::from(vec![
+            Span::styled(format!("{:.0}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
+            Span::styled("  ", Style::default()),
             Span::styled(t("stat.used"), Style::default().fg(state.theme.muted)),
             Span::styled(format!("{}", crate::tui::components::bars::format_ctx(used)), Style::default().fg(state.theme.text)),
             Span::styled(" / ", Style::default().fg(state.theme.muted)),
@@ -1702,26 +1696,149 @@ fn compute_timeline_groups(state: &AppState) -> Vec<crate::tui::state::TimelineG
 
 fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::layout::{Layout, Constraint, Direction};
-    // 三区块：Timeline(50%) + Focus(30%) + Data(20%) — 比例可随 streaming 动态调整
-    let dyn_focus = if state.is_streaming { Constraint::Fill(2) } else { Constraint::Fill(1) };
-    let secs = Layout::default().direction(Direction::Vertical)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(1),
-            dyn_focus,
-            Constraint::Length(1),
-            Constraint::Min(3),
-        ])
-        .split(area);
-    render_timeline_grouped(f, state, secs[0]);
+    // 三区块布局（V40: Stockroom 合并进 Scene）：
+    // 1. Stockroom + 统计标题行（记忆/工具/技能 + ctx%/cost 内嵌）
+    // 2. Timeline（现场时间线）
+    // 3. Focus（当前焦点）
+    //
+    // 统计数据不再单独占一区块——作为 Stockroom 区块的标题/尾行嵌入
     let sep = ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
         " ╌╌╌╌╌╌╌╌",
         ratatui::style::Style::default().fg(state.theme.muted).add_modifier(ratatui::style::Modifier::DIM),
     ));
+
+    // 动态分配：streaming 时 Focus 占更多空间（Timeline 让位）
+    let dyn_focus = if state.is_streaming { Constraint::Fill(2) } else { Constraint::Fill(1) };
+    let secs = Layout::default().direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(6),         // Stockroom + inline 统计
+            Constraint::Length(1),      // 分隔线
+            Constraint::Fill(1),        // Timeline
+            Constraint::Length(1),      // 分隔线
+            dyn_focus,                  // Focus
+        ])
+        .split(area);
+
+    render_stockroom_with_stats(f, state, secs[0]);
     f.render_widget(sep.clone(), secs[1]);
-    render_focus_panel(f, state, secs[2]);
+    render_timeline_grouped(f, state, secs[2]);
     f.render_widget(sep, secs[3]);
-    render_tab_data(f, state, secs[4]);
+    render_focus_panel(f, state, secs[4]);
+}
+
+/// Stockroom + 统计合并渲染：记忆/工具/技能信息 + ctx%/in/out/cost 内嵌为标题行
+///
+/// 引用关系：被 render_tab_scene 第一区块调用
+/// 生命周期：每帧渲染
+fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::Paragraph;
+    use ratatui::style::{Style, Modifier};
+    use crate::tui::state::ToolStatus;
+    use crate::tui::components::bars::format_ctx;
+
+    let muted = Style::default().fg(state.theme.muted);
+    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+    let ab = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let txt = Style::default().fg(state.theme.text);
+    let gold = Style::default().fg(state.theme.gold);
+    let mut lines: Vec<Line> = Vec::new();
+
+    // ── 统计标题行（ctx% + in/out + cost）──
+    {
+        let raw_used = if state.ctx_live_tokens > 0 {
+            state.ctx_live_tokens as usize
+        } else {
+            state.session_tokens.latest_prompt_tokens as usize
+        };
+        let max_ctx = state.context_window;
+        let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
+        let pct = if max_ctx > 0 && used > 0 { used * 100 / max_ctx } else { 0 };
+        let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };
+        let inp = state.session_tokens.prompt_tokens;
+        let out = state.session_tokens.completion_tokens;
+        let cached = state.session_tokens.cached_tokens;
+        let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
+
+        // 紧凑单行：📊 [====--------] 38% 415K↑5K↓ c78 ¥0.08
+        let bw = 12usize;
+        let filled = (pct * bw / 100).min(bw);
+        let bar_str = format!("[{}{}]", "=".repeat(filled), "-".repeat(bw - filled));
+        let mut row = vec![
+            Span::styled("📊 ", ab),
+            Span::styled(bar_str, Style::default().fg(pc)),
+            Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+        ];
+        row.push(Span::styled(format!(" {}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), dim));
+        if cpct > 0 {
+            row.push(Span::styled(format!(" >{}%", cpct), Style::default().fg(state.theme.success)));
+        }
+        if state.session_tokens.cost_cny > 0.001 {
+            row.push(Span::styled(format!(" ¥{:.2}", state.session_tokens.cost_cny), gold));
+        }
+        lines.push(Line::from(row));
+    }
+
+    // ── 工具健康摘要（一行）──
+    {
+        let hc = state.tool_health.len();
+        let tc = state.tool_records.len();
+        if hc > 0 || tc > 0 {
+            let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
+            let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
+            let mut parts = vec![
+                Span::styled("🔧 ", ab),
+                Span::styled(format!("{}/{}", avail, hc), txt),
+            ];
+            if tc > 0 {
+                parts.push(Span::styled(format!(" · 调{}✓{}", tc, sc), muted));
+                // 最频繁工具
+                let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+                for r in &state.tool_records { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
+                if let Some((tn, cnt)) = freq.iter().max_by_key(|(_, c)| *c) {
+                    let t: String = tn.rsplitn(2, "__").next().unwrap_or(tn).chars().take(12).collect();
+                    parts.push(Span::styled(format!(" · {}{}", t, cnt), dim));
+                }
+            }
+            lines.push(Line::from(parts));
+        }
+    }
+
+    // ── 记忆宫殿摘要（一行）──
+    if let Some(ref snap) = state.palace_data {
+        let domains = snap.knowledge_domains.len();
+        let behaviors = snap.behavior_count;
+        if domains > 0 || behaviors > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("🧠 ", ab),
+                Span::styled(format!("{}域 {}行为", domains, behaviors), txt),
+            ]));
+        }
+    }
+
+    // ── 技能摘要（一行，仅有调用时）──
+    {
+        let skills: Vec<_> = state.tool_records.iter()
+            .filter(|r| !r.name.contains("__") && !r.name.starts_with("mcp_"))
+            .collect();
+        if !skills.is_empty() {
+            let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+            for r in &skills { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
+            let top: Vec<String> = freq.iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(n, c)| format!("{} {}×", n, c))
+                .into_iter().collect();
+            lines.push(Line::from(vec![
+                Span::styled("⚡ ", ab),
+                Span::styled(format!("{}次", skills.len()), txt),
+                Span::styled(if top.is_empty() { String::new() } else { format!(" · {}", top.join("")) }, dim),
+            ]));
+        }
+    }
+
+    let vis = area.height as usize;
+    if lines.len() > vis { lines.truncate(vis); }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
@@ -1731,7 +1848,7 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     let w = (area.width as usize).saturating_sub(3).max(10);
     let muted = Style::default().fg(state.theme.muted);
     let dim   = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let ab    = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
+    let _ab    = Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD);
     let txt   = Style::default().fg(state.theme.text);
     let mut lines: Vec<Line> = Vec::new();
     // ── 标题行 ──
@@ -1818,9 +1935,22 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         lines.push(Line::from(vec![Span::styled("Focus", ab), Span::styled(format!(" · {}", stage), muted)]));
 
         if !state.streaming_thinking.is_empty() {
-            for l in state.streaming_thinking.lines().filter(|l| !l.trim().is_empty()).take(2) {
+            // 显示 thinking 行数进度 + 最新 3 行内容（让用户跟踪思考方向）
+            let think_lines: Vec<&str> = state.streaming_thinking.lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let total = think_lines.len();
+            // 取最后 3 行（最新内容）而非前 3 行
+            let visible = if total > 3 { &think_lines[total-3..] } else { &think_lines[..] };
+            for l in visible {
                 let t = crate::tui::util::truncate_to_width(l, (area.width as usize).saturating_sub(6).max(20));
                 lines.push(Line::from(vec![Span::raw("  💭 "), Span::styled(t, Style::default().fg(state.theme.accent))]));
+            }
+            if total > 3 {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("… {}行", total), Style::default().fg(state.theme.muted)),
+                ]));
             }
         }
         for (name, status, dur_opt, _) in state.streaming_tools.iter().rev() {
@@ -2048,19 +2178,24 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::widgets::Paragraph;
     use ratatui::style::{Style, Modifier};
     use crate::tui::components::bars::format_ctx;
-    use crate::tui::cost;
+    
     let w = (area.width as usize).saturating_sub(2).max(10);
     let label = Style::default().fg(state.theme.muted); // 标签色
     let val   = Style::default().fg(state.theme.text);   // 数值色
     let dim   = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let gold  = Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD);
+    let _gold  = Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD);
     let mut lns: Vec<Line> = Vec::new();
     // ── 标题行 ──
     lns.push(Line::from(Span::styled("统计", Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD))));
 
     // ── context 进度条 ──
-    let used = state.session_tokens.latest_prompt_tokens as usize;
+    let raw_used = if state.ctx_live_tokens > 0 {
+        state.ctx_live_tokens as usize
+    } else {
+        state.session_tokens.latest_prompt_tokens as usize
+    };
     let max_ctx = state.context_window;
+    let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
     if max_ctx > 0 && used > 0 {
         let pct = (used * 100 / max_ctx).min(100);
         let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };

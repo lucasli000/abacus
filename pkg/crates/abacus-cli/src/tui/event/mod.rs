@@ -2135,7 +2135,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 let before = &state.input[..state.cursor_pos];
                 if before.rfind('\n').is_none() { break; }
                 // 模拟 Up 一次
-                let nl = before.rfind('\n').unwrap();
+                let nl = before.rfind('\n').unwrap_or(0);
                 let line_start = before[..nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
                 let prev_line = &before[line_start..nl];
                 let target_col = state.cursor_col.min(
@@ -2306,6 +2306,112 @@ pub fn submit_message(state: &mut AppState) {
             // 超时：静默清除
             state.pending_meeting_execution = None;
         }
+    }
+
+    // V41: Plan 两阶段——AwaitingApproval 时拦截 A/S/T 选择执行策略
+    // 消息流交互：计划已在消息流中展示，用户输入 A/S/T 被消费为策略选择
+    // 引用关系：
+    //   - 写入: run.rs 设置 plan_phase = AwaitingApproval（Phase 1 完成时）
+    //   - 读取: 此处检测 + 消费
+    //   - 触发: pending_slash_command = TurnkeyExecute / ExecuteWithTeam
+    // 生命周期：AwaitingApproval 时激活 → 用户选择后转为 Executing → Phase 2 启动
+    if let Some(crate::tui::state::PlanPhase::AwaitingApproval { .. }) = &state.plan_phase {
+        let input_upper = text.trim().to_uppercase();
+        match input_upper.as_str() {
+            "A" | "AUTO" => {
+                // 自动执行——工具调用自动放行（skip progressive gate）
+                let task = state.pending_turnkey_plan.take();
+                state.plan_phase = Some(crate::tui::state::PlanPhase::Executing {
+                    strategy: crate::tui::state::PlanExecutionStrategy::Auto,
+                });
+                if let Some(task) = task {
+                    state.pending_slash_command = Some(
+                        crate::tui::state::SlashCommand::TurnkeyExecute(task),
+                    );
+                }
+                state.add_message(crate::tui::state::Message::new_session(
+                    vec![crate::tui::state::MsgContent::Stream("▶ 策略: 自动执行 — 工具调用自动放行".to_string())],
+                    chrono::Local::now().format("%H:%M").to_string(),
+                ));
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Thinking;
+                return;
+            }
+            "S" | "STEP" => {
+                // 逐步确认——每个敏感操作需 MCIP 确认
+                let task = state.pending_turnkey_plan.take();
+                state.plan_phase = Some(crate::tui::state::PlanPhase::Executing {
+                    strategy: crate::tui::state::PlanExecutionStrategy::StepByStep,
+                });
+                if let Some(task) = task {
+                    state.pending_slash_command = Some(
+                        crate::tui::state::SlashCommand::TurnkeyExecute(task),
+                    );
+                }
+                state.add_message(crate::tui::state::Message::new_session(
+                    vec![crate::tui::state::MsgContent::Stream("▶ 策略: 逐步确认 — 每步操作需确认".to_string())],
+                    chrono::Local::now().format("%H:%M").to_string(),
+                ));
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Thinking;
+                return;
+            }
+            "T" | "TEAM" => {
+                // 团队分发——转为 Team 模式多专家并行
+                let goal = if let Some(ref task) = state.pending_turnkey_plan {
+                    task.goal.clone()
+                } else {
+                    "执行计划".to_string()
+                };
+                state.pending_turnkey_plan = None;
+                state.plan_phase = Some(crate::tui::state::PlanPhase::Executing {
+                    strategy: crate::tui::state::PlanExecutionStrategy::Team,
+                });
+                state.pending_slash_command = Some(
+                    crate::tui::state::SlashCommand::ExecuteWithTeam { task: goal },
+                );
+                state.add_message(crate::tui::state::Message::new_session(
+                    vec![crate::tui::state::MsgContent::Stream("▶ 策略: 团队分发 — 多专家并行执行".to_string())],
+                    chrono::Local::now().format("%H:%M").to_string(),
+                ));
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Thinking;
+                return;
+            }
+            "N" | "NO" | "C" | "CANCEL" => {
+                // 取消计划
+                state.plan_phase = None;
+                state.pending_turnkey_plan = None;
+                state.add_toast("已取消计划执行".to_string(), Duration::from_secs(2));
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                state.input_state = InputState::Ready;
+                return;
+            }
+            _ => {
+                // 非策略输入：清除 AwaitingApproval，作为普通消息继续处理
+                state.plan_phase = None;
+                state.pending_turnkey_plan = None;
+            }
+        }
+    }
+
+    // V41: @ 自动路由 — Clarify 模式中 @开头自动切到 Meeting
+    // 设计意图：用户用 @专家名 指向专家时，无需手动 /meeting
+    // 引用关系：try_switch_mode 处理 ClarifyBrief 注入 + 过渡动画
+    if state.mode == crate::tui::state::AbacusMode::Clarify && text.trim_start().starts_with('@') {
+        crate::tui::slash_commands::try_switch_mode_pub(state, crate::tui::state::AbacusMode::Meeting);
     }
 
     // 2026-05-27: 清除保留输入（如果有）

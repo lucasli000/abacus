@@ -331,12 +331,25 @@ impl SegmentKind {
 /// A single segment of text tagged with its priority kind.
 ///
 /// Used by [`DynamicInjector`] to produce ordered prompt fragments.
+///
+/// ## 引用关系
+/// - 生产方：`DynamicInjector::inject()` / `rebuild_cache()`
+/// - 消费方：`PromptAssembly::assemble_segments()` — 根据 `semi_stable` 决定归入 Tier 2.5 或 Dynamic
 #[derive(Debug, Clone)]
 pub struct PromptSegment {
     /// The priority kind of this segment
     pub kind: SegmentKind,
     /// The text content to inject
     pub text: String,
+    /// 半稳定标记：true 时归入 Tier 2.5（cacheable=true），即使 priority < 185
+    /// 适用于：retained_context（task 执行中多 turn 不变）、活跃 expert_role（TTL>1，consecutive_hits>1）
+    ///
+    /// ## 生命周期
+    /// - 创建：默认 false
+    /// - 激活：`rebuild_cache()` 中检测 expert_role entry 的 consecutive_hits > 1 时置 true
+    /// - 消费：`assemble_segments()` 在分层收集时检查此字段
+    #[allow(dead_code)]
+    pub semi_stable: bool,
 }
 
 /// A registered injection rule.
@@ -461,6 +474,7 @@ impl DynamicInjector {
                         entry.segment = PromptSegment {
                             kind: SegmentKind::Knowledge,
                             text: full_text,
+                            semi_stable: false,
                         };
                     }
                     mutated = true;
@@ -474,6 +488,7 @@ impl DynamicInjector {
                     segment: PromptSegment {
                         kind: SegmentKind::Knowledge,
                         text: brief_text,
+                        semi_stable: false,
                     },
                     role_id,
                     ttl: cfg_ttl,
@@ -569,10 +584,20 @@ impl DynamicInjector {
 
     /// Rebuild the cached_segments vector from current state.
     /// Called after any mutation to knowledge_entries or non_role_knowledge.
+    ///
+    /// ## Tier 2.5 semi_stable 标记逻辑
+    /// expert_role entry 的 `consecutive_hits > 1` 表示角色已被连续确认（非一次性检测），
+    /// 在同一 task 执行中跨 turn 稳定——标记 `semi_stable: true` 以归入 Tier 2.5（cacheable）。
+    /// 非 role 的 Knowledge 段（topic/tool_result）每 turn 可能变化，保持 semi_stable=false。
     fn rebuild_cache(&mut self) {
         self.cached_segments.clear();
         for entry in &self.knowledge_entries {
-            self.cached_segments.push(entry.segment.clone());
+            let mut seg = entry.segment.clone();
+            // expert_role 连续命中 > 1 次 → 已稳定，归入 Tier 2.5
+            if entry.consecutive_hits > 1 {
+                seg.semi_stable = true;
+            }
+            self.cached_segments.push(seg);
         }
         self.cached_segments.extend(self.non_role_knowledge.clone());
     }
@@ -620,6 +645,7 @@ impl DynamicInjector {
                 Some(PromptSegment {
                     kind: SegmentKind::Knowledge,
                     text: role.to_string(),
+                    semi_stable: false,
                 })
             }),
         });
@@ -649,6 +675,7 @@ impl DynamicInjector {
                 Some(PromptSegment {
                     kind: SegmentKind::Knowledge,
                     text: format!("[Injector] Topic context: user discussing {topic}. Use relevant best practices and conventions."),
+                    semi_stable: false,
                 })
             }),
         });
@@ -669,6 +696,38 @@ impl DynamicInjector {
                 Some(PromptSegment {
                     kind: SegmentKind::Knowledge,
                     text: "[Injector] Tool results available in current turn. Review them before responding.".to_string(),
+                    semi_stable: false,
+                })
+            }),
+        });
+
+        // V41: ToolAgent batch awareness — 引导 LLM 主动批量发出只读调用
+        //
+        // ## 设计意图
+        // LLM 不知道 pipeline 会自动聚合只读工具调用——它可能分多轮逐个 read。
+        // 注入此 hint 后 LLM 会主动"攒一批"发出，触发 ToolAgent 批量路径。
+        //
+        // ## KV cache 友好
+        // semi_stable=true → Tier 2.5 缓存命中（文本跨 turn 不变）
+        // 固定文本，不含动态变量，字节级稳定
+        //
+        // ## 引用关系
+        // - 消费方: LLM 推理（影响工具调用策略）
+        // - 效果: 更多 tool_calls 被聚合到单轮 → ToolAgent batch → 省 token + 不刷屏
+        self.register_source(InjectionSource {
+            source_id: "toolagent_hint".into(),
+            should_inject: Box::new(|_input, _ctx| true), // 常驻注入
+            inject: Box::new(|_input, _ctx| {
+                Some(PromptSegment {
+                    kind: SegmentKind::Knowledge,
+                    text: concat!(
+                        "[Batch Tools] When you need to read/search multiple files or resources, ",
+                        "issue ALL read-only tool calls in ONE turn (not spread across turns). ",
+                        "The system batches them for efficiency. ",
+                        "Batchable: fs_read, grep, fs_search, cg_query, db_query, web_search, lsp_*. ",
+                        "Write operations (fs_write, fs_edit, bash_exec) remain individual."
+                    ).to_string(),
+                    semi_stable: true, // Tier 2.5: 跨 turn 缓存命中
                 })
             }),
         });
@@ -729,6 +788,7 @@ impl DynamicInjector {
                 detect_expert_role(&lower).map(|text| PromptSegment {
                     kind: SegmentKind::Knowledge,
                     text: text.to_string(),
+                    semi_stable: false,
                 })
             }),
         });
@@ -757,6 +817,7 @@ impl DynamicInjector {
                         return Some(PromptSegment {
                             kind: SegmentKind::Knowledge,
                             text: format!("[Injector] Topic context: user discussing {}. {}", topic.hint, "Use relevant best practices and conventions."),
+                            semi_stable: false,
                         });
                     }
                 }
@@ -777,6 +838,7 @@ impl DynamicInjector {
                 Some(PromptSegment {
                     kind: SegmentKind::Knowledge,
                     text: "[Injector] Tool results available in current turn. Review them before responding.".to_string(),
+                    semi_stable: false,
                 })
             }),
         });

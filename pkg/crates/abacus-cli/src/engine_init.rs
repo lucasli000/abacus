@@ -180,10 +180,11 @@ pub async fn create_engine(
         Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
     }
     // 2026-05-28: 从 providers[].models[] per-model 参数合并到 catalog
+    // 2026-05-30 PR2: 传入 provider_id 写入 qualified_specs（provider-aware 索引）
     let provider_entries_for_catalog = cfg_mgr.parse_providers();
     for entry in &provider_entries_for_catalog {
         for model_entry in &entry.models {
-            catalog.merge_model_entry(model_entry);
+            catalog.merge_model_entry(model_entry, Some(&entry.id));
         }
     }
     let model_catalog = Some(std::sync::Arc::new(catalog));
@@ -211,6 +212,10 @@ pub async fn create_engine(
         lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
         // Task #96：单 session 模型升级预算
         max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
+        // 模型升级目标：从 config 读取；空字符串或缺省视为 None（禁用升级）
+        escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
+            .filter(|s| !s.is_empty())
+            .map(|s| abacus_types::ModelId(s.to_string())),
         // W2 (Task #100): tool result dedup 与 abacus-core 默认值对齐
         tool_result_dedup_enabled: false,
         tool_result_dedup_ttl_secs: 60,
@@ -322,8 +327,10 @@ pub async fn create_engine(
                     let base = entry.base_url.clone()
                         .map(|u| u.trim_end_matches("/v1").trim_end_matches("/v2")
                             .trim_end_matches("/v3").trim_end_matches("/v4").to_string());
+                    let default_ds_model = models.first().cloned()
+                        .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
                     let p = Arc::new(DeepSeekProvider::with_config(
-                        api_key, models.first().cloned().unwrap_or(ModelId("deepseek-v4-flash".into())),
+                        api_key, default_ds_model,
                         base, None, None,
                     ));
                     core.register_provider_group(&entry.id, models, p).await;
@@ -332,8 +339,10 @@ pub async fn create_engine(
                     use abacus_core::llm::providers::openai_compatible::OpenAICompatibleProvider;
                     let base = entry.base_url.clone()
                         .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                    let default_oai_model = models.first().cloned()
+                        .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
                     let p = Arc::new(OpenAICompatibleProvider::new(
-                        api_key, models.first().cloned().unwrap_or(ModelId("gpt-4".into())),
+                        api_key, default_oai_model,
                         base, None, None, None,
                     ));
                     core.register_provider_group(&entry.id, models, p).await;
@@ -469,6 +478,29 @@ pub async fn create_engine(
     }
     } // end of else block (旧路径)
 
+    // ─── PR4: Load ModelPreference + apply last_selected ─────────────────
+    // After all providers registered, load user preference from disk.
+    // If the user previously selected a model via `/model`, auto-restore that choice.
+    //
+    // ## 引用关系
+    // - 写入: core.model_preference() (Arc<RwLock<ModelPreference>>)
+    // - 写入: core.set_model_override() (如果 last_selected 存在)
+    // - 读取: resolve_provider() 在每次 turn 时消费 preference
+    //
+    // ## 生命周期
+    // - 创建: 此处（provider 注册后）
+    // - 销毁: 随 core Arc drop（进程结束）
+    {
+        let pref_path = abacus_types::preference_file_path();
+        let preference = abacus_types::load_model_preference(&pref_path).unwrap_or_default();
+        // Step 10: If last_selected is set, auto-restore model_override so the
+        // user's previous `/model` selection takes effect immediately.
+        if let Some(ref last) = preference.last_selected {
+            core.set_model_override(&last.model.0).await;
+        }
+        *core.model_preference().write().await = preference;
+    }
+
     // ─── MCIP 权限配置（来自 security.yaml）───────────────────────
     // 内置工具前缀（fs_/lsp./kb_ 等）已硬编码豁免，无需配置。
     core.configure_mcip_permissions(
@@ -485,6 +517,16 @@ pub async fn create_engine(
             .map(|d| d.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into());
         core.enable_lsp(workspace).await;
+    }
+
+    // ─── CodeGraph 代码知识图谱（默认启用）──────────────────────────────
+    // tree-sitter 多语言代码索引 + FTS5 符号搜索 + 调用图/依赖图遍历。
+    // 共享 knowledge.db（WAL 模式并发安全）。schemas 已在 register_all() 注册，
+    // enable_code_graph 仅绑定 executor。可用 `code_graph.enabled = false` 禁用。
+    if cfg_mgr.get_bool("code_graph.enabled").unwrap_or(true) {
+        let workspace = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        core.enable_code_graph(&workspace).await;
     }
 
     // ─── Skill workflow executor（默认禁用）──────────────────────────

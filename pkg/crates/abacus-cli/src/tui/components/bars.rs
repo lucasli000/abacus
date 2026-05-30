@@ -46,9 +46,9 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     // V34: plan_mode 字段已删除（/plan-prefix 功能已随 plan_mode 字段移除）
 
-    // ABACUS logo（braille 单行版）
+    // ABACUS logo（纯文本）
     left.push(Span::styled(
-        "⎡⠆⠎⠇⠆⠇⠆⠎⠇⎤",
+        "ABACUS",
         Style::default()
             .fg(state.theme.mode)
             .add_modifier(Modifier::BOLD),
@@ -285,9 +285,8 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         f.render_widget(top_overlay, top_segment);
     }
 
-    let cursor_color = state.input_bar_color();
+    let _cursor_color = state.input_bar_color(); // 保留调用以备后续光标颜色定制
     let mut input_lines: Vec<Line> = Vec::new();
-    let muted = state.theme.text_style(TextRole::Caption);
 
     // ── 顶行：状态指示（spinner + phase + elapsed）──
     let spinner = || {
@@ -328,56 +327,116 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Span::styled(status_text, Style::default().fg(status_color)),
     ]));
 
-    // ── 中间：输入文本区（自适应高度：inner.height - 2 (status + info)）──
-    // 2026-05-28: 从固定 2 行改为动态（layout 已自适应扩展 input_h）
-    let text_area_h = inner.height.saturating_sub(2).max(1) as usize; // 减去 status + info 行
-    let display_lines: Vec<&str> = state.input.lines().collect();
-    let start = display_lines.len().saturating_sub(text_area_h);
-    let visible_lines: Vec<&str> = if display_lines.is_empty() {
-        let mut v = Vec::with_capacity(text_area_h);
-        for _ in 0..text_area_h { v.push(""); }
-        v
-    } else {
-        let mut v: Vec<&str> = display_lines[start..].to_vec();
-        while v.len() < text_area_h {
-            v.push("");
-        }
-        v
-    };
+    // ── 中间：输入文本区（自适应高度 + soft-wrap）──
+    // V40: 支持 soft-wrap——超出框宽的行自动视觉折行
+    let text_area_h = inner.height.saturating_sub(2).max(1) as usize;
+    let wrap_width = inner.width.saturating_sub(0) as usize; // 可用渲染宽度
 
-    let cursor_visible_line = if state.cursor_line >= start && state.cursor_line < start + visible_lines.len() {
-        state.cursor_line - start
-    } else {
-        visible_lines.len().saturating_sub(1)
-    };
-    // placeholder：输入为空且 Ready 态时显示 muted italic 提示
-    let show_placeholder = state.input.is_empty() && matches!(state.input_state, InputState::Ready);
-    for (i, line) in visible_lines.iter().enumerate() {
-        if show_placeholder && i == 0 {
-            // placeholder: 保留一个细条作为输入行视觉锚点
-            input_lines.push(Line::from(vec![
-                Span::styled(
-                    "Ask anything...",
-                    Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+    // Soft-wrap：将每个逻辑行按 wrap_width 拆分为多个视觉行
+    struct WrappedLine<'a> {
+        text: &'a str,
+        logical_line: usize, // 对应原始的第几行
+    }
+    let logical_lines: Vec<&str> = state.input.lines().collect();
+    let mut wrapped: Vec<WrappedLine> = Vec::new();
+    for (li, line) in logical_lines.iter().enumerate() {
+        if line.is_empty() {
+            wrapped.push(WrappedLine { text: "", logical_line: li });
         } else {
-            // 光标行和普通行都直接渲染原始文本
-            // 终端光标由 f.set_cursor_position() 定位，无需 ▎ 字符占位
-            // （▎ 会把光标后的文字右移 1 列，产生视觉偏移）
+            // 按字符宽度拆分（兼容 CJK 双宽字符）
+            let mut pos = 0;
+            let chars: Vec<char> = line.chars().collect();
+            while pos < chars.len() {
+                let mut w = 0usize;
+                let mut end = pos;
+                while end < chars.len() {
+                    let cw = if chars[end] as u32 > 0x7F { 2 } else { 1 };
+                    if w + cw > wrap_width && end > pos { break; }
+                    w += cw;
+                    end += 1;
+                }
+                let start_byte: usize = chars[..pos].iter().map(|c| c.len_utf8()).sum();
+                let end_byte: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
+                wrapped.push(WrappedLine { text: &line[start_byte..end_byte], logical_line: li });
+                pos = end;
+            }
+        }
+    }
+
+    // 滚动：保证光标所在视觉行可见
+    let cursor_wrapped_idx = {
+        let mut idx = 0;
+        let mut char_count = 0;
+        for (wi, wl) in wrapped.iter().enumerate() {
+            if wl.logical_line == state.cursor_line {
+                let line_start_pos: usize = logical_lines[..state.cursor_line].iter().map(|l| l.len() + 1).sum();
+                let col_in_line = state.cursor_pos.saturating_sub(line_start_pos);
+                let wl_char_len = wl.text.chars().count();
+                if col_in_line <= char_count + wl_char_len {
+                    idx = wi;
+                    break;
+                }
+                char_count += wl_char_len;
+                idx = wi;
+            } else if wl.logical_line > state.cursor_line {
+                break;
+            } else {
+                idx = wi;
+            }
+        }
+        idx
+    };
+    let start = if wrapped.len() <= text_area_h {
+        0
+    } else if cursor_wrapped_idx >= text_area_h {
+        cursor_wrapped_idx + 1 - text_area_h
+    } else {
+        0
+    };
+    let end = (start + text_area_h).min(wrapped.len());
+
+    let show_placeholder = state.input.is_empty() && matches!(state.input_state, InputState::Ready);
+    let cursor_visible_line = cursor_wrapped_idx.saturating_sub(start);
+
+    if show_placeholder {
+        // V41: AwaitingApproval 时 placeholder 变为策略选择提示
+        let placeholder_text = if matches!(
+            state.plan_phase,
+            Some(crate::tui::state::PlanPhase::AwaitingApproval { .. })
+        ) {
+            "输入 A/S/T/C 选择策略..."
+        } else {
+            "Ask anything..."
+        };
+        let placeholder_color = if matches!(
+            state.plan_phase,
+            Some(crate::tui::state::PlanPhase::AwaitingApproval { .. })
+        ) {
+            state.theme.accent
+        } else {
+            state.theme.muted
+        };
+        input_lines.push(Line::from(vec![
+            Span::styled(
+                placeholder_text,
+                Style::default().fg(placeholder_color).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+        for _ in 1..text_area_h {
+            input_lines.push(Line::raw(""));
+        }
+    } else {
+        for vi in start..end {
+            let wl = &wrapped[vi];
             let mut spans: Vec<Span> = vec![
-                Span::styled(line.to_string(), Style::default().fg(state.theme.text)),
+                Span::styled(wl.text.to_string(), Style::default().fg(state.theme.text)),
             ];
-            // 在光标行追加内联建议（灰色静默补全）
-            let is_cursor_line = i == cursor_visible_line;
-            let is_last_visible = i == visible_lines.len() - 1
-                || visible_lines.iter().skip(i + 1).all(|l| l.is_empty());
-            if is_cursor_line && is_last_visible && state.cursor_pos == state.input.len() {
+            // 内联建议：仅在最后一个视觉行 + 光标在末尾时
+            let is_last_wrapped = vi == wrapped.len().saturating_sub(1);
+            if is_last_wrapped && state.cursor_pos == state.input.len() {
                 if let Some(sugg) = &state.inline_suggestion {
                     let full_input = state.input.trim();
-                    let rest = sugg.strip_prefix(full_input)
-                        .filter(|r| !r.is_empty());
-                    if let Some(r) = rest {
+                    if let Some(r) = sugg.strip_prefix(full_input).filter(|r| !r.is_empty()) {
                         spans.push(Span::styled(
                             r,
                             Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
@@ -387,28 +446,13 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
             }
             input_lines.push(Line::from(spans));
         }
-        let _ = cursor_color; // 光标颜色由终端控制，此变量不再用于渲染
+        // 填充剩余空行
+        for _ in (end - start)..text_area_h {
+            input_lines.push(Line::raw(""));
+        }
     }
-
-    // ── 底行：左侧 thinking_depth · 百分比 已用/上限，右侧 ⏎ Enter / Esc ──
-    // ctx_live_tokens: 流式期间每 500ms 估算一次，Complete 后换为 prompt+completion 真实值
-    // 居优先于 legacy latest_prompt_tokens（仅 prompt，精度较低）
-    let real_tokens = if state.ctx_live_tokens > 0 {
-        state.ctx_live_tokens as usize
-    } else {
-        state.session_tokens.latest_prompt_tokens as usize
-    };
-    let (pct, used_str, max_str) = if state.context_window > 0 && real_tokens > 0 {
-        let pct = (real_tokens * 100 / state.context_window).min(99);
-        (pct, format_ctx(real_tokens), format_ctx(state.context_window))
-    } else if state.context_window > 0 {
-        (0, "0".to_string(), format_ctx(state.context_window))
-    } else {
-        (0, "?".to_string(), "?".to_string())
-    };
-    let pct_color = if pct >= 80 { state.theme.error }
-        else if pct >= 50 { state.theme.gold }
-        else { state.theme.success };
+    // ── 底行：左侧模式标识 + 右侧操作提示 ──
+    // 注：token 统计已迁移到健康仪表盘（extras.rs render_dashboard_health）
 
     let is_busy = matches!(state.input_state,
         InputState::Thinking | InputState::Executing | InputState::Outputting);
@@ -419,22 +463,21 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
     };
 
-    // 左侧：model · thinking_depth · 百分比 已用/上限
-    let model_style = Style::default().fg(state.theme.primary).add_modifier(Modifier::BOLD);
-    let ctx_left = vec![
-        Span::styled(state.model_name.clone(), model_style),
-        Span::styled(format!(" · {} · ", state.thinking_depth), muted),
-        Span::styled(format!("{}%", pct), Style::default().fg(pct_color).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" {}/{}", used_str, max_str), muted),
-    ];
-    let ctx_left_width: usize = ctx_left.iter().map(|s| display_width(s.content.as_ref())).sum();
-    let fill = inner.width.saturating_sub(
-        (ctx_left_width + display_width(right_hint_text)) as u16,
-    ).max(1);
+    // 底行简化：左侧模式标识 + 右侧操作提示
+    // model/ctx 统计已迁移到右下角"健康"面板
+    let mode_span = Span::styled(
+        mode_label,
+        Style::default().fg(state.theme.muted),
+    );
+    let mode_w = display_width(mode_label);
+    let right_w = display_width(right_hint_text);
+    let fill = inner.width.saturating_sub((mode_w + right_w) as u16).max(1);
 
-    let mut bottom_spans = ctx_left;
-    bottom_spans.push(Span::raw(" ".repeat(fill as usize)));
-    bottom_spans.push(Span::styled(right_hint_text, right_style));
+    let bottom_spans = vec![
+        mode_span,
+        Span::raw(" ".repeat(fill as usize)),
+        Span::styled(right_hint_text, right_style),
+    ];
     input_lines.push(Line::from(bottom_spans));
 
     f.render_widget(Paragraph::new(input_lines), inner);

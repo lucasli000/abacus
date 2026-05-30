@@ -533,7 +533,7 @@ async fn register_specialist(
     let model = req.model.clone().unwrap_or_else(|| {
         state.config_manager.get_str("core.default_model")
             .map(String::from)
-            .unwrap_or_else(|| "deepseek-v4-flash".into())
+            .unwrap_or_else(|| abacus_types::ModelId::AUTO.to_string())
     });
     let registration = SpecialistRegistration {
         id: req.id.clone(),
@@ -794,6 +794,17 @@ async fn chat_stream_handler(
                 StreamChunk::StreamRetryReset { partial_text } => {
                     let data = serde_json::json!({"partial_text": partial_text}).to_string();
                     yield Ok(Event::default().event("stream_retry_reset").data(data));
+                }
+                StreamChunk::LongOperation { tool_name, estimated_secs } => {
+                    let data = serde_json::json!({"tool_name": tool_name, "estimated_secs": estimated_secs}).to_string();
+                    yield Ok(Event::default().event("long_operation").data(data));
+                }
+                StreamChunk::ToolAgentResult { agent_id, icon, name, call_count, summary, details } => {
+                    let data = serde_json::json!({
+                        "agent_id": agent_id, "icon": icon, "name": name,
+                        "call_count": call_count, "summary": summary, "details": details,
+                    }).to_string();
+                    yield Ok(Event::default().event("tool_agent_result").data(data));
                 }
             }
         }

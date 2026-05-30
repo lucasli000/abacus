@@ -64,6 +64,21 @@ pub struct ToolSchema {
     /// - 消费方：CoreLoop::build_tool_definitions_for（排序优化，待实现）
     #[serde(default)]
     pub schema_stable: bool,
+    /// 短描述（≤50 chars）— 当工具数 > 12 时对非热点工具使用，节省 token
+    ///
+    /// ## 设计
+    /// build_tool_definitions_for 在最终工具数 > 12 时，对最近 3 轮未使用的工具
+    /// 用 short_description 替代完整 description 发给 LLM，减少 schema token 开销。
+    /// 热点工具（最近 3 turn 内调用过）仍使用完整 description。
+    ///
+    /// ## 引用关系
+    /// - 设置方：builtin 各模块 schemas()（filengine/db/kb/git/cg）
+    /// - 消费方：CoreLoop::build_tool_definitions_for（Short-Mode 分支）
+    ///
+    /// ## 生命周期
+    /// - 随 ToolSchema 静态存在；None 时 Short-Mode 退化为使用完整 description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
 }
 
 /// Phase β-C: 工具调用示例
@@ -454,9 +469,13 @@ pub struct TurnStats {
     /// 来源：pipeline persist_and_build_result 从 context_manager.window 读取
     #[serde(default)]
     pub context_tokens: Option<u64>,
-    /// 上下文窗口容量上限（token）
+    /// 系统设定上下文窗口容量（= model_limit * ratio）
     #[serde(default)]
     pub context_max: Option<u64>,
+    /// LLM 模型物理最大上下文（如 1M）
+    /// 来源：pipeline 从 context_manager.window.model_limit 读取
+    #[serde(default)]
+    pub model_limit: Option<u64>,
 }
 
 // ─── Multi-Provider Configuration ──────────────────────────────────────────

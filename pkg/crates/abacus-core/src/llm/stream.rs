@@ -123,6 +123,36 @@ pub enum StreamChunk {
     },
     /// 错误（非致命，pipeline 继续；致命错误通过 channel drop 信号）
     Error(String),
+    /// 长时间操作提示（pipeline 在工具执行耗时超过阈值时发送）
+    ///
+    /// ## 引用关系
+    /// - 生产者: TurnPipeline 工具 dispatch 超过耗时阈值时
+    /// - 消费者: TUI toast + HTTP SSE `long_operation` 事件
+    LongOperation { tool_name: String, estimated_secs: u64 },
+
+    /// V41: ToolAgent 批量执行结果 — 替代多个 ToolStart/ToolEnd 刷屏
+    ///
+    /// ## 引用关系
+    /// - 生产者: pipeline tool dispatch 检测到 ToolAgent 匹配后批量执行完毕
+    /// - 消费者: TUI 消息流渲染（折叠展示：图标+名称+数量+摘要）
+    ///
+    /// ## 设计意图
+    /// 主消息流只看到一条汇总，详情可折叠展开查看每个工具的独立输出
+    ToolAgentResult {
+        /// ToolAgent ID（如 "explorer", "coder"）
+        agent_id: String,
+        /// 显示图标
+        icon: String,
+        /// 显示名
+        name: String,
+        /// 执行的工具调用数
+        call_count: usize,
+        /// 一句话摘要（首个输出的前 100 字符）
+        summary: String,
+        /// 各工具输出详情（折叠可展开）
+        details: Vec<String>,
+    },
+
     /// 流中断后重试——TUI 收到后清除当前 iteration 的已渲染流式内容
     ///
     /// ## 引用关系

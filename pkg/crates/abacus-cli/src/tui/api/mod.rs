@@ -1529,8 +1529,18 @@ pub async fn send_meeting_message_streaming(
             let sp_session = abacus_core::core::SessionState::new(&format!("_meeting_{}", sp_id));
             let sp_session = tokio::sync::RwLock::new(sp_session);
 
-            let req_ctx = if let Some(ref model) = sp_instance.preferred_model {
-                abacus_core::core::RequestContext::with_model(model)
+            // V41: 解析 "provider/model" 格式 → forced_provider + model
+            // 示例: "openrouter/deepseek-v4-flash" → provider="openrouter", model="deepseek-v4-flash"
+            let req_ctx = if let Some(ref model_spec) = sp_instance.preferred_model {
+                if let Some(slash_pos) = model_spec.find('/') {
+                    let provider_part = &model_spec[..slash_pos];
+                    let model_part = &model_spec[slash_pos + 1..];
+                    let mut ctx = abacus_core::core::RequestContext::with_model(model_part);
+                    ctx.forced_provider = Some(provider_part.to_string());
+                    ctx
+                } else {
+                    abacus_core::core::RequestContext::with_model(model_spec)
+                }
             } else {
                 abacus_core::core::RequestContext::default()
             };
@@ -1738,6 +1748,38 @@ pub async fn send_plan_and_execute_streaming(
             });
         }
 
+        // V41: Plan 两阶段——Phase 1 完成后返回计划 + 任务列表
+        // run.rs 收到此 response 后进入 plan_phase = AwaitingApproval
+        // 用户选择执行策略后再调 Phase 2
+        let task_summary = tasks.iter().enumerate()
+            .map(|(i, t)| format!("{}. {}", i + 1, &t.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
+            format!("\n📋 计划已生成（{} 个任务）。选择执行方式：\n  [A] 自动  [S] 逐步确认  [T] Team\n", tasks.len()),
+        ));
+        return ApiResult::Ok(EngineResponse {
+            text: format!("{}\n\n---\n{}", plan_text, task_summary),
+            thinking: None,
+            tool_records: vec![],
+            stats: None,
+            progressive_state: None,
+            inertia_warning: None,
+            pending_confirmations: vec![],
+            meeting_experts: None,
+            auto_fallback_chat: None,
+            turnkey_plan: Some(abacus_types::sandbox::TaskSpec {
+                goal: message.to_string(),
+                phases: tasks.iter().map(|t| abacus_types::sandbox::PhaseSpec {
+                    id: t.id.clone(),
+                    description: t.description.clone(),
+                    steps: vec![],
+                }).collect(),
+            }),
+            needs_clarify: None,
+        });
+
+        #[allow(unreachable_code)]
         // Phase 2: 自动执行（复用 Team 执行逻辑）
         let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
             format!("\n执行阶段 — {} 个任务开始执行\n\n", tasks.len()),

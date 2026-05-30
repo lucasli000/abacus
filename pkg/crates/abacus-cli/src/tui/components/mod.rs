@@ -50,8 +50,7 @@ use ratatui::widgets::{Block, BorderType, Borders, List, ListDirection, Paragrap
 use crate::tui::effects;
 use crate::tui::markdown::{self, LineType};
 use crate::tui::state::{
-    AppState, BlockKind, Focus, MsgContent, MsgRole,
-    StreamingToolStatus, TimelineEntry,
+    AppState, BlockKind, Focus, MsgContent, MsgRole, TimelineEntry, StreamingBlock, ToolCallSummary,
 };
 use crate::tui::theme::{TextRole, Theme};
 
@@ -86,9 +85,9 @@ fn build_message_lines(
     // 排版布局：参考英文 CLI 工具风格
     // 色条 "│" + 1 空格 + 内容（简洁留白，不过度缩进）
     let bar_indent = 2usize; // │ + 1空格
-    // 内容宽度分离：正文用 5/7（右侧留白提升可读性），代码/表格用全宽（不能被错误折行）
+    // 内容宽度分离：正文用 6/7（右侧留白提升可读性），代码/表格用全宽（不能被错误折行）
     let full_usable = (max_width as usize).saturating_sub(bar_indent + 1);
-    let prose_width = full_usable * 5 / 7;
+    let prose_width = full_usable * 6 / 7;
     let code_width  = full_usable;
     // content_width 保留供 Block/Trace 等非 Stream 路径使用（这些内容暂用 prose 宽）
     let content_width = prose_width;
@@ -135,13 +134,18 @@ fn build_message_lines(
             MsgRole::Expert(name) => (name.as_str(), theme.expert, "🧠"),
         };
 
-        // ── 消息间空行分隔（首条消息除外）──
-        if visible_idx > 0 {
-            lines.push(Line::raw(""));
-        }
-
         // ── 色条（贯穿该消息所有行）── ▎ 稍粗，突出消息边界
         let bar = Span::styled("▎", Style::default().fg(role_color));
+
+        // ── 消息间分隔线（首条消息除外）──
+        if visible_idx > 0 {
+            let sep = Span::styled(
+                "  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+                Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+            );
+            lines.push(Line::from(vec![bar.clone(), sep]));
+            lines.push(Line::raw(""));
+        }
 
         // ── Header: icon name (左对齐) + time (右对齐) ──
         // 名字用 role_color + BOLD；时间右侧贴边，中间空格填充
@@ -197,7 +201,7 @@ fn build_message_lines(
                     };
                     // Markdown 渲染 + word-wrap + 代码块折叠
                     let styled_lines = markdown::render_markdown_bounded(main_text, theme, is_user, code_width);
-                    let muted_dim = theme.text_style(TextRole::Caption);
+                    let _muted_dim = theme.text_style(TextRole::Caption);
                     // 代码块折叠追踪（per-Stream 段）
                     let mut in_cb = false;        // 是否在代码块中
                     let mut cb_line_count = 0u32; // 当前代码块已显示的行数
@@ -211,14 +215,17 @@ fn build_message_lines(
                                 cb_hidden = 0;
                             } else {
                                 in_cb = false;
-                                // 关闭 fence 前插入折叠提示行
+                                // 关闭 fence 前插入折叠提示行（gold BOLD 提升可见性）
                                 if cb_hidden > 0 {
+                                    let fold_style = Style::default()
+                                        .fg(theme.gold)
+                                        .add_modifier(Modifier::BOLD);
                                     lines.push(Line::from(vec![
                                         bar.clone(),
                                         Span::raw(" "),
                                         Span::styled(
                                             format!("↳ +{} 行  Ctrl+E 展开全部", cb_hidden),
-                                            muted_dim,
+                                            fold_style,
                                         ),
                                     ]));
                                 }
@@ -642,7 +649,8 @@ pub(crate) fn estimate_msg_rows(msg: &crate::tui::state::Message, content_width:
                         continue;
                     }
                     let dw = crate::tui::util::display_width(line);
-                    rows += if dw <= content_width { 1 } else { (dw + content_width - 1) / content_width };
+                    let cw = content_width.max(1);
+                    rows += if dw <= cw { 1 } else { (dw + cw - 1) / cw };
                 }
             }
             MsgContent::Block { collapsed, detail, kind, .. } => {
@@ -1276,143 +1284,87 @@ pub fn render_messages_in_card(
         // ──
         // P7 优化：所有 streaming 内容直接 push（O(1)）
         // 旧 cursor_line 已移除
-        // Phase 1: 宽度与 build_message_lines 对齐（prose=5/7, code=full）
+        // Phase 1: 宽度与 build_message_lines 对齐（prose=6/7, code=full）
         let bar_indent_stream = 2usize;
         let full_usable_stream = (inner.width as usize).saturating_sub(bar_indent_stream + 1);
-        let prose_width = full_usable_stream * 5 / 7;
+        let prose_width = full_usable_stream * 6 / 7;
         let code_width  = full_usable_stream;
 
         // ── 正文文本推迟到最后渲染，避免被工具调用夹在中间 ──
         let mut pending_text_render = false;
-        for entry in &state.streaming_timeline {
-            match entry {
-                TimelineEntry::Thinking { summary } => {
-                    // 流式 thinking：首行加 💭 图标，续行缩进对齐
-                    // summary 存最近 2 行非空内容（\n 分隔），实时更新
-                    let think_lines: Vec<&str> = summary.lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .collect();
-                    if think_lines.is_empty() {
-                        lines.push(Line::from(vec![
-                            bar.clone(),
-                            Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
-                            Span::styled("thinking...", Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
-                        ]));
-                    } else {
-                        // 2026-05-28: thinking 文本自动 word-wrap 到消息流宽度（不再硬截断）
-                        let think_prefix_w = 6usize; // "  💭 " 占 6 列
-                        let wrap_w = prose_width.saturating_sub(think_prefix_w);
-                        for (i, line) in think_lines.iter().enumerate() {
-                            let segments = crate::tui::util::word_wrap_segments(line, wrap_w);
-                            for (seg_idx, (seg_start, seg_end)) in segments.iter().enumerate() {
-                                let text = &line[*seg_start..*seg_end];
-                                let s = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
-                                if i == 0 && seg_idx == 0 {
-                                    lines.push(Line::from(vec![
-                                        bar.clone(),
-                                        Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
-                                        Span::styled(text.to_string(), s),
-                                    ]));
-                                } else {
-                                    lines.push(Line::from(vec![
-                                        bar.clone(),
-                                        Span::styled("    · ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                                        Span::styled(text.to_string(), s),
-                                    ]));
-                                }
-                            }
+        // Phase 3: 每帧从 timeline 聚合为 StreamingBlock，然后分块渲染
+        // O(timeline_len) 轻量聚合，连续同名 Tool 合并为 ToolGroup
+        {
+            let mut blocks: Vec<StreamingBlock> = Vec::new();
+            let mut next_id: u64 = 1;
+            for entry in &state.streaming_timeline {
+                match entry {
+                    TimelineEntry::Thinking { summary } => {
+                        let id = next_id; next_id += 1;
+                        blocks.push(StreamingBlock::Thinking {
+                            id, summary: summary.clone(), full_text: String::new(),
+                            collapsed: false, duration_ms: None,
+                        });
+                    }
+                    TimelineEntry::Tool { name, context, status, duration_ms, failure_kind, trace_id } => {
+                        let merge = blocks.last_mut().and_then(|b| match b {
+                            StreamingBlock::ToolGroup { tool_name, calls, .. } if tool_name == name => Some(calls),
+                            _ => None,
+                        });
+                        if let Some(calls) = merge {
+                            calls.push(ToolCallSummary {
+                                trace_id: *trace_id, context: context.clone(), status: *status,
+                                duration_ms: *duration_ms, failure_kind: failure_kind.clone(),
+                            });
+                        } else {
+                            let id = next_id; next_id += 1;
+                            blocks.push(StreamingBlock::ToolGroup {
+                                id, tool_name: name.clone(),
+                                calls: vec![ToolCallSummary {
+                                    trace_id: *trace_id, context: context.clone(), status: *status,
+                                    duration_ms: *duration_ms, failure_kind: failure_kind.clone(),
+                                }],
+                                collapsed: false,
+                            });
                         }
                     }
-                }
-                TimelineEntry::Tool { name, context, status, duration_ms, failure_kind, trace_id } => {
-                    let (status_mark, mark_style) = match status {
-                        StreamingToolStatus::Running => ("…", Style::default().fg(state.theme.gold)),
-                        StreamingToolStatus::Success => ("✓", Style::default().fg(state.theme.success)),
-                        StreamingToolStatus::Failed => ("✗", Style::default().fg(state.theme.error)),
-                    };
-                    let dur_text = match (status, duration_ms) {
-                        (StreamingToolStatus::Running, _) => String::new(),
-                        (_, Some(d)) => format!(" {:.1}s", *d as f64 / 1000.0),
-                        _ => String::new(),
-                    };
-                    let failure_text = match (status, failure_kind.as_deref()) {
-                        (StreamingToolStatus::Failed, Some(kind)) => format!(" ({})", kind.to_lowercase()),
-                        _ => String::new(),
-                    };
-                    let context_span = if context.is_empty() {
-                        Span::raw("")
-                    } else {
-                        Span::styled(format!(" {}", context), Style::default().fg(state.theme.accent))
-                    };
-                    lines.push(Line::from(vec![
-                        bar.clone(),
-                        Span::styled("  · ", Style::default().fg(state.theme.muted)),
-                        Span::styled(name.clone(), Style::default().fg(state.theme.muted)),
-                        context_span,
-                        Span::styled(format!(" {}{}{}", status_mark, dur_text, failure_text), mark_style),
-                    ]));
-
-                    // 编辑类工具完成时：内联 diff 预览
-                    if matches!(status, StreamingToolStatus::Success | StreamingToolStatus::Failed) {
-                        // diff 渲染缓存：首次计算后存入 streaming_diff_cache
-                        // 避免每帧重复 LCS + JSON 解析（多次 fs_edit 时每帧开销 = O(N) × LCS）
-                        // 缓存 key = trace_id，reset_streaming 时清除
-                        let cached = state.streaming_diff_cache.borrow().get(trace_id).cloned();
-                        let diff_lines = if let Some(cached) = cached {
-                            Some(cached)
-                        } else if let Some(ev) = state.trace_event_index.get(trace_id)
-                            .and_then(|&i| state.trace_events.get(i))
-                        {
-                            if let crate::tui::state::TraceKind::ToolCall { ref args, ref output, .. } = ev.kind {
-                                if !args.is_empty() {
-                                    let result = block_detail::try_render_edit_diff_with_output(
-                                        name, args, output.as_deref(), &state.theme, 8,
-                                    );
-                                    if let Some(ref dl) = result {
-                                        state.streaming_diff_cache.borrow_mut().insert(*trace_id, dl.clone());
-                                    }
-                                    result
-                                } else { None }
-                            } else { None }
-                        } else { None };
-
-                        if let Some(diff_lines) = diff_lines {
-                            for dl in diff_lines {
-                                let mut spans: Vec<Span> = vec![bar.clone(), Span::raw("  ")];
-                                spans.extend(dl.spans);
-                                lines.push(Line::from(spans));
-                            }
+                    TimelineEntry::ToolOutput { .. } => {}
+                    TimelineEntry::Text { start, end } => {
+                        if *start == 0 { pending_text_render = true; }
+                        let merge = blocks.last_mut().and_then(|b| match b {
+                            StreamingBlock::Text { byte_range, .. } => Some(byte_range),
+                            _ => None,
+                        });
+                        if let Some(range) = merge {
+                            range.1 = *end;
+                        } else {
+                            let id = next_id; next_id += 1;
+                            blocks.push(StreamingBlock::Text { id, byte_range: (*start, *end) });
                         }
                     }
-                }
-                TimelineEntry::ToolOutput { summary } => {
-                    if !summary.is_empty() {
-                        lines.push(Line::from(vec![
-                            bar.clone(),
-                            Span::raw("  "), // 2sp 与正文一致
-                            Span::styled(
-                                format!("└ {}", summary),
-                                Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-                            ),
-                        ]));
+                    TimelineEntry::Iteration { number } => {
+                        blocks.push(StreamingBlock::Iteration { number: *number });
                     }
-                }
-                TimelineEntry::Text { start, end: _ } => {
-                    // 标记正文推迟到所有工具之后渲染
-                    if *start == 0 {
-                        pending_text_render = true;
+                    TimelineEntry::ToolAgent { icon, name, call_count, summary, .. } => {
+                        // V41: ToolAgent 汇总作为一个 ToolGroup 展示
+                        let id = next_id; next_id += 1;
+                        blocks.push(StreamingBlock::ToolGroup {
+                            id,
+                            tool_name: format!("{} {}", icon, name),
+                            calls: vec![ToolCallSummary {
+                                trace_id: 0,
+                                context: format!("{} 处 → {}", call_count, summary),
+                                status: crate::tui::state::StreamingToolStatus::Success,
+                                duration_ms: None,
+                                failure_kind: None,
+                            }],
+                            collapsed: false,
+                        });
                     }
-                }
-                TimelineEntry::Iteration { number } => {
-                    lines.push(Line::from(vec![
-                        bar.clone(),
-                        Span::styled(
-                            format!("  ─ #{} ", number),
-                            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-                        ),
-                    ]));
                 }
             }
+            let block_lines = render_streaming_blocks(&blocks, state, &bar, prose_width, code_width);
+            lines.extend(block_lines);
         }
 
         // 正文推迟到所有 thinking 和 tool 之后渲染（避免被夹在中间）
@@ -1596,11 +1548,18 @@ fn render_streaming_blocks(
     state: &AppState,
     bar: &Span<'static>,
     prose_width: usize,
-    code_width: usize,
+    _code_width: usize,
 ) -> Vec<Line<'static>> {
     use crate::tui::state::{StreamingBlock, StreamingToolStatus};
     let mut lines: Vec<Line> = Vec::new();
     let expanded_ids = state.expanded_block_ids.borrow();
+
+    // 全局工具折叠策略：超过 5 个 ToolGroup 时，仅最近 3 个展开子行
+    // 更早的 ToolGroup 折叠为一行摘要（防止大量工具调用挤占正文空间）
+    let tool_group_count = blocks.iter()
+        .filter(|b| matches!(b, StreamingBlock::ToolGroup { .. }))
+        .count();
+    let mut tool_group_index = 0usize;
 
     for (bi, block) in blocks.iter().enumerate() {
         let is_latest = bi == blocks.len().saturating_sub(1);
@@ -1608,46 +1567,80 @@ fn render_streaming_blocks(
 
         match block {
             StreamingBlock::Thinking { summary, duration_ms, .. } => {
-                // Phase 4: 自动折叠非最新的 thinking（>2 行时折叠）
-                let auto_collapse = !is_latest && summary.lines().count() > 2;
+                // 消息流融合设计：thinking 作为轻量内联区块，有明确的视觉边界
+                // - 折叠态：一行带首句预览 + 耗时（用户扫一眼即知思考方向）
+                // - 展开态：最多显示 5 行，超出用"…N行"收尾（避免 thinking 挤占正文空间）
+                // 对标 Claude Code：thinking 是次要信息，正文是主角
+                let think_lines: Vec<&str> = summary.lines().filter(|l| !l.trim().is_empty()).collect();
+                let line_count = think_lines.len();
+                let dur = duration_ms.map(|d| format!(" {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
+
+                // 折叠条件：非最新 block，或超过 5 行
+                let auto_collapse = !is_latest || line_count > 5;
                 let collapsed = auto_collapse && !user_expanded;
-                let dur = duration_ms.map(|d| format!(" · {:.1}s", d as f64 / 1000.0)).unwrap_or_default();
+
                 if collapsed {
+                    // 折叠态：一行 —— 💭 首句预览… · 耗时 · N行
+                    let preview: String = think_lines.first()
+                        .unwrap_or(&"")
+                        .chars().take(50).collect();
+                    let meta = format!("{}· {}行", dur, line_count);
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
-                        Span::styled("thinking", Style::default().fg(state.theme.muted)),
-                        Span::styled(dur, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                        Span::styled("  ↳ 展开", Style::default().fg(state.theme.muted)),
+                        Span::styled("  ╭─ ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                        Span::styled("💭 ", Style::default().fg(state.theme.accent)),
+                        Span::styled(preview, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                        Span::styled(format!("  {}", meta), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                     ]));
                 } else {
-                    let think_lines: Vec<&str> = summary.lines().filter(|l| !l.trim().is_empty()).collect();
-                    let think_prefix_w = 6usize;
-                    let wrap_w = prose_width.saturating_sub(think_prefix_w);
-                    for (i, line) in think_lines.iter().enumerate() {
+                    // 展开态：顶部边界 + 内容（最多 5 行）+ 底部边界
+                    // wrap 宽度与消息流正文一致（prose_width），前缀 `│ ` 不额外扣减
+                    let wrap_w = prose_width;
+                    let max_visible = 5;
+                    let visible_lines = if think_lines.len() > max_visible {
+                        &think_lines[..max_visible]
+                    } else {
+                        &think_lines[..]
+                    };
+
+                    // 顶部边界线
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled("  ╭─ 💭 thinking", Style::default().fg(state.theme.accent).add_modifier(Modifier::DIM)),
+                        Span::styled(dur.clone(), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                    ]));
+
+                    // 内容行
+                    for line in visible_lines {
                         let segments = crate::tui::util::word_wrap_segments(line, wrap_w);
-                        for (seg_idx, (seg_start, seg_end)) in segments.iter().enumerate() {
+                        for (seg_start, seg_end) in &segments {
                             let text = &line[*seg_start..*seg_end];
-                            let s = Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC);
-                            if i == 0 && seg_idx == 0 {
-                                lines.push(Line::from(vec![
-                                    bar.clone(),
-                                    Span::styled("  💭 ", Style::default().fg(state.theme.accent)),
-                                    Span::styled(text.to_string(), s),
-                                ]));
-                            } else {
-                                lines.push(Line::from(vec![
-                                    bar.clone(),
-                                    Span::styled("    · ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                                    Span::styled(text.to_string(), s),
-                                ]));
-                            }
+                            lines.push(Line::from(vec![
+                                bar.clone(),
+                                Span::styled("  │ ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                                Span::styled(text.to_string(), Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                            ]));
                         }
                     }
+
+                    // 超出部分提示
+                    if think_lines.len() > max_visible {
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::styled(format!("  │ … +{}行", think_lines.len() - max_visible), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                        ]));
+                    }
+
+                    // 底部边界线
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled("  ╰─────", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                    ]));
                 }
             }
 
             StreamingBlock::ToolGroup { tool_name, calls, .. } => {
+                tool_group_index += 1;
                 let total = calls.len();
                 let running = calls.iter().any(|c| matches!(c.status, StreamingToolStatus::Running));
                 let success_count = calls.iter().filter(|c| matches!(c.status, StreamingToolStatus::Success)).count();
@@ -1657,8 +1650,11 @@ fn render_streaming_blocks(
                 let count_text = if total > 1 { format!(" ×{}", total) } else { String::new() };
                 let dur_text = if total_dur > 0 { format!(" · {:.1}s", total_dur as f64 / 1000.0) } else { String::new() };
 
-                // Phase 4: 自动折叠旧的 ToolGroup (>3 调用)
-                let auto_collapse = !is_latest && total > 3;
+                // 全局折叠策略：超过 5 个 ToolGroup 时，仅最近 3 个显示子行
+                // 早期的 ToolGroup 仅显示一行摘要（tool_name + count + status）
+                let is_recent = tool_group_index > tool_group_count.saturating_sub(3);
+                // 单 group 折叠：非最新且 >3 调用；全局折叠：非最近 3 个
+                let auto_collapse = (!is_latest && total > 3) || (tool_group_count > 5 && !is_recent);
                 let collapsed = auto_collapse && !user_expanded;
 
                 lines.push(Line::from(vec![
@@ -1691,9 +1687,15 @@ fn render_streaming_blocks(
                         ]));
                     }
                 } else {
+                    // 折叠态：显示第一个 call 的 context 预览（而非空洞的"展开详情"）
+                    let preview = calls.first()
+                        .map(|c| if c.context.is_empty() { "…".to_string() } else {
+                            c.context.chars().take(50).collect::<String>()
+                        })
+                        .unwrap_or_else(|| "…".to_string());
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::styled("    ↳ 展开详情", Style::default().fg(state.theme.muted)),
+                        Span::styled(format!("    ↳ {}", preview), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                     ]));
                 }
             }
@@ -1704,10 +1706,21 @@ fn render_streaming_blocks(
             }
 
             StreamingBlock::Iteration { number } => {
-                lines.push(Line::from(vec![
-                    bar.clone(),
-                    Span::styled(format!("  ─ iteration {} ─", number), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                ]));
+                // iteration 分隔：轻量水平线（不占视觉注意力，仅标记 turn 内循环边界）
+                // 超过 3 次迭代后不再逐条显示——避免 8+ 次迭代时满屏分隔线
+                if *number <= 3 {
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled(format!("  ── iter {} ──", number), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                    ]));
+                } else if *number == 4 {
+                    // 第 4 次及以后：折叠为一行提示
+                    lines.push(Line::from(vec![
+                        bar.clone(),
+                        Span::styled("  ── … ──", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+                    ]));
+                }
+                // number > 4: 不渲染分隔线（工具调用本身仍正常显示）
             }
         }
     }

@@ -259,6 +259,12 @@ impl<'a> TurnPipeline<'a> {
         // Cooldown tick
         self.core.registry.tick_cooldowns().await;
 
+        // 每 5 turn 重评估 Adaptive 子系统注册状态（热重载/冷卸载）
+        // 引用：CoreLoop::reevaluate_adaptive_subsystems()
+        // 位置：在 effectiveness 记录完成 + cooldown tick 之后（stats 已更新），
+        //       health check 之前（tool list 变化可能影响 health 视角）
+        self.core.reevaluate_adaptive_subsystems(ctx.turn_number).await;
+
         // Health check — detect degraded subsystems, emit warnings
         {
             let warnings = self.core.health_registry.tick().await;

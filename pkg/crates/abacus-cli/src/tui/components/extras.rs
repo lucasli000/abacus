@@ -273,99 +273,70 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
     }
 }
 
-/// 健康仪表盘：Context 进度条 + 费用/KV/轮次 + 模型
+/// 健康仪表盘：模型 + 上下文 + 轮次/压缩（紧凑 2-3 行）
+///
+/// V40 重设计：去掉进度条，纯文本紧凑排列
+/// 第一行：模型名 · 思考档位
+/// 第二行：⬡ 上下文已用/总量 · turns N · cmp N
 fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use crate::tui::components::bars::format_ctx;
 
     let mut lines: Vec<Line> = Vec::new();
     let muted = Style::default().fg(state.theme.muted);
+    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
 
-    // Context 进度条（▓░ 半高）
-    let total = state.session_tokens.total_tokens as usize;
-    let max_ctx = state.context_window;
-    let pct = if max_ctx > 0 { (total * 100 / max_ctx).min(100) } else { 0 };
-    let bar_color = match pct {
+    // 第一行：provider(状态) · 模型名 · 思考档位
+    // provider 来自 config.yaml providers[].id（真实配置，非推断）
+    // 状态指示：● = 可用（discover 成功），✗ = 不可用，— = 未检测
+    let provider_label = if state.active_provider_id.is_empty() { "—" } else { &state.active_provider_id };
+    let (status_icon, status_color) = match state.provider_statuses.iter()
+        .find(|(id, _, _)| id == &state.active_provider_id)
+    {
+        Some((_, true, _)) => ("●", state.theme.success),
+        Some((_, false, _)) => ("✗", state.theme.error),
+        None => ("·", state.theme.muted),
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {}{} ", status_icon, provider_label), Style::default().fg(status_color)),
+        Span::styled(&state.model_name, Style::default().fg(state.theme.accent)),
+        Span::styled(" · ", dim),
+        Span::styled(&state.thinking_depth, Style::default().fg(state.theme.text)),
+    ]));
+
+    // 第二行：⬡ 已用/系统设定/LLM最大 · turns N · cmp N
+    let raw_used = if state.ctx_live_tokens > 0 {
+        state.ctx_live_tokens as usize
+    } else {
+        state.session_tokens.latest_prompt_tokens as usize
+    };
+    let configured = state.context_window;       // 系统设定有效窗口
+    let model_max = state.model_max_context;     // LLM 物理最大
+    // 防御性 clamp：显示值不超过系统设定窗口
+    let used = if configured > 0 { raw_used.min(configured) } else { raw_used };
+    let ctx_color = match (used * 100).checked_div(configured).unwrap_or(0) {
         0..=49 => state.theme.success,
         50..=79 => state.theme.gold,
         _ => state.theme.error,
     };
-    let pct_mod = if pct >= 80 { Modifier::BOLD } else { Modifier::empty() };
 
-    let bar_w: usize = 16.min(area.width.saturating_sub(8) as usize);
-    let filled = (pct * bar_w / 100).min(bar_w);
-    let empty = bar_w - filled;
-    // V35: 进度条单行 — 右侧追加 ×轮次·总token|↑input↓output
-    // 引用: state.turn_count / prompt_tokens / completion_tokens
-    let prompt = state.session_tokens.prompt_tokens;
-    let completion = state.session_tokens.completion_tokens;
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("▓".repeat(filled), Style::default().fg(bar_color)),
-        Span::styled("░".repeat(empty), muted),
-        Span::styled(format!(" {}%", pct), Style::default().fg(bar_color).add_modifier(pct_mod)),
-        Span::styled(
-            format!("  ×{}·{}|↑{}↓{}",
-                state.turn_count,
-                format_ctx(total),
-                format_ctx(prompt as usize),
-                format_ctx(completion as usize),
-            ),
-            muted,
-        ),
-    ]));
-    lines.push(Line::raw(""));
-
-    // 指标列表
-    let cost = state.session_tokens.cost_cny;
-    let cached = state.session_tokens.cached_tokens;
-    // completion / prompt 已在上方声明，此处不重复 let
-    let kv_pct = if prompt > 0 { (cached * 100 / prompt).min(100) } else { 0 };
-    let kv_color = match kv_pct {
-        70..=100 => state.theme.success,
-        30..=69 => state.theme.gold,
-        _ => state.theme.muted,
+    // 格式：⬡ 19.9K/500K/1M  (已用/设定/最大)
+    // 当 configured == model_max 时省略最后一段（无 ratio 配置）
+    let ctx_text = if configured == model_max || model_max == 0 {
+        format!("{}/{}", format_ctx(used), format_ctx(configured))
+    } else {
+        format!("{}/{}/{}", format_ctx(used), format_ctx(configured), format_ctx(model_max))
     };
 
-    if cost > 0.001 {
-        lines.push(Line::from(vec![
-            Span::styled("  费用  ", muted),
-            Span::styled(crate::tui::cost::format_cny(cost), Style::default().fg(state.theme.gold)),
-        ]));
-    }
-    if prompt > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("  缓存  ", muted),
-            Span::styled(format!("{}%", kv_pct), Style::default().fg(kv_color)),
-        ]));
-    }
-    lines.push(Line::from(vec![
-        Span::styled("  轮次  ", muted),
-        Span::styled(format!("{}", state.turn_count), Style::default().fg(state.theme.text)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  输入  ", muted),
-        Span::styled(format_ctx(prompt as usize), Style::default().fg(state.theme.text)),
-        Span::styled("  输出  ", muted),
-        Span::styled(format_ctx(completion as usize), Style::default().fg(state.theme.text)),
-    ]));
+    let mut row: Vec<Span> = vec![
+        Span::styled("  ⬡ ", Style::default().fg(ctx_color)),
+        Span::styled(ctx_text, Style::default().fg(ctx_color)),
+        Span::styled(format!(" · turns {}", state.turn_count), muted),
+    ];
     let comp = state.session_tokens.compress_count;
     if comp > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("  压缩  ", muted),
-            Span::styled(format!("{}×", comp), Style::default().fg(state.theme.text)),
-            Span::styled("  释放  ", muted),
-            Span::styled(format_ctx(state.session_tokens.compress_tokens_saved as usize), Style::default().fg(state.theme.success)),
-        ]));
+        row.push(Span::styled(format!(" · cmp {}", comp), muted));
     }
-
-    lines.push(Line::raw(""));
-    let model_short = state.model_name.split('-').next_back().unwrap_or(&state.model_name);
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(model_short, Style::default().fg(state.theme.accent)),
-        Span::styled(" · ", muted),
-        Span::styled(&state.thinking_depth, Style::default().fg(state.theme.text)),
-    ]));
+    lines.push(Line::from(row));
 
     let visible = area.height as usize;
     if lines.len() > visible { lines.truncate(visible); }

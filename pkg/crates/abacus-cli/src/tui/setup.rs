@@ -184,6 +184,12 @@ struct SetupState {
     context_window: String,
     /// Abacus 实际使用的上下文（单位 k token，空 = 全用，最低 128k）
     context_window_use: String,
+    /// 是否已进入可选功能页
+    features_page: bool,
+    /// 可选功能开关：[Skill Workflow, AutoEngine, WASM Plugins, MCP Servers]
+    feature_toggles: [bool; 4],
+    /// 可选功能列表中当前选中的 index
+    feature_focus: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -201,6 +207,7 @@ enum FocusField {
     ApiKey,
     ContextWindow,
     ContextWindowUse,
+    Features,
 }
 
 impl SetupState {
@@ -224,6 +231,9 @@ impl SetupState {
             model_rx: None,
             context_window: String::new(),
             context_window_use: String::new(),
+            features_page: false,
+            feature_toggles: [false, false, false, false],
+            feature_focus: 0,
         }
     }
     fn provider(&self) -> ProviderKind {
@@ -385,6 +395,72 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         "anthropic"
     };
 
+    // 生成可选功能注释
+    let features_section = {
+        let labels = ["skill_workflow", "auto_engine", "wasm_plugins", "mcp_servers"];
+        let comments = [
+            "# Skill Workflow — 将 Skill 工作流注册为工具，支持多步骤编排",
+            "# AutoEngine — 后台定时/条件触发任务调度器",
+            "# WASM Plugins — WebAssembly 沙箱，运行第三方插件",
+            "# MCP Servers — 连接外部数据源和服务的 MCP 协议",
+        ];
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("\n# ─── 可选功能 ─────────────────────────────────────────────────────────────────\n".to_string());
+        for (i, label) in labels.iter().enumerate() {
+            let enabled = state.feature_toggles[i];
+            lines.push(comments[i].to_string());
+            match *label {
+                "skill_workflow" => {
+                    if enabled {
+                        lines.push("core.skill_workflow_enabled: true".to_string());
+                    } else {
+                        lines.push("# core.skill_workflow_enabled: false".to_string());
+                    }
+                }
+                "auto_engine" => {
+                    lines.push("# auto:".to_string());
+                    lines.push(if enabled {
+                        "#   persist_path: ~/.abacus/auto.db".to_string()
+                    } else {
+                        "#   # persist_path: ~/.abacus/auto.db".to_string()
+                    });
+                }
+                "wasm_plugins" => {
+                    lines.push("# core.plugins:".to_string());
+                    lines.push(if enabled {
+                        "#   base_dir: ~/.abacus/plugins".to_string()
+                    } else {
+                        "#   # base_dir: ~/.abacus/plugins".to_string()
+                    });
+                    lines.push(if enabled {
+                        "#   signing_required: true".to_string()
+                    } else {
+                        "#   # signing_required: true".to_string()
+                    });
+                }
+                "mcp_servers" => {
+                    lines.push("# mcp:".to_string());
+                    lines.push("#   servers:".to_string());
+                    if enabled {
+                        lines.push("#     - id: example-server".to_string());
+                        lines.push("#       transport: stdio".to_string());
+                        lines.push("#       command: npx".to_string());
+                        lines.push("#       args: [\"-y\", \"@modelcontextprotocol/server-example\"]".to_string());
+                    } else {
+                        lines.push("#     # 示例：".to_string());
+                        lines.push("#     # - id: my-server".to_string());
+                        lines.push("#     #   transport: stdio".to_string());
+                        lines.push("#     #   command: npx".to_string());
+                        lines.push("#     #   args: [\"-y\", \"@modelcontextprotocol/server-example\"]".to_string());
+                    }
+                }
+                _ => {}
+            }
+            lines.push(String::new());
+        }
+        lines.join("\n")
+    };
+
     let yaml = format!(
         r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║  ABACUS 配置文件 (config.yaml)                                              ║
@@ -428,9 +504,9 @@ core:
   default_model: "{}"
   stream: true
 {}  context_window_ratio: {:.4}
-"#,
+{}"#,
         provider_type_str, api_key_e, base_url, resolved_model,
-        resolved_model, cw_line, cw_ratio,
+        resolved_model, cw_line, cw_ratio, features_section,
     );
 
     let dir = config_dir();
@@ -1010,6 +1086,114 @@ fn poll_model_fetch(state: &mut SetupState) {
     }
 }
 
+/// 渲染可选功能选择页（配置填写完成后展示）
+fn render_features_page(f: &mut Frame, state: &SetupState) {
+    let area = f.area();
+    let theme = setup_theme();
+
+    let buf = f.buffer_mut();
+    for x in 0..area.width {
+        for y in 0..area.height {
+            buf[(x, y)].set_bg(theme.bg);
+        }
+    }
+
+    let cw = ((area.width as f64 * 0.55).max(46.0).min(64.0) as u16).min(area.width);
+    let ch = 20u16.min(area.height);
+    let cx = area.width.saturating_sub(cw) / 2;
+    let cy = area.height.saturating_sub(ch) / 2;
+    let card = Rect::new(cx, cy, cw, ch);
+
+    let block = Block::default()
+        .title(" 可选功能 ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.gold));
+    let inner = block.inner(card);
+    block.render(card, f.buffer_mut());
+
+    let features = [
+        ("Skill Workflow",   "将 Skill 工作流注册为工具，支持多步骤编排"),
+        ("AutoEngine",       "后台定时/条件触发任务调度器"),
+        ("WASM Plugins",     "WebAssembly 沙箱，运行第三方插件"),
+        ("MCP Servers",      "连接外部数据源和服务的 MCP 协议"),
+    ];
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),  // 0 标题
+            Constraint::Length(1),  // 1 gap
+            Constraint::Length(3),  // 2 Skill Workflow
+            Constraint::Length(3),  // 3 AutoEngine
+            Constraint::Length(3),  // 4 WASM Plugins
+            Constraint::Length(3),  // 5 MCP Servers
+            Constraint::Length(2),  // 6 底部提示
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " 以下功能可按需启用，也可之后通过 /set 或 config.yaml 更改",
+            Style::default().fg(theme.muted),
+        ))),
+        parts[0],
+    );
+
+    for (i, (name, desc)) in features.iter().enumerate() {
+        let is_focused = state.feature_focus == i;
+        let checked = state.feature_toggles[i];
+        let checkbox = if checked { " [✓]" } else { " [ ]" };
+        let prefix = if is_focused { " >" } else { "  " };
+        let line = if is_focused {
+            let spans = vec![
+                Span::styled(format!("{}{}", prefix, checkbox), Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                Span::raw(" "),
+                Span::styled(*name, Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+            ];
+            Line::from(spans)
+        } else {
+            let spans = vec![
+                Span::styled(format!("{}{}", prefix, checkbox), Style::default().fg(if checked { theme.success } else { theme.muted })),
+                Span::raw(" "),
+                Span::styled(*name, Style::default().fg(theme.text)),
+            ];
+            Line::from(spans)
+        };
+
+        let desc_line = Line::from(Span::styled(
+            format!("     {}", desc),
+            Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
+        ));
+
+        let item_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(
+                if is_focused { theme.primary } else { theme.border }
+            ));
+        let item_inner = item_block.inner(parts[2 + i]);
+        item_block.render(parts[2 + i], f.buffer_mut());
+
+        let inner_parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0)])
+            .split(item_inner);
+        f.render_widget(Paragraph::new(line), inner_parts[0]);
+        f.render_widget(Paragraph::new(desc_line), inner_parts[1]);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  ↑↓ 选择", Style::default().fg(theme.muted)),
+            Span::raw("  "),
+            Span::styled("Space/Enter 切换", Style::default().fg(theme.muted)),
+            Span::raw("  "),
+            Span::styled("Esc 完成", Style::default().fg(theme.muted)),
+        ])),
+        parts[6],
+    );
+}
+
 fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers) {
     match state.focus {
         FocusField::BaseUrl => {
@@ -1090,9 +1274,16 @@ fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers
                 KeyCode::Char(c) => state.context_window_use.push(c),
                 KeyCode::Backspace => { state.context_window_use.pop(); }
                 KeyCode::Tab => state.focus = FocusField::BaseUrl,
-                KeyCode::Enter => if state.is_all_filled() { state.exit = true; }
+                KeyCode::Enter => {
+                    // Enter 进入可选功能页
+                    state.features_page = true;
+                }
                 _ => {}
             }
+        }
+        FocusField::Features => {
+            // 功能页的按键在 run_setup 主循环中已处理（features_page 分支）
+            // 此处仅作 match exhaustive 覆盖
         }
     }
 }
@@ -1109,7 +1300,11 @@ pub fn run_setup(
         // 轮询异步模型检索结果
         poll_model_fetch(&mut state);
 
-        terminal.draw(|f| render_setup(f, &state))?;
+        if state.features_page {
+            terminal.draw(|f| render_features_page(f, &state))?;
+        } else {
+            terminal.draw(|f| render_setup(f, &state))?;
+        }
 
         if state.exit {
             break;
@@ -1121,12 +1316,29 @@ pub fn run_setup(
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                         return Ok(false);
                     }
-                    if key.code == KeyCode::Esc {
-                        state.skip = true;
-                        state.exit = true;
-                        continue;
+                    if state.features_page {
+                        // 功能页按键
+                        match key.code {
+                            KeyCode::Esc => { state.exit = true; }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                state.feature_focus = state.feature_focus.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                state.feature_focus = state.feature_focus.min(3).saturating_add(1).min(3);
+                            }
+                            KeyCode::Char(' ') | KeyCode::Enter => {
+                                state.feature_toggles[state.feature_focus] = !state.feature_toggles[state.feature_focus];
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        if key.code == KeyCode::Esc {
+                            state.skip = true;
+                            state.exit = true;
+                            continue;
+                        }
+                        handle_edit(&mut state, key.code, key.modifiers);
                     }
-                    handle_edit(&mut state, key.code, key.modifiers);
                 }
             }
         }

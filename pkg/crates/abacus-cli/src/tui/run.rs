@@ -190,13 +190,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     // V29.11: 系统级 always_allow 加载（优先于 session，全局共享）
     state.always_allow = load_always_allow();
 
-    // 自动恢复上次会话
-    let resumed = load_last_session(&mut state).unwrap_or(false);
-    if resumed && !state.messages.is_empty() {
-        state.add_toast(format!("已恢复上次会话（{} 条消息）", state.messages.len()), Duration::from_secs(3));
-    } else {
-        state.add_toast(format!("Abacus — {} 模式", mode.label()), Duration::from_secs(3));
-    }
+    // V41: 不自动恢复上次会话——每次启动都是干净 session
+    // 会话仍持久化到 sessions/{uuid}.json，用户可通过 /resume <uuid> 主动恢复
+    // 设计理由：避免"进入就看到上次对话"的困惑，保持每次启动的确定性
+    state.add_toast(format!("Abacus — {} 模式", mode.label()), Duration::from_secs(3));
 
     // 首次配置 + 免责声明合并展示
     // 免责声明未接受 或 无 API 配置时 → 进入配置向导
@@ -237,7 +234,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
     let engine = match tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        EngineHandle::new("deepseek-v4-flash", &state.thinking_depth),
+        EngineHandle::new(abacus_types::ModelId::AUTO, &state.thinking_depth),
     ).await {
         Ok(Ok(e)) => {
             state.add_toast("引擎已连接，输入消息即可对话", Duration::from_secs(3));
@@ -248,8 +245,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             let actual_model = e.core.config().default_model.0.clone();
             state.model_name = actual_model.clone();
             state.theme.apply_model_brand(&actual_model);
-            // V40: 同步真实 context_window 到 TUI state（修复硬编码 1M 导致百分比失真）
+            // V40: 同步 context 到 TUI state
+            // model_max_context = LLM 物理上限（model_spec 定义）
+            // context_window = 系统设定有效窗口（首次由 Complete stats.context_max 覆盖）
             if let Some(ref spec) = e.core.config().model_spec {
+                state.model_max_context = spec.context_window;
+                // 初始 context_window 暂用 model_limit（Complete 后会被 stats.context_max 精确覆盖）
                 state.context_window = spec.context_window;
             }
             // 可用模型列表延迟到首次打开 /model picker 时通过 pending_model_fetch 触发
@@ -258,7 +259,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
             // 异步拉取记忆宫殿本体数据（行为宫殿条目数 + 知识宫殿 domain 分布）
             {
-                use abacus_core::memory_palace::DualPalaceMemory;
+                
                 let palace_opt = e.core.memory_palace();
                 if let Some(palace) = palace_opt {
                     let p = palace.read().await;
@@ -307,8 +308,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     let (comp_tx, mut comp_rx) = mpsc::unbounded_channel::<(Vec<String>, String)>();
     // T-2 fix: 独立 channel 传递 discover_all_models 结果，防止占用 comp_rx
     // 生命周期：model_list_tx 在 spawn 内发送一次后 drop；model_list_rx 在 tick 分支拥收
-    // 2026-05-28: 扩展为 (models, provider_groups) 二元组
-    let (model_list_tx, mut model_list_rx) = mpsc::unbounded_channel::<(Vec<String>, Vec<(String, Vec<String>)>)>();
+    // 2026-05-28: 扩展为 (models, provider_groups, provider_statuses) 三元组
+    // provider_statuses: Vec<(provider_id, available, error_msg)>
+    type DiscoverResult = (Vec<String>, Vec<(String, Vec<String>)>, Vec<(String, bool, Option<String>)>);
+    let (model_list_tx, mut model_list_rx) = mpsc::unbounded_channel::<DiscoverResult>();
     // V0.2: Streaming chunk channel
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<abacus_core::llm::stream::StreamChunk>();
     state.engine_tx = Some(res_tx.clone());
@@ -394,9 +397,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                 // T-2 fix: discover_all_models 是网络调用，不能在主循环 tick 里直接 .await
                 // 改为 spawn 异步，结果通过独立的 model_list_rx channel 回传
-                while let Ok((models, provider_groups)) = model_list_rx.try_recv() {
+                while let Ok((models, provider_groups, provider_statuses)) = model_list_rx.try_recv() {
                     state.available_models = models;
                     state.available_providers = provider_groups;
+                    state.provider_statuses = provider_statuses;
                 }
                 if state.pending_model_fetch {
                     state.pending_model_fetch = false;
@@ -404,8 +408,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         let engine_clone = engine.clone();
                         let tx = model_list_tx.clone();
                         tokio::spawn(async move {
-                            let discovered = engine_clone.core.discover_all_models().await;
-                            // 2026-05-28: 按 provider 分组保留（用于 picker 分组显示）
+                            // 使用带状态的 discover（同时检测每个 provider 的可用性）
+                            let (discovered, statuses) = engine_clone.core.discover_all_models_with_status().await;
+                            // 按 provider 分组保留（用于 picker 分组显示）
                             let providers_grouped: Vec<(String, Vec<String>)> = discovered.iter()
                                 .map(|(id, ms)| (id.clone(), ms.clone()))
                                 .collect();
@@ -413,11 +418,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let models = if flat.is_empty() {
                                 engine_clone.core.list_models().await
                             } else {
-                                // 不去重——同名模型可能来自不同供应商（价格/速度/配额不同）
-                                // picker 按 provider 分组显示，用户靠分组区分
                                 flat
                             };
-                            let _ = tx.send((models, providers_grouped));
+                            let _ = tx.send((models, providers_grouped, statuses));
                         });
                     }
                 }
@@ -524,9 +527,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // 生命周期：随 Message 持久化，collapsed=true 默认折叠，Space 展开
                         if !thinking_text.is_empty() {
                             let line_count = thinking_text.lines().count();
+                            // 摘要：行数 + 首行内容预览（截断到 40 chars）
+                            // 让用户折叠态也能看到思考方向，决定是否展开
+                            let first_line = thinking_text.lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("")
+                                .trim();
+                            let preview: String = first_line.chars().take(40).collect();
+                            let summary = if preview.is_empty() {
+                                format!("💭 {}行", line_count)
+                            } else {
+                                format!("💭 {}行 · {}", line_count, preview)
+                            };
                             parts.push(MsgContent::Block {
                                 kind: crate::tui::state::BlockKind::Think,
-                                summary: format!("思考过程 · {}行", line_count),
+                                summary,
                                 collapsed: true,
                                 detail: thinking_text.clone(),
                             });
@@ -541,7 +556,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         if !tool_trace_ids.is_empty() {
                             parts.push(MsgContent::Trace {
                                 event_ids: tool_trace_ids,
-                                collapsed: false,
+                                // P1: Trace 默认折叠——减少消息噪音，用户按需展开
+                                collapsed: true,
                                 expanded_event_ids: std::collections::HashSet::new(),
                             });
                         }
@@ -714,6 +730,39 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             );
                         }
 
+                        // V41: 策略自动推荐 — Clarify 模式收到响应后分析用户输入复杂度
+                        // 引用关系：TaskAnalyzer(abacus-core) → toast 建议
+                        // 触发条件：Clarify 模式 + 本 session 未建议过 + 用户输入足够长
+                        // 生命周期：meeting_suggested_this_session 标记防重复（/new 重置）
+                        if state.mode == crate::tui::state::AbacusMode::Clarify
+                            && !state.meeting_suggested_this_session
+                        {
+                            let last_user_text: Option<String> = state.messages.iter().rev()
+                                .find(|m| matches!(m.role, crate::tui::state::MsgRole::User))
+                                .and_then(|m| m.parts.iter().find_map(|p| match p {
+                                    crate::tui::state::MsgContent::Stream(t) => Some(t.clone()),
+                                    _ => None,
+                                }));
+                            if let Some(ref input_text) = last_user_text {
+                                if input_text.len() > 20 {
+                                    let cx = abacus_core::core::task_analyzer::TaskAnalyzer::analyze_complexity(input_text);
+                                    if cx.domain_count >= 2 && cx.score > 0.4 {
+                                        state.meeting_suggested_this_session = true;
+                                        state.add_toast(
+                                            "💡 此问题涉及多领域，可用 /meeting 启动多专家会诊".to_string(),
+                                            Duration::from_secs(8),
+                                        );
+                                    } else if cx.dimensions.structural > 0.6 && cx.score > 0.5 {
+                                        state.meeting_suggested_this_session = true;
+                                        state.add_toast(
+                                            "💡 复杂任务可用 /plan 自动规划执行".to_string(),
+                                            Duration::from_secs(6),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         // V29.10 (C4-Phase2) ── Turnkey plan 缓存到 state ──
                         // 引用关系:
                         //   生产者: SlashCommand::TurnkeyPlan dispatch 成功时
@@ -724,13 +773,29 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         if let Some(task) = response.turnkey_plan.clone() {
                             let phases = task.phases.len();
                             let steps: usize = task.phases.iter().map(|p| p.steps.len()).sum();
+                            // V41: 设置 plan_phase = AwaitingApproval（两阶段状态机）
+                            let task_descs: Vec<String> = task.phases.iter()
+                                .map(|p| p.description.clone())
+                                .collect();
+                            state.plan_phase = Some(crate::tui::state::PlanPhase::AwaitingApproval {
+                                plan_summary: task.goal.clone(),
+                                tasks: task_descs,
+                            });
                             state.pending_turnkey_plan = Some(task);
-                            state.add_event(
-                                &ts,
-                                "session",
-                                &format!("Turnkey 计划已就绪: {} phases × {} steps  (输入 /turnkey execute 执行)", phases, steps),
-                                crate::tui::state::EventLevel::Info,
-                            );
+                            // 消息流中展示策略选项（用户输入 A/S/T 将在 event/mod.rs 中被拦截）
+                            state.add_message(crate::tui::state::Message::new_session(
+                                vec![crate::tui::state::MsgContent::Stream(format!(
+                                    "📋 计划已就绪 — {} 阶段, {} 步骤\n\n\
+                                     选择执行策略:\n\
+                                     [A] 自动执行 — 工具调用自动放行\n\
+                                     [S] 逐步确认 — 每步操作需确认\n\
+                                     [T] 团队分发 — 多专家并行执行\n\
+                                     [C] 取消\n\n\
+                                     输入 A/S/T/C:",
+                                    phases, steps,
+                                ))],
+                                ts.clone(),
+                            ));
                         }
 
                         // V28.7 ── Meeting 模式：参会者快照写入 state.experts ──
@@ -914,16 +979,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             had_streaming_update = true;
                         }
                         StreamChunk::TextDelta(t) => {
-                            // 500ms 门控：实时估算 ctx_live_tokens
-                            // 估算 = latest_prompt_tokens（上轮真实值）+ 本轮已生成字符 / 4
+                            // 100ms 门控：实时估算 ctx_live_tokens（流式期间及时更新上下文占用）
+                            // 估算 = latest_prompt_tokens（上轮真实值）+ 本轮已生成字符 / 3
+                            // 除数 3 是英文(~0.25 tok/char)和中文(~1.5 tok/char)的折中
+                            // 100ms 保证视觉平滑跟动（TUI 帧率 ~60fps），O(1) 计算无性能压力
                             let now = std::time::Instant::now();
                             let should_refresh = state.ctx_estimate_at
-                                .map(|t| now.duration_since(t).as_millis() >= 500)
+                                .map(|t| now.duration_since(t).as_millis() >= 100)
                                 .unwrap_or(true);
                             if should_refresh {
-                                let gen_est = (state.streaming_text.len() / 4) as u64;
-                                state.ctx_live_tokens = state.session_tokens.latest_prompt_tokens
+                                let gen_est = (state.streaming_text.len() / 3) as u64;
+                                // clamp 到 context_window：估算不可能超过物理上限
+                                let raw = state.session_tokens.latest_prompt_tokens
                                     .saturating_add(gen_est);
+                                let cap = state.context_window as u64;
+                                state.ctx_live_tokens = if cap > 0 { raw.min(cap) } else { raw };
                                 state.ctx_estimate_at = Some(now);
                             }
                             if !t.is_empty() && !state.streaming_text_started {
@@ -1373,9 +1443,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::Complete(stats) => {
                             // 成功完成：清除网络异常标记
                             state.connection_error = false;
-                            // Complete: 用真实 prompt+completion 更新 ctx_live_tokens，清除估算状态
-                            state.ctx_live_tokens = stats.prompt_tokens.saturating_add(stats.completion_tokens);
+                            // 同步当前 provider_id（配置中的实际 provider，非推断）
+                            if !stats.provider_id.is_empty() {
+                                state.active_provider_id = stats.provider_id.clone();
+                            }
+                            // Complete: ctx_live_tokens 优先用 context_tokens（含 system prompt/tools），
+                            // fallback 到 prompt+completion（API usage 返回值）
+                            state.ctx_live_tokens = stats.context_tokens
+                                .unwrap_or_else(|| stats.prompt_tokens.saturating_add(stats.completion_tokens));
                             state.ctx_estimate_at = None;
+                            // 同步 latest_prompt_tokens — 让 Panel/fallback 路径及时反映最新值
+                            state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
                             // V40: 实时更新 token 统计（面板每帧可见最新数据）
                             state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
                                 .max(stats.prompt_tokens);
@@ -1385,15 +1463,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 .max(stats.total_tokens);
                             state.session_tokens.cached_tokens = state.session_tokens.cached_tokens
                                 .max(stats.cached_tokens);
-                            // 实时同步上下文占用（Panel 进度条实时反映）
+                            // context_tokens 覆盖 total_tokens（用 context_manager 的精确值替换 API usage）
                             if let Some(ctx_tok) = stats.context_tokens {
                                 state.session_tokens.total_tokens = ctx_tok;
                             }
                             if let Some(ctx_max) = stats.context_max {
                                 state.context_window = ctx_max as usize;
                             }
-                            // ST1：清理流式累积避免双显示
-                            state.reset_streaming();
+                            if let Some(ml) = stats.model_limit {
+                                state.model_max_context = ml as usize;
+                            }
+                            // P1: 不在 Complete 时清空 streaming 内容——等 EngineResponse 到达后统一处理
+                            // 避免 Complete→EngineResponse 间隔导致内容"闪跳"（ST1 改进）
+                            state.streaming_complete = true;
                             // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"
                             // Pipeline 可能继续执行工具 + 发起新 LLM 调用。
                             // 只有 EngineResponse 到达才真正设 Ready。
@@ -1482,6 +1564,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 保留 ToolStart/ToolEnd（已执行的工具不会重做）
                             state.streaming_text.clear();
                             state.streaming_thinking.clear();
+                            // P2: 重置 markdown 增量解析引擎——text 清空后 md 内部偏移不一致
+                            *state.streaming_md.borrow_mut() = None;
                             // 在 timeline 中标注中断点
                             if !partial_text.is_empty() {
                                 let truncated = if partial_text.len() > 60 {
@@ -1554,6 +1638,34 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::InertiaDetected { recommendation, .. } => {
                             state.add_event(&ts, "inertia", &recommendation, crate::tui::state::EventLevel::Warning);
                             state.add_toast(format!("⚠ 检测到循环: {}", recommendation), Duration::from_secs(5));
+                            had_streaming_update = true;
+                        }
+                        StreamChunk::LongOperation { tool_name, estimated_secs } => {
+                            state.add_toast(
+                                format!("此操作预计耗时较长（~{}s），请耐心等待...", estimated_secs),
+                                Duration::from_secs(estimated_secs.min(10)),
+                            );
+                            state.add_event(&ts, "tool", &format!("{} 预计 {}s", tool_name, estimated_secs), crate::tui::state::EventLevel::Info);
+                            had_streaming_update = true;
+                        }
+                        // V41: ToolAgent 批量执行结果 — 替代多条 ToolStart/ToolEnd 刷屏
+                        StreamChunk::ToolAgentResult { agent_id: _, icon, name, call_count, summary, details } => {
+                            // 在消息流中追加折叠块（展示汇总，详情可展开）
+                            let display = format!("{} {} · {} 处", icon, name, call_count);
+                            state.streaming_text.push_str(&format!("\n{}\n", display));
+                            if !summary.is_empty() {
+                                state.streaming_text.push_str(&format!("  → {}\n", summary));
+                            }
+                            // 记录到 timeline
+                            state.streaming_timeline.push(
+                                crate::tui::state::TimelineEntry::ToolAgent {
+                                    icon: icon.clone(),
+                                    name: name.clone(),
+                                    call_count,
+                                    summary: summary.clone(),
+                                    details,
+                                }
+                            );
                             had_streaming_update = true;
                         }
                     }
@@ -2207,7 +2319,7 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
             let status = engine.core.context_status().await;
             format!(
                 "📊 上下文状态\n  使用率: {:.1}% ({}/{} tokens)\n  已压缩: {} 条消息",
-                status.usage_pct * 100.0, status.current_tokens, status.max_tokens, status.compressed_count,
+                status.usage_pct, status.current_tokens, status.max_tokens, status.compressed_count,
             )
         }
         SlashCommand::ContextCompress => {
@@ -2427,6 +2539,7 @@ fn format_turnkey_plan(goal: &str, task: &abacus_types::sandbox::TaskSpec) -> St
 fn step_model_label(m: &abacus_types::sandbox::ModelAssignment) -> &'static str {
     use abacus_types::sandbox::ModelAssignment;
     match m {
+        ModelAssignment::Auto => "auto",
         ModelAssignment::Fixed { .. } => "fixed",
         ModelAssignment::Execute => "execute",
         ModelAssignment::Verify => "verify",
