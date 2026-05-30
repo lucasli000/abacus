@@ -320,10 +320,11 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
         50..=79 => state.theme.gold,
         _ => state.theme.error,
     };
-    let ctx_text = if configured == model_max || model_max == 0 {
-        format!("{}/{}", format_ctx(used), format_ctx(configured))
-    } else {
+    // 始终三段：已用/可用(configured)/LLM最大(model_max)
+    let ctx_text = if model_max > 0 {
         format!("{}/{}/{}", format_ctx(used), format_ctx(configured), format_ctx(model_max))
+    } else {
+        format!("{}/{}", format_ctx(used), format_ctx(configured))
     };
     let mut ctx_spans = vec![
         Span::styled(" ⬡ ", Style::default().fg(ctx_color)),
