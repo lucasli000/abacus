@@ -1760,40 +1760,51 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let cached = state.session_tokens.cached_tokens;
         let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
 
-        // 行 1：进度条
-        let bw = (area.width as usize).saturating_sub(7).min(14);
+        // ─ Context ─── 标题行
+        let header_fill = (area.width as usize).saturating_sub(12).min(12);
+        lines.push(Line::from(vec![
+            Span::styled("  ─ ", dim),
+            Span::styled("Context", muted),
+            Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
+        ]));
+
+        // 进度条（缩进 4 格）
+        let bw = (area.width as usize).saturating_sub(10).min(12);
         let filled = (pct * bw / 100).min(bw);
         let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
         lines.push(Line::from(vec![
-            Span::styled("  ", dim),
+            Span::styled("    ", dim),
             Span::styled(bar_str, Style::default().fg(pc)),
-            Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
         ]));
 
-        // 行 2-3：两列对齐（label 暗色 + value 亮色）
+        // token 明细（缩进 4 格，空格分隔）
         let in_str = format_ctx(inp as usize);
         let out_str = if state.is_streaming { "...".to_string() } else { format_ctx(out as usize) };
-        lines.push(Line::from(vec![
-            Span::styled("  in  ", dim),
-            Span::styled(format!("{:<6}", in_str), txt),
-            Span::styled("out  ", dim),
-            Span::styled(out_str, txt),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("  c   ", dim),
-            Span::styled(format!("{:<6}", if cpct > 0 { format!("{}%", cpct) } else { "—".into() }),
-                if cpct > 50 { Style::default().fg(state.theme.success) } else { muted }),
-            Span::styled("cost ", dim),
-            Span::styled(
-                if state.session_tokens.cost_cny > 0.001 { format!("¥{:.2}", state.session_tokens.cost_cny) } else { "—".into() },
-                gold,
-            ),
-        ]));
+        let mut tok_parts = vec![
+            Span::styled("    ", dim),
+            Span::styled(format!("in {}", in_str), muted),
+            Span::styled(format!("  out {}", out_str), muted),
+        ];
+        if cpct > 0 {
+            tok_parts.push(Span::styled(format!("  c {}%", cpct), Style::default().fg(state.theme.success)));
+        }
+        lines.push(Line::from(tok_parts));
     }
 
 
-    // ── 工具 + 效率（统一 2 空格缩进 + label/value 对齐）──
+    // 空行分隔
+    lines.push(Line::raw(""));
+
+    // ─ Session ─── 标题行
     {
+        let header_fill = (area.width as usize).saturating_sub(12).min(12);
+        lines.push(Line::from(vec![
+            Span::styled("  ─ ", dim),
+            Span::styled("Session", muted),
+            Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
+        ]));
+
         let hc = state.tool_health.len();
         let tc = state.tool_records.len();
         let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
@@ -1801,16 +1812,20 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let rate = if tc > 0 { sc * 100 / tc } else { 100 };
         let comp = state.session_tokens.compress_count;
 
-        lines.push(Line::from(vec![
-            Span::styled("  tool ", dim),
-            Span::styled(format!("{:<6}", format!("{}/{}", avail, hc.max(1))), txt),
-            Span::styled("rate ", dim),
-            Span::styled(format!("{}%", rate), if rate >= 80 {
+        // 工具行（缩进 4 格）
+        let mut tool_parts = vec![
+            Span::styled("    ", dim),
+            Span::styled(format!("⚙ {}/{}", avail, hc.max(1)), txt),
+            Span::styled(format!("  {}%", rate), if rate >= 80 {
                 Style::default().fg(state.theme.success)
             } else { Style::default().fg(state.theme.gold) }),
-        ]));
+        ];
+        if state.session_tokens.cost_cny > 0.001 {
+            tool_parts.push(Span::styled(format!("  ¥{:.2}", state.session_tokens.cost_cny), gold));
+        }
+        lines.push(Line::from(tool_parts));
 
-        // 预估剩余轮数
+        // 效率行（缩进 4 格）
         let est_turns = if state.turn_count > 0 && state.context_window > 0 {
             let tok_per_turn = (state.session_tokens.total_tokens as usize).max(1) / (state.turn_count as usize).max(1);
             if tok_per_turn > 0 {
@@ -1820,26 +1835,13 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         } else { None };
 
         lines.push(Line::from(vec![
-            Span::styled("  cmp  ", dim),
-            Span::styled(format!("{:<6}", comp), muted),
-            Span::styled("left ", dim),
+            Span::styled("    ", dim),
+            Span::styled(format!("▴ {} cmp", comp), muted),
             Span::styled(
-                est_turns.map(|t| format!("~{}轮", t)).unwrap_or_else(|| "—".into()),
+                est_turns.map(|t| format!("  ~{} left", t)).unwrap_or_default(),
                 if est_turns.unwrap_or(99) < 5 { Style::default().fg(state.theme.error) } else { muted },
             ),
         ]));
-    }
-
-    // ── 记忆（仅有数据时）──
-    if let Some(ref snap) = state.palace_data {
-        let domains = snap.knowledge_domains.len();
-        let behaviors = snap.behavior_count;
-        if domains > 0 || behaviors > 0 {
-            lines.push(Line::from(vec![
-                Span::styled("  mem  ", dim),
-                Span::styled(format!("{}域 {}行为", domains, behaviors), muted),
-            ]));
-        }
     }
 
     let vis = area.height as usize;
