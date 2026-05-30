@@ -1755,6 +1755,8 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
         let pct = if max_ctx > 0 && used > 0 { used * 100 / max_ctx } else { 0 };
         let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };
+        // V41: streaming 期间用稳定值（latest_prompt_tokens）防止闪烁
+        // 只有 turn 完成后才更新 inp/out（Complete 事件写入 session_tokens）
         let inp = state.session_tokens.prompt_tokens;
         let out = state.session_tokens.completion_tokens;
         let cached = state.session_tokens.cached_tokens;
@@ -1769,9 +1771,14 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
             Span::styled(bar_str, Style::default().fg(pc)),
             Span::styled(format!(" {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
         ];
-        row.push(Span::styled(format!(" {}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), dim));
+        // streaming 期间只显示 inp（稳定），out 用 "..." 占位防止长度跳变
+        if state.is_streaming {
+            row.push(Span::styled(format!(" {}↑...↓", format_ctx(inp as usize)), dim));
+        } else {
+            row.push(Span::styled(format!(" {}↑{}↓", format_ctx(inp as usize), format_ctx(out as usize)), dim));
+        }
         if cpct > 0 {
-            row.push(Span::styled(format!(" >{}%", cpct), Style::default().fg(state.theme.success)));
+            row.push(Span::styled(format!(" c{}%", cpct), Style::default().fg(state.theme.success)));
         }
         if state.session_tokens.cost_cny > 0.001 {
             row.push(Span::styled(format!(" ¥{:.2}", state.session_tokens.cost_cny), gold));

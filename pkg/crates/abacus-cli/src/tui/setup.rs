@@ -312,6 +312,15 @@ fn accept_disclaimer() {
 /// 解析上下文大小输入（单位 k token）
 /// 支持格式："1000k" / "1000" / "1m" → 返回 token 数
 /// 无法解析或为 0 时返回 None
+/// 解析上下文窗口大小输入
+///
+/// 支持格式：
+///   "1m" / "2m"     → 百万 (1_000_000 / 2_000_000)
+///   "128k" / "1000k" → 千 (128_000 / 1_000_000)
+///   "128000"         → 原始 token 数（不乘以任何系数）
+///   "128"            → 智能判断：≤ 10000 视为"千"（128 → 128_000）；> 10000 视为原始
+///
+/// V41 修复：之前无后缀数字一律 ×1000，导致用户输入 "100000" 被解析为 100M
 fn parse_context_k(s: &str) -> Option<u64> {
     let s = s.trim().to_lowercase();
     if s.is_empty() { return None; }
@@ -319,9 +328,16 @@ fn parse_context_k(s: &str) -> Option<u64> {
     if let Some(n_str) = s.strip_suffix('m') {
         return n_str.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000_000));
     }
-    // "1000k" / "128k" / "1000" → 千
-    let n_str = s.strip_suffix('k').unwrap_or(&s);
-    n_str.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000))
+    // "128k" / "1000k" → 明确千
+    if let Some(n_str) = s.strip_suffix('k') {
+        return n_str.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000));
+    }
+    // 纯数字：智能判断
+    // ≤ 10000 → 视为"K"单位（如 128 → 128K = 128_000）
+    // > 10000 → 视为原始 token 数（如 128000 → 128000）
+    s.parse::<u64>().ok().map(|n| {
+        if n <= 10_000 { n * 1_000 } else { n }
+    })
 }
 
 /// YAML 字符串值转义（H1 fix）

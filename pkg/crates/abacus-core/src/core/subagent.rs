@@ -207,11 +207,11 @@ impl ToolAgentRegistry {
     ///
     /// ## 匹配规则
     /// 批次中所有 tool_id 都在某个 ToolAgentDef.tool_filter 内 → 匹配
+    /// 全量匹配：所有 tool_ids 都在同一 agent 的 filter 里
     pub fn match_batch(&self, tool_ids: &[&str]) -> Option<&ToolAgentDef> {
         if tool_ids.is_empty() {
             return None;
         }
-        // 按优先级遍历（已排序）
         for agent in &self.agents {
             if !agent.enabled {
                 continue;
@@ -219,6 +219,38 @@ impl ToolAgentRegistry {
             let all_match = tool_ids.iter().all(|id| agent.tool_filter.contains(*id));
             if all_match {
                 return Some(agent);
+            }
+        }
+        None
+    }
+
+    /// V41: 部分匹配——将 tool_calls 拆分为 (agent匹配的, 不匹配的)
+    ///
+    /// 返回：Some((agent_def, matched_indices, unmatched_indices))
+    /// 其中 matched_indices 对应可由 ToolAgent 批量处理的 tool_call index，
+    /// unmatched_indices 需走普通逐个 dispatch 路径。
+    ///
+    /// 匹配条件：至少 2 个 tool_call 匹配同一 agent（否则 batch 无意义）
+    pub fn match_partial(&self, tool_ids: &[&str]) -> Option<(&ToolAgentDef, Vec<usize>, Vec<usize>)> {
+        if tool_ids.len() < 2 {
+            return None;
+        }
+        // 按优先级找第一个能匹配 >=2 个 tool_call 的 agent
+        for agent in &self.agents {
+            if !agent.enabled {
+                continue;
+            }
+            let mut matched: Vec<usize> = Vec::new();
+            let mut unmatched: Vec<usize> = Vec::new();
+            for (i, id) in tool_ids.iter().enumerate() {
+                if agent.tool_filter.contains(*id) {
+                    matched.push(i);
+                } else {
+                    unmatched.push(i);
+                }
+            }
+            if matched.len() >= 2 {
+                return Some((agent, matched, unmatched));
             }
         }
         None

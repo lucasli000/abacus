@@ -2146,7 +2146,11 @@ impl<'a> TurnPipeline<'a> {
             let tool_ids_for_match: Vec<&str> = tool_calls.iter()
                 .map(|tc| tc.function.name.as_str())
                 .collect();
+            // V41: 先尝试全量匹配；失败则部分匹配（拆分为 agent 路径 + 普通路径）
             let toolagent_match = self.core.subagent_registry.match_batch(&tool_ids_for_match);
+            let partial_match = if toolagent_match.is_none() {
+                self.core.subagent_registry.match_partial(&tool_ids_for_match)
+            } else { None };
 
             if let Some(agent_def) = toolagent_match {
                 // ── ToolAgent 批量执行路径 ──
@@ -2288,8 +2292,100 @@ impl<'a> TurnPipeline<'a> {
                 continue; // 跳过下方的逐个 dispatch 循环，进入下一轮 LLM 调用
             }
 
+            // V41: 部分匹配——拆分 agent 路径 vs 普通路径
+            // matched_indices 的 tool_calls 由 ToolAgent 批量执行，unmatched 走普通 dispatch
+            let partial_handled_indices: std::collections::HashSet<usize> = if let Some((agent_def, matched_idx, _unmatched_idx)) = partial_match {
+                let agent_id = agent_def.id.clone();
+                let agent_icon = agent_def.icon.clone();
+                let agent_name = agent_def.name.clone();
+                let summarize = agent_def.summarize_results;
+                let mut batch_outputs: Vec<ToolOutput> = Vec::new();
+                let mut batch_details: Vec<String> = Vec::new();
+
+                let batch_exec_ctx = {
+                    let s = self.session.read().await;
+                    crate::tool::ExecutionContext {
+                        session_id: s.session_id.clone(),
+                        filengine: s.filengine_session.clone(),
+                        turn_number: ctx.turn_number,
+                        bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
+                        bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                        tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
+                        role_caps: Arc::clone(&s.role_caps),
+                    }
+                };
+
+                for &idx in &matched_idx {
+                    if self.is_cancelled() { break; }
+                    let tc = &tool_calls[idx];
+                    let tool_id = ToolId(tc.function.name.clone());
+                    let params: Value = serde_json::from_str(&tc.function.arguments).unwrap_or(Value::Null);
+                    match self.core.registry.execute(&tool_id, params, &batch_exec_ctx).await {
+                        Ok(output) => {
+                            let preview: String = output.output.to_string().chars().take(80).collect();
+                            batch_details.push(format!("✓ {} → {}", tool_id.0, preview));
+                            batch_outputs.push(output);
+                        }
+                        Err(e) => {
+                            batch_details.push(format!("✗ {} → {}", tool_id.0, e));
+                            batch_outputs.push(ToolOutput {
+                                tool_id, success: false,
+                                output: serde_json::json!({"error": e.to_string()}),
+                                latency_ms: 0, failure_kind: Some("ExecutionError".into()),
+                                try_instead: Vec::new(),
+                            });
+                        }
+                    }
+                }
+
+                // 推送 ToolAgentResult
+                if let Some(ref stx) = self.stream_tx {
+                    let summary: String = batch_outputs.iter()
+                        .find(|o| o.success)
+                        .map(|o| o.output.to_string().chars().take(80).collect())
+                        .unwrap_or_else(|| "部分执行".into());
+                    let _ = stx.send(crate::llm::stream::StreamChunk::ToolAgentResult {
+                        agent_id: agent_id.clone(), icon: agent_icon, name: agent_name,
+                        call_count: batch_outputs.len(), summary, details: batch_details,
+                    });
+                }
+
+                // 写入 tool results 到 session
+                {
+                    let s = self.session.read().await;
+                    let mut msgs = s.messages.write().await;
+                    for (batch_i, &orig_idx) in matched_idx.iter().enumerate() {
+                        let tc = &tool_calls[orig_idx];
+                        if let Some(output) = batch_outputs.get(batch_i) {
+                            ctx.all_tool_outputs.push(output.clone());
+                            let content = if summarize {
+                                summarize_tool_output(&tc.function.name, &output.output, output.success)
+                            } else {
+                                serde_json::to_string(&output.output).unwrap_or_default()
+                            };
+                            msgs.push(Message {
+                                role: MessageRole::Tool,
+                                content: Some(MessageContent::Text(content)),
+                                name: Some(tc.function.name.clone()),
+                                tool_calls: None,
+                                tool_call_id: Some(tc.id.clone()),
+                                reasoning_content: None, prefix: false,
+                            });
+                        }
+                    }
+                }
+
+                matched_idx.into_iter().collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+
             let mut tool_results: Vec<Message> = Vec::new();
-            for tc in &tool_calls {
+            for (tc_idx, tc) in tool_calls.iter().enumerate() {
+                // V41: 跳过已被 partial ToolAgent 处理的 tool_call
+                if partial_handled_indices.contains(&tc_idx) {
+                    continue;
+                }
                 // 单一命名约定：schema.name == ToolId.0 == LLM 调用名（全部 _ 形态）。
                 // 注册时已保证 LLM 协议字符集合规，dispatch 直接构造 ToolId，
                 // 不再做 O(N) 反查（旧 V21 resolve_sanitized_id 已删除）。

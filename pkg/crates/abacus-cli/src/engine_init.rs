@@ -205,7 +205,8 @@ pub async fn create_engine(
         // Task #84/#87：默认开启路由 + 频率剪枝
         task_kind_routing_enabled: true,
         tool_frequency_pruning_turns: Some(20),
-        palace_sync_interval_turns: None,
+        // V41: 默认每 5 轮同步一次到记忆宫殿（None = 关闭写入）
+        palace_sync_interval_turns: Some(5),
         // V28.7: schema 演化补漏——CoreConfig 新增字段，与 abacus-core 默认值对齐
         default_compress_level: abacus_core::core::context::CompressLevel::Brief,
         // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
