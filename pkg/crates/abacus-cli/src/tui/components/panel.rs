@@ -1846,11 +1846,11 @@ fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: R
         if let Some(ref snap) = state.palace_data {
             let mut parts = vec![Span::styled("    ", dim)];
             if snap.behavior_count > 0 {
-                parts.push(Span::styled(format!("🧠 {}b", snap.behavior_count), gold));
+                parts.push(Span::styled(format!("◈ {}b", snap.behavior_count), gold));
             }
             if snap.knowledge_total > 0 {
                 if snap.behavior_count > 0 { parts.push(Span::styled(" ", dim)); }
-                parts.push(Span::styled(format!("📚 {}k", snap.knowledge_total), muted));
+                parts.push(Span::styled(format!("◇ {}k", snap.knowledge_total), muted));
             }
             if snap.behavior_count > 0 || snap.knowledge_total > 0 {
                 lines.push(Line::from(parts));
