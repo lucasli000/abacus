@@ -231,7 +231,7 @@ pub async fn create_engine(
         subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
     };
 
-    let core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
+    let mut core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
 
     // ─── 知识库 + 记忆宫殿 wire-up ───────────────────────────────────────
     // KnowledgeStore 和 DualPalaceMemory 均未集成进 CoreLoop::new()，需在此显式初始化。
@@ -270,7 +270,12 @@ pub async fn create_engine(
 
     // 注册 kb.* 工具执行器（schema 已由 register_all() 在 CoreLoop::new() 内注册）
     // registry 已 move 进 CoreLoop，通过 tool_registry_ref() 取回 Arc 引用
-    abacus_core::tool::builtin::kb::register_executors(core.tool_registry_ref(), kb_store, palace).await;
+    abacus_core::tool::builtin::kb::register_executors(core.tool_registry_ref(), kb_store.clone(), palace.clone()).await;
+
+    // V42: 注入 memory palace 到 CoreLoop（面板数据拉取 + pipeline 主动读写 + PalaceAbsorbHook）
+    // 引用关系：core.memory_palace() 被 TUI run.rs 读取 → state.palace_data
+    // 必须在 register_executors 之后调用（with_memory 内部重注册 result.expand executor）
+    core = core.with_memory(kb_store, palace).await;
 
     // ─── MagChain 中间件注册 ─────────────────────────────────────────
     // 执行顺序由 priority 决定（lower = earlier）。
