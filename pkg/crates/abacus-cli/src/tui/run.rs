@@ -166,7 +166,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         );
         let _ = crossterm::terminal::disable_raw_mode();
         eprintln!("\n[PANIC] AbacusTUI crashed: {}", info);
-        eprintln!("  上次正常退出的 session 保留在 ~/.abacus/projects/<cwd>/sessions/<uuid>.json");
+        eprintln!("  Last saved session at ~/.abacus/projects/<cwd>/sessions/<uuid>.json");
         default_hook(info);
     }));
 
@@ -195,7 +195,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     // V41: 不自动恢复上次会话——每次启动都是干净 session
     // 会话仍持久化到 sessions/{uuid}.json，用户可通过 /resume <uuid> 主动恢复
     // 设计理由：避免"进入就看到上次对话"的困惑，保持每次启动的确定性
-    state.add_toast(format!("Abacus — {} 模式", mode.label()), Duration::from_secs(3));
+    state.add_toast(format!("Abacus — {}", mode.label()), Duration::from_secs(3));
 
     // 首次配置 + 免责声明合并展示
     // 免责声明未接受 或 无 API 配置时 → 进入配置向导
@@ -222,12 +222,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         let loading = Paragraph::new(vec![
             Line::raw(""),
             Line::from(Span::styled(
-                "  正在初始化引擎，请稍候...",
+                "  Initializing engine...",
                 Style::default().fg(state.theme.text),
             )),
             Line::raw(""),
             Line::from(Span::styled(
-                "  API key 检测中...",
+                "  Checking API key...",
                 state.theme.text_style(crate::tui::theme::TextRole::Caption),
             )),
         ]).alignment(Alignment::Center);
@@ -279,17 +279,17 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         }
         Ok(Err(e)) => {
             guard.deactivate()?;
-            eprintln!("\n[x] 引擎初始化失败: {}\n", e);
-            eprintln!("  请检查:");
-            eprintln!("    - API key 是否已配置 (ABACUS_API_KEY 或 DEEPSEEK_API_KEY)");
-            eprintln!("    - 网络连接是否正常");
-            eprintln!("    - config.yaml 中的模型配置\n");
+            eprintln!("\n[x] Engine init failed: {}\n", e);
+            eprintln!("  Please check:");
+            eprintln!("    - API key configured (ABACUS_API_KEY or DEEPSEEK_API_KEY)");
+            eprintln!("    - Network connectivity");
+            eprintln!("    - Model config in config.yaml\n");
             return Err(io::Error::other(e));
         }
         Err(_) => {
             guard.deactivate()?;
-            eprintln!("\n[x] 引擎初始化超时 (15s)\n");
-            eprintln!("  请检查网络连接或 API 服务状态\n");
+            eprintln!("\n[x] Engine init timed out (15s)\n");
+            eprintln!("  Please check network or API service status\n");
             return Err(io::Error::new(io::ErrorKind::TimedOut, "engine init timed out"));
         }
     };
@@ -546,9 +546,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 .trim();
                             let preview: String = first_line.chars().take(40).collect();
                             let summary = if preview.is_empty() {
-                                format!("💭 {}行", line_count)
+                                format!("💭 {} lines", line_count)
                             } else {
-                                format!("💭 {}行 · {}", line_count, preview)
+                                format!("💭 {} lines · {}", line_count, preview)
                             };
                             parts.push(MsgContent::Block {
                                 kind: crate::tui::state::BlockKind::Think,
@@ -594,7 +594,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             let icon = if report.verdict.is_pass() { "✓" } else if matches!(report.verdict, crate::tui::api::ReviewVerdict::Fail) { "⛔" } else { "⚠" };
                             let strict_marker = if strict { " · 🔒strict" } else { "" };
                             state.add_toast(
-                                format!("{} 审查结果：{} · {} 项 issue{}", icon, report.verdict.label(), report.issues.len(), strict_marker),
+                                format!("{} Review: {} · {} issue(s){}", icon, report.verdict.label(), report.issues.len(), strict_marker),
                                 std::time::Duration::from_secs(8),
                             );
                             // V41-4: 历史推入（FIFO 上限 20）
@@ -688,7 +688,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.model_name = stats.model_id.clone();
                                 state.theme.apply_model_brand(&stats.model_id);
                                 state.add_toast(
-                                    format!("🔄 已自动升级到 {} 以获得更深层推理", stats.model_id),
+                                    format!("🔄 Auto-escalated to {} for deeper reasoning", stats.model_id),
                                     Duration::from_secs(5),
                                 );
                             }
@@ -710,13 +710,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 crate::tui::event::switch_mode(&mut state, crate::tui::state::AbacusMode::Clarify);
                             }
                             state.add_toast(
-                                format!("ℹ️ 已自动切到 Clarify 模式：{}", reason),
+                                format!("ℹ️ Auto-fallback to Clarify: {}", reason),
                                 Duration::from_secs(6),
                             );
                             state.add_event(
                                 &ts,
                                 "session",
-                                &format!("自动兜底切到 Clarify：{}", reason),
+                                &format!("Auto-fallback to Clarify: {}", reason),
                                 crate::tui::state::EventLevel::Warning,
                             );
                         }
@@ -730,13 +730,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 crate::tui::event::switch_mode(&mut state, crate::tui::state::AbacusMode::Clarify);
                             }
                             state.add_toast(
-                                format!("💡 建议澄清: {}", suggestion),
+                                format!("💡 Suggest clarify: {}", suggestion),
                                 Duration::from_secs(8),
                             );
                             state.add_event(
                                 &ts,
                                 "session",
-                                "Meeting 路由无匹配，自动切到 Clarify",
+                                "Meeting route no match, auto-switch to Clarify",
                                 crate::tui::state::EventLevel::Notice,
                             );
                         }
@@ -760,13 +760,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     if cx.domain_count >= 2 && cx.score > 0.4 {
                                         state.meeting_suggested_this_session = true;
                                         state.add_toast(
-                                            "💡 此问题涉及多领域，可用 /meeting 启动多专家会诊".to_string(),
+                                            "💡 Multi-domain topic, try /meeting for expert panel".to_string(),
                                             Duration::from_secs(8),
                                         );
                                     } else if cx.dimensions.structural > 0.6 && cx.score > 0.5 {
                                         state.meeting_suggested_this_session = true;
                                         state.add_toast(
-                                            "💡 复杂任务可用 /plan 自动规划执行".to_string(),
+                                            "💡 Complex task, try /plan for auto planning".to_string(),
                                             Duration::from_secs(6),
                                         );
                                     }
@@ -796,13 +796,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 消息流中展示策略选项（用户输入 A/S/T 将在 event/mod.rs 中被拦截）
                             state.add_message(crate::tui::state::Message::new_session(
                                 vec![crate::tui::state::MsgContent::Stream(format!(
-                                    "📋 计划已就绪 — {} 阶段, {} 步骤\n\n\
-                                     选择执行策略:\n\
-                                     [A] 自动执行 — 工具调用自动放行\n\
-                                     [S] 逐步确认 — 每步操作需确认\n\
-                                     [T] 团队分发 — 多专家并行执行\n\
-                                     [C] 取消\n\n\
-                                     输入 A/S/T/C:",
+                                    "📋 Plan ready — {} phases, {} steps\n\n\
+                                     Choose strategy:\n\
+                                     [A] Auto — tool calls auto-approved\n\
+                                     [S] Step-by-step — confirm each op\n\
+                                     [T] Team — multi-agent parallel\n\
+                                     [C] Cancel\n\n\
+                                     Enter A/S/T/C:",
                                     phases, steps,
                                 ))],
                                 ts.clone(),
@@ -822,7 +822,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.add_event(
                                 &ts,
                                 "meeting",
-                                &format!("参会者已更新（{} 人）", count),
+                                &format!("Participants updated ({})", count),
                                 crate::tui::state::EventLevel::Info,
                             );
                         }
@@ -872,13 +872,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let mut details = if confirmations.len() > 1 {
                                     vec![
                                         first.reason.clone(),
-                                        format!("(及其他 {} 个工具需要授权)", confirmations.len() - 1),
+                                        format!("(+{} more tools need auth)", confirmations.len() - 1),
                                     ]
                                 } else {
                                     vec![first.reason.clone()]
                                 };
                                 if let Some(ref preview) = first.params_preview {
-                                    details.push(format!("参数: {}", preview));
+                                    details.push(format!("params: {}", preview));
                                 }
                                 let is_destructive = is_destructive_flag;
                                 let mut options = vec![
@@ -928,7 +928,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             ).is_some() {
                                 state.meeting_suggested_this_session = true;
                                 state.add_toast(
-                                    "💡 此话题可能适合专家会诊模式 (/meeting)".to_string(),
+                                    "💡 This topic may suit expert panel (/meeting)".to_string(),
                                     Duration::from_secs(8),
                                 );
                             }
@@ -952,7 +952,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.cursor_pos = state.input.len();
                                 state.recalculate_cursor();
                                 state.add_toast(
-                                    format!("自动发送排队消息 (剩余 {})", state.pending_inputs.len()),
+                                    format!("Auto-sending queued ({} remaining)", state.pending_inputs.len()),
                                     Duration::from_secs(2),
                                 );
                                 state.pending_send = true;
@@ -1173,10 +1173,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 let display = val.get("display_name").and_then(|v| v.as_str()).unwrap_or(target_str);
                                                 state.set_mode(target);
                                                 state.add_toast(
-                                                    format!("🤖 LLM 切换到 {} 模式: {}", display, reason),
+                                                    format!("🤖 Mode switch: {} — {}", display, reason),
                                                     std::time::Duration::from_secs(5),
                                                 );
-                                                state.add_event(&ts, "session", &format!("LLM 切换 → {}", display), crate::tui::state::EventLevel::Notice);
+                                                state.add_event(&ts, "session", &format!("LLM switch → {}", display), crate::tui::state::EventLevel::Notice);
                                             }
                                         }
                                     }
@@ -1359,7 +1359,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 };
                                 let mut details = vec![req.reason.clone()];
                                 if let Some(ref preview) = req.params_preview {
-                                    details.push(format!("参数: {}", preview));
+                                    details.push(format!("params: {}", preview));
                                 }
                                 let mut options = vec![ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() }];
                                 if !is_destructive_flag {
@@ -1437,7 +1437,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // Execution 阶段压缩完成，自动续行
                             // 优先使用用户暂存消息；无暂存则发送续行提示
                             let msg = state.pending_compress_input.take()
-                                .unwrap_or_else(|| "继续当前任务".to_string());
+                                .unwrap_or_else(|| "continue current task".to_string());
                             // 压缩完成 toast 已由 CompressEnd 发出，AutoResume 不再重复
                             state.input = msg;
                             crate::tui::event::submit_message(&mut state);
@@ -1492,7 +1492,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 只有 EngineResponse 到达才真正设 Ready。
                             // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
                             state.set_busy_state(InputState::Executing);
-                            state.processing_phase = "· 收尾中...".into();
+                            state.processing_phase = "· wrapping up...".into();
                             state.rendered_lines_dirty.set(true);
                             // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
                             // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
@@ -1500,9 +1500,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         StreamChunk::AuthResult { tool, approved } => {
                             // 授权结果通知：显示 toast，不产生假工具 trace
                             let msg = if approved {
-                                format!("✓ 已授权 {}", tool)
+                                format!("✓ Authorized {}", tool)
                             } else {
-                                format!("✗ 已拒绝 {} （不安全操作）", tool)
+                                format!("✗ Denied {} (unsafe op)", tool)
                             };
                             let dur = if approved {
                                 Duration::from_secs(2)
@@ -1535,14 +1535,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 // 网络错误：标记状态 + 专属提示
                                 state.connection_error = true;
                                 let msg = if is_fatal_net {
-                                    "网络连接失败，请检查网络后重试".to_string()
+                                    "Network connection failed, please check and retry".to_string()
                                 } else {
                                     // 重试中：不弹 toast，只更新 processing_phase
                                     let phase_msg = e.trim_start_matches("NETWORK_ERROR:")
                                         .trim_start_matches("retrying ")
                                         .to_string();
                                     state.processing_phase = format!("⚠ {}", phase_msg);
-                                    state.add_event(&ts, "network", "网络连接失败，重试中...", crate::tui::state::EventLevel::Warning);
+                                    state.add_event(&ts, "network", "Network failed, retrying...", crate::tui::state::EventLevel::Warning);
                                     while stream_rx.try_recv().is_ok() {}
                                     // 继续处理下一个 chunk（等待重试结果），不 break
                                     continue;
@@ -1550,11 +1550,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 // 2026-05-28: 如果有部分内容，保留为系统消息（不丢弃用户已看到的内容）
                                 if let Some(partial) = partial_text {
                                     state.push_system_note(&format!(
-                                        "--- 输出中断（已接收部分内容）---\n{}\n\n⚠ {}",
+                                        "--- Output interrupted (partial received) ---\n{}\n\n⚠ {}",
                                         partial, msg
                                     ));
                                 } else {
-                                    state.push_system_note(&format!("--- 网络异常 ---\n{}", msg));
+                                    state.push_system_note(&format!("--- Network error ---\n{}", msg));
                                 }
                                 state.add_event(&ts, "network", &msg, crate::tui::state::EventLevel::Warning);
                                 state.add_toast(
@@ -1563,7 +1563,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 );
                             } else {
                                 // API / 其他错误
-                                state.add_event(&ts, "llm", &format!("错误: {}", e), crate::tui::state::EventLevel::Warning);
+                                state.add_event(&ts, "llm", &format!("Error: {}", e), crate::tui::state::EventLevel::Warning);
                                 state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
                             }
                             while stream_rx.try_recv().is_ok() {}
@@ -1584,14 +1584,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 } else {
                                     partial_text
                                 };
-                                state.add_event(&ts, "stream", &format!("输出中断({}字符)，重试中...", truncated.len()),
+                                state.add_event(&ts, "stream", &format!("Output interrupted ({} chars), retrying...", truncated.len()),
                                     crate::tui::state::EventLevel::Warning);
                             }
-                            state.processing_phase = "流中断，重试中...".to_string();
+                            state.processing_phase = "Stream interrupted, retrying...".to_string();
                             had_streaming_update = true;
                         }
                         StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
-                            state.processing_phase = format!("重试 {}/{}: {}", attempt, max_attempts, reason);
+                            state.processing_phase = format!("Retry {}/{}: {}", attempt, max_attempts, reason);
                             had_streaming_update = true;
                         }
                         // ── Team 模式进度通知 → 更新 state.tasks 面板 ──
@@ -1622,7 +1622,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // ── 预留事件处理（轻量级 — trace event + toast）──
                         StreamChunk::ModelEscalation { from_model, to_model, reason } => {
                             state.add_event(&ts, "model", &format!("{} → {} ({})", from_model, to_model, reason), crate::tui::state::EventLevel::Info);
-                            state.add_toast(format!("模型升级: {} → {}", from_model, to_model), Duration::from_secs(3));
+                            state.add_toast(format!("Model escalation: {} → {}", from_model, to_model), Duration::from_secs(3));
                             had_streaming_update = true;
                         }
                         StreamChunk::SessionFocusUpdate { goal, phase, .. } => {
@@ -1634,7 +1634,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             had_streaming_update = true;
                         }
                         StreamChunk::MeetingStatusChange { new_status, .. } => {
-                            state.add_event(&ts, "meeting", &format!("状态: {}", new_status), crate::tui::state::EventLevel::Info);
+                            state.add_event(&ts, "meeting", &format!("Status: {}", new_status), crate::tui::state::EventLevel::Info);
                             had_streaming_update = true;
                         }
                         StreamChunk::SpecialistThinking { specialist_id, content } => {
@@ -1648,21 +1648,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         StreamChunk::InertiaDetected { recommendation, .. } => {
                             state.add_event(&ts, "inertia", &recommendation, crate::tui::state::EventLevel::Warning);
-                            state.add_toast(format!("⚠ 检测到循环: {}", recommendation), Duration::from_secs(5));
+                            state.add_toast(format!("⚠ Loop detected: {}", recommendation), Duration::from_secs(5));
                             had_streaming_update = true;
                         }
                         StreamChunk::LongOperation { tool_name, estimated_secs } => {
                             state.add_toast(
-                                format!("此操作预计耗时较长（~{}s），请耐心等待...", estimated_secs),
+                                format!("Long operation ~{}s, please wait...", estimated_secs),
                                 Duration::from_secs(estimated_secs.min(10)),
                             );
-                            state.add_event(&ts, "tool", &format!("{} 预计 {}s", tool_name, estimated_secs), crate::tui::state::EventLevel::Info);
+                            state.add_event(&ts, "tool", &format!("{} est. {}s", tool_name, estimated_secs), crate::tui::state::EventLevel::Info);
                             had_streaming_update = true;
                         }
                         // V41: ToolAgent 批量执行结果 — 替代多条 ToolStart/ToolEnd 刷屏
                         StreamChunk::ToolAgentResult { agent_id: _, icon, name, call_count, summary, details } => {
                             // 在消息流中追加折叠块（展示汇总，详情可展开）
-                            let display = format!("{} {} · {} 处", icon, name, call_count);
+                            let display = format!("{} {} · {} calls", icon, name, call_count);
                             state.streaming_text.push_str(&format!("\n{}\n", display));
                             if !summary.is_empty() {
                                 state.streaming_text.push_str(&format!("  → {}\n", summary));
@@ -1734,7 +1734,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 if needs_draw {
                     state.frame_dirty.set(false);
                     if let Err(e) = terminal.draw(|f| modes::render(f, &state, rows)) {
-                        tracing::error!(?e, "TUI 渲染错误");
+                        tracing::error!(?e, "TUI render error");
                     }
                 }
                 state.cleanup_toasts();
@@ -1786,10 +1786,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                         if allowed {
                             state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auth_tools", &[&format!("{:?}", tool_names)]), crate::tui::state::EventLevel::Info);
-                            state.add_toast("🔓 已授权，继续执行", Duration::from_secs(2));
+                            state.add_toast("🔓 Authorized, continuing", Duration::from_secs(2));
                         } else {
-                            state.add_event(&ts, "mcip", &format!("已拒绝（pipeline 将返回 deny output）: {:?}", tool_names), crate::tui::state::EventLevel::Warning);
-                            state.add_toast("🚫 已拒绝工具执行", Duration::from_secs(2));
+                            state.add_event(&ts, "mcip", &format!("Denied (pipeline returns deny output): {:?}", tool_names), crate::tui::state::EventLevel::Warning);
+                            state.add_toast("🚫 Tool execution denied", Duration::from_secs(2));
                         }
 
                         // 通过 nonce → sender 直发决策
@@ -2065,7 +2065,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.is_streaming = true;
                                 // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🔍 审查{}...", kind.label());
+                                state.processing_phase = format!("🔍 Reviewing {}...", kind.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
                                 state.pending_review_parses = state.pending_review_parses.saturating_add(1);
@@ -2106,7 +2106,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "📋 规划+执行中...".into();
+                                state.processing_phase = "📋 Planning + executing...".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_plan_and_execute_streaming(&engine, &task, stx, plan_req_ctx).await {
@@ -2138,7 +2138,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "🤖 多 Agent 执行中...".into();
+                                state.processing_phase = "🤖 Multi-agent executing...".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_team_message(&engine, &task, stx).await {
@@ -2170,7 +2170,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🤖 {} 处理中...", role.label());
+                                state.processing_phase = format!("🤖 {} processing...", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     use crate::tui::api::send_role_message_streaming;
@@ -2266,9 +2266,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     guard.deactivate()?;
     let count = state.messages.len();
     match save_err {
-        None => println!("会话已保存（{} 条消息，{} 轮次）。", count, state.turn_count),
+        None => println!("Session saved ({} messages, {} turns).", count, state.turn_count),
         Some(e) => eprintln!(
-            "[!] 会话保存失败：{}\n    本次 {} 条消息可能丢失，请检查 ~/.abacus/sessions/ 权限",
+            "[!] Session save failed: {}\n    {} messages may be lost, check ~/.abacus/sessions/ permissions",
             e, count
         ),
     }
@@ -2295,7 +2295,7 @@ async fn execute_slash_command(
                     let text = format_turnkey_plan(&goal, &task);
                     (text, Some(task))
                 }
-                Err(e) => (format!("⚠️ Turnkey plan 失败: {}\n\n目标: {}", e, goal), None),
+                Err(e) => (format!("⚠️ Turnkey plan failed: {}\n\nGoal: {}", e, goal), None),
             }
         }
         SlashCommand::TurnkeyExecute(task) => {
@@ -2314,7 +2314,7 @@ async fn execute_slash_command(
 
             let text = match result {
                 Ok(task_state) => format_turnkey_result_with_events(&task, task_state, &events),
-                Err(e) => format!("⚠️ Turnkey execute 失败: {}", e),
+                Err(e) => format!("⚠️ Turnkey execute failed: {}", e),
             };
             (text, None)
         }
@@ -2329,35 +2329,35 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         SlashCommand::ContextStatus => {
             let status = engine.core.context_status().await;
             format!(
-                "📊 上下文状态\n  使用率: {:.1}% ({}/{} tokens)\n  已压缩: {} 条消息",
+                "📊 Context status\n  Usage: {:.1}% ({}/{} tokens)\n  Compressed: {} messages",
                 status.usage_pct, status.current_tokens, status.max_tokens, status.compressed_count,
             )
         }
         SlashCommand::ContextCompress => {
             let compressed = engine.core.compress_context(&engine.session).await;
-            format!("🗜️ 已压缩 {} 条消息", compressed)
+            format!("🗜️ Compressed {} messages", compressed)
         }
         SlashCommand::ContextInject(content) => {
             engine.core.inject_context("user_inject", &content).await;
-            format!("💉 已注入临时知识（下一轮生效）: {}", content.chars().take(50).collect::<String>())
+            format!("💉 Injected ephemeral knowledge (next turn): {}", content.chars().take(50).collect::<String>())
         }
         SlashCommand::ToolList => {
             let tools = engine.core.tool_registry_ref().all_tools().await;
             let active: Vec<_> = tools.iter()
                 .filter(|t| matches!(t.state, abacus_types::ToolState::Loaded | abacus_types::ToolState::Active))
                 .collect();
-            let mut out = format!("🔧 已注册工具 ({}):\n", active.len());
+            let mut out = format!("🔧 Registered tools ({}):\n", active.len());
             for t in active.iter().take(20) {
                 out.push_str(&format!("  • {} — {}\n", t.schema.name, t.schema.description.chars().take(40).collect::<String>()));
             }
-            if active.len() > 20 { out.push_str(&format!("  ... 及 {} 个更多\n", active.len() - 20)); }
+            if active.len() > 20 { out.push_str(&format!("  ... +{} more\n", active.len() - 20)); }
             out
         }
         SlashCommand::ToolStats => {
             let stats = engine.core.tool_stats().await;
             let mut sorted = stats;
             sorted.sort_by(|a, b| b.1.composite_score.partial_cmp(&a.1.composite_score).unwrap_or(std::cmp::Ordering::Equal));
-            let mut out = String::from("📈 工具效能 Top 10:\n");
+            let mut out = String::from("📈 Tool performance Top 10:\n");
             for (name, s) in sorted.iter().take(10) {
                 out.push_str(&format!("  [{:?}] {:.2} {}\n", s.tier, s.composite_score, name));
             }
@@ -2365,14 +2365,14 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         }
         SlashCommand::SafetyStatus => {
             let s = engine.core.safety_status();
-            format!("🔒 安全限制（Turn 级）\n  最大输入: {} 字符\n  单轮工具上限: {} 次\n  Session 级: 无限制",
+            format!("🔒 Safety limits (per turn)\n  Max input: {} chars\n  Max tool calls: {}\n  Session: unlimited",
                 s.max_input_length, s.max_total_tool_calls)
         }
         SlashCommand::ModelList => {
             let models = engine.core.list_models().await;
-            if models.is_empty() { "🤖 无已注册模型".to_string() }
+            if models.is_empty() { "🤖 No registered models".to_string() }
             else {
-                let mut out = format!("🤖 可用模型 ({}):\n", models.len());
+                let mut out = format!("🤖 Available models ({}):\n", models.len());
                 for m in &models { out.push_str(&format!("  • {}\n", m)); }
                 out
             }
@@ -2381,13 +2381,13 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
             let s = engine.session.read().await;
             let msg_count = s.messages.read().await.len();
             let map = s.interaction_map.read().await;
-            format!("📋 会话\n  ID: {}\n  轮次: {}\n  消息: {}\n  检查点: {}",
+            format!("📋 Session\n  ID: {}\n  Turns: {}\n  Messages: {}\n  Checkpoints: {}",
                 s.session_id, s.turn_count, msg_count, map.checkpoints.len())
         }
         SlashCommand::Provider => {
             let providers = engine.core.list_providers().await;
             if providers.is_empty() {
-                "⚠️ 无已注册 Provider".to_string()
+                "⚠️ No registered providers".to_string()
             } else {
                 let lines: Vec<String> = providers.iter()
                     .map(|(id, models)| format!("  {} → [{}]", id, models.join(", ")))
@@ -2400,36 +2400,36 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         SlashCommand::UndoLast { session_id } => {
             match engine.undo_engine.undo_last(session_id.as_deref()).await {
                 Ok(r) => format_undo_result(&r),
-                Err(e) => format!("⚠️ undo 失败: {e}"),
+                Err(e) => format!("⚠️ undo failed: {e}"),
             }
         }
         SlashCommand::UndoSeq { session_id, seq } => {
             match engine.undo_engine.undo_seq(&session_id, seq).await {
                 Ok(r) => format_undo_result(&r),
-                Err(e) => format!("⚠️ undo seq={seq} 失败: {e}"),
+                Err(e) => format!("⚠️ undo seq={seq} failed: {e}"),
             }
         }
         SlashCommand::UndoTurn { session_id, turn } => {
             match engine.undo_engine.undo_turn(&session_id, turn).await {
-                Ok(rs) if rs.is_empty() => format!("turn={turn} 无可撤销条目"),
+                Ok(rs) if rs.is_empty() => format!("turn={turn} no undoable entries"),
                 Ok(rs) => {
                     let parts: Vec<String> = rs.iter().map(format_undo_result).collect();
-                    format!("⏪ undo turn={} ({} 条):\n{}", turn, rs.len(), parts.join("\n"))
+                    format!("⏪ undo turn={} ({} entries):\n{}", turn, rs.len(), parts.join("\n"))
                 }
-                Err(e) => format!("⚠️ undo turn={turn} 失败: {e}"),
+                Err(e) => format!("⚠️ undo turn={turn} failed: {e}"),
             }
         }
         SlashCommand::Redo { session_id } => {
             match engine.undo_engine.redo(&session_id).await {
                 Ok(r) => format!("⏩ redo seq={} → {:?}", r.seq, r.action),
-                Err(e) => format!("⚠️ redo 失败: {e}"),
+                Err(e) => format!("⚠️ redo failed: {e}"),
             }
         }
         SlashCommand::UndoHistory { session_id, limit } => {
             match engine.undo_engine.history(session_id.as_deref(), limit) {
-                Ok(entries) if entries.is_empty() => "📜 暂无 undo 历史".to_string(),
+                Ok(entries) if entries.is_empty() => "📜 No undo history".to_string(),
                 Ok(entries) => format_history(&entries),
-                Err(e) => format!("⚠️ history 读取失败: {e}"),
+                Err(e) => format!("⚠️ history read failed: {e}"),
             }
         }
         SlashCommand::UndoTimeline { since_hours } => {
@@ -2439,9 +2439,9 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
             let cur_sid = engine.session.read().await.session_id.clone();
             match engine.undo_engine.timeline(since) {
                 Ok(entries) if entries.is_empty() =>
-                    format!("📜 过去 {since_hours}h 内无写操作"),
+                    format!("📜 No writes in past {since_hours}h"),
                 Ok(entries) => format_timeline(&entries, since_hours, &cur_sid),
-                Err(e) => format!("⚠️ timeline 读取失败: {e}"),
+                Err(e) => format!("⚠️ timeline read failed: {e}"),
             }
         }
         // V29.10: TurnkeyPlan / TurnkeyExecute 已被外层 execute_slash_command 提前拦截,
@@ -2486,13 +2486,13 @@ fn format_turnkey_result_with_events(
         TS::Running => "Running",
     };
     let mut out = format!(
-        "{} Turnkey 执行完成\n\n**目标**: {}\n**状态**: {}\n**Phases**: {}\n",
+        "{} Turnkey complete\n\n**Goal**: {}\n**Status**: {}\n**Phases**: {}\n",
         icon, task.goal, status, task.phases.len()
     );
 
     // 事件日志（A 路径：完整展示）
     if !events.is_empty() {
-        out.push_str(&format!("\n── 事件日志 ({} 条) ──\n", events.len()));
+        out.push_str(&format!("\n── Event log ({} entries) ──\n", events.len()));
         for ev in events.iter().take(30) {
             let kind_icon = match &ev.kind {
                 SandboxEventKind::PhaseCompleted => "✓ phase",
@@ -2506,7 +2506,7 @@ fn format_turnkey_result_with_events(
             out.push_str(&format!("  {} [{}] {}\n", kind_icon, ev.phase_id, ev.message));
         }
         if events.len() > 30 {
-            out.push_str(&format!("  ... +{} 更多事件\n", events.len() - 30));
+            out.push_str(&format!("  ... +{} more events\n", events.len() - 30));
         }
     }
     out
@@ -2516,8 +2516,8 @@ fn format_turnkey_result_with_events(
 /// 引用关系: 仅 SlashCommand::TurnkeyPlan 分支调用
 fn format_turnkey_plan(goal: &str, task: &abacus_types::sandbox::TaskSpec) -> String {
     let mut out = String::new();
-    out.push_str("🎯 Turnkey 计划生成\n\n");
-    out.push_str(&format!("**目标**: {}\n\n", goal));
+    out.push_str("🎯 Turnkey plan generated\n\n");
+    out.push_str(&format!("**Goal**: {}\n\n", goal));
     out.push_str(&format!("**Phases**: {}\n\n", task.phases.len()));
     for (pi, p) in task.phases.iter().enumerate() {
         out.push_str(&format!(
@@ -2541,8 +2541,8 @@ fn format_turnkey_plan(goal: &str, task: &abacus_types::sandbox::TaskSpec) -> St
         out.push('\n');
     }
     out.push_str("─────────────────────────\n");
-    out.push_str("⚠ 当前仅展示计划. execute 接通在后续迭代。\n");
-    out.push_str("CLI 路径: `abacus turnkey run \"<goal>\" --yes` 可执行(实验功能)。");
+    out.push_str("⚠ Preview only. Execute will be connected in future iterations.\n");
+    out.push_str("CLI: `abacus turnkey run \"<goal>\" --yes` (experimental).");
     out
 }
 
@@ -2561,11 +2561,11 @@ fn step_model_label(m: &abacus_types::sandbox::ModelAssignment) -> &'static str 
 fn format_undo_result(r: &abacus_core::undo::UndoResult) -> String {
     use abacus_core::undo::UndoAction;
     let action_str = match r.action {
-        UndoAction::RestoredContent => "恢复内容",
-        UndoAction::RemovedFile => "删除文件",
-        UndoAction::RemovedDir => "删除空目录",
-        UndoAction::ReverseMoved => "反向 rename",
-        UndoAction::Aborted => "中止（冲突）",
+        UndoAction::RestoredContent => "restored",
+        UndoAction::RemovedFile => "removed file",
+        UndoAction::RemovedDir => "removed dir",
+        UndoAction::ReverseMoved => "reverse rename",
+        UndoAction::Aborted => "aborted (conflict)",
     };
     let path_str = r.path.to_string_lossy();
     let header = format!("⏪ undo seq={} session={} ({}): {}",
@@ -2574,24 +2574,24 @@ fn format_undo_result(r: &abacus_core::undo::UndoResult) -> String {
     if let Some(c) = &r.conflict {
         let detail = match c {
             abacus_core::undo::UndoConflict::ExternalModification { observed_sha256, expected_sha256 } =>
-                format!("文件被外部修改\n  expected sha256: {}\n  observed sha256: {}",
+                format!("File externally modified\n  expected sha256: {}\n  observed sha256: {}",
                     expected_sha256.get(..16).unwrap_or(&expected_sha256),
                     observed_sha256.get(..16).unwrap_or(&observed_sha256)),
             abacus_core::undo::UndoConflict::FileGone =>
-                "文件已被外部删除".to_string(),
+                "File externally deleted".to_string(),
             abacus_core::undo::UndoConflict::DirectoryNotEmpty { entries } =>
-                format!("目录非空：{}", entries.join(", ")),
+                format!("Directory not empty: {}", entries.join(", ")),
             abacus_core::undo::UndoConflict::DestinationOccupied =>
-                "源路径已被占用，不能 rename 回去".to_string(),
+                "Destination occupied, cannot rename back".to_string(),
         };
-        format!("{header}\n  ⚠️ 冲突: {detail}")
+        format!("{header}\n  ⚠️ Conflict: {detail}")
     } else {
         header
     }
 }
 
 fn format_history(entries: &[abacus_core::undo::HistoryEntry]) -> String {
-    let mut out = format!("📜 Undo History ({} 条):\n", entries.len());
+    let mut out = format!("📜 Undo History ({} entries):\n", entries.len());
     for e in entries {
         let mark = if e.undone { "↺" } else { "✓" };
         let sid_short = &e.session_id[..e.session_id.len().min(8)];
@@ -2617,7 +2617,7 @@ fn format_timeline(
     hours: u64,
     current_session_id: &str,
 ) -> String {
-    let mut out = format!("📜 Project Timeline (过去 {hours}h, {} 条):\n", entries.len());
+    let mut out = format!("📜 Project Timeline (past {hours}h, {} entries):\n", entries.len());
 
     // 派生窗口序号：按时间倒序中 session 首次出现的顺序编号
     let mut window_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
