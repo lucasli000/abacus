@@ -217,8 +217,8 @@ pub async fn create_engine(
         escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
             .filter(|s| !s.is_empty())
             .map(|s| abacus_types::ModelId(s.to_string())),
-        // W2 (Task #100): tool result dedup 与 abacus-core 默认值对齐
-        tool_result_dedup_enabled: false,
+        // V41: tool result dedup 默认开启（防止 LLM 对同一文件重复读取浪费 token）
+        tool_result_dedup_enabled: true,
         tool_result_dedup_ttl_secs: 60,
         tool_result_dedup_capacity_kb: 2048,
         adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),

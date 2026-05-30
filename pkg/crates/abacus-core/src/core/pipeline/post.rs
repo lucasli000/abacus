@@ -124,6 +124,50 @@ impl<'a> TurnPipeline<'a> {
             }
         }
 
+        // V41: compress_tracker 接线——每 turn 结束时更新引用计数 + 注册新消息
+        // 引用关系：compress_tracker 在 auto_compress_messages 评分时读取
+        // 生命周期：post_process 每 turn 写一次，压缩时批量读
+        {
+            let s = self.session.read().await;
+            let msgs = s.messages.read().await;
+            let turn = ctx.turn_number;
+            let mut tracker = self.core.context_manager.compress_tracker.write().await;
+            tracker.current_turn = turn;
+
+            // 注册新消息（本 turn 新增的）
+            let msg_count = msgs.len();
+            let start_idx = msg_count.saturating_sub(ctx.all_tool_outputs.len() + 2); // 大约本 turn 新增的
+            for idx in start_idx..msg_count {
+                if let Some(msg) = msgs.get(idx) {
+                    let text = match &msg.content {
+                        Some(MessageContent::Text(t)) => t.clone(),
+                        _ => String::new(),
+                    };
+                    tracker.register_message(idx, &text, turn);
+                }
+            }
+
+            // 更新引用计数：用 final_response 中的符号反向匹配旧消息
+            if !ctx.final_response.is_empty() {
+                let all_indices: Vec<usize> = tracker.reference_counts.keys().copied().collect();
+                let response_text = ctx.final_response.clone();
+                // 简化版：直接用 symbol 匹配（避免持有 msgs borrow 跨 closure）
+                for &idx in &all_indices {
+                    if idx < msgs.len() {
+                        if let Some(msg) = msgs.get(idx) {
+                            if let Some(MessageContent::Text(old_text)) = &msg.content {
+                                // 检查 final_response 是否引用了旧消息中的符号
+                                let symbols = crate::core::compress_math::extract_symbols(old_text);
+                                if symbols.iter().any(|sym| response_text.contains(sym)) {
+                                    *tracker.reference_counts.entry(idx).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Phase Ctx-C：扫描 LLM 输出标记 segment 命中 + 周期性 evict
         {
             let turn = ctx.turn_number;

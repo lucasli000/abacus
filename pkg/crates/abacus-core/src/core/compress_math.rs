@@ -674,7 +674,9 @@ impl SnippetOptimizer {
 ///
 /// 符号 = 可能是标识符的连续字符序列（长度 > 4，含下划线/点/斜杠）
 /// 例如：function_name, file/path.rs, my_variable, ClassName
-fn extract_symbols(text: &str) -> Vec<&str> {
+///
+/// 引用关系：compress_math 内部 + pipeline/post.rs 引用计数更新
+pub fn extract_symbols(text: &str) -> Vec<&str> {
     let mut symbols = Vec::new();
     let mut start = None;
 
