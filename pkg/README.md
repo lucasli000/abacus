@@ -78,13 +78,51 @@ Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning acro
 
 ## Install
 
-### Quick Install (macOS / Linux)
+### Quick Install (Recommended)
+
+One command, auto-detects your platform:
 
 ```bash
 curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
 ```
 
+Default install path: `/usr/local/bin/abacus`. Custom path:
+
+```bash
+INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
+```
+
+### Manual Download
+
+Download the binary for your platform from [Releases](https://github.com/lucasli000/abacus/releases/latest):
+
+| Platform | File |
+|----------|------|
+| macOS Apple Silicon | `abacus-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` |
+
+```bash
+# Example: macOS Apple Silicon
+tar -xzf abacus-aarch64-apple-darwin.tar.gz
+sudo mv abacus /usr/local/bin/
+chmod +x /usr/local/bin/abacus
+
+# Verify
+abacus --version
+```
+
+### Homebrew (macOS)
+
+```bash
+brew tap lucasli000/tap
+brew install abacus
+```
+
 ### From Source
+
+Requires Rust 1.75+:
 
 ```bash
 git clone https://github.com/lucasli000/abacus.git
@@ -92,14 +130,53 @@ cd abacus/pkg
 cargo install --path crates/abacus-cli
 ```
 
+Or build with optimizations:
+
+```bash
+make build    # Release build
+make install  # Install to /usr/local/bin
+```
+
+### Verify Installation
+
+```bash
+$ abacus --version
+abacus 1.0.0 (3b43be7d 2026-05-30)
+
+$ which abacus
+/usr/local/bin/abacus
+```
+
+### Shell Completions
+
+```bash
+# Zsh (add to ~/.zshrc)
+eval "$(abacus completions zsh)"
+
+# Bash (add to ~/.bashrc)
+eval "$(abacus completions bash)"
+
+# Fish
+abacus completions fish | source
+```
+
+### Uninstall
+
+```bash
+rm /usr/local/bin/abacus
+rm -rf ~/.abacus  # Remove config + data (optional)
+```
+
 ### Supported Platforms
 
-| Platform | Architecture | Status |
-|----------|-------------|--------|
-| macOS | Apple Silicon (arm64) | ✅ Primary |
-| macOS | Intel (x86_64) | ✅ |
-| Linux | x86_64 | ✅ |
-| Linux | aarch64 | ✅ |
+| Platform | Architecture | Binary Size | Status |
+|----------|-------------|-------------|--------|
+| macOS | Apple Silicon (arm64) | ~19MB | ✅ Primary |
+| macOS | Intel (x86_64) | ~20MB | ✅ |
+| Linux | x86_64 (glibc) | ~22MB | ✅ |
+| Linux | aarch64 (glibc) | ~21MB | ✅ |
+
+> Binary is fully self-contained — no runtime dependencies. SQLite bundled, TLS via rustls, all resources embedded.
 
 ## Usage
 
