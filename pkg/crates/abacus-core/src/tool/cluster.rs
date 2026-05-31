@@ -324,23 +324,21 @@ impl ClusterRegistry {
     ///
     /// ## byte-stable
     /// 同一组工具集 + 同一 ClusterRegistry 输出 byte-identical——不破 KV cache 前缀。
+    /// V43 token 优化：精简 cluster hint 格式
+    /// 旧格式：列出所有 sibling 完整 differentiator（6 工具 cluster ≈ 200 tokens）
+    /// 新格式：仅列 sibling 名字 + 自身 differentiator（≈ 40 tokens）
     pub fn render_hint_for(&self, tool_id: &str) -> Option<String> {
         let cluster = self.cluster_for(tool_id)?;
         let me = cluster.members.iter().find(|m| m.tool_id == tool_id)?;
         let siblings = cluster.siblings_of(tool_id);
         if siblings.is_empty() {
-            // 单工具 cluster 不需要对比——LLM 不会混淆
             return None;
         }
-        let sibling_str: Vec<String> = siblings
-            .iter()
-            .map(|m| format!("{} ({})", m.tool_id, m.differentiator))
-            .collect();
+        // 仅列 sibling 工具名（不含 differentiator），LLM 通过各自 description 区分
+        let names: Vec<&str> = siblings.iter().map(|m| m.tool_id).collect();
         Some(format!(
-            "\n[Cluster: {} ({}). Siblings: {}. This tool: {}]",
-            cluster.id,
-            cluster.purpose,
-            sibling_str.join("; "),
+            " [vs: {}. This: {}]",
+            names.join("/"),
             me.differentiator
         ))
     }

@@ -3268,6 +3268,40 @@ impl CoreLoop {
             .insert("turn_timeout".to_string(), seconds.to_string());
     }
 
+    /// 同步 runtime_overrides 到实际子系统（每轮 build_system_output 前调用）
+    ///
+    /// 当 LLM 通过 config_set 修改推演引擎/认识论/记忆宫殿参数后，
+    /// 此方法将覆盖值推送到对应子系统实例。
+    pub async fn sync_runtime_overrides(&self) {
+        use crate::tool::builtin::config::read_override_bool;
+        use crate::tool::builtin::config::read_override_u32;
+
+        let overrides = &self.runtime_overrides;
+
+        // 推演引擎开关
+        let occ = read_override_bool(overrides, "deduction_observer_contamination");
+        let css = read_override_bool(overrides, "deduction_cross_session");
+        let pi = read_override_bool(overrides, "deduction_prompt_impact");
+        let cd = read_override_bool(overrides, "deduction_context_degradation");
+        if occ.is_some() || css.is_some() || pi.is_some() || cd.is_some() {
+            let flags = crate::deduction::DeductionFlags {
+                observer_contamination: occ.unwrap_or(true),
+                cross_session: css.unwrap_or(true),
+                prompt_impact: pi.unwrap_or(true),
+                context_degradation: cd.unwrap_or(true),
+            };
+            self.deduction_engine.set_enabled(flags).await;
+        }
+
+        // 认识论约束阈值
+        if let Some(threshold) = read_override_u32(overrides, "epistemic_threshold") {
+            self.epistemic_guard.set_declaration_threshold(threshold);
+        }
+
+        // 记忆宫殿开关（palace_enabled=false 时不注入 palace hints）
+        // 注：palace_enabled 由 build_system_output 中的 awareness 层读取
+    }
+
     /// 获取记忆宫殿引用（TUI 面板数据拉取用）
     pub fn memory_palace(&self) -> Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>> {
         self.memory_palace.clone()
@@ -3685,6 +3719,9 @@ impl CoreLoop {
         session: &RwLock<SessionState>,
         preflight: &PreflightReport,
     ) -> SystemPromptOutput {
+        // ─── 同步 runtime_overrides 到子系统（每轮调用）─────────────────────
+        self.sync_runtime_overrides().await;
+
         // ─── 数据采集（一次，text + segments 共享）─────────────────────────────
 
         let retained = self.context_manager.retained_context_block().await;
@@ -3788,23 +3825,9 @@ impl CoreLoop {
                 let msgs = s.messages.read().await;
                 msgs.iter().filter(|m| matches!(m.role, crate::llm::provider::MessageRole::Tool)).count() as u32
             };
-            let model_name = self.config.default_model.0.as_str();
-            let thinking_mode = self.config.thinking_intent.as_ref()
-                .map(|t| format!("{:?}", t))
-                .unwrap_or_else(|| "off".into());
-
-            // 环境感知
-            let task_kind_str = {
-                let locked = s.task_kind_locked.read().await;
-                locked.as_ref().map(|k| k.label().to_string()).unwrap_or_else(|| "unclassified".into())
-            };
-            let user_role = format!("{:?}", s.user_role);
-
-            // 能力感知
+            // V43: 精简 awareness — 仅保留决策相关变量
             let max_turns = self.config.max_turns_per_request;
-            let _max_tool_calls = self.config.max_tool_calls_per_turn;
             let max_tokens = self.config.default_max_tokens;
-            let escalations_left = self.config.max_escalations;
 
             // 获取最近调用的工具名（供 palace recommendations 使用）
             let last_tool = {
@@ -3812,19 +3835,14 @@ impl CoreLoop {
                 map.recent_tools(1).into_iter().next().map(|tid| tid.0)
             };
 
-            // Policy 感知：让 LLM 知道当前约束状态
-            let policy = &self.config.policy;
-            let guard_status = if policy.guard.entropy_guard.is_empty() { "off" } else { "on" };
-            let decl_status = if policy.guard.explicit_declaration.is_empty() { "off" } else { "on" };
-
-            // 上下文占用感知（让 LLM 每轮知道剩余空间、预算比例、模型容量）
+            // 上下文占用感知（让 LLM 每轮知道剩余空间）
             //
             // Fix 1: 将本轮最大输出纳入估算，避免 LLM 看到的百分比过乐观
             //   effective_pct = (history_tokens + max_output_tokens) / max_tokens
             //   ctx_status 基于 effective_pct，触发阈值提前到实际压力点
             // Fix 2: 向 LLM 展示实际可用输出上限（受剩余空间压缩）
             let ctx_window = self.context_manager.window.read().await;
-            let ctx_pct = ctx_window.usage_pct();
+            let _ctx_pct = ctx_window.usage_pct();
             // 含输出预留的保守估算百分比
             let effective_used = ctx_window.current_tokens.saturating_add(max_tokens as usize);
             let effective_pct = (effective_used as f64 / ctx_window.max_tokens.max(1) as f64 * 100.0).min(100.0);
@@ -3838,48 +3856,27 @@ impl CoreLoop {
                 .saturating_sub(1024)
                 .min(max_tokens as usize)
                 .max(2048);
-            let ratio_pct = (self.config.context_window_ratio * 100.0) as u32;
-            let ctx_info = format!(
-                "Context: history={:.0}% effective={:.0}% ({}/{}tok) [{}] | Output: {}tok avail | Budget: {}% of {}tok",
-                ctx_pct, effective_pct,
-                ctx_window.current_tokens, ctx_window.max_tokens, ctx_status,
-                effective_output,
-                ratio_pct, ctx_window.model_limit);
             drop(ctx_window);
 
-            let block = format!(
-                "[Awareness]\n\
-                 Turn: {}/{} | Tools called: {} | Model: {} | Thinking: {}\n\
-                 Task: {} | Role: {} | Max output: {}tok (effective: {}tok)\n\
-                 {} \n\
-                 [Limits] tools: 0/{} per turn | iterations: 0/{} | No session limit\n\
-                 Capabilities: {} escalations available | scene_loading: {} | router: {}\n\
-                 Policy: entropy_guard={} | explicit_decl={} | stop_threshold={}chars | confirm_timeout={}s\n\
-                 [Context Management] HARD RULE: your output + existing context MUST stay within the budget shown above. \
-                 When status=OK: output freely within max_output. \
-                 When status=WARNING (70-84%): be concise, avoid redundant explanations, prefer structured output. \
-                 When status=ELEVATED (85-94%): output key conclusions ONLY, then immediately call context_compress(mode=\"messages\"). \
-                 When status=CRITICAL (95%+): output ≤200 tokens summary, then compress. Exceeding budget causes data loss. \
-                 Last 8 messages are always preserved after compression.",
-                current_turn, max_turns,
-                tool_calls_used,
-                model_name,
-                thinking_mode,
-                task_kind_str,
-                user_role,
-                max_tokens,
-                effective_output,
-                ctx_info,
-                self.config.thresholds.turn_max_tool_calls,
-                self.config.thresholds.turn_max_iterations,
-                escalations_left,
-                if self.config.scene_tool_loading_enabled { "on" } else { "off" },
-                if self.config.silent_router_enabled { "on" } else { "off" },
-                guard_status,
-                decl_status,
-                policy.thresholds.premature_stop_chars,
-                policy.thresholds.confirm_timeout_secs,
-            );
+            // V43 token 优化：精简 awareness — 仅保留 LLM 决策所需信息
+            // 旧格式 ~400 tokens（含 policy/capabilities/context management rules 等冗余）
+            // 新格式 ~80 tokens（turn/ctx 状态 + 临界时的行动指令）
+            let block = if effective_pct >= 85.0 {
+                // Context 压力大时注入行动指令
+                format!(
+                    "[t{}/{} tools:{} ctx:{:.0}%({}) out:{}tok]\n\
+                     ⚠ Context {}. Compress immediately: call context_compress(mode=\"messages\").",
+                    current_turn, max_turns, tool_calls_used,
+                    effective_pct, ctx_status, effective_output, ctx_status
+                )
+            } else {
+                // 正常状态：极简状态行
+                format!(
+                    "[t{}/{} tools:{} ctx:{:.0}%({}) out:{}tok]",
+                    current_turn, max_turns, tool_calls_used,
+                    effective_pct, ctx_status, effective_output
+                )
+            };
             (block, last_tool)
         };
 
@@ -5032,17 +5029,18 @@ Output JSON:
 /// - 返回 &'static 切片，无分配
 fn scene_active_prefixes(task_kind: &str) -> &'static [&'static str] {
     match task_kind {
-        "code_writing" | "code_reading" => &["fs_", "file_", "dir_", "code", "cargo"],
-        "debugging" => &["fs_", "file_", "code", "cargo", "test"],
+        "code_writing" | "code_reading" => &["fs_", "bash", "code", "cargo"],
+        "debugging" => &["fs_", "bash", "code", "cargo", "test"],
         "web_search" => &["web", "fetch", "search", "browse"],
-        "file_edit" => &["fs_", "file_", "dir_"],
-        "data_analysis" => &["fs_", "file_", "code", "db", "data"],
-        "mathematics" => &["code", "math", "calculate"],
-        "architecture" => &["fs_", "file_", "dir_", "code", "diagram"],
-        "review" => &["fs_", "file_", "code", "lint", "test"],
+        "file_edit" => &["fs_", "bash"],
+        "data_analysis" => &["fs_", "bash", "code", "db", "data"],
+        "mathematics" => &["code", "math", "bash"],
+        "architecture" => &["fs_", "bash", "code"],
+        "review" => &["fs_", "bash", "code", "lint", "test"],
         "knowledge_query" => &["kb", "search", "web", "fetch"],
-        // general_chat, linguistics 等 → 空前缀列表（仅最近调用 / 显式 task_kind 命中可保留）
-        _ => &[],
+        // V43: general_chat / linguistics 等 → 最小核心集（fs_read + bash + web）
+        // 其余工具通过 catalog 告知 LLM 存在，按需 On-Demand 调用
+        _ => &["fs_read", "fs_write", "fs_edit", "bash", "web"],
     }
 }
 
