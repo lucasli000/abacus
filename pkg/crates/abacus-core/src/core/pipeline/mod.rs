@@ -866,44 +866,37 @@ impl<'a> TurnPipeline<'a> {
         // + 工具数量加成: tool_count * 10s (上限 100s)
         // 总上限: 900s (15 分钟，防止无限等待)
         //
+        // ## Per-call timeout（V43: 从 turn-level 改为 per-LLM-call）
+        //
+        // 设计变更：之前 dynamic_timeout_secs 覆盖整个 turn（含多次工具执行），
+        // 导致长 agentic 循环（10+ tool calls）中后期 LLM 调用被 turn deadline 截断。
+        //
+        // 新语义：dynamic_timeout_secs = 单次 LLM API 调用的最大等待时间。
+        // 每次 LLM 调用独立计时，工具执行时间不算入 LLM 超时。
+        //
         // ## 引用关系
-        // - 消费: execute_loop tokio::time::timeout + 时长预警
-        // - 数据源: classification.complexity (TaskAnalyzer) + tool_defs.len()
+        // - 消费: execute_loop 中每次 provider.complete_cancellable() 的 tokio::time::timeout
+        // - 数据源: thinking level（主因子，决定 LLM 单次推理上限）
         let estimated_timeout = {
-            let mut t = self.core.config.thresholds.turn_provider_timeout_secs.max(60).min(600);
-
-            // Factor 1: thinking 深度
-            if let Some(ref ti) = complexity_thinking {
+            // 基准：按 thinking depth 决定单次 LLM 调用超时
+            let t = if let Some(ref ti) = complexity_thinking {
                 match ti {
                     abacus_types::ThinkingIntent::Effort(e) => match e {
-                        // V42: 对齐 provider timeout 600s — 复杂 agentic 循环需要足够时间
-                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => t = t.max(600),
-                        abacus_types::EffortLevel::Medium => t = t.max(300),
-                        abacus_types::EffortLevel::Low => t = t.max(180),
-                        _ => {}
+                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => 600,
+                        abacus_types::EffortLevel::Medium => 300,
+                        abacus_types::EffortLevel::Low => 180,
+                        _ => 300,
                     },
-                    abacus_types::ThinkingIntent::Adaptive => t = t.max(300),
-                    abacus_types::ThinkingIntent::Budget(_) => t = t.max(600),
-                    _ => {}
+                    abacus_types::ThinkingIntent::Adaptive => 300,
+                    abacus_types::ThinkingIntent::Budget(_) => 600,
+                    abacus_types::ThinkingIntent::Off => 120,
                 }
-            }
-
-            // Factor 2: ComplexityProfile 加成（高复杂度任务需要更长推理时间）
-            // 使用 setup() 中已计算的 complexity（TaskAnalyzer::analyze_complexity 结果）
-            let complexity_bonus = (complexity.score * 120.0) as u64;
-            t += complexity_bonus;
-
-            // Factor 3: 工具数量加成（多工具 turn 可能有多轮 tool_call → LLM 调用）
-            let tool_bonus = (tool_defs.len() as u64 * 10).min(100);
-            t += tool_bonus;
-
-            // 上限取 config（默认 1800s = 30 分钟）
-            // 可通过 config.yaml `core.max_turn_timeout_secs` 覆盖
-            // Claude Code 允许 2h，但实际 >15min 有 tool_result 丢失风险
-            // 30min 是安全与灵活的平衡点
-            let max_timeout = self.core.config.thresholds.max_turn_timeout_secs
-                .unwrap_or(1800);
-            t.min(max_timeout)
+            } else {
+                // 无 thinking（纯 completion）— 120s 足够
+                120
+            };
+            // 上限：provider 级别超时（默认 600s）
+            t.min(self.core.config.thresholds.turn_provider_timeout_secs)
         };
 
         Ok(TurnContext {
@@ -1388,12 +1381,10 @@ impl<'a> TurnPipeline<'a> {
                 // 2026-05-28: 追踪已发送到 TUI 的文本内容（用于流中断重试时通知 TUI 清除部分内容）
                 let mut streamed_text_acc = String::new();
 
-                // P0 修复: streaming 路径增加总超时保护
-                // 问题：CDN keepalive/server 心跳可绕过 45s idle timeout → 无限期卡死
-                // 解决：pipeline 级 total timeout 包裹整个事件消费循环
-                // 引用关系：dynamic_timeout_secs 由 complexity + tool_bonus 综合计算
+                // V43: per-call streaming timeout（每次 LLM 调用独立计时）
+                // +60s 余量：streaming 响应已经在传输中，给足缓冲
                 let stream_total_timeout = std::time::Duration::from_secs(
-                    ctx.dynamic_timeout_secs.saturating_add(60).min(900) // +60s 余量
+                    ctx.dynamic_timeout_secs.saturating_add(60)
                 );
                 let stream_deadline = tokio::time::Instant::now() + stream_total_timeout;
 
@@ -2046,12 +2037,13 @@ impl<'a> TurnPipeline<'a> {
                 });
             }
 
-            // ── 2026-05-27: 时长预算感知 ──
-            // 在 turn 时间消耗达到动态超时的 60% 时注入提示（仅一次）
-            // V41 修复: 使用 ctx.dynamic_timeout_secs（综合因子）而非静态 config 值
+            // ── 时长预算感知 ──
+            // V43: 改用 turn-level 时间预算（max_turn_timeout_secs），而非 per-call timeout
+            // 因为 agentic 循环中多次 tool call + LLM 调用总时间自然累加
             if !ctx.time_warning_emitted {
                 let elapsed = ctx.turn_started_at.elapsed();
-                let budget = std::time::Duration::from_secs(ctx.dynamic_timeout_secs);
+                let turn_budget_secs = self.core.config.thresholds.max_turn_timeout_secs.unwrap_or(1800);
+                let budget = std::time::Duration::from_secs(turn_budget_secs);
                 if elapsed > budget.mul_f64(0.6) {
                     ctx.time_warning_emitted = true;
                     let remaining_secs = budget.saturating_sub(elapsed).as_secs();
