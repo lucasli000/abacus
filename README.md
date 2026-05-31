@@ -118,6 +118,7 @@ Abacus is a pre-compiled binary with **no runtime dependencies**. You only need:
 For building from source, you additionally need:
 - Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 - A C linker (macOS: Xcode Command Line Tools; Linux: `build-essential`)
+- Protocol Buffers compiler (`brew install protobuf` on macOS; `apt install protobuf-compiler` on Linux)
 
 ## Install
 
