@@ -1,1 +1,110 @@
+name: Release
 
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            cross: true
+
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: pkg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('pkg/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install cross (Linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --package abacus-cli --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --package abacus-cli --target ${{ matrix.target }}
+
+      - name: Strip binary
+        run: |
+          BINARY="target/${{ matrix.target }}/release/abacus"
+          if command -v strip &> /dev/null; then
+            strip "$BINARY" 2>/dev/null || true
+          fi
+          ls -lh "$BINARY"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/abacus dist/
+          cd dist
+          tar -czf abacus-${{ matrix.target }}.tar.gz abacus
+          shasum -a 256 abacus-${{ matrix.target }}.tar.gz > abacus-${{ matrix.target }}.tar.gz.sha256
+          cat abacus-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abacus-${{ matrix.target }}
+          path: pkg/dist/abacus-${{ matrix.target }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | sort
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/abacus-*/abacus-*.tar.gz
+            artifacts/abacus-*/abacus-*.sha256
+            pkg/scripts/install.sh
