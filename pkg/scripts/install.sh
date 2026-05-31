@@ -54,13 +54,28 @@ main() {
     fi
     echo "Version: v${version}"
 
-    url="https://github.com/${REPO}/releases/download/v${version}/${BINARY_NAME}-${platform}.tar.gz"
-    echo "Downloading: ${url}"
+    local filename="${BINARY_NAME}-${platform}.tar.gz"
+    local url="https://github.com/${REPO}/releases/download/v${version}/${filename}"
+    # 镜像加速（中国大陆用户访问 GitHub releases 常遇 HTTP2 framing error）
+    local mirror_url="https://gh-proxy.com/https://github.com/${REPO}/releases/download/v${version}/${filename}"
 
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' EXIT
 
-    curl -fsSL "$url" | tar -xz -C "$tmp"
+    echo "Downloading: ${url}"
+    if ! curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$tmp/${filename}" 2>/dev/null; then
+        echo "Direct download failed, trying mirror..."
+        echo "Downloading: ${mirror_url}"
+        if ! curl -fsSL --retry 2 "$mirror_url" -o "$tmp/${filename}" 2>/dev/null; then
+            echo "Error: Download failed. Please check your network or download manually:" >&2
+            echo "  ${url}" >&2
+            echo "" >&2
+            echo "If in China, try: curl -x socks5://127.0.0.1:7890 -fsSL '${url}' | tar -xz" >&2
+            exit 1
+        fi
+    fi
+
+    tar -xzf "$tmp/${filename}" -C "$tmp"
 
     # 安装
     if [ -w "$INSTALL_DIR" ]; then
