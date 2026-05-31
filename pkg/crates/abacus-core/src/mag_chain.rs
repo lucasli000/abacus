@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
@@ -485,8 +486,8 @@ pub struct EpistemicGuard {
     violation_count: RwLock<u32>,
     /// 连续 ZeroHit 计数（用于冷启动检测）
     zero_hit_streak: RwLock<u32>,
-    /// 显式声明阈值：连续违规超过此值时强制插入声明
-    declaration_threshold: u32,
+    /// 显式声明阈值：连续违规超过此值时强制插入声明（LLM 可通过 config_set 修改）
+    declaration_threshold: AtomicU32,
 }
 
 impl EpistemicGuard {
@@ -494,7 +495,7 @@ impl EpistemicGuard {
         Self {
             violation_count: RwLock::new(0),
             zero_hit_streak: RwLock::new(0),
-            declaration_threshold: 3,
+            declaration_threshold: AtomicU32::new(3),
         }
     }
 
@@ -522,7 +523,8 @@ impl EpistemicGuard {
     /// 生成显式声明文本（当违规超阈值时，CoreLoop 插入到 LLM 输出前）
     pub async fn declaration_if_needed(&self) -> Option<String> {
         let count = *self.violation_count.read().await;
-        if count >= self.declaration_threshold {
+        let threshold = self.declaration_threshold.load(Ordering::Relaxed);
+        if count >= threshold {
             Some(format!(
                 "[EPISTEMIC VIOLATION ×{}] 本 session 已连续 {} 次违反认识论约束。\
                 后续输出将强制标注 [unverified]，直到调用工具验证或 KB 命中。",
@@ -531,6 +533,11 @@ impl EpistemicGuard {
         } else {
             None
         }
+    }
+
+    /// 运行时设置违规阈值（LLM 通过 config_set 触发）
+    pub fn set_declaration_threshold(&self, threshold: u32) {
+        self.declaration_threshold.store(threshold, Ordering::Relaxed);
     }
 }
 

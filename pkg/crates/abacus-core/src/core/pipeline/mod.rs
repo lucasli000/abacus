@@ -3487,7 +3487,7 @@ impl<'a> TurnPipeline<'a> {
 
     // ─── Phase 7: Persist & Build Result ────────────────────────────────────
 
-    async fn persist_and_build_result(self, mut ctx: TurnContext) -> Result<TurnResult, KernelError> {
+    async fn persist_and_build_result(self, ctx: TurnContext) -> Result<TurnResult, KernelError> {
         // V42: 空回复不再注入 "(max turns reached)" — 空就是空，TUI 不渲染空消息
 
         let latency = ctx.start_time.elapsed().as_millis() as u64;

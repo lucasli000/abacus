@@ -1300,7 +1300,7 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
     // 唯一保留的安全防线：DANGEROUS_COMMANDS 系统级命令由 pipeline 在 MCIP 阶段拦截。
     let _ = session.bash_policy; // consumed by pipeline's classify call
 
-    let mut child = TokioCmd::new("sh")
+    let child = TokioCmd::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(&workdir)

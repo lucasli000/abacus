@@ -192,20 +192,17 @@ pub(super) fn render_single_trace_event<'a>(
                 }
             } else {
                 // 非编辑类：单行（args 摘要内联）
-                // 格式：⚙ name ✓ context  dur
+                // 格式：⚙ name ✓ dur（第一行）+ context（超宽时第二行缩进）
                 let context = if !args.is_empty() {
                     extract_tool_param_summary(args)
                 } else {
                     String::new()
                 };
-                // 截断 context 到可用宽度
-                // bar(1) + "  "(2) + "⚙ "(2) + name + " "(1) + icon(1) + dur(~6) = ~13 + name.len
-                let avail = max_width.saturating_sub(13 + name.len() + dur_str.len());
-                let ctx_display: String = if context.len() > avail {
-                    context.chars().take(avail.saturating_sub(1)).collect::<String>() + "…"
-                } else {
-                    context
-                };
+
+                // 第一行：⚙ name ✓ [context_if_fits]  dur
+                let header_overhead = 13 + name.len() + dur_str.len(); // bar+indent+icon+name+space+status+dur
+                let avail = max_width.saturating_sub(header_overhead);
+                let fits_on_one_line = context.chars().count() <= avail;
 
                 let mut spans = vec![
                     bar.clone(),
@@ -215,14 +212,32 @@ pub(super) fn render_single_trace_event<'a>(
                     Span::raw(" "),
                     Span::styled(status_icon, Style::default().fg(status_color)),
                 ];
-                if !ctx_display.is_empty() {
+                if fits_on_one_line && !context.is_empty() {
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled(ctx_display, theme.text_style(TextRole::Caption)));
+                    spans.push(Span::styled(context.clone(), theme.text_style(TextRole::Caption)));
                 }
                 if !dur_str.is_empty() {
                     spans.push(Span::styled(format!("  {}", dur_str.trim()), theme.text_style(TextRole::Hint)));
                 }
                 lines.push(Line::from(spans));
+
+                // 超宽 context → 换行展示（缩进 6 格：bar+indent+4space）
+                if !fits_on_one_line && !context.is_empty() {
+                    // 按可用宽度自动 wrap
+                    let wrap_width = max_width.saturating_sub(6); // 6 = bar(1) + "      "(5)
+                    let mut pos = 0;
+                    let chars: Vec<char> = context.chars().collect();
+                    while pos < chars.len() {
+                        let end = (pos + wrap_width).min(chars.len());
+                        let chunk: String = chars[pos..end].iter().collect();
+                        lines.push(Line::from(vec![
+                            bar.clone(),
+                            Span::raw("      "),
+                            Span::styled(chunk, theme.text_style(TextRole::Caption)),
+                        ]));
+                        pos = end;
+                    }
+                }
             }
         }
         TraceKind::Generic { content } => {
@@ -485,19 +500,19 @@ pub(crate) fn extract_tool_param_summary(args_json: &str) -> String {
     }
 
     if let Ok(obj) = serde_json::from_str::<serde_json::Value>(args_json) {
-        // 按优先级尝试提取有意义的字段
+        // 按优先级尝试提取有意义的字段（不截断——超宽由渲染层 wrap）
         for key in &["path", "file_path", "url", "query", "command", "pattern", "selector"] {
             if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-                return truncate_chars(val, 60);
+                return val.to_string();
             }
         }
-        // fallback: 序列化首 60 字符
+        // fallback: 序列化（限 200 字符避免 JSON blob 过长）
         let s = serde_json::to_string(&obj).unwrap_or_default();
-        truncate_chars(&s, 60)
+        truncate_chars(&s, 200)
     } else {
-        // 非 JSON: 首行截断
+        // 非 JSON: 首行
         let first_line = args_json.lines().next().unwrap_or("");
-        truncate_chars(first_line, 60)
+        first_line.to_string()
     }
 }
 

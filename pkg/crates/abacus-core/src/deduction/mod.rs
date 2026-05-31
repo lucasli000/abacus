@@ -50,6 +50,14 @@ use crate::deduction::series::{
 /// - `collect_post_turn()` — CoreLoop 每轮结束后调用
 /// - `analyze()` — deduction.* 工具调用
 /// - `build_injection()` — PromptAssembly 注入文本
+///
+/// ## 强制消费协议 (Deduction Consumption Protocol)
+///
+/// 推演引擎的告警不仅是被动提示——LLM 必须在响应前消费 critical 告警。
+/// 机制：
+/// - `last_analyze_turn` 追踪上次调用 `deduction_analyze` 的轮次
+/// - `build_injection()` 在 critical 告警存在且超过 2 轮未消费时，注入强制指令
+/// - awareness 层追加代价声明（不消费 = 污染累积 + 行为退化）
 pub struct DeductionEngine {
     store: Arc<MetricStore>,
     active_alerts: Arc<RwLock<Vec<DeductionAlert>>>,
@@ -59,6 +67,10 @@ pub struct DeductionEngine {
     purge_counter: Arc<RwLock<u32>>,
     /// 双宫殿记忆系统（可选 — 用于自动行为记录 + 知识维护）
     palace: Option<Arc<DualPalaceMemory>>,
+    /// 上次调用 deduction_analyze 的轮次（强制消费协议）
+    last_analyze_turn: Arc<RwLock<Option<u32>>>,
+    /// 自上次 analyze 消费后经过的轮数（用于升级提醒）
+    turns_since_analyze: Arc<RwLock<u32>>,
 }
 
 /// 每项推演能力的开关
@@ -158,6 +170,8 @@ impl DeductionEngine {
             enabled: Arc::new(RwLock::new(DeductionFlags::default())),
             purge_counter: Arc::new(RwLock::new(0)),
             palace,
+            last_analyze_turn: Arc::new(RwLock::new(None)),
+            turns_since_analyze: Arc::new(RwLock::new(0)),
         })
     }
 
@@ -179,6 +193,30 @@ impl DeductionEngine {
     /// 清除过期数据
     pub async fn purge_old(&self) -> Result<(), String> {
         self.store.purge_old().await
+    }
+
+    /// 标记 deduction_analyze 已被调用（强制消费协议）
+    ///
+    /// 当 LLM 调用 deduction_analyze 时，DeductionToolExecutor 会调用此方法
+    /// 记录消费轮次，重置未消费计数器。
+    pub async fn mark_analyze_consumed(&self, turn: u32) {
+        *self.last_analyze_turn.write().await = Some(turn);
+        *self.turns_since_analyze.write().await = 0;
+    }
+
+    /// 递增未消费轮数（每轮 collect_post_turn 调用）
+    pub async fn increment_turns_since_analyze(&self) {
+        *self.turns_since_analyze.write().await += 1;
+    }
+
+    /// 查询上次消费 deduction_analyze 的轮次
+    pub async fn last_analyze_turn(&self) -> Option<u32> {
+        *self.last_analyze_turn.read().await
+    }
+
+    /// 查询自上次 analyze 消费后经过的轮数
+    pub async fn turns_since_analyze(&self) -> u32 {
+        *self.turns_since_analyze.read().await
     }
 
     // ─── 整轮采集（CoreLoop 调用） ────────────────────────────────────────
@@ -397,25 +435,90 @@ impl DeductionEngine {
             }
         }
 
+        // 强制消费协议：每轮递增未消费计数器
+        self.increment_turns_since_analyze().await;
+
         Ok(())
     }
 
     /// 将活跃告警注入为 Prompt 文本（Layer 160，DeductionEngine 调用方负责注入）
+    ///
+    /// ## 强制消费协议（Deduction Consumption Protocol）
+    ///
+    /// 当存在 severity=critical 的告警时，注入文本包含强制消费指令：
+    /// LLM 在响应用户之前，必须调用 deduction_analyze 消费告警。
+    /// 不消费告警的代价：污染持续累积 → 工具滥用加剧 → 用户信任下降。
+    ///
+    /// ## 协议规则
+    /// - critical 告警：必须先 deduction_analyze → 处理根因 → 然后才响应用户
+    /// - warning 告警：建议消费，但不强制
+    /// - info 告警：仅供参考
+    /// - 每 3 轮至少检查一次 deduction_status
     pub async fn build_injection(&self) -> Option<String> {
         let alerts = self.active_alerts.read().await;
         if alerts.is_empty() {
             return None;
         }
 
+        let has_critical = alerts.iter().any(|a| matches!(a.severity, AlertSeverity::Critical));
+        let turns_unconsumed = self.turns_since_analyze().await;
+
         let mut parts = vec!["## Agent 阶段感知".to_string()];
+
+        // 强制消费协议：critical 告警时注入强制指令
+        if has_critical {
+            parts.push(String::new());
+            parts.push("### ⛔ 强制消费协议（Deduction Consumption Protocol）".to_string());
+            parts.push(String::new());
+
+            if turns_unconsumed > 5 {
+                parts.push("🚨 **严重违规**：critical 告警已存在超过 5 轮未被消费！".to_string());
+                parts.push("你的工具使用模式正在持续退化。立即停止当前操作，调用 deduction_analyze。".to_string());
+            } else if turns_unconsumed > 2 {
+                parts.push(format!(
+                    "⚠️ **警告**：critical 告警已 {} 轮未被消费。再不消费将进入退化模式。",
+                    turns_unconsumed
+                ));
+            } else {
+                parts.push("检测到 critical 级别告警。在响应用户之前，你必须：".to_string());
+            }
+
+            parts.push("1. 调用 `deduction_analyze(kind=\"<对应类型>\")` 消费告警".to_string());
+            parts.push("2. 根据分析结果调整行为（如减少过度使用的工具）".to_string());
+            parts.push("3. 然后才能处理用户请求".to_string());
+            parts.push(String::new());
+            parts.push("跳过消费的代价：告警持续累积 → 工具滥用恶化 → 用户信任下降。".to_string());
+            parts.push("这不是可选的——这是协议要求。".to_string());
+            parts.push(String::new());
+        }
+
+        parts.push("---".to_string());
+        parts.push(String::new());
         for alert in alerts.iter() {
+            let prefix = match alert.severity {
+                AlertSeverity::Critical => "🔴 [CRITICAL]",
+                AlertSeverity::Warning => "🟡 [WARNING]",
+                AlertSeverity::Info => "🔵 [INFO]",
+            };
             parts.push(format!(
-                "- [{}] [{}] {}",
-                alert.severity.label(),
+                "- {} [{}] {}",
+                prefix,
                 alert.kind.label(),
                 alert.message
             ));
         }
+
+        // 附加行动指引
+        if has_critical {
+            parts.push(String::new());
+            parts.push("---".to_string());
+            parts.push(format!(
+                "**行动要求**：存在 critical 告警（已 {} 轮未消费），必须先消费再响应用户。",
+                turns_unconsumed
+            ));
+            parts.push("调用 deduction_analyze(kind=\"observer_contamination\") 开始。".to_string());
+        }
+
         Some(parts.join("\n"))
     }
 
@@ -698,7 +801,7 @@ impl DeductionToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for DeductionToolExecutor {
-    async fn execute(&self, tool_id: &ToolId, params: Value, _ctx: &ExecutionContext) -> Result<Value, KernelError> {
+    async fn execute(&self, tool_id: &ToolId, params: Value, ctx: &ExecutionContext) -> Result<Value, KernelError> {
         match tool_id.0.as_str() {
             "deduction_status" => {
                 let alerts = self.engine.active_alerts.read().await;
@@ -710,6 +813,9 @@ impl ToolExecutor for DeductionToolExecutor {
                 Ok(json!({"alerts": items, "count": items.len()}))
             }
             "deduction_analyze" => {
+                // 强制消费协议：标记 deduction_analyze 已被调用
+                self.engine.mark_analyze_consumed(ctx.turn_number).await;
+
                 let all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let reports = if all {
                     self.engine.analyze_all().await

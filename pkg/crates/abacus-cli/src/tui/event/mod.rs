@@ -2605,41 +2605,6 @@ pub fn toggle_block(state: &mut AppState, msg_idx: usize, part_idx: usize) {
     }
 }
 
-/// V28 (T7): 翻转 Trace 中某个 event 的"全展开"状态(per-event 细粒度,>30/20 行时全部显示)
-/// part_idx 在 Block + Trace 共用计数空间(同 toggle_block);event_id 必须存在于该 Trace 的 event_ids
-///
-/// **状态**：架构预留（V33 审查留存）。当前 trace 事件展开通过整体 toggle 完成。
-/// **Planned for V35+**：UI hit-test 接入鼠标 hover 单事件展开 + 键盘 Ctrl+E 聚焦展开。
-/// 调用方注册点：mouse 事件 dispatch 在 events area 命中 trace event 子块时 → 调此函数。
-#[allow(dead_code)] // V35+ hit-test 接入
-pub fn toggle_trace_event(state: &mut AppState, msg_idx: usize, part_idx: usize, event_id: u64) {
-    let mut toggled = false;
-    if let Some(msg) = state.messages.get_mut(msg_idx) {
-        let mut bi = 0;
-        for part in &mut msg.parts {
-            match part {
-                crate::tui::state::MsgContent::Block { .. } => bi += 1,
-                crate::tui::state::MsgContent::Trace { event_ids, expanded_event_ids, .. } => {
-                    if bi == part_idx && event_ids.contains(&event_id) {
-                        if expanded_event_ids.contains(&event_id) {
-                            expanded_event_ids.remove(&event_id);
-                        } else {
-                            expanded_event_ids.insert(event_id);
-                        }
-                        toggled = true;
-                        break;
-                    }
-                    bi += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    if toggled {
-        state.mark_dirty();
-    }
-}
-
 #[cfg(test)]
 mod ev10_panic_tests {
     use super::*;

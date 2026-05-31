@@ -692,9 +692,11 @@ impl AbacusServer {
             silent_router_enabled: silent_router,
             model_catalog,
             tool_visibility_threshold: abacus_types::VisibilityTier::D,
-            // Task #84/#87：默认开启路由 + 频率剪枝（与 CoreConfig::default 对齐）
-            task_kind_routing_enabled: true,
-            tool_frequency_pruning_turns: Some(20),
+            // Task #84/#87：按任务类型路由工具
+            task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
+            tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
+                .map(|n| n as u64)
+                .or(Some(20)),
             palace_sync_interval_turns: None,
             default_compress_level: abacus_core::core::context::CompressLevel::Brief,
             // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
@@ -716,6 +718,15 @@ impl AbacusServer {
             thresholds: abacus_core::core::ThresholdConfig::default(),
             prompt_roles_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/prompt_roles.toml")),
             subscenes_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/subscenes.toml")),
+            // 推演引擎
+            deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
+            deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),
+            deduction_prompt_impact: cfg_mgr.get_bool("deduction.prompt_impact").unwrap_or(true),
+            deduction_context_degradation: cfg_mgr.get_bool("deduction.context_degradation").unwrap_or(true),
+            // 认识论约束
+            epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
+            // 记忆宫殿
+            palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
         };
 
         // ─── Progressive Gate config ────────────────────────────────────

@@ -306,7 +306,7 @@ impl ModelCatalog {
         // thinking: 将字符串转为 ThinkingCapabilities
         // off → 清空 supported_modes; adaptive/low/medium/high/max → 设置对应模式
         if let Some(ref thinking_str) = entry.thinking {
-            use abacus_types::{ThinkingModeKind, ThinkingCapabilities, MultiTurnReplay, EffortLevel};
+            use abacus_types::{ThinkingModeKind, ThinkingCapabilities, EffortLevel};
             match thinking_str.as_str() {
                 "off" => {
                     spec.thinking_capabilities = ThinkingCapabilities::default();

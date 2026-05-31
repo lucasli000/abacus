@@ -39,21 +39,33 @@ use crate::tool::{ExecutionContext, ToolExecutor, ToolRegistry};
 /// - config_get: 遍历此列表输出所有键值
 /// - config_set: 校验 key 是否在此列表中
 const SUPPORTED_KEYS: &[&str] = &[
+    // ── 模型行为 ──
     "thinking",
     "max_turns",
     "max_tool_calls",
     "max_tokens",
     "temperature",
+    // ── 工具与路由 ──
     "scene_tool_loading",
     "task_kind_routing",
     "tool_frequency_pruning_turns",
     "adaptive_d_tier_hide",
     "silent_router",
     "max_escalations",
+    // ── 上下文与压缩 ──
     "compress_level",
     "context_ratio",
     "dedup_enabled",
     "turn_timeout",
+    // ── 推演引擎 ──
+    "deduction_observer_contamination",
+    "deduction_cross_session",
+    "deduction_prompt_impact",
+    "deduction_context_degradation",
+    // ── 认识论约束 ──
+    "epistemic_threshold",
+    // ── 记忆宫殿 ──
+    "palace_enabled",
 ];
 
 /// Runtime overrides 共享类型别名
@@ -176,6 +188,15 @@ impl ConfigToolExecutor {
                 CompressLevel::Detailed => "detailed".into(),
                 CompressLevel::Minimal => "minimal".into(),
             },
+            // ── 推演引擎 ──
+            "deduction_observer_contamination" => self.base_config.deduction_observer_contamination.to_string(),
+            "deduction_cross_session" => self.base_config.deduction_cross_session.to_string(),
+            "deduction_prompt_impact" => self.base_config.deduction_prompt_impact.to_string(),
+            "deduction_context_degradation" => self.base_config.deduction_context_degradation.to_string(),
+            // ── 认识论约束 ──
+            "epistemic_threshold" => self.base_config.epistemic_threshold.to_string(),
+            // ── 记忆宫殿 ──
+            "palace_enabled" => self.base_config.palace_enabled.to_string(),
             _ => "unknown".into(),
         }
     }
@@ -240,6 +261,29 @@ impl ConfigToolExecutor {
             "turn_timeout" => {
                 value.parse::<u64>().map_err(|_| KernelError::Other(format!(
                     "invalid u64 value for 'turn_timeout': '{}'", value
+                )))?;
+            }
+            // ── 推演引擎（bool）──
+            "deduction_observer_contamination"
+            | "deduction_cross_session"
+            | "deduction_prompt_impact"
+            | "deduction_context_degradation" => {
+                parse_bool(value).ok_or_else(|| KernelError::Other(format!(
+                    "invalid bool value for '{}': '{}'. Expected: true/false/1/0/on/off",
+                    key, value
+                )))?;
+            }
+            // ── 认识论约束（u32）──
+            "epistemic_threshold" => {
+                value.parse::<u32>().map_err(|_| KernelError::Other(format!(
+                    "invalid u32 value for 'epistemic_threshold': '{}'", value
+                )))?;
+            }
+            // ── 记忆宫殿（bool）──
+            "palace_enabled" => {
+                parse_bool(value).ok_or_else(|| KernelError::Other(format!(
+                    "invalid bool value for 'palace_enabled': '{}'. Expected: true/false/1/0/on/off",
+                    value
                 )))?;
             }
             _ => {}

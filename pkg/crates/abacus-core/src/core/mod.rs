@@ -721,6 +721,30 @@ pub struct CoreConfig {
     /// - 读取方: pipeline handle_model_escalation 决策升级目标模型
     /// - 生命周期: 进程启动时确定，session 内不变
     pub escalation_model: Option<ModelId>,
+
+    // ─── 推演引擎配置（LLM 可运行时修改）────────────────────────────────
+    /// 观察者污染检测开关
+    /// **Default: true**
+    pub deduction_observer_contamination: bool,
+    /// 跨会话模式提取开关
+    /// **Default: true**
+    pub deduction_cross_session: bool,
+    /// Prompt 影响追踪开关
+    /// **Default: true**
+    pub deduction_prompt_impact: bool,
+    /// Context 退化预测开关
+    /// **Default: true**
+    pub deduction_context_degradation: bool,
+
+    // ─── 认识论约束配置（LLM 可运行时修改）──────────────────────────────
+    /// 连续违规触发显式声明的阈值
+    /// **Default: 3**
+    pub epistemic_threshold: u32,
+
+    // ─── 记忆宫殿配置（LLM 可运行时修改）────────────────────────────────
+    /// 是否启用记忆宫殿（palace hints + 到期复习提醒）
+    /// **Default: true**
+    pub palace_enabled: bool,
 }
 
 impl Default for CoreConfig {
@@ -777,6 +801,15 @@ impl Default for CoreConfig {
             prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
             subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
             escalation_model: None,
+            // ─── 推演引擎 ──
+            deduction_observer_contamination: true,
+            deduction_cross_session: true,
+            deduction_prompt_impact: true,
+            deduction_context_degradation: true,
+            // ─── 认识论约束 ──
+            epistemic_threshold: 3,
+            // ─── 记忆宫殿 ──
+            palace_enabled: true,
         }
     }
 }
@@ -1406,18 +1439,6 @@ pub struct CoreLoop {
     /// 没注册到 cluster 的工具 render_hint_for 返 None，不破坏 description。
     pub(crate) cluster_registry: Arc<crate::tool::cluster::ClusterRegistry>,
 
-    // ─── P0-A1: ZeroShotCotHook 控制标志 ─────────────────────────────────
-    // 两个 Arc<AtomicBool> 与 ZeroShotCotHook 内部字段共享同一 Arc 实例，
-    // 允许 CoreLoop 在每轮 turn 开始前更新标志而无需锁争用。
-    //
-    // ## 引用关系
-    // - 创建：CoreLoop::new() 构建 ZeroShotCotHook 时同步返回
-    // - 写入：build_system_output() / TurnPipeline 在解析 thinking_intent 后调用
-    // - 读取：ZeroShotCotHook::should_inject()（通过 Arc 共享）
-    // - 生命周期：随 CoreLoop drop（Arc 引用计数归零，AtomicBool 释放）
-    pub(crate) cot_model_supports_native: Arc<std::sync::atomic::AtomicBool>,
-    pub(crate) cot_thinking_enabled: Arc<std::sync::atomic::AtomicBool>,
-
     /// 用户模型偏好（/model 命令选择 + alias 解析）
     ///
     /// ## 引用关系
@@ -1624,11 +1645,8 @@ impl CoreLoop {
         //
         // ## 引用关系
         // - hook 注册到 PromptAssembly，随 prompt_assembly 生命周期存活
-        // - cot_model_flag / cot_thinking_flag：Arc<AtomicBool> 持久化在 CoreLoop，
-        //   每轮 turn 解析 thinking_intent 后由 build_thinking_intent() 调用方更新
-        //   （两个 AtomicBool 通过 Arc 与 hook 内部字段共享同一实例）
-        // - 生命周期：hook 随 prompt_assembly drop；Arc 随 CoreLoop drop
-        let (cot_hook, cot_model_flag, cot_thinking_flag) =
+        // - 生命周期：hook 随 prompt_assembly drop
+        let (cot_hook, _cot_model_flag, _cot_thinking_flag) =
             crate::core::cot_hook::ZeroShotCotHook::new();
         prompt_assembly.register_hook(Box::new(cot_hook));
 
@@ -1732,7 +1750,7 @@ impl CoreLoop {
         ).await;
         // TokenBudgetMonitor：context window 容量取 default_max_tokens * 2（保守估计）
         let token_budget_monitor = token_budget::TokenBudgetMonitor::new(config.default_max_tokens as usize * 2);
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), cot_model_supports_native: cot_model_flag, cot_thinking_enabled: cot_thinking_flag, model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -3872,10 +3890,27 @@ impl CoreLoop {
         // - 依赖：last_tool_name（来自 session interaction_map）
         // - 消费方：LLM（通过 awareness_block 末尾 "Palace hints:" 行）
         //
+        // ## 消费协议
+        // Palace 提示不仅是建议——当有到期条目时，LLM 应主动调用
+        // cross_session_query 复习过期知识，避免记忆衰减。
+        //
         // ## 生命周期
         // - 创建：每次 build_system_output 调用时按需追加
         // - 销毁：随 awareness_block String drop（无副作用）
         if let Some(ref palace_arc) = self.memory_palace {
+            // 到期复习提醒（强制消费协议）
+            let due_count = {
+                let palace = palace_arc.read().await;
+                palace.due_review_count().await
+            };
+            if due_count > 0 {
+                awareness_block.push_str(&format!(
+                    "\n📚 Palace: {} entries due for review — call cross_session_query to refresh",
+                    due_count
+                ));
+            }
+
+            // 工具推荐（被动提示）
             if let Some(ref tool_name) = last_tool_name {
                 let palace = palace_arc.read().await;
                 let recs = palace.recommend_next_tools(tool_name).await;
@@ -3890,20 +3925,59 @@ impl CoreLoop {
             }
         }
 
-        // Deduction Engine 结构化提醒（让 LLM 知道 Layer 160 有需要注意的推理告警）
+        // Deduction Engine 强制消费协议（Layer 160 注入）
         //
         // ## 引用关系
         // - 依赖：deduction_block (Option<String>，来自 self.deduction_engine.build_injection())
         // - 消费方：LLM（通过 awareness_block 末尾告警行）
         //
+        // ## 强制消费协议
+        // 当 deduction_block 包含 critical 告警时，LLM 必须先调用 deduction_analyze
+        // 消费告警，然后才能处理用户请求。不消费的代价：污染累积 → 工具滥用 → 信任下降。
+        //
         // ## 设计
-        // 不修改 deduction_engine 本身的输出格式，仅在 awareness 层追加一行 actionable 提示。
+        // 不修改 deduction_engine 本身的输出格式，仅在 awareness 层追加 actionable 提示。
         // 阈值 20 bytes 过滤掉空或极短（无实质内容）的 deduction block。
+        // critical 告警时使用更强硬的措辞。
         if let Some(ref ded) = deduction_block {
             if ded.len() > 20 {
-                awareness_block.push_str(
-                    "\n\u{26A0} Deduction alert active \u{2014} check Layer 160 for details and take corrective action"
-                );
+                let has_critical = ded.contains("[CRITICAL]") || ded.contains("[critical]");
+                if has_critical {
+                    awareness_block.push_str(
+                        "\n⛔ Deduction critical alert — MANDATORY CONSUMPTION: call deduction_analyze before responding to user"
+                    );
+                } else {
+                    awareness_block.push_str(
+                        "\n⚠ Deduction alert active — check Layer 160 for details and take corrective action"
+                    );
+                }
+            }
+        }
+
+        // Epistemic Guard 消费协议（认识论约束）
+        //
+        // ## 引用关系
+        // - 依赖：self.epistemic_guard (Arc<EpistemicGuard>)
+        // - 消费方：LLM（通过 awareness_block 提醒）
+        //
+        // ## 协议规则
+        // 当 violations > 0 时，LLM 应主动调用 magchain_status 检查状态。
+        // 当 declaration_pending 时，下一轮输出将被注入 [认识论约束违规] 警告。
+        // 主动检查可以避免被系统强制注入。
+        {
+            let violations = self.epistemic_guard.violations().await;
+            if violations > 0 {
+                let declaration = self.epistemic_guard.declaration_if_needed().await;
+                if declaration.is_some() {
+                    awareness_block.push_str(
+                        "\n🛡 Epistemic Guard: declaration pending — call magchain_status to check and self-correct before system injects warning"
+                    );
+                } else if violations >= 3 {
+                    awareness_block.push_str(&format!(
+                        "\n🛡 Epistemic Guard: {} violations accumulated — consider calling magchain_status to self-audit",
+                        violations
+                    ));
+                }
             }
         }
 

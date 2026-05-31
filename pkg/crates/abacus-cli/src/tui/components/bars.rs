@@ -73,16 +73,7 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         state.theme.text_style(TextRole::BodyEmphasis),
     ));
 
-    // · 当前模式（i18n）
-    let mode_label = match state.mode {
-        crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
-        crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
-    };
-    left.push(Span::styled(" · ", Style::default().fg(state.theme.border).add_modifier(Modifier::DIM)));
-    left.push(Span::styled(
-        mode_label,
-        Style::default().fg(state.theme.accent),
-    ));
+    // Mode 标签不在 TopBar 重复显示（StatusBar 已有唯一模式指示）
 
     // V35: 策略执行徽章 — Plan/Team 策略运行时显示在模式标签旁
     // 检测依据: processing_phase 前缀（run.rs 写入时已加前缀 📋/🤖）
@@ -308,20 +299,17 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     } else { String::new() };
     let phase = if state.processing_phase.is_empty() { String::new() }
         else { format!(" {}", state.processing_phase) };
-    let mode_label = match state.mode {
-        crate::tui::state::AbacusMode::Clarify => t("mode.clarify"),
-        crate::tui::state::AbacusMode::Meeting => t("mode.meeting"),
-    };
+    // Mode 标签不在 InputBar 重复显示（StatusBar 已有唯一模式指示）
     let (status_text, status_color) = match state.input_state {
-        InputState::Thinking => (format!("{} {} {} {}{}", spinner(), t("event.thinking"), mode_label, phase, elapsed), state.theme.accent),
-        InputState::Executing => (format!("{} {} {} {}{}", spinner(), t("event.working"), mode_label, phase, elapsed), state.theme.gold),
-        InputState::Outputting => (format!("{} {} {}{}", spinner(), t("event.outputting"), mode_label, elapsed), state.theme.success),
+        InputState::Thinking => (format!("{} {}{}{}", spinner(), t("event.thinking"), phase, elapsed), state.theme.accent),
+        InputState::Executing => (format!("{} {}{}{}", spinner(), t("event.working"), phase, elapsed), state.theme.gold),
+        InputState::Outputting => (format!("{} {}{}", spinner(), t("event.outputting"), elapsed), state.theme.success),
         InputState::Paused => (format!("⏸ {}", t("hint.paused")), state.theme.semantic_fg(SemanticIntent::Warning)),
         _ if state.engine_handle.is_some() && state.inline_suggestion.is_some() => {
-            (format!("● {} · Tab ↵ {}", t("event.ready"), mode_label), state.theme.success)
+            (format!("● {} · Tab ↵", t("event.ready")), state.theme.success)
         }
-        _ if state.engine_handle.is_some() => (format!("● {} · {}", t("event.ready"), mode_label), state.theme.success),
-        _ => (format!("● {} · {}", t("event.ready"), mode_label), state.theme.muted),
+        _ if state.engine_handle.is_some() => (format!("● {}", t("event.ready")), state.theme.success),
+        _ => (format!("● {}", t("event.ready")), state.theme.muted),
     };
     input_lines.push(Line::from(vec![
         Span::styled(status_text, Style::default().fg(status_color)),
@@ -463,18 +451,11 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
     };
 
-    // 底行简化：左侧模式标识 + 右侧操作提示
-    // model/ctx 统计已迁移到右下角"健康"面板
-    let mode_span = Span::styled(
-        mode_label,
-        Style::default().fg(state.theme.muted),
-    );
-    let mode_w = display_width(mode_label);
+    // 底行：右侧操作提示（mode 标签仅在 StatusBar 显示，不重复）
     let right_w = display_width(right_hint_text);
-    let fill = inner.width.saturating_sub((mode_w + right_w) as u16).max(1);
+    let fill = inner.width.saturating_sub(right_w as u16).max(1);
 
     let bottom_spans = vec![
-        mode_span,
         Span::raw(" ".repeat(fill as usize)),
         Span::styled(right_hint_text, right_style),
     ];

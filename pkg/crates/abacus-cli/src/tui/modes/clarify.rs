@@ -11,22 +11,6 @@ use ratatui::Frame;
 
 use crate::tui::state::AppState;
 
-// V7 完善：z_index 渲染顺序参考（const 引用让 z_index 模块被实际使用，避免死码）
-// 实际渲染顺序由 render() 函数内部调用次序保证：背景 → 卡片 → 浮动 → 模态 → 覆盖 → 光标
-#[allow(dead_code)]
-const RENDER_LAYER_ORDER: [u8; 10] = [
-    crate::tui::theme::z_index::GLOBAL_BG,
-    crate::tui::theme::z_index::CARD_SHADOW,
-    crate::tui::theme::z_index::CARD_BG,
-    crate::tui::theme::z_index::CARD_BORDER,
-    crate::tui::theme::z_index::CARD_CONTENT,
-    crate::tui::theme::z_index::STATE_HIGHLIGHT,
-    crate::tui::theme::z_index::FLOATING,
-    crate::tui::theme::z_index::MODAL,
-    crate::tui::theme::z_index::OVERLAY,
-    crate::tui::theme::z_index::CURSOR,
-];
-
 pub fn render(f: &mut Frame, state: &AppState, terminal_rows: u16) {
     // Phase 3: 公共布局骨架（极小终端保护 + 背景 + 四段 Layout + top_bar）
     let Some(frame) = super::common::render_standard_frame(f, state, terminal_rows) else {

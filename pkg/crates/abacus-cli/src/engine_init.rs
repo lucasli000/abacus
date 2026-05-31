@@ -202,11 +202,17 @@ pub async fn create_engine(
         silent_router_enabled: silent_router,
         model_catalog,
         tool_visibility_threshold: abacus_types::VisibilityTier::D,
-        // Task #84/#87：默认开启路由 + 频率剪枝
-        task_kind_routing_enabled: true,
-        tool_frequency_pruning_turns: Some(20),
-        // V41: 默认每 5 轮同步一次到记忆宫殿（None = 关闭写入）
-        palace_sync_interval_turns: Some(5),
+        // Task #84/#87：按任务类型路由工具（减少 LLM 上下文噪声 1k-3k tokens/turn）
+        task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
+        // 频率剪枝：N turn 未调用的工具隐藏（None = 关闭）
+        tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
+            .map(|n| n as u64)
+            .or(Some(20)),
+        // 记忆宫殿同步频率：每 N 轮写一次（0 或缺省 = 关闭）
+        palace_sync_interval_turns: cfg_mgr.get_number("palace.sync_interval_turns")
+            .map(|n| n as u32)
+            .filter(|&n| n > 0)
+            .or(Some(5)),
         // V28.7: schema 演化补漏——CoreConfig 新增字段，与 abacus-core 默认值对齐
         default_compress_level: abacus_core::core::context::CompressLevel::Brief,
         // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
@@ -217,10 +223,10 @@ pub async fn create_engine(
         escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
             .filter(|s| !s.is_empty())
             .map(|s| abacus_types::ModelId(s.to_string())),
-        // V41: tool result dedup 默认开启（防止 LLM 对同一文件重复读取浪费 token）
-        tool_result_dedup_enabled: true,
-        tool_result_dedup_ttl_secs: 60,
-        tool_result_dedup_capacity_kb: 2048,
+        // Tool result dedup：相同幂等工具调用短 TTL 内复用结果
+        tool_result_dedup_enabled: cfg_mgr.get_bool("core.dedup.enabled").unwrap_or(true),
+        tool_result_dedup_ttl_secs: cfg_mgr.get_number("core.dedup.ttl_secs").map(|n| n as u64).unwrap_or(60),
+        tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(2048),
         adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),
         // cross-session: 默认开启 jsonl 事件流写入
         event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
@@ -229,6 +235,15 @@ pub async fn create_engine(
         thresholds: abacus_core::core::ThresholdConfig::default(),
         prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
         subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
+        // Deduction engine capabilities（默认全开）
+        deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
+        deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),
+        deduction_context_degradation: cfg_mgr.get_bool("deduction.context_degradation").unwrap_or(true),
+        deduction_prompt_impact: cfg_mgr.get_bool("deduction.prompt_impact").unwrap_or(true),
+        // 认识论约束：连续违规 N 次后强制 LLM 显式声明不确定性
+        epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
+        // 记忆宫殿：palace hints + 到期复习提醒
+        palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
     };
 
     let mut core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
