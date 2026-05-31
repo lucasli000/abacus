@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <code>v1.0.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
+  <code>v1.2.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
 </p>
 
 ---
@@ -107,66 +107,115 @@ Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning acro
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Prerequisites
+
+Abacus is a pre-compiled binary with **no runtime dependencies**. You only need:
+
+- **macOS** 12+ (Monterey) or **Linux** (glibc 2.31+, e.g. Ubuntu 20.04+)
+- A terminal emulator (Terminal.app, iTerm2, Warp, Kitty, Alacritty, etc.)
+- An LLM API key (DeepSeek / OpenAI / Anthropic / any OpenAI-compatible endpoint)
+
+For building from source, you additionally need:
+- Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- A C linker (macOS: Xcode Command Line Tools; Linux: `build-essential`)
+
 ## Install
 
-### Quick Install (macOS / Linux)
+### Option 1: One-line Install (Recommended)
 
 ```bash
 curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
 ```
 
-Custom install path:
+This auto-detects your platform (macOS/Linux, ARM64/x86_64), downloads the correct binary, and installs to `/usr/local/bin/`.
+
+To install to a custom path:
 
 ```bash
 INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
 ```
 
-### Manual Download
+### Option 2: Manual Download
 
-Download from [Releases](https://github.com/lucasli000/abacus/releases/latest):
+Go to [Releases](https://github.com/lucasli000/abacus/releases/latest) and download for your platform:
 
-| Platform | File |
-|----------|------|
-| macOS Apple Silicon | `abacus-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` |
+| Platform | File | Size |
+|----------|------|------|
+| macOS Apple Silicon (M1/M2/M3/M4) | `abacus-aarch64-apple-darwin.tar.gz` | ~19 MB |
+| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` | ~20 MB |
+| Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` | ~22 MB |
+| Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` | ~21 MB |
+
+Then install:
 
 ```bash
+# 1. Extract
 tar -xzf abacus-aarch64-apple-darwin.tar.gz
+
+# 2. Move to PATH
 sudo mv abacus /usr/local/bin/
-abacus --version
+
+# 3. (macOS only) Remove quarantine flag
+xattr -d com.apple.quarantine /usr/local/bin/abacus 2>/dev/null || true
+
+# 4. Verify
+abacus
 ```
 
-### From Source
+### Option 3: Build from Source
 
 ```bash
+# Install Rust (if not already)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+
+# Clone and build
 git clone https://github.com/lucasli000/abacus.git
 cd abacus/pkg
-cargo install --path crates/abacus-cli
+cargo build --release --package abacus-cli
+
+# Install
+sudo cp target/release/abacus /usr/local/bin/
 ```
 
-### Verify
+### First Run
 
 ```bash
-$ abacus --version
-abacus 1.0.0 (3b43be7d 2026-05-30)
+# Start Abacus — it launches a full-screen TUI
+abacus
 ```
 
-### Shell Completions
+On first run, a setup wizard will guide you through:
+1. Choosing an LLM provider (DeepSeek / OpenAI / Anthropic / custom)
+2. Entering your API key
+3. Selecting a default model
+
+Config is saved to `~/.abacus/config.yaml`. You can skip the wizard in CI:
 
 ```bash
-eval "$(abacus completions zsh)"    # Zsh
-eval "$(abacus completions bash)"   # Bash
-abacus completions fish | source    # Fish
+export ABACUS_API_KEY=sk-xxx
 ```
+
+### Verify Installation
+
+If Abacus launches and shows the TUI interface, installation is successful. The program uses the full terminal screen — press `Ctrl+D` or type `/quit` to exit.
 
 ### Uninstall
 
 ```bash
 rm /usr/local/bin/abacus
-rm -rf ~/.abacus  # Config + data (optional)
+rm -rf ~/.abacus  # Remove config + data (optional)
 ```
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `zsh: killed abacus` | macOS code signing issue. Run: `codesign --sign - --force /usr/local/bin/abacus` |
+| `permission denied` | Run: `chmod +x /usr/local/bin/abacus` |
+| `command not found` | Ensure `/usr/local/bin` is in your `$PATH` |
+| `"abacus" cannot be opened` (macOS) | Run: `xattr -d com.apple.quarantine /usr/local/bin/abacus` |
+| Blank screen / no output | Ensure your terminal supports alternate screen (most modern terminals do) |
 
 ## Features
 
@@ -232,8 +281,6 @@ abacus --model deepseek-v4 ask "optimize this"
 ```
 
 Auto-detects 9 providers from URL. Config: `~/.abacus/config.yaml`
-
-Skip wizard (CI): `export ABACUS_API_KEY=sk-xxx`
 
 ## Architecture
 
