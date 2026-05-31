@@ -2720,7 +2720,9 @@ fn index_code_file(content: &str, max_tokens: usize) -> Vec<IndexSegment> {
         let chunk_size = (content.len() / 5).max(100);
         let mut offset = 0;
         while offset < content.len() && budget > 0 {
-            let end = (offset + chunk_size).min(content.len());
+            let mut end = (offset + chunk_size).min(content.len());
+            // 确保 end 落在 char boundary 上
+            while end < content.len() && !content.is_char_boundary(end) { end += 1; }
             let chunk = &content[offset..end];
             let skel = chunk.lines().next().unwrap_or("").trim().to_string();
             let tok = estimate_tokens(&skel);

@@ -500,8 +500,10 @@ impl MapAnalyzer {
         let candidates = ["choose", "selected", "decided", "recommend", "prefer"];
         for kw in candidates {
             if let Some(pos) = lower.find(kw) {
-                let start = pos.saturating_sub(20);
-                let end = (pos + 30).min(output.len());
+                let mut start = pos.saturating_sub(20);
+                while start > 0 && !output.is_char_boundary(start) { start -= 1; }
+                let mut end = (pos + 30).min(output.len());
+                while end < output.len() && !output.is_char_boundary(end) { end += 1; }
                 let snippet = &output[start..end];
                 decisions.push(Decision {
                     description: Self::truncate(output, 80),
