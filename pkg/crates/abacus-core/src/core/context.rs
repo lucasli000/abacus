@@ -2481,7 +2481,8 @@ impl PromptConflictDetector {
         // 中文模式
         for pattern in ["不要", "禁止", "避免", "切勿", "别用", "不能"] {
             if let Some(pos) = lower.find(pattern) {
-                let end = (pos + pattern.len() + 60).min(lower.len());
+                let mut end = (pos + pattern.len() + 60).min(lower.len());
+                while end < lower.len() && !lower.is_char_boundary(end) { end += 1; }
                 let snippet = &lower[pos..end];
                 let topic = snippet.split(&['。', '！', '！', '.', '!', '\n'][..]).next().unwrap_or(snippet).to_string();
                 result.push((topic, snippet.to_string()));
@@ -2491,7 +2492,8 @@ impl PromptConflictDetector {
         let eng_patterns = ["never ", "do not ", "don't ", "avoid ", "must not ", "should not "];
         for pattern in eng_patterns {
             if let Some(pos) = lower.find(pattern) {
-                let end = (pos + pattern.len() + 80).min(lower.len());
+                let mut end = (pos + pattern.len() + 80).min(lower.len());
+                while end < lower.len() && !lower.is_char_boundary(end) { end += 1; }
                 let snippet = lower[pos..end].to_string();
                 let topic = snippet.split(&['.', '!', '\n'][..]).next().unwrap_or(&snippet).to_string();
                 result.push((topic, snippet));
@@ -2506,7 +2508,11 @@ impl PromptConflictDetector {
         let patterns = ["请", "必须", "优先", "推荐", "always ", "must ", "prefer ", "always use ", "recommend "];
         for pattern in patterns {
             if let Some(pos) = lower.find(pattern) {
-                let end = (pos + pattern.len() + 80).min(lower.len());
+                let mut end = (pos + pattern.len() + 80).min(lower.len());
+                // 确保 end 落在 char boundary 上（中文字符 3 字节，直接截断会 panic）
+                while end < lower.len() && !lower.is_char_boundary(end) {
+                    end += 1;
+                }
                 let snippet = lower[pos..end].to_string();
                 let topic = snippet.split(&['。', '！', '！', '.', '!', '\n'][..]).next().unwrap_or(&snippet).to_string();
                 result.push((topic, snippet));
