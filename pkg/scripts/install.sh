@@ -77,6 +77,12 @@ main() {
 
     tar -xzf "$tmp/${filename}" -C "$tmp"
 
+    # 确保安装目录存在（新 Mac 默认无 /usr/local/bin）
+    if [ ! -d "$INSTALL_DIR" ]; then
+        echo "Creating ${INSTALL_DIR}..."
+        sudo mkdir -p "$INSTALL_DIR"
+    fi
+
     # 安装
     if [ -w "$INSTALL_DIR" ]; then
         mv "$tmp/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
