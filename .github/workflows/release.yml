@@ -64,6 +64,14 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --package abacus-cli --target ${{ matrix.target }}
 
+      - name: Install protoc in cross container (Linux aarch64)
+        if: matrix.cross
+        run: |
+          # Cross uses Docker; protoc must be available inside the container.
+          # Set CROSS_CONTAINER_OPTS to install protoc before build.
+          echo '[target.aarch64-unknown-linux-gnu]' > Cross.toml
+          echo 'pre-build = ["apt-get update && apt-get install -y protobuf-compiler"]' >> Cross.toml
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --package abacus-cli --target ${{ matrix.target }}
