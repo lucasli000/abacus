@@ -216,7 +216,19 @@ rm -rf ~/.abacus  # Remove config + data (optional)
 | `permission denied` | Run: `chmod +x /usr/local/bin/abacus` |
 | `command not found` | Ensure `/usr/local/bin` is in your `$PATH` |
 | `"abacus" cannot be opened` (macOS) | Run: `xattr -d com.apple.quarantine /usr/local/bin/abacus` |
+| `Error in the HTTP2 framing layer` | Network issue (common in China). Use mirror: see below |
 | Blank screen / no output | Ensure your terminal supports alternate screen (most modern terminals do) |
+
+**China mainland users** — if downloads fail due to network issues:
+
+```bash
+# Option A: Use mirror proxy
+curl -fsSL https://gh-proxy.com/https://github.com/lucasli000/abacus/releases/download/v1.2.0/abacus-aarch64-apple-darwin.tar.gz | tar -xz
+sudo mv abacus /usr/local/bin/
+
+# Option B: Use local SOCKS proxy
+curl -x socks5://127.0.0.1:7890 -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
+```
 
 ## Features
 
