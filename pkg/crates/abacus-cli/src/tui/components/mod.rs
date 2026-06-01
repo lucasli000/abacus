@@ -1303,8 +1303,21 @@ pub fn render_messages_in_card(
                 match entry {
                     TimelineEntry::Thinking { summary } => {
                         let id = next_id; next_id += 1;
+                        // V43.5: streaming thinking 展示完整内容（取最近 8 行）
+                        // 原 summary 只有 2 行预览，用户反馈"看不到 thinking"
+                        let full = if state.streaming_thinking.is_empty() {
+                            summary.clone()
+                        } else {
+                            // 取 streaming_thinking 最近 8 行非空内容
+                            let recent: Vec<&str> = state.streaming_thinking.lines()
+                                .filter(|l| !l.trim().is_empty())
+                                .collect::<Vec<_>>()
+                                .into_iter().rev().take(8).rev()
+                                .collect();
+                            recent.join("\n")
+                        };
                         blocks.push(StreamingBlock::Thinking {
-                            id, summary: summary.clone(), full_text: String::new(),
+                            id, summary: full, full_text: String::new(),
                             collapsed: false, duration_ms: None,
                         });
                     }
@@ -1629,10 +1642,10 @@ fn render_streaming_blocks(
                         Span::styled(format!("  {}", meta), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                     ]));
                 } else {
-                    // 展开态：顶部边界 + 内容（最多 5 行）+ 底部边界
+                    // 展开态：顶部边界 + 内容（最多 8 行）+ 底部边界
                     // wrap 宽度与消息流正文一致（prose_width），前缀 `│ ` 不额外扣减
                     let wrap_w = prose_width;
-                    let max_visible = 5;
+                    let max_visible = 8;
                     let visible_lines = if think_lines.len() > max_visible {
                         &think_lines[..max_visible]
                     } else {
