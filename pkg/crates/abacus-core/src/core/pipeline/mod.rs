@@ -22,6 +22,8 @@ use crate::llm::{
 use crate::mcip::McipDecision;
 use crate::skill::SkillCandidate;
 
+use crate::core::fallible::MutexExt;
+
 use super::CoreLoop;
 use super::SessionState;
 use super::TurnResult;
@@ -556,14 +558,22 @@ impl<'a> TurnPipeline<'a> {
 
         let turn_number = { let s = self.session.read().await; s.turn_count + 1 };
 
-        if turn_number == 1 {
-            if let Some(ref spec) = self.core.config.model_spec {
-                // 可用窗口 = 模型最大上下文 × ratio，下限 128K
-                // ratio 由用户配置 core.context_window_ratio（默认 1.0 = 全用；旧配置可能为 0.5）
-                let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
-                let available = ((spec.context_window as f64 * ratio) as usize).max(128_000);
-                self.core.context_manager.set_window(available, spec.context_window);
-            }
+        // V43.2: context_window 跟随当前活跃模型（per-model，非全局）
+        // 每轮 turn 1 或模型切换后重新从 ModelCatalog 查询 context_window
+        // 引用关系：ModelCatalog.lookup_or_default() → spec.context_window
+        {
+            let effective_model = self.req_ctx.model.clone()
+                .unwrap_or_else(|| self.core.config.default_model.clone());
+            let spec = if let Some(ref catalog) = self.core.config.model_catalog {
+                catalog.lookup_or_default(&effective_model)
+            } else if let Some(ref s) = self.core.config.model_spec {
+                std::sync::Arc::new(s.clone())
+            } else {
+                std::sync::Arc::new(abacus_types::ModelSpec::default())
+            };
+            let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
+            let available = ((spec.context_window as f64 * ratio) as usize).max(128_000);
+            self.core.context_manager.set_window(available, spec.context_window);
         }
 
         // Progressive Output: complexity analysis + strategy decision（RequestContext 可跳过）
@@ -878,24 +888,18 @@ impl<'a> TurnPipeline<'a> {
         // - 消费: execute_loop 中每次 provider.complete_cancellable() 的 tokio::time::timeout
         // - 数据源: thinking level（主因子，决定 LLM 单次推理上限）
         let estimated_timeout = {
-            // 基准：按 thinking depth 决定单次 LLM 调用超时
-            let t = if let Some(ref ti) = complexity_thinking {
+            // V43.1: 统一 per-call timeout 为 600s
+            // 原因：thinking 模型（deepseek-v4-flash 等）推理时间不可预测，
+            // Medium 任务也可能需要 5+ 分钟。300s 导致频繁误杀。
+            // 无 thinking 的纯 completion 也给足余量（避免大上下文慢响应被截）。
+            let t: u64 = if let Some(ref ti) = complexity_thinking {
                 match ti {
-                    abacus_types::ThinkingIntent::Effort(e) => match e {
-                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => 600,
-                        abacus_types::EffortLevel::Medium => 300,
-                        abacus_types::EffortLevel::Low => 180,
-                        _ => 300,
-                    },
-                    abacus_types::ThinkingIntent::Adaptive => 300,
-                    abacus_types::ThinkingIntent::Budget(_) => 600,
-                    abacus_types::ThinkingIntent::Off => 120,
+                    abacus_types::ThinkingIntent::Off => 300, // 无思考：300s 足够
+                    _ => 600, // 有思考：统一 600s
                 }
             } else {
-                // 无 thinking（纯 completion）— 120s 足够
-                120
+                300 // 无 thinking intent（纯 completion）
             };
-            // 上限：provider 级别超时（默认 600s）
             t.min(self.core.config.thresholds.turn_provider_timeout_secs)
         };
 
@@ -2704,7 +2708,7 @@ impl<'a> TurnPipeline<'a> {
                             let (tx_one, rx_one) = tokio::sync::oneshot::channel::<bool>();
                             {
                                 let s = self.session.read().await;
-                                s.mcip_confirm_channels.lock().unwrap().insert(nonce.clone(), tx_one);
+                                s.mcip_confirm_channels.lock_or_recover().insert(nonce.clone(), tx_one);
                             }
                             // V30: bash 命令预览——让用户在弹窗中看到具体命令
                             let preview = serde_json::to_string(&params)
