@@ -580,18 +580,19 @@ impl LlmProvider for OpenAICompatibleProvider {
             if status.as_u16() == 401 {
                 return Err(KernelError::Unauthorized(body_text));
             }
-            // V18：openai-compatible 路径错误增强
-            let summary = body.messages.iter().enumerate()
-                .map(|(i, m)| format!("  [{}] role={}", i, m.role))
-                .collect::<Vec<_>>().join("\n");
-            let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            // V43.4: 清洗错误响应——HTML 页面只取 title，不暴露原始 HTML/JS
+            let clean_body = if body_text.contains("<html") || body_text.contains("<!DOCTYPE") {
+                let title = body_text.find("<title>")
+                    .and_then(|s| body_text[s+7..].find("</title>").map(|e| &body_text[s+7..s+7+e]));
+                title.unwrap_or("(HTML error page)").to_string()
             } else {
-                String::new()
+                let mut end = body_text.len().min(300);
+                while end < body_text.len() && !body_text.is_char_boundary(end) { end += 1; }
+                body_text[..end].to_string()
             };
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18 openai-compat) ---\nbase_url={}\nmessages:\n{}{}",
-                body_text, self.base_url, summary, wire_hint
+                "HTTP {} from {}: {}",
+                status.as_u16(), self.base_url, clean_body
             );
             return Err(KernelError::ApiError {
                 status: status.as_u16(),
@@ -671,21 +672,24 @@ impl LlmProvider for OpenAICompatibleProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamEvent::Error(
-                format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
-            ));
-            // V18：openai-compatible streaming 错误增强
-            let summary = body.messages.iter().enumerate()
-                .map(|(i, m)| format!("  [{}] role={}", i, m.role))
-                .collect::<Vec<_>>().join("\n");
-            let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            // V43.4: 清洗 HTML 响应——只保留有意义的错误信息，不展示原始 HTML/JS
+            let clean_body = if body_text.contains("<html") || body_text.contains("<!DOCTYPE") {
+                // HTML 响应 → 提取 title 或前 100 字符纯文本
+                let title = body_text.find("<title>")
+                    .and_then(|s| body_text[s+7..].find("</title>").map(|e| &body_text[s+7..s+7+e]));
+                title.unwrap_or("(HTML error page)").to_string()
             } else {
-                String::new()
+                // JSON/text → 截断到 200 字符
+                let mut end = body_text.len().min(200);
+                while end < body_text.len() && !body_text.is_char_boundary(end) { end += 1; }
+                body_text[..end].to_string()
             };
+            let _ = tx.send(StreamEvent::Error(
+                format!("HTTP {}: {}", status.as_u16(), clean_body)
+            ));
             let enriched = format!(
-                "{}\n--- REQ DUMP (V18 openai-compat stream) ---\nbase_url={}\nmessages:\n{}{}",
-                body_text, self.base_url, summary, wire_hint
+                "HTTP {} from {}: {}",
+                status.as_u16(), self.base_url, clean_body
             );
             return Err(KernelError::ApiError { status: status.as_u16(), body: enriched });
         }
