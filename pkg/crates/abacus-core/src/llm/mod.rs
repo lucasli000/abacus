@@ -60,13 +60,15 @@ pub fn shared_http_client() -> &'static reqwest::Client {
             // 连接超时：防止 DNS 解析/TCP 握手卡住（默认无限等待）
             .connect_timeout(std::time::Duration::from_secs(10))
             // 不设 Client-level timeout — 让 provider per-request timeout 生效
-            // 原 300s 硬限导致 thinking 模型（需 600s）被提前截断
             // 兜底由 pipeline dynamic_timeout_secs + select! deadline 保障
-            // 连接池
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(32)
-            // TCP keepalive：及时发现断连（防止长时间挂起在死连接上）
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            // V43.3: 连接池——缩短 idle timeout 防止死连接累积
+            // 问题：长 session 中服务端可能发 GOAWAY/RST_STREAM，但客户端连接池
+            // 还持有旧连接引用，下次请求直接用死连接→失败→重试也失败（池里都是死的）
+            // 修复：idle 30s 即回收（原 90s），强制下次请求建新连接
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(8) // 减少池大小，加速死连接淘汰
+            // TCP keepalive：及时发现断连
+            .tcp_keepalive(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_default()
     })
