@@ -83,13 +83,13 @@ Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning acro
 One command, auto-detects your platform:
 
 ```bash
-curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3/install.sh" | bash
+curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3.3/install.sh" | bash
 ```
 
 Default install path: `/usr/local/bin/abacus`. Custom path:
 
 ```bash
-INSTALL_DIR=~/.local/bin curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3/install.sh" | bash
+INSTALL_DIR=~/.local/bin curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3.3/install.sh" | bash
 ```
 
 ### Manual Download
@@ -104,7 +104,7 @@ Download from [Releases](https://github.com/lucasli000/abacus/releases/latest) a
 
 ```bash
 # macOS Apple Silicon
-curl -fsSL -o abacus.tar.gz "https://github.com/lucasli000/abacus/releases/download/v1.3/abacus-aarch64-apple-darwin.tar.gz"
+curl -fsSL -o abacus.tar.gz "https://github.com/lucasli000/abacus/releases/download/v1.3.3/abacus-aarch64-apple-darwin.tar.gz"
 tar xzf abacus.tar.gz
 sudo mv abacus /usr/local/bin/
 sudo xattr -cr /usr/local/bin/abacus   # Remove quarantine (macOS)
@@ -119,7 +119,7 @@ abacus --version
 If you have GitHub CLI installed (works even when curl to GitHub fails):
 
 ```bash
-gh release download v1.3 -R lucasli000/abacus -p "abacus-aarch64-apple-darwin.tar.gz"
+gh release download v1.3.3 -R lucasli000/abacus -p "abacus-aarch64-apple-darwin.tar.gz"
 tar xzf abacus-aarch64-apple-darwin.tar.gz
 sudo mv abacus /usr/local/bin/
 sudo xattr -cr /usr/local/bin/abacus
