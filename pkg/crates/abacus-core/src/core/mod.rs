@@ -92,6 +92,7 @@ use crate::sandbox::{SandboxOrchestrator, SandboxToolExecutor, SandboxConfig};
 use crate::tool::builtin::filengine::FilengineSession;
 use crate::tool::effectiveness::EffectivenessTracker;
 use crate::tool::ToolRegistry;
+use crate::core::fallible::RwLockExt;
 use crate::core::pipeline::TurnPipeline;
 use crate::llm::providers::openai_compatible::OpenAICompatibleProvider;
 use crate::llm::providers::anthropic::AnthropicProvider;
@@ -3073,7 +3074,7 @@ impl CoreLoop {
         // 写入 Always 授权到 session；收集 Once 授权到临时集合
         {
             let s = session.read().await;
-            let mut grants = s.mcip_grants.write().unwrap();
+            let mut grants = s.mcip_grants.write_or_recover();
             for (tool_id, decision) in decisions {
                 match decision {
                     McipGrantDecision::Always => { grants.insert(tool_id.clone()); }
@@ -3300,6 +3301,36 @@ impl CoreLoop {
 
         // 记忆宫殿开关（palace_enabled=false 时不注入 palace hints）
         // 注：palace_enabled 由 build_system_output 中的 awareness 层读取
+    }
+
+    /// 读取 threshold 值——优先 runtime override，fallback 到 config.thresholds
+    ///
+    /// ## 引用关系
+    /// - 调用方: pipeline 中所有读取 timeout/threshold 的位置
+    /// - 数据源: runtime_overrides (config_set 写入) > config.thresholds (启动时固定)
+    pub fn threshold_u64(&self, key: &str) -> u64 {
+        if let Some(v) = crate::tool::builtin::config::read_override_u64(&self.runtime_overrides, key) {
+            return v;
+        }
+        match key {
+            "turn_timeout" => self.config.thresholds.turn_provider_timeout_secs,
+            "bash_timeout" => self.config.thresholds.tool_bash_timeout_secs,
+            "tool_timeout" => self.config.thresholds.tool_default_timeout_secs,
+            "subagent_timeout" => self.config.thresholds.subagent_max_duration_secs,
+            "confirm_timeout" => self.config.thresholds.confirm_timeout_secs,
+            "max_turn_timeout" => self.config.thresholds.max_turn_timeout_secs.unwrap_or(1800),
+            _ => 0,
+        }
+    }
+
+    pub fn threshold_f64(&self, key: &str) -> f64 {
+        if let Some(v) = crate::tool::builtin::config::read_override_f64(&self.runtime_overrides, key) {
+            return v;
+        }
+        match key {
+            "context_compress_ratio" => self.config.thresholds.context_compress_ratio,
+            _ => 0.0,
+        }
     }
 
     /// 获取记忆宫殿引用（TUI 面板数据拉取用）
@@ -4554,7 +4585,7 @@ Output JSON:
             // 如果已在 always_allow / mcip_grants 中，直接告知 LLM 已授权，无需等待
             "session_request_permission" => {
                 let requested_tool = params.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
-                let grants = s.mcip_grants.read().unwrap();
+                let grants = s.mcip_grants.read_or_recover();
                 let already_granted = grants.contains(requested_tool);
                 drop(grants);
                 drop(map);
@@ -4641,24 +4672,27 @@ Output JSON:
             tracing::warn!(forced_provider = %forced_id, "forced_provider not found, falling back to normal resolution");
         }
 
-        // 0. 优先使用 FallbackProvider（双协议自动回退）
-        if let Some(provider) = providers.get("primary") {
-            return Ok(("primary".into(), provider.clone()));
-        }
-
-        // 1. 精确匹配：按 provider_id 查
-        if let Some(provider) = providers.get(&model) {
-            return Ok((model.clone(), provider.clone()));
-        }
-
-        // 2. 厂商分组匹配：模型名是否属于某个分组
+        // 1. 厂商分组匹配：按模型名查找所属的 provider_group
+        //    这是多 provider 场景的主路由——default_model 是裸模型名，
+        //    需要在所有 provider_group 中查找哪个 group 支持该模型
         for group in self.provider_groups.read().await.iter() {
             if group.supports(&model) {
                 return Ok((group.id.clone(), group.provider.clone()));
             }
         }
 
-        // 3. CapabilityHub 路由
+        // 2. "primary" fallback chain（无分组匹配时的向后兼容）
+        //    注意：不能放在步骤 1 前面，否则永远走 primary 跳过分组匹配
+        if let Some(provider) = providers.get("primary") {
+            return Ok(("primary".into(), provider.clone()));
+        }
+
+        // 3. 精确匹配：按 provider_id 查（旧路径兼容）
+        if let Some(provider) = providers.get(&model) {
+            return Ok((model.clone(), provider.clone()));
+        }
+
+        // 4. CapabilityHub 路由
         let request = CapabilityRequest {
             kind: CapabilityKind::LlmCompletion {
                 model: model.clone(),
@@ -4673,7 +4707,7 @@ Output JSON:
             }
         }
 
-        // 4. Fallback: 第一个已注册 provider
+        // 5. Fallback: 第一个已注册 provider
         if let Some((id, provider)) = providers.iter().next() {
             return Ok((id.clone(), provider.clone()));
         }

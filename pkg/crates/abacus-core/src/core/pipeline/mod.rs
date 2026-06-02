@@ -424,7 +424,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-        let timeout_secs = self.core.config.thresholds.turn_provider_timeout_secs;
+        let timeout_secs = self.core.threshold_u64("turn_timeout");
         let provider_timeout = std::time::Duration::from_secs(timeout_secs);
         let response = match tokio::time::timeout(provider_timeout, provider.complete_cancellable(req, self.cancel_token())).await {
             Ok(result) => result?,
@@ -900,7 +900,7 @@ impl<'a> TurnPipeline<'a> {
             } else {
                 300 // 无 thinking intent（纯 completion）
             };
-            t.min(self.core.config.thresholds.turn_provider_timeout_secs)
+            t.min(self.core.threshold_u64("turn_timeout"))
         };
 
         Ok(TurnContext {
@@ -2046,7 +2046,7 @@ impl<'a> TurnPipeline<'a> {
             // 因为 agentic 循环中多次 tool call + LLM 调用总时间自然累加
             if !ctx.time_warning_emitted {
                 let elapsed = ctx.turn_started_at.elapsed();
-                let turn_budget_secs = self.core.config.thresholds.max_turn_timeout_secs.unwrap_or(1800);
+                let turn_budget_secs = self.core.threshold_u64("max_turn_timeout");
                 let budget = std::time::Duration::from_secs(turn_budget_secs);
                 if elapsed > budget.mul_f64(0.6) {
                     ctx.time_warning_emitted = true;
@@ -3358,7 +3358,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（escalation 路径同样受保护）
-        let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
+        let provider_timeout = std::time::Duration::from_secs(self.core.threshold_u64("turn_timeout"));
         let escalation_result = match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(escalated_req, self.cancel_token())).await {
             Ok(result) => result,
             Err(_elapsed) => {
