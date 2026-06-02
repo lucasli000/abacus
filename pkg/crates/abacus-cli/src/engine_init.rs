@@ -202,6 +202,7 @@ pub async fn create_engine(
         model_catalog,
         tool_visibility_threshold: abacus_types::VisibilityTier::D,
         // Task #84/#87：按任务类型路由工具（减少 LLM 上下文噪声 1k-3k tokens/turn）
+        auto_escalation: cfg_mgr.get_bool("core.auto_escalation").unwrap_or(false),
         task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
         // 频率剪枝：N turn 未调用的工具隐藏（None = 关闭）
         tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")

@@ -404,9 +404,14 @@ impl<'a> TurnPipeline<'a> {
 
         // V35-1: continue_gated 路径同步注入 prefix message（与 execute_loop 对齐）
         // 优先级与 execute_loop 一致：req_ctx.model > model_override > default
-        let cg_model = self.req_ctx.model.clone()
+        let cg_model_raw = self.req_ctx.model.clone()
             .or(self.core.get_model_override().await)
             .unwrap_or_else(|| self.core.config.default_model.clone());
+        // 提取裸 model name（去掉 "provider:" 前缀）
+        let cg_model = {
+            let qid = abacus_types::QualifiedModelId::parse(&cg_model_raw.0);
+            ModelId(qid.model_name().to_string())
+        };
         maybe_inject_prefix_message(
             &mut messages,
             &cg_model.0,
@@ -1328,27 +1333,34 @@ impl<'a> TurnPipeline<'a> {
             // 不把 model_override 放进 req_ctx.model（那是 per-request），而是作为 session 级默认
             // 优先级：req_ctx.model（显式单请求覆盖）> model_override（用户 /model 设置）> escalated > default
             let model_override = self.core.get_model_override().await;
-            let effective_model = self.req_ctx.model.clone()
+            let effective_model_raw = self.req_ctx.model.clone()
                 .or(model_override)
                 .or(escalated)
                 .unwrap_or_else(|| self.core.config.default_model.clone());
+            // V44: 提取裸 model name——去掉 "provider:" 前缀（API 只接受裸名）
+            // 例：ModelId("DS:deepseek-v4-flash") → ModelId("deepseek-v4-flash")
+            let effective_model = {
+                let qid = abacus_types::QualifiedModelId::parse(&effective_model_raw.0);
+                ModelId(qid.model_name().to_string())
+            };
             // V44: 同步到 ctx，让 TurnStats 报告实际使用的 model（修复 /model 切换后显示回退 bug）
             ctx.effective_model = effective_model.clone();
-            // V44: provider 热修正——当 effective_model 变化需要不同 provider 时，重新解析
-            // 场景：escalated_model 指向另一个 provider / 用户切换后首次进入 loop
-            // 代价：每轮一次 resolve（读锁，μs 级）；仅在 provider_id 确实不同时做重赋值
-            if let Some(new_pid) = self.core.resolve_provider_id_for_model(&effective_model.0).await {
-                if new_pid != ctx.provider_id {
-                    // Provider 需要切换
-                    if let Ok((pid, prov)) = self.core.resolve_provider_with_hint(None).await {
+            // V44: provider 热修正——仅首轮(loop_iter==0)检查一次
+            // setup 阶段已经用 model_override 解析了 provider，多轮 loop 内 model 不会变
+            // （escalation 在 handle_model_escalation 中有独立的 provider 重解析）
+            if loop_iter == 0 {
+                // 用 resolve_provider_with_hint（读 model_override，含 qualified 路由）做权威解析
+                // 只有结果与 setup 不同时才切换（避免 priority 歧义导致误切）
+                if let Ok((resolved_pid, resolved_prov)) = self.core.resolve_provider_with_hint(None).await {
+                    if resolved_pid != ctx.provider_id {
                         tracing::info!(
                             old_provider = %ctx.provider_id,
-                            new_provider = %pid,
+                            new_provider = %resolved_pid,
                             model = %effective_model.0,
                             "execute_loop: provider hot-switch for model change"
                         );
-                        ctx.provider_id = pid;
-                        ctx.provider = prov;
+                        ctx.provider_id = resolved_pid;
+                        ctx.provider = resolved_prov;
                     }
                 }
             }
@@ -1722,6 +1734,18 @@ impl<'a> TurnPipeline<'a> {
                 Err(e) => {
                     let err_str = e.to_string();
                     let is_net = is_network_error(&err_str);
+                    // V44: auth 错误(401/403)不 retry——重试不会修复 key 问题，直接报错
+                    let is_auth_error = err_str.contains("401") || err_str.contains("403")
+                        || err_str.contains("Unauthorized") || err_str.contains("Forbidden")
+                        || err_str.contains("Authentication");
+                    if is_auth_error {
+                        if let Some(ref stx) = self.stream_tx {
+                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
+                                format!("⚠️ 认证失败：{}。请检查 API Key 配置（/config）。", e)
+                            ));
+                        }
+                        return Err(KernelError::Provider(format!("Authentication failed: {}", e)));
+                    }
 
                     ctx.provider_retries += 1;
                     if ctx.provider_retries <= 2 {
@@ -2042,9 +2066,11 @@ impl<'a> TurnPipeline<'a> {
                     break;
                 }
 
-                // Model Self-Escalation (flash → pro)
-                if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
-                    return Ok(Some(result));
+                // Model Self-Escalation (flash → pro) — 默认关闭，config.yaml `core.auto_escalation: true` 启用
+                if self.core.config.auto_escalation {
+                    if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
+                        return Ok(Some(result));
+                    }
                 }
 
                 // Progressive Output gate check
@@ -3293,9 +3319,33 @@ impl<'a> TurnPipeline<'a> {
         if !text.starts_with("[ESCALATE]") && !text.starts_with("[escalate]") {
             return Ok(None);
         }
-        let escalate_to = "deepseek-v4-pro";
-        let current_model = &self.core.config.default_model.0;
-        if current_model.contains("pro") {
+        // V44: 不再 hardcode escalation target——从同 provider 的 model 列表选择更强模型
+        // 规则：当前 model 含 "flash"/"mini"/"lite" → 尝试同 provider 的 "pro"/"max" 变体
+        // 找不到 → 放弃 escalation（不跨 provider 切换，避免 auth 错误）
+        let current_model = ctx.effective_model.0.clone();
+        let escalate_to = {
+            let groups = self.core.provider_groups.read().await;
+            let mut target: Option<String> = None;
+            for group in groups.iter() {
+                if group.supports(&current_model) {
+                    // 在同 provider 中找更强的 model
+                    for m in &group.models {
+                        let name = m.0.as_str();
+                        if name != current_model && (name.contains("pro") || name.contains("max") || name.contains("plus")) {
+                            target = Some(name.to_string());
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            match target {
+                Some(t) => t,
+                None => return Ok(None), // 同 provider 无更强 model，放弃 escalation
+            }
+        };
+        // 如果当前已经是 pro/max 级别，不再 escalate
+        if current_model.contains("pro") || current_model.contains("max") {
             return Ok(None);
         }
 
@@ -3398,7 +3448,7 @@ impl<'a> TurnPipeline<'a> {
         };
         maybe_inject_prefix_message(
             &mut messages,
-            escalate_to,
+            &escalate_to,
             self.req_ctx.prefix_assistant_content.as_deref(),
         );
         let escalated_req = LlmRequest {

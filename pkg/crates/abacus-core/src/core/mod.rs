@@ -571,6 +571,10 @@ pub struct CoreConfig {
     /// ## 何时启用
     /// 工具集 ≥ 30 且任务类型差异明显（code/debug/analysis）→ 启用可显著缩短 LLM 选择空间，
     /// 配合工具的 applicable_task_kinds 白名单使用。
+    /// Model Self-Escalation：是否允许 LLM 自动升级到同 provider 更强模型
+    /// **Default: false**（默认关闭——避免非预期的 model 切换和费用增加）
+    /// 启用方式：config.yaml `core.auto_escalation: true`
+    pub auto_escalation: bool,
     pub task_kind_routing_enabled: bool,
     /// Phase α-S：是否启用场景化工具加载（只发场景相关工具的完整 schema）
     ///
@@ -793,6 +797,7 @@ impl Default for CoreConfig {
             // Phase β-D 默认开启（Task #84）：按 task_kind 过滤工具，每轮省 1k-3k tokens
             // 引用关系：被 build_tool_definitions_for 在 routing_active 路径消费
             // 副作用：未标 applicable_task_kinds 的工具仍全可见——透明降级
+            auto_escalation: false,
             task_kind_routing_enabled: true,
             // Phase α-S 默认开启：场景化工具加载——按 task_kind 前缀过滤，每轮省 2k-5k tokens
             // 引用关系：被 build_tool_definitions_for（Phase α-S 分支）消费
@@ -3505,16 +3510,14 @@ impl CoreLoop {
     }
 
     /// List supported models from all registered providers.
+    /// 列出所有已注册 model（格式: "provider:model"）
+    /// 用户可用返回的格式直接传给 /model 命令
     pub async fn list_models(&self) -> Vec<String> {
-        let providers = self.providers.read().await;
-        let mut models: Vec<String> = Vec::new();
-        for (_, p) in providers.iter() {
-            for m in p.supported_models() {
-                models.push(m.0);
-            }
-        }
+        let all = self.provider_registry.list_all().await;
+        let mut models: Vec<String> = all.iter()
+            .map(|(pid, mid)| format!("{}:{}", pid.0, mid.0))
+            .collect();
         models.sort();
-        models.dedup();
         models
     }
 
@@ -4052,21 +4055,8 @@ impl CoreLoop {
         // ## 设计
         // 不修改 deduction_engine 本身的输出格式，仅在 awareness 层追加 actionable 提示。
         // 阈值 20 bytes 过滤掉空或极短（无实质内容）的 deduction block。
-        // critical 告警时使用更强硬的措辞。
-        if let Some(ref ded) = deduction_block {
-            if ded.len() > 20 {
-                let has_critical = ded.contains("[CRITICAL]") || ded.contains("[critical]");
-                if has_critical {
-                    awareness_block.push_str(
-                        "\n⛔ Deduction critical alert — MANDATORY CONSUMPTION: call deduction_analyze before responding to user"
-                    );
-                } else {
-                    awareness_block.push_str(
-                        "\n⚠ Deduction alert active — check Layer 160 for details and take corrective action"
-                    );
-                }
-            }
-        }
+        // Deduction 告警：build_injection() 已按需返回极简提示（或 None），
+        // 不在 awareness 层额外追加——避免双重注入干扰 LLM
 
         // Epistemic Guard 消费协议（认识论约束）
         //
@@ -4732,9 +4722,19 @@ Output JSON:
     /// 4. CapabilityHub 路由
     /// 5. 第一个已注册 provider
     pub(crate) async fn resolve_provider_with_hint(&self, forced: Option<&str>) -> Result<(String, Arc<dyn LlmProvider>), KernelError> {
-        let model: String = self.model_override.read().await
+        let raw_model: String = self.model_override.read().await
             .as_ref().map(|m| m.0.clone())
             .unwrap_or_else(|| self.config.default_model.0.clone());
+
+        // V44: "auto" / 空 model 不静默降级——直接报错让用户感知配置问题
+        let model = if raw_model == "auto" || raw_model.is_empty() {
+            return Err(KernelError::Provider(
+                "未配置有效模型。请检查 providers.json 是否存在且至少包含一个可用 provider 和 model。\
+                 运行 /config 重新配置。".to_string()
+            ));
+        } else {
+            raw_model
+        };
 
         // ── Step 0: ProviderRegistry 主路由 ──────────────────────────────────
         // 构造 QualifiedModelId：如果 forced 有值则作为 provider 限定；

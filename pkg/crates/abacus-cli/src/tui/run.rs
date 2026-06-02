@@ -690,14 +690,20 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             per_m.cost_cny += cny_delta;
                             per_m.turns += 1;
 
-                            // Model Escalation 通知：检测到模型切换时同步 state.model_name + 主题色
-                            if !stats.model_id.is_empty() && stats.model_id != state.model_name {
-                                state.model_name = stats.model_id.clone();
-                                state.theme.apply_model_brand(&stats.model_id);
-                                state.add_toast(
-                                    format!("🔄 Auto-escalated to {} for deeper reasoning", stats.model_id),
-                                    Duration::from_secs(5),
-                                );
+                            // Model Escalation 通知：仅在真正 auto-escalation 时触发
+                            // 比较时提取裸 model name（去掉 "provider:" 前缀），避免
+                            // "/model DS:deepseek-v4-flash" 后误触发 toast
+                            if !stats.model_id.is_empty() {
+                                let bare_state = abacus_types::QualifiedModelId::parse(&state.model_name)
+                                    .model_name().to_string();
+                                if stats.model_id != bare_state {
+                                    state.model_name = stats.model_id.clone();
+                                    state.theme.apply_model_brand(&stats.model_id);
+                                    state.add_toast(
+                                        format!("🔄 Auto-escalated to {} for deeper reasoning", stats.model_id),
+                                        Duration::from_secs(5),
+                                    );
+                                }
                             }
                         }
                         // Progressive Gate state — 状态在 status bar 已有显示，无需 toast

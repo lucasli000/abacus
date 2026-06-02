@@ -696,6 +696,7 @@ impl AbacusServer {
             model_catalog,
             tool_visibility_threshold: abacus_types::VisibilityTier::D,
             // Task #84/#87：按任务类型路由工具
+            auto_escalation: cfg_mgr.get_bool("core.auto_escalation").unwrap_or(false),
             task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
             tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
                 .map(|n| n as u64)

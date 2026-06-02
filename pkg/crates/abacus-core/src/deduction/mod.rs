@@ -454,72 +454,46 @@ impl DeductionEngine {
     /// - warning 告警：建议消费，但不强制
     /// - info 告警：仅供参考
     /// - 每 3 轮至少检查一次 deduction_status
+    /// 按需注入：仅返回极简状态行（不阻塞对话）
+    ///
+    /// ## 设计：自动衰减 + 按需消费
+    /// - 未超阈值：不注入任何内容（完全透明）
+    /// - 超 5 轮未消费：注入一行提示（LLM 可选择调用 deduction_analyze）
+    /// - 超 10 轮：自动清除告警（问题要么已自愈，要么下次 record_turn_metrics 会重新检测）
     pub async fn build_injection(&self) -> Option<String> {
+        let turns_unconsumed = self.turns_since_analyze().await;
+
+        // 自动衰减：超 10 轮未消费 → 清除告警（避免永久累积）
+        if turns_unconsumed > 10 {
+            let mut alerts = self.active_alerts.write().await;
+            if !alerts.is_empty() {
+                tracing::info!(turns = turns_unconsumed, "deduction alerts auto-decayed (unconsumed > 10 turns)");
+                alerts.clear();
+            }
+            return None;
+        }
+
         let alerts = self.active_alerts.read().await;
         if alerts.is_empty() {
             return None;
         }
 
-        let has_critical = alerts.iter().any(|a| matches!(a.severity, AlertSeverity::Critical));
-        let turns_unconsumed = self.turns_since_analyze().await;
-
-        let mut parts = vec!["## Agent 阶段感知".to_string()];
-
-        // 强制消费协议：critical 告警时注入强制指令
-        if has_critical {
-            parts.push(String::new());
-            parts.push("### ⛔ 强制消费协议（Deduction Consumption Protocol）".to_string());
-            parts.push(String::new());
-
-            if turns_unconsumed > 5 {
-                parts.push("🚨 **严重违规**：critical 告警已存在超过 5 轮未被消费！".to_string());
-                parts.push("你的工具使用模式正在持续退化。立即停止当前操作，调用 deduction_analyze。".to_string());
-            } else if turns_unconsumed > 2 {
-                parts.push(format!(
-                    "⚠️ **警告**：critical 告警已 {} 轮未被消费。再不消费将进入退化模式。",
-                    turns_unconsumed
-                ));
-            } else {
-                parts.push("检测到 critical 级别告警。在响应用户之前，你必须：".to_string());
-            }
-
-            parts.push("1. 调用 `deduction_analyze(kind=\"<对应类型>\")` 消费告警".to_string());
-            parts.push("2. 根据分析结果调整行为（如减少过度使用的工具）".to_string());
-            parts.push("3. 然后才能处理用户请求".to_string());
-            parts.push(String::new());
-            parts.push("跳过消费的代价：告警持续累积 → 工具滥用恶化 → 用户信任下降。".to_string());
-            parts.push("这不是可选的——这是协议要求。".to_string());
-            parts.push(String::new());
+        // 前 5 轮：不注入（让 LLM 正常对话，不干扰）
+        if turns_unconsumed <= 5 {
+            return None;
         }
 
-        parts.push("---".to_string());
-        parts.push(String::new());
-        for alert in alerts.iter() {
-            let prefix = match alert.severity {
-                AlertSeverity::Critical => "🔴 [CRITICAL]",
-                AlertSeverity::Warning => "🟡 [WARNING]",
-                AlertSeverity::Info => "🔵 [INFO]",
-            };
-            parts.push(format!(
-                "- {} [{}] {}",
-                prefix,
-                alert.kind.label(),
-                alert.message
-            ));
-        }
+        // 5-10 轮：仅注入一行极简提示
+        let critical_count = alerts.iter().filter(|a| matches!(a.severity, AlertSeverity::Critical)).count();
+        let warning_count = alerts.iter().filter(|a| matches!(a.severity, AlertSeverity::Warning)).count();
 
-        // 附加行动指引
-        if has_critical {
-            parts.push(String::new());
-            parts.push("---".to_string());
-            parts.push(format!(
-                "**行动要求**：存在 critical 告警（已 {} 轮未消费），必须先消费再响应用户。",
-                turns_unconsumed
-            ));
-            parts.push("调用 deduction_analyze(kind=\"observer_contamination\") 开始。".to_string());
-        }
+        let hint = if critical_count > 0 {
+            format!("[deduction: {} critical, {} warning — call deduction_analyze to inspect]", critical_count, warning_count)
+        } else {
+            format!("[deduction: {} warning — call deduction_analyze if needed]", warning_count)
+        };
 
-        Some(parts.join("\n"))
+        Some(hint)
     }
 
     // ─── 深度分析（工具调用触发） ─────────────────────────────────────────
