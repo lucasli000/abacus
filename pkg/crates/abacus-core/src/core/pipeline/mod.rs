@@ -559,10 +559,12 @@ impl<'a> TurnPipeline<'a> {
         let turn_number = { let s = self.session.read().await; s.turn_count + 1 };
 
         // V43.2: context_window 跟随当前活跃模型（per-model，非全局）
-        // 每轮 turn 1 或模型切换后重新从 ModelCatalog 查询 context_window
+        // 优先级链与 execute_loop 一致：req_ctx.model > model_override(/model) > default_model
         // 引用关系：ModelCatalog.lookup_or_default() → spec.context_window
         {
+            let model_override = self.core.get_model_override().await;
             let effective_model = self.req_ctx.model.clone()
+                .or(model_override)
                 .unwrap_or_else(|| self.core.config.default_model.clone());
             let spec = if let Some(ref catalog) = self.core.config.model_catalog {
                 catalog.lookup_or_default(&effective_model)

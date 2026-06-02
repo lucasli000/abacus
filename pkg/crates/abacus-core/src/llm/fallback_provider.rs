@@ -75,6 +75,10 @@ pub struct FallbackProvider {
     primary_id: String,
     fallback_id: String,
     rate_limit_config: RateLimitConfig,
+    /// 主 provider 单次请求超时（秒）——超时后立即切 fallback
+    /// 默认 60s：覆盖网络连接失败场景（connect_timeout 10s + 首 token 等待余量）
+    /// thinking 模型可能需要更长时间，但如果 60s 完全无响应说明连接有问题
+    primary_timeout_secs: u64,
 }
 
 impl FallbackProvider {
@@ -90,6 +94,7 @@ impl FallbackProvider {
             primary_id: primary_id.into(),
             fallback_id: fallback_id.into(),
             rate_limit_config: RateLimitConfig::default(),
+            primary_timeout_secs: 60,
         }
     }
 
@@ -125,7 +130,8 @@ impl FallbackProvider {
         matches!(error, KernelError::ApiError { status: 0, .. })
             || matches!(error, KernelError::ApiError { status: 400..=499, .. })
             || matches!(error, KernelError::ApiError { status: 500..=599, .. })
-            || matches!(error, KernelError::Other(_)) // network/timeout errors
+            || matches!(error, KernelError::Provider(_)) // network/timeout/connection errors
+            || matches!(error, KernelError::Other(_))
     }
 
     /// 执行带速率限制重试的请求
@@ -168,14 +174,28 @@ impl FallbackProvider {
 #[async_trait]
 impl LlmProvider for FallbackProvider {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse> {
-        // 尝试主 provider（带速率限制重试）
-        // H4: 借用而非 clone，省掉成功路径的一次 deep copy
-        let result = self.execute_with_retry(&self.primary, &req).await;
+        // V43.8: 主 provider 加独立超时——快速切 fallback 而非等外层 pipeline deadline
+        let primary_timeout = Duration::from_secs(self.primary_timeout_secs);
+        let result = match tokio::time::timeout(
+            primary_timeout,
+            self.execute_with_retry(&self.primary, &req)
+        ).await {
+            Ok(r) => r,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    primary = %self.primary_id,
+                    timeout_secs = self.primary_timeout_secs,
+                    "primary provider timeout, switching to fallback"
+                );
+                Err(KernelError::Provider(format!(
+                    "primary timeout ({}s)", self.primary_timeout_secs
+                )))
+            }
+        };
+
         match result {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                // 认证错误 → 不回退（key 问题，不是协议问题）
-                // 符合回退条件（4xx/5xx/网络错误，但排除 auth 错误）→ 切备用 provider
                 if self.is_fallback_eligible(&e) {
                     tracing::warn!(
                         primary = %self.primary_id,
@@ -185,8 +205,6 @@ impl LlmProvider for FallbackProvider {
                     );
                     return self.execute_with_retry(&self.fallback, &req).await;
                 }
-
-                // 其他错误（5xx 服务器错误等）→ 不回退
                 Err(e)
             }
         }
