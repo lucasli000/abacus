@@ -536,6 +536,32 @@ core:
             let _ = std::fs::set_permissions(config_path(), perms);
         }
     }
+
+    // V43: 同步写入 providers.json（新格式，优先级高于 config.yaml providers 段）
+    // 确保 engine_init load_providers_json 能正确加载
+    let providers_json = format!(
+        r#"[
+  {{
+    "id": "primary",
+    "type": "{}",
+    "api_key": "{}",
+    "base_url": "{}",
+    "models": [
+      {{"name": "{}", "context_window": {}, "max_tokens": 16384}}
+    ]
+  }}
+]"#,
+        provider_type_str,
+        state.api_key,  // 原始值（非 YAML 转义）
+        raw_url,        // 原始 URL
+        if state.model_name.is_empty() { provider.default_model() } else { &state.model_name },
+        cw_tokens_opt.unwrap_or(128_000),
+    );
+    let providers_json_path = abacus_core::paths::providers_json();
+    if let Err(e) = std::fs::write(&providers_json_path, &providers_json) {
+        tracing::warn!("failed to write providers.json: {e}");
+    }
+
     Ok(())
 }
 

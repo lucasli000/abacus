@@ -299,20 +299,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     };
     state.engine_handle = Some(engine.clone());
 
-    // V43: 首次启动 onboarding 检测——无 providers.json 时自动触发 config wizard
-    if !abacus_core::paths::providers_json().exists() {
-        state.setup_wizard = Some(crate::tui::state::SetupWizard::new(true));
-        state.add_toast(
-            "首次使用，请配置 Provider（输入 API Key）",
-            Duration::from_secs(6),
-        );
-        // 直接弹出 provider 选择 picker
-        let items: Vec<String> = crate::tui::state::PROVIDER_TEMPLATES.iter()
-            .map(|t| t.id.to_string()).collect();
-        let labels: Vec<String> = crate::tui::state::PROVIDER_TEMPLATES.iter()
-            .map(|t| t.name.to_string()).collect();
-        state.open_picker_generic(crate::tui::state::PickerKind::Config, items, labels);
-    }
+    // V43: 首次启动由 setup::run_setup() 处理（在 engine init 之前）
+    // setup form 已同步写入 providers.json，此处不再重复触发 picker wizard
 
     // 启动 AutoEngine Runner——将 AutoHealth 快照推送到自动化 Tab
     // 生命周期：_auto_runner_handle drop 后 runner task 退出；与 TUI 同生命周期
