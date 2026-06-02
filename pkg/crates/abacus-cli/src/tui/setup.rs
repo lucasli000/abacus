@@ -490,23 +490,25 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         lines.join("\n")
     };
 
-    // V43: config.yaml 只管系统行为，不含 providers（由 providers.json 管理）
+    // V44: config.yaml 只管系统行为；default_model 不写入（自动从 providers.json 第一个推导）
+    // 若用户想指定特定模型可手动加 `core.default_model: provider_id/model_name`
     let yaml = format!(
         r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║  ABACUS 配置文件 (config.yaml) — 系统行为配置                               ║
 # ║  LLM Provider 配置在 providers.json（同目录）                                ║
+# ║  默认模型 = providers.json 第一个 provider 的第一个 model（无需手动指定）      ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
 # ─── 全局设置 ───────────────────────────────────────────────────────────────────
 core:
-  default_model: "{}"
+  # default_model: auto  # 取消注释可指定，格式: provider_id/model_name
   temperature: 0.3
   max_tokens: 16384
   thinking: low
   stream: true
 {}  context_window_ratio: {:.4}
 {}"#,
-        resolved_model, cw_line, cw_ratio, features_section,
+        cw_line, cw_ratio, features_section,
     );
 
     let dir = config_dir();

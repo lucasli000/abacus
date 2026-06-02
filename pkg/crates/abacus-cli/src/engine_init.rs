@@ -86,8 +86,14 @@ pub async fn create_engine(
         tracing::warn!("config validation: {}", w);
     }
 
-    // Model — prefer config over parameter
-    let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
+    // Model — 优先级链: config.yaml core.default_model > providers.json 第一个 model > CLI 参数
+    // V44: 不再硬编码默认模型——从 providers.json 自动推导
+    let auto_model: Option<String> = cfg_mgr.parse_providers()
+        .first()
+        .and_then(|entry| entry.models.first())
+        .map(|m| m.name.clone());
+    let resolved_model = cfg_mgr.get_str("core.default_model")
+        .unwrap_or_else(|| auto_model.as_deref().unwrap_or(model));
 
     let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(200);
     // V29.14 (Risk 3): max_turns 过高时记录 tracing::warn, 提示 token 费用风险
