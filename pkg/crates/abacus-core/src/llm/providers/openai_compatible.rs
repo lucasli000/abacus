@@ -288,6 +288,36 @@ impl OpenAICompatibleProvider {
         self.discover_enabled = enabled;
     }
 
+    /// 构建 chat/completions 的完整 URL
+    ///
+    /// 智能路径拼接：
+    /// - base_url 已含 /v1 或 /v2 等版本路径 → 直接拼 /chat/completions
+    /// - base_url 以 /chat/completions 结尾 → 直接使用（用户给了完整 endpoint）
+    /// - 否则 → 拼 /v1/chat/completions（标准 OpenAI 格式）
+    ///
+    /// 引用关系：complete() 和 stream_complete() 调用
+    fn completions_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") || base.ends_with("/v4") {
+            format!("{}/chat/completions", base)
+        } else {
+            format!("{}/v1/chat/completions", base)
+        }
+    }
+
+    /// 构建 models endpoint URL（discover_models 用）
+    /// 同 completions_url 逻辑：自适应版本路径
+    fn models_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") || base.ends_with("/v4") {
+            format!("{}/models", base)
+        } else {
+            format!("{}/v1/models", base)
+        }
+    }
+
     fn build_request(&self, req: &LlmRequest) -> ChatRequest {
         let messages: Vec<ChatMessage> = self.build_messages(req);
 
@@ -524,7 +554,7 @@ impl LlmProvider for OpenAICompatibleProvider {
             let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
             let result = self
                 .client
-                .post(format!("{}/v1/chat/completions", self.base_url))
+                .post(self.completions_url())
                 .timeout(self.request_timeout) // H8: per-request timeout
                 .header(&self.auth_header, auth_value)
                 .header("Content-Type", "application/json")
@@ -660,7 +690,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(self.completions_url())
             .timeout(self.request_timeout) // H8: per-request timeout
             .header(&self.auth_header, auth_value)
             .header("Content-Type", "application/json")
@@ -834,7 +864,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self.client
-            .get(format!("{}/v1/models", self.base_url))
+            .get(self.models_url())
             .timeout(std::time::Duration::from_secs(15)) // discover 短超时（不让首次启动卡死）
             .header(&self.auth_header, auth_value)
             .send()
