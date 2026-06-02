@@ -133,6 +133,40 @@ impl ConfigManager {
         Self { merged, provider_entries: Vec::new() }
     }
 
+    /// 从 providers.json 加载 provider 配置（优先于 config.yaml 中的 providers 字段）
+    ///
+    /// ## 文件格式
+    /// ```json
+    /// [
+    ///   {
+    ///     "id": "primary",
+    ///     "type": "openai-compatible",
+    ///     "api_key": "sk-xxx",
+    ///     "base_url": "https://api.deepseek.com/v1",
+    ///     "models": [{"name": "deepseek-chat", "context_window": 128000}]
+    ///   }
+    /// ]
+    /// ```
+    ///
+    /// ## 引用关系
+    /// - 调用方: engine_init.rs（在 load_file(config_yaml) 之后调用）
+    /// - 写入: self.provider_entries（覆盖 config.yaml 中的 providers）
+    pub fn load_providers_json(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(()); // 文件不存在 → 静默跳过（向后兼容）
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read providers.json: {e}"))?;
+        let entries: Vec<abacus_types::ProviderEntry> = serde_json::from_str(&content)
+            .map_err(|e| format!("providers.json parse error: {e}"))?;
+        if !entries.is_empty() {
+            tracing::info!(count = entries.len(), "loaded providers from providers.json");
+            self.provider_entries = entries;
+        }
+        Ok(())
+    }
+
     /// 从配置文件加载 (自动检测 JSON/YAML 由扩展名决定)
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let content = std::fs::read_to_string(&path)

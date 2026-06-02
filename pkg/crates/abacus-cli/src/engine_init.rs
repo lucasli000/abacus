@@ -82,10 +82,12 @@ pub async fn create_engine(
     // 配置加载顺序：默认内置层 < models.yaml < config.yaml < security.yaml < conf.d/*.yaml < 环境变量
     // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
     use abacus_core::paths;
-    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 凭证 + 模型参数
+    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 模型能力声明
     let _ = cfg_mgr.load_file(paths::config_yaml());      // config.yaml — Abacus 行为配置
     let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
+    // V43.7: providers.json 优先——JSON 格式的 provider/LLM 配置（覆盖 config.yaml 中的 providers）
+    let _ = cfg_mgr.load_providers_json(paths::providers_json());
 
     // Validate config before using — warn on out-of-range values
     let validation_warnings = cfg_mgr.validate();
