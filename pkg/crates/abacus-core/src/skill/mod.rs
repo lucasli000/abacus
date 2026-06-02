@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use abacus_types::{SkillDef, SkillExecutionRecord, SkillExperience, SkillId, Sm2State, ToolHandle, ToolId, ToolProvider, ToolSchema};
 use regex::Regex;
 
+use crate::core::fallible::RwLockExt;
 use crate::tool::ToolRegistry;
 
 #[derive(Debug, Clone)]
@@ -221,7 +222,7 @@ impl SkillEngine {
 
     /// 反查 sanitized ToolId → (SkillId, step_id)
     pub fn lookup_skill_step(&self, sanitized_id: &str) -> Option<(SkillId, String)> {
-        self.name_map.read().unwrap().get(sanitized_id).cloned()
+        self.name_map.read_or_recover().get(sanitized_id).cloned()
     }
 
     /// Replace the default n-gram embedder with a custom one for semantic matching.
@@ -238,12 +239,12 @@ impl SkillEngine {
         let id = def.id.clone();
         self.matcher.register(&id, &def.triggers, &def.prompt);
         self.skills.insert(id.clone(), def);
-        self.loaded.write().unwrap().insert(id, false);
+        self.loaded.write_or_recover().insert(id, false);
     }
 
     pub fn evaluate(&self, input: &str, task_kind: Option<&str>) -> Vec<SkillCandidate> {
         let mut candidates = self.matcher.evaluate(input, task_kind);
-        let experiences = self.experiences.read().unwrap();
+        let experiences = self.experiences.read_or_recover();
         for c in &mut candidates {
             if let Some(exp) = experiences.get(&c.id) {
                 c.confidence *= experience_multiplier(exp);
@@ -353,7 +354,7 @@ impl SkillEngine {
         registry: &ToolRegistry,
         executor: std::sync::Arc<dyn crate::tool::ToolExecutor>,
     ) -> Result<(), String> {
-        if self.loaded.read().unwrap().get(id) == Some(&true) {
+        if self.loaded.read_or_recover().get(id) == Some(&true) {
             return Ok(());
         }
         let def = self.skills.get(id).ok_or_else(|| format!("skill not found: {id}"))?;
@@ -368,7 +369,7 @@ impl SkillEngine {
                 crate::llm::tool_view::sanitize_name(&step.id),
             );
             // 同步登记反查（execute 时 O(1) 还原 raw skill_id + step_id）
-            self.name_map.write().unwrap().insert(
+            self.name_map.write_or_recover().insert(
                 sanitized.clone(),
                 (id.clone(), step.id.clone()),
             );
@@ -394,7 +395,7 @@ impl SkillEngine {
             registry.register_executor(tool_id, executor.clone()).await;
         }
 
-        self.loaded.write().unwrap().insert(id.clone(), true);
+        self.loaded.write_or_recover().insert(id.clone(), true);
         Ok(())
     }
 
@@ -417,7 +418,7 @@ impl SkillEngine {
         registry: &ToolRegistry,
         executor: std::sync::Arc<dyn crate::tool::ToolExecutor>,
     ) -> Result<(), String> {
-        if self.loaded.read().unwrap().get(id) == Some(&true) {
+        if self.loaded.read_or_recover().get(id) == Some(&true) {
             return Ok(());
         }
         let def = self.skills.get(id)
@@ -469,15 +470,15 @@ impl SkillEngine {
         registry.register_executor(tool_id.clone(), executor).await;
 
         // 更新 name_map（compound skill 映射到 (skill_id, "compound")）
-        self.name_map.write().unwrap()
+        self.name_map.write_or_recover()
             .insert(tool_name, (id.clone(), "compound".to_string()));
 
-        *self.loaded.write().unwrap().entry(id.clone()).or_insert(false) = true;
+        *self.loaded.write_or_recover().entry(id.clone()).or_insert(false) = true;
         Ok(())
     }
 
     pub fn record_execution(&mut self, record: SkillExecutionRecord) {
-        let mut exp_map = self.experiences.write().unwrap();
+        let mut exp_map = self.experiences.write_or_recover();
         let key = record.skill_id.clone();
         let exp = exp_map.entry(key).or_insert_with(|| SkillExperience {
             skill_id: record.skill_id.clone(),
@@ -810,7 +811,7 @@ impl crate::tool::ToolExecutor for CompoundSkillExecutor {
         // 从 name_map 反查 skill_id（compound 映射到 "compound" 占位符）
         let skill_id = {
             let eng = engine_arc.read().await;
-            let result = eng.name_map.read().unwrap()
+            let result = eng.name_map.read_or_recover()
                 .get(&tool_id.0)
                 .map(|(sid, _)| sid.clone());
             result.ok_or_else(|| KernelError::Other(

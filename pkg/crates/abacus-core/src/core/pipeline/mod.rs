@@ -147,9 +147,15 @@ struct TurnContext {
     dynamic_timeout_secs: u64,
     /// V41: 安全分类器连续拦截计数
     /// 引用：工具执行前 ToolActionClassifier 返回 NeedsConfirm/Deny 时递增
-    /// 效果：达到 3 次时自动重新开启 progressive gate（降级到逐步确认）
+    /// 效果：达到 3 次时 force_confirm_all=true（后续所有工具调用走确认通道）
     /// 生命周期：turn 级别，每轮重置
     consecutive_blocks: u32,
+    /// V41 Step 3: 连续拦截降级标记
+    /// true 时所有后续工具调用强制走 NeedsConfirm，跳过 user_grant 和 MCIP Allowed
+    /// 引用：execute_loop tool dispatch 在 MCIP 决策前检查
+    /// 激活：consecutive_blocks >= 3
+    /// 销毁：随 TurnContext（turn 结束）
+    force_confirm_all: bool,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -943,6 +949,7 @@ impl<'a> TurnPipeline<'a> {
             time_warning_emitted: false,
             dynamic_timeout_secs: estimated_timeout,
             consecutive_blocks: 0,
+            force_confirm_all: false,
         })
     }
 
@@ -2599,22 +2606,32 @@ impl<'a> TurnPipeline<'a> {
                     } else {
 
                     // 授权检查：优先于session 永久授权和本 turn 单次授权，匹配则跳过 MCIP 策略
-                    let is_user_granted = {
+                    // V41 Step 3: force_confirm_all 激活后，忽略 user_grant（强制确认所有操作）
+                    let is_user_granted = if ctx.force_confirm_all {
+                        false
+                    } else {
                         let s = self.session.read().await;
                         let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
                         grants.contains(tool_id.0.as_str())
-                    } || self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str());
+                    } || (!ctx.force_confirm_all && self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str()));
 
                     // V41: safety NeedsConfirm 升级为 MCIP NeedsConfirm（复用已有确认通道）
-                    let decision = if is_user_granted {
+                    let decision = if ctx.force_confirm_all && !is_user_granted {
+                        // 降级模式：所有工具强制确认
+                        McipDecision::NeedsConfirm("[降级] 连续拦截后所有操作需确认".into())
+                    } else if is_user_granted {
                         McipDecision::Allowed
                     } else if let ClassifyResult::NeedsConfirm(reason) = &safety_result {
                         ctx.consecutive_blocks += 1;
-                        // 连续 3 次拦截 → 通知用户降级（实际行为：后续走 MCIP confirm 通道）
-                        if ctx.consecutive_blocks == 3 {
+                        // 连续 3 次拦截 → 降级执行策略（V41 Step 3）
+                        // 行为：force_confirm_all=true，后续所有工具调用强制走 NeedsConfirm
+                        // 引用关系：下方 MCIP 决策前检查 ctx.force_confirm_all
+                        if ctx.consecutive_blocks >= 3 && !ctx.force_confirm_all {
+                            ctx.force_confirm_all = true;
+                            tracing::warn!("连续 {} 次安全拦截，降级到逐步确认模式", ctx.consecutive_blocks);
                             if let Some(ref stx) = self.stream_tx {
                                 let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(
-                                    format!("\n⚠️ 连续 {} 次操作被安全策略拦截\n", ctx.consecutive_blocks)
+                                    "\n⚠️ 连续多次操作被安全策略拦截，已切换到逐步确认模式\n".into()
                                 ));
                             }
                         }

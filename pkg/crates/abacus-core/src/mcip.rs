@@ -49,6 +49,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::core::fallible::RwLockExt;
+
 // ─── Capability Declarations ────────────────────────────────────────────
 
 /// Resource access capability for an MCP tool.
@@ -311,13 +313,13 @@ impl McipGateway {
 
     /// 从 config 批量设置允许工具名单（security.yaml `mcip.allow_tools`）
     pub fn apply_allow_tools(&self, tools: &[String]) {
-        let mut guard = self.allow_tools.write().unwrap();
+        let mut guard = self.allow_tools.write_or_recover();
         for t in tools { guard.insert(t.clone()); }
     }
 
     /// 从 config 批量设置禁止工具名单（security.yaml `mcip.deny_tools`）
     pub fn apply_deny_tools(&self, tools: &[String]) {
-        let mut guard = self.deny_tools.write().unwrap();
+        let mut guard = self.deny_tools.write_or_recover();
         for t in tools { guard.insert(t.clone()); }
     }
 
@@ -326,12 +328,12 @@ impl McipGateway {
     /// 内置前缀（`BUILTIN_EXEMPT_PREFIXES`）无需手动添加，已默认生效。
     /// 取 `&self` ——可在 CoreLoop 初始化后、Arc 包裹前后任意时刻调用。
     pub fn add_exempt_prefix(&self, prefix: impl Into<String>) {
-        self.extra_exempt_prefixes.write().unwrap().push(prefix.into());
+        self.extra_exempt_prefixes.write_or_recover().push(prefix.into());
     }
 
     /// 批量注册豆免前缀（从 config.yaml 读入的列表）
     pub fn apply_exempt_prefixes(&self, prefixes: &[String]) {
-        let mut guard = self.extra_exempt_prefixes.write().unwrap();
+        let mut guard = self.extra_exempt_prefixes.write_or_recover();
         for p in prefixes {
             if !guard.contains(p) {
                 guard.push(p.clone());
@@ -393,7 +395,7 @@ impl McipGateway {
 
         // ① deny_tools：最高优先级——系统管理员第一道防线，覆盖一切授权
         {
-            let deny = self.deny_tools.read().unwrap();
+            let deny = self.deny_tools.read_or_recover();
             if deny.contains(id_str) {
                 return McipDecision::Denied(format!(
                     "tool '{id_str}' is on the permanent deny list (security.yaml mcip.deny_tools)"
@@ -403,7 +405,7 @@ impl McipGateway {
 
         // ② allow_tools：精确允许名单——跳过策略直接放行
         {
-            let allow = self.allow_tools.read().unwrap();
+            let allow = self.allow_tools.read_or_recover();
             if allow.contains(id_str) {
                 return McipDecision::Allowed;
             }
@@ -412,7 +414,7 @@ impl McipGateway {
         // ③ exempt_prefixes：内置工具和自定义前缀豆免
         // 内置前缀：env_/fs_/db_/kb_/lsp. 等——可信二进制不需 capability policy
         // 自定义前缀：调用方通过 `add_exempt_prefix()` 或 security.yaml 添加
-        let extra = self.extra_exempt_prefixes.read().unwrap();
+        let extra = self.extra_exempt_prefixes.read_or_recover();
         let is_exempt = BUILTIN_EXEMPT_PREFIXES.iter().any(|p| id_str.starts_with(p))
             || extra.iter().any(|p| id_str.starts_with(p.as_str()));
         drop(extra); // 释放读锁，避免后续策略循环持锁

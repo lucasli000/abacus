@@ -2924,9 +2924,17 @@ impl AppState {
                 ("deepseek-v4-flash", "最快响应"),
                 ("deepseek-v4-pro",   "最强推理"),
             ];
-            // 从模型 ID 推断 provider 名（按前缀匹配）
-            // 2026-05-28: 优先用 available_providers 实际分组（配置 id 作为组名）
-            // fallback: 无分组信息时用 infer_provider 静态推断
+            // V43: 检测同名模型跨 provider 的歧义——歧义模型使用 provider:model 格式
+            let ambiguous_models: std::collections::HashSet<String> = {
+                let mut model_count: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+                for (_, models) in &self.available_providers {
+                    for m in models {
+                        *model_count.entry(m.as_str()).or_default() += 1;
+                    }
+                }
+                model_count.into_iter().filter(|(_, c)| *c > 1).map(|(k, _)| k.to_string()).collect()
+            };
+
             if !self.available_providers.is_empty() {
                 for (provider_id, models) in &self.available_providers {
                     let start = items.len();
@@ -2935,12 +2943,25 @@ impl AppState {
                             .find(|(k, _)| *k == model_name.as_str())
                             .map(|(_, d)| *d)
                             .unwrap_or("");
-                        items.push(model_name.clone());
-                        labels.push(if desc.is_empty() {
+                        // 同名模型在多个 provider 中：使用 qualified 格式
+                        let item_id = if ambiguous_models.contains(model_name.as_str()) {
+                            format!("{}:{}", provider_id, model_name)
+                        } else {
                             model_name.clone()
+                        };
+                        let label = if desc.is_empty() {
+                            if ambiguous_models.contains(model_name.as_str()) {
+                                format!("{:<22}  [{}]", model_name, provider_id)
+                            } else {
+                                model_name.clone()
+                            }
+                        } else if ambiguous_models.contains(model_name.as_str()) {
+                            format!("{:<22}  {} [{}]", model_name, desc, provider_id)
                         } else {
                             format!("{:<22}  {}", model_name, desc)
-                        });
+                        };
+                        items.push(item_id);
+                        labels.push(label);
                     }
                     let end = items.len();
                     if end > start {
