@@ -10,7 +10,7 @@ use abacus_types::ModelId;
 
 /// No-op LLM provider that returns a helpful error message.
 ///
-/// Registered when `ABACUS_API_KEY` / `DEEPSEEK_API_KEY` is not set.
+/// Registered when no valid provider is configured in providers.json.
 /// This allows the engine to initialize and respond gracefully rather than crashing.
 pub struct NoApiKeyProvider;
 
@@ -22,7 +22,7 @@ impl LlmProvider for NoApiKeyProvider {
             message: Message {
                 role: MessageRole::Assistant,
                 content: Some(MessageContent::Text(
-                    "[Error: No API key configured. Set DEEPSEEK_API_KEY or ABACUS_API_KEY]"
+                    "[Error: No API key configured. Edit ~/.abacus/providers.json or run /config]"
                         .into(),
                 )),
                 name: None,

@@ -181,10 +181,9 @@ impl EngineHandle {
             let models: Vec<ModelId> = entry.models.iter()
                 .map(|m| ModelId(m.name.clone()))
                 .collect();
-            let base = entry.base_url.clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1".into());
+            let base = entry.base_url.clone().unwrap_or_default();
             let default_model = models.first().cloned()
-                .unwrap_or_else(|| ModelId("gpt-4o".into()));
+                .unwrap_or_else(|| ModelId("auto".into()));
 
             let provider = OpenAICompatibleProvider::new(
                 api_key, default_model, base, None, None, None,

@@ -285,9 +285,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             guard.deactivate()?;
             eprintln!("\n[x] Engine init failed: {}\n", e);
             eprintln!("  Please check:");
-            eprintln!("    - API key configured (ABACUS_API_KEY or DEEPSEEK_API_KEY)");
+            eprintln!("    - ~/.abacus/providers.json has valid API key");
             eprintln!("    - Network connectivity");
-            eprintln!("    - Model config in config.yaml\n");
+            eprintln!("    - Run `abacus` to re-trigger setup wizard\n");
             return Err(io::Error::other(e));
         }
         Err(_) => {

@@ -594,7 +594,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                         // B3：API Key 设计为只读——TUI 内修改有泄漏风险（屏幕共享、剪贴板）
                         // 提示具体路径让用户去更安全的入口操作
                         state.add_toast(
-                            "API Key 只读：编辑 ~/.abacus/config.yaml 或导出 ABACUS_API_KEY",
+                            "API Key 只读：编辑 ~/.abacus/providers.json 或运行 /config",
                             Duration::from_secs(4),
                         );
                     }
