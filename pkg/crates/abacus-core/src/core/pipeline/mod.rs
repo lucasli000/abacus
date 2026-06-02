@@ -558,16 +558,22 @@ impl<'a> TurnPipeline<'a> {
 
         let turn_number = { let s = self.session.read().await; s.turn_count + 1 };
 
-        // V43.2: context_window 跟随当前活跃模型（per-model，非全局）
-        // 优先级链与 execute_loop 一致：req_ctx.model > model_override(/model) > default_model
-        // 引用关系：ModelCatalog.lookup_or_default() → spec.context_window
+        // V43.2: context_window 跟随当前活跃模型（per-model + per-provider）
+        // 优先级链：req_ctx.model > model_override(/model) > default_model
+        // Spec 查询：qualified_specs (provider+model) > specs (model) > default
         {
             let model_override = self.core.get_model_override().await;
             let effective_model = self.req_ctx.model.clone()
                 .or(model_override)
                 .unwrap_or_else(|| self.core.config.default_model.clone());
+            // 解析 provider_id 用于 qualified spec lookup
+            let provider_id = self.core.resolve_provider_id_for_model(&effective_model.0).await;
             let spec = if let Some(ref catalog) = self.core.config.model_catalog {
-                catalog.lookup_or_default(&effective_model)
+                if let Some(ref pid) = provider_id {
+                    catalog.lookup_qualified(pid, &effective_model)
+                } else {
+                    catalog.lookup_or_default(&effective_model)
+                }
             } else if let Some(ref s) = self.core.config.model_spec {
                 std::sync::Arc::new(s.clone())
             } else {

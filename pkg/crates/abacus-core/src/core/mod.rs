@@ -3181,12 +3181,16 @@ impl CoreLoop {
     ) {
         let id_str = id.into();
         let group = ProviderGroup::new(&id_str, models.clone(), provider.clone());
-        self.provider_groups.write().await.push(group);
+        let mut groups = self.provider_groups.write().await;
+        // V43: priority 按注册顺序递增（config 中第 1 个=100, 第 2 个=101...）
+        // 同名模型冲突时 lower priority wins → config 数组顺序即偏好顺序
+        let priority = 100u32 + groups.len() as u32;
+        groups.push(group);
+        drop(groups);
 
-        // 双写：同步注册到 ProviderRegistry（model-aware routing 主路径）
-        // priority 100 = 默认优先级；后续可通过 register_provider_group_with_priority 指定
+        // 双写：同步注册到 ProviderRegistry（model-aware routing + 歧义检测）
         let model_names: Vec<String> = models.iter().map(|m| m.0.clone()).collect();
-        self.provider_registry.register(&id_str, model_names, provider.clone(), 100).await;
+        self.provider_registry.register(&id_str, model_names, provider.clone(), priority).await;
 
         // 同时注册为普通 provider（包装后返回完整模型列表）
         let wrapped = Arc::new(GroupProvider {
@@ -3538,8 +3542,7 @@ impl CoreLoop {
             }
         }
 
-        // 2026-05-28: 将发现的模型写回 ProviderGroup — 让 resolve_provider() 能匹配到
-        // 解决：config 中 models 为空或只有占位符时，group.supports(model) 失败的问题
+        // 2026-05-28: 将发现的模型写回 ProviderGroup + ProviderRegistry
         if !result.is_empty() {
             let mut groups = self.provider_groups.write().await;
             for group in groups.iter_mut() {
@@ -3548,7 +3551,18 @@ impl CoreLoop {
                         .map(|m| ModelId(m.clone()))
                         .collect();
                     if new_models.len() > group.models.len() {
+                        // 找出新增的模型（不在原有列表中的）
+                        let new_names: Vec<String> = discovered.iter()
+                            .filter(|m| !group.models.iter().any(|gm| gm.0 == **m))
+                            .cloned()
+                            .collect();
                         group.models = new_models;
+                        // V43: 同步新增模型到 ProviderRegistry
+                        if !new_names.is_empty() {
+                            self.provider_registry.register(
+                                &group.id, new_names, group.provider.clone(), 100
+                            ).await;
+                        }
                     }
                 }
             }
@@ -4711,9 +4725,26 @@ Output JSON:
             abacus_types::QualifiedModelId::parse(&model)
         };
 
-        // Registry resolve：qualified → exact match; unqualified → priority 消歧
-        if let Some((provider_id, provider)) = self.provider_registry.resolve(&qid).await {
-            return Ok((provider_id.0, provider));
+        // Registry resolve：qualified → exact match; unqualified → priority 消歧 + 歧义检测
+        if qid.provider.is_some() {
+            // Qualified：精确路由
+            if let Some((provider_id, provider)) = self.provider_registry.resolve(&qid).await {
+                return Ok((provider_id.0, provider));
+            }
+        } else {
+            // Unqualified：先做歧义检测，再 resolve
+            let model_name = &qid.model.0;
+            match self.provider_registry.resolve_unqualified(model_name).await {
+                Ok(qualified) => {
+                    if let Some((provider_id, provider)) = self.provider_registry.resolve(&qualified).await {
+                        return Ok((provider_id.0, provider));
+                    }
+                }
+                Err(ambiguity_msg) => {
+                    // 歧义或未找到——log 并 fallback 到旧路径（first-wins）
+                    tracing::warn!("{}", ambiguity_msg);
+                }
+            }
         }
 
         // ── Step 1: 旧路径 fallback（兼容未注册到 registry 的 provider）────────
