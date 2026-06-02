@@ -923,6 +923,10 @@ impl SetupWizard {
     }
 
     /// 生成 providers.json 内容
+    /// 生成 providers.json 内容（flat array 格式，与 load_providers_json 对齐）
+    ///
+    /// 格式: Vec<ProviderEntry> JSON — 不含外层 "providers" key
+    /// 引用关系: event/mod.rs wizard 完成时调用 → 写入 ~/.abacus/providers.json
     pub fn to_providers_json(&self) -> Option<String> {
         let tmpl = self.provider_type.as_ref()?;
         let api_key = self.api_key.as_ref()?;
@@ -931,23 +935,29 @@ impl SetupWizard {
             .unwrap_or(tmpl.default_base_url);
 
         let models_json: Vec<String> = tmpl.default_models.iter()
-            .map(|m| format!("      \"{}\"", m))
+            .map(|m| format!("    \"{}\"", m))
             .collect();
 
+        // provider type 映射：模板 id → ProviderEntry.type 字段值
+        let provider_type = match tmpl.id {
+            "anthropic" => "anthropic",
+            "deepseek" => "deepseek",
+            _ => "openai-compatible",
+        };
+
         let json = format!(
-r#"{{
-  "providers": [
-    {{
-      "id": "{}",
-      "base_url": "{}",
-      "api_key": "{}",
-      "models": [
+r#"[
+  {{
+    "id": "{}",
+    "type": "{}",
+    "base_url": "{}",
+    "api_key": "{}",
+    "models": [
 {}
-      ]
-    }}
-  ]
-}}"#,
-            tmpl.id, base_url, api_key, models_json.join(",\n")
+    ]
+  }}
+]"#,
+            tmpl.id, provider_type, base_url, api_key, models_json.join(",\n")
         );
         Some(json)
     }
