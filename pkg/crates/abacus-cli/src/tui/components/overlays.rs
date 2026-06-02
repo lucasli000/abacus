@@ -546,6 +546,7 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         PickerKind::History  => format!(" {} ({}) ", t("picker.history"), p.items.len()),
         PickerKind::Meeting  => format!(" 🧠 {} ", t("mode.meeting")),
         PickerKind::Preset   => t("picker.preset").to_string(),
+        PickerKind::Config   => "⚙️ Provider 配置".to_string(),
     };
     let frame = f.area();
 
@@ -737,6 +738,7 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         PickerKind::History  => t("picker.hint_history"),
         PickerKind::Meeting  => t("picker.hint_generic"),
         PickerKind::Preset   => t("picker.hint_preset"),
+        PickerKind::Config   => "↑↓ 选择 · Enter 确认 · Esc 取消",
     };
     lines.push(Line::from(vec![
         Span::styled(hint, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),

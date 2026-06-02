@@ -299,6 +299,21 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     };
     state.engine_handle = Some(engine.clone());
 
+    // V43: 首次启动 onboarding 检测——无 providers.json 时自动触发 config wizard
+    if !abacus_core::paths::providers_json().exists() {
+        state.setup_wizard = Some(crate::tui::state::SetupWizard::new(true));
+        state.add_toast(
+            "首次使用，请配置 Provider（输入 API Key）",
+            Duration::from_secs(6),
+        );
+        // 直接弹出 provider 选择 picker
+        let items: Vec<String> = crate::tui::state::PROVIDER_TEMPLATES.iter()
+            .map(|t| t.id.to_string()).collect();
+        let labels: Vec<String> = crate::tui::state::PROVIDER_TEMPLATES.iter()
+            .map(|t| t.name.to_string()).collect();
+        state.open_picker_generic(crate::tui::state::PickerKind::Config, items, labels);
+    }
+
     // 启动 AutoEngine Runner——将 AutoHealth 快照推送到自动化 Tab
     // 生命周期：_auto_runner_handle drop 后 runner task 退出；与 TUI 同生命周期
     // 引用关系：health_rx 在 interval tick 分支被 try_recv；state.auto_health 消费
@@ -2198,6 +2213,29 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         _ => {}
                                     }
                                 });
+                            } else if matches!(cmd, crate::tui::state::SlashCommand::ReloadProviders) {
+                                // V43: 重载 providers.json（config wizard 写入后触发）
+                                let engine = engine.clone();
+                                let tx = res_tx.clone();
+                                tokio::spawn(async move {
+                                    let result = engine.reload_providers().await;
+                                    let text = match result {
+                                        Ok(count) => format!("✓ 已重载 providers.json（{} 个 provider）", count),
+                                        Err(e) => format!("⚠️ 重载失败: {}", e),
+                                    };
+                                    let _ = tx.send(EngineResponse {
+                                        text,
+                                        thinking: None,
+                                        tool_records: vec![],
+                                        stats: None,
+                                        progressive_state: None,
+                                        inertia_warning: None,
+                                        pending_confirmations: vec![],
+                                        meeting_experts: None,
+                                        auto_fallback_chat: None,
+                                        turnkey_plan: None, needs_clarify: None,
+                                    });
+                                });
                             } else {
                                 let engine = engine.clone();
                                 let tx = res_tx.clone();
@@ -2466,6 +2504,10 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
         // V34: ExecuteWithPlan/ExecuteWithTeam 走流式路径，同 ReviewRole
         SlashCommand::ExecuteWithPlan { .. } | SlashCommand::ExecuteWithTeam { .. } => {
             unreachable!("ExecuteWithPlan/ExecuteWithTeam 应该被 pending_slash_command 处理分支提前截获走流式路径")
+        }
+        // V43: ReloadProviders 走 main loop 流式路径
+        SlashCommand::ReloadProviders => {
+            unreachable!("ReloadProviders 应该被 pending_slash_command 处理分支提前截获")
         }
     }
 }

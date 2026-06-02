@@ -99,6 +99,7 @@ fn registry() -> &'static [Entry] {
         v.push(Entry { names: &["review-history"],  handler: cmd_review_history, help: "review 历史" });
         v.push(Entry { names: &["review-required"], handler: cmd_review_required, help: "review 强约束 - /review-required <on|off>" });
         v.push(Entry { names: &["feedback"],        handler: cmd_feedback, help: "提交反馈" });
+        v.push(Entry { names: &["config", "setup"], handler: cmd_config,   help: "Provider 配置向导" });
         v.push(Entry { names: &["version", "v"],    handler: cmd_version,  help: "版本号" });
 
         // ── /help 置最后 ──
@@ -1447,7 +1448,31 @@ fn cmd_debug(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 }
 
 fn cmd_version(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
-    s.add_toast("Abacus v1.0.0", std::time::Duration::from_secs(3));
+    s.add_toast("Abacus v1.3.0", std::time::Duration::from_secs(3));
+    CmdResult::Consumed
+}
+
+/// /config — Provider 配置向导
+///
+/// 引用关系：
+/// - 触发: registry dispatch → cmd_config
+/// - 写入: state.setup_wizard = Some(...)
+/// - 消费: event/mod.rs 检测 setup_wizard 激活后拦截输入
+/// - 完成: 写入 ~/.abacus/providers.json + 发送 reload 信号
+///
+/// 设计: 开启 Step 1 (SelectProvider)，弹出 picker 让用户选类型
+fn cmd_config(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
+    use crate::tui::state::{SetupWizard, PROVIDER_TEMPLATES, PickerKind};
+
+    // 初始化向导
+    s.setup_wizard = Some(SetupWizard::new(false));
+
+    // 弹出 provider 类型选择 picker
+    let items: Vec<String> = PROVIDER_TEMPLATES.iter().map(|t| t.id.to_string()).collect();
+    let labels: Vec<String> = PROVIDER_TEMPLATES.iter().map(|t| t.name.to_string()).collect();
+    s.open_picker_generic(PickerKind::Config, items, labels);
+
+    s.add_toast("Provider 配置向导", std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
 

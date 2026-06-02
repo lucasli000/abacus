@@ -74,6 +74,26 @@ pub fn apply_picker_selection(state: &mut AppState) {
             }
         }
         PickerKind::Preset   => format!("/preset {}", value),
+        PickerKind::Config   => {
+            // V43: Config wizard — provider 类型选择完成，进入 API key 输入
+            use crate::tui::state::{SetupStep, PROVIDER_TEMPLATES};
+            if let Some(ref mut wizard) = state.setup_wizard {
+                // 找到匹配的模板
+                if let Some(tmpl) = PROVIDER_TEMPLATES.iter().find(|t| t.id == value) {
+                    wizard.provider_type = Some(tmpl.clone());
+                    wizard.step = SetupStep::EnterApiKey;
+                    state.add_toast(
+                        &format!("已选择 {}，请输入 API Key", tmpl.name),
+                        std::time::Duration::from_secs(3),
+                    );
+                }
+            }
+            state.input.clear();
+            state.cursor_pos = 0;
+            state.cursor_line = 0;
+            state.cursor_col = 0;
+            return;
+        }
         PickerKind::History  => {
             // History 不走 slash dispatch，直接写入 input 并 submit
             state.picker = None; // 已被 take，确保清空
@@ -2264,6 +2284,87 @@ pub fn submit_message(state: &mut AppState) {
             Duration::from_secs(3),
         );
         return;
+    }
+
+    // V43: SetupWizard 输入拦截——wizard 激活时收集输入而非发送消息
+    if let Some(ref mut wizard) = state.setup_wizard {
+        use crate::tui::state::SetupStep;
+        match wizard.step {
+            SetupStep::EnterApiKey => {
+                if text.is_empty() {
+                    state.add_toast("API Key 不能为空", Duration::from_secs(2));
+                } else {
+                    wizard.api_key = Some(text.clone());
+                    wizard.step = SetupStep::EnterBaseUrl;
+                    let default_url = wizard.provider_type.as_ref()
+                        .map(|t| t.default_base_url)
+                        .unwrap_or("");
+                    state.add_toast(
+                        &format!("输入 Base URL（回车使用默认: {}）", default_url),
+                        Duration::from_secs(5),
+                    );
+                }
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                return;
+            }
+            SetupStep::EnterBaseUrl => {
+                // 空输入 = 使用默认 URL
+                wizard.base_url = if text.is_empty() { None } else { Some(text.clone()) };
+                // 生成并写入 providers.json
+                if let Some(json) = wizard.to_providers_json() {
+                    let path = abacus_core::paths::providers_json();
+                    // 确保目录存在
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::write(&path, &json) {
+                        Ok(()) => {
+                            state.add_toast(
+                                &format!("✓ 已写入 {}", path.display()),
+                                Duration::from_secs(4),
+                            );
+                            // 通知引擎重载 provider（通过 pending_slash_command）
+                            state.pending_slash_command = Some(
+                                crate::tui::state::SlashCommand::ReloadProviders
+                            );
+                        }
+                        Err(e) => {
+                            state.add_toast(
+                                &format!("写入失败: {}", e),
+                                Duration::from_secs(5),
+                            );
+                        }
+                    }
+                }
+                // 清除向导
+                state.setup_wizard = None;
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                return;
+            }
+            SetupStep::SelectProvider => {
+                // 不应到这里（SelectProvider 由 picker 处理）
+                // 但如果用户直接输入 provider id，也处理
+                use crate::tui::state::PROVIDER_TEMPLATES;
+                if let Some(tmpl) = PROVIDER_TEMPLATES.iter().find(|t| t.id == text || t.name == text) {
+                    wizard.provider_type = Some(tmpl.clone());
+                    wizard.step = SetupStep::EnterApiKey;
+                    state.add_toast("请输入 API Key", Duration::from_secs(3));
+                } else {
+                    state.add_toast("未知 Provider，请选择列表中的选项", Duration::from_secs(3));
+                }
+                state.input.clear();
+                state.cursor_pos = 0;
+                state.cursor_line = 0;
+                state.cursor_col = 0;
+                return;
+            }
+        }
     }
 
     // 斜杠命令拦截：本地消费，不发给引擎

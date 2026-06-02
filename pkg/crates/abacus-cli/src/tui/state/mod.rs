@@ -104,6 +104,8 @@ pub enum PickerKind {
     Meeting,
     /// 2026-05-28: 场景预设选择
     Preset,
+    /// V43: Provider 配置向导——选择 provider 类型
+    Config,
 }
 
 /// Picker 状态
@@ -757,6 +759,16 @@ pub enum SlashCommand {
     ExecuteWithTeam {
         task: String,
     },
+
+    /// V43: 重新加载 providers.json（config wizard 写入后触发）
+    ///
+    /// ## 引用关系
+    /// - 设置：event/mod.rs SetupWizard EnterBaseUrl 完成后
+    /// - 消费：run.rs 主循环调 engine reload_providers
+    ///
+    /// ## 生命周期
+    /// 一次性 dispatch；完成后 toast 通知
+    ReloadProviders,
 }
 
 /// V41: Plan 策略两阶段状态机
@@ -797,6 +809,148 @@ pub enum PlanExecutionStrategy {
     StepByStep,
     /// 转为 Team 模式多专家并行执行
     Team,
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// SetupWizard — Provider 配置向导
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Provider 配置向导状态机
+///
+/// ## 触发条件
+/// 1. 首次启动无 providers.json → 自动触发
+/// 2. `/config` 命令 → 手动触发
+///
+/// ## 引用关系
+/// - 写入: `/config` 命令 + engine_init onboarding 检测
+/// - 读取: event/mod.rs 拦截输入 + bars.rs placeholder 提示
+/// - 完成: 写入 ~/.abacus/providers.json + 重载 provider
+///
+/// ## 生命周期
+/// /config 或 onboarding → SelectProvider → EnterApiKey → EnterBaseUrl → 写入文件 → None
+#[derive(Debug, Clone)]
+pub struct SetupWizard {
+    pub step: SetupStep,
+    /// 已选择的 provider 类型（SelectProvider 完成后填充）
+    pub provider_type: Option<ProviderTemplate>,
+    /// 用户输入的 API key（EnterApiKey 完成后填充）
+    pub api_key: Option<String>,
+    /// 用户输入的 base_url（EnterBaseUrl 完成后填充，None = 用默认）
+    pub base_url: Option<String>,
+    /// 是否为首次 onboarding（影响欢迎文案）
+    pub is_onboarding: bool,
+}
+
+/// 向导步骤
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupStep {
+    /// 选择 Provider 类型（弹 picker）
+    SelectProvider,
+    /// 输入 API Key（文本输入）
+    EnterApiKey,
+    /// 输入 Base URL（文本输入，可回车跳过用默认）
+    EnterBaseUrl,
+}
+
+/// 预置 Provider 模板
+///
+/// 设计: 内置常见 provider 的默认配置，减少用户输入量
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderTemplate {
+    /// 显示名
+    pub name: &'static str,
+    /// provider_id（写入 JSON 的 key）
+    pub id: &'static str,
+    /// 默认 base_url
+    pub default_base_url: &'static str,
+    /// 默认模型列表
+    pub default_models: &'static [&'static str],
+}
+
+/// 内置 Provider 模板列表
+pub const PROVIDER_TEMPLATES: &[ProviderTemplate] = &[
+    ProviderTemplate {
+        name: "Anthropic (Claude)",
+        id: "anthropic",
+        default_base_url: "https://api.anthropic.com/v1",
+        default_models: &["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514"],
+    },
+    ProviderTemplate {
+        name: "OpenAI",
+        id: "openai",
+        default_base_url: "https://api.openai.com/v1",
+        default_models: &["gpt-4o", "gpt-4o-mini", "o3-mini"],
+    },
+    ProviderTemplate {
+        name: "DeepSeek",
+        id: "deepseek",
+        default_base_url: "https://api.deepseek.com/v1",
+        default_models: &["deepseek-chat", "deepseek-reasoner"],
+    },
+    ProviderTemplate {
+        name: "OpenRouter",
+        id: "openrouter",
+        default_base_url: "https://openrouter.ai/api/v1",
+        default_models: &["anthropic/claude-sonnet-4", "openai/gpt-4o"],
+    },
+    ProviderTemplate {
+        name: "自定义 (OpenAI Compatible)",
+        id: "custom",
+        default_base_url: "",
+        default_models: &[],
+    },
+];
+
+impl SetupWizard {
+    /// 创建新向导（首次 onboarding 或手动 /config）
+    pub fn new(is_onboarding: bool) -> Self {
+        Self {
+            step: SetupStep::SelectProvider,
+            provider_type: None,
+            api_key: None,
+            base_url: None,
+            is_onboarding,
+        }
+    }
+
+    /// 当前步骤的输入提示文案
+    pub fn placeholder(&self) -> &'static str {
+        match self.step {
+            SetupStep::SelectProvider => "选择 Provider 类型…",
+            SetupStep::EnterApiKey => "粘贴 API Key (sk-...)…",
+            SetupStep::EnterBaseUrl => "Base URL (回车使用默认)…",
+        }
+    }
+
+    /// 生成 providers.json 内容
+    pub fn to_providers_json(&self) -> Option<String> {
+        let tmpl = self.provider_type.as_ref()?;
+        let api_key = self.api_key.as_ref()?;
+        let base_url = self.base_url.as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(tmpl.default_base_url);
+
+        let models_json: Vec<String> = tmpl.default_models.iter()
+            .map(|m| format!("      \"{}\"", m))
+            .collect();
+
+        let json = format!(
+r#"{{
+  "providers": [
+    {{
+      "id": "{}",
+      "base_url": "{}",
+      "api_key": "{}",
+      "models": [
+{}
+      ]
+    }}
+  ]
+}}"#,
+            tmpl.id, base_url, api_key, models_json.join(",\n")
+        );
+        Some(json)
+    }
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1249,6 +1403,10 @@ pub struct AppState {
     /// 引用关系：/plan 触发 → api/mod.rs Phase 1 设置 → run.rs 监听 Approval → Phase 2 执行
     /// 生命周期：/plan 创建 → Researching → AwaitingApproval → Executing → None（完成清除）
     pub plan_phase: Option<PlanPhase>,
+    /// V43: Provider 配置向导
+    /// 引用关系：/config 或首次启动触发 → event/mod.rs 拦截输入 → 写入 providers.json
+    /// 生命周期：触发 → 多步完成 → 写文件 → None
+    pub setup_wizard: Option<SetupWizard>,
     /// 设置面板状态
     pub show_settings: bool,
     /// 设置面板焦点字段索引
@@ -2523,6 +2681,7 @@ impl AppState {
             text_selection: None,
             pending_slash_command: None,
             plan_phase: None,
+            setup_wizard: None,
             show_settings: false,
             settings_focus: 0,
             settings_input: String::new(),
