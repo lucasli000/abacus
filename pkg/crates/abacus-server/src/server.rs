@@ -813,9 +813,75 @@ impl AbacusServer {
         }
 
         // ─── Provider registration ──────────────────────────────────────
-        // 双协议自动回退: 同时注册 Anthropic + OpenAI 协议 provider，
-        // FallbackProvider 在主协议失败时自动切换到备用协议。
-        // 优先级: Anthropic > OpenAI-compatible > DeepSeek > NoApiKey
+        // V43: 新路径优先（providers.json / config.yaml providers 数组）
+        // fallback 到旧路径（llm.* 单键配置）
+        use abacus_types::ProviderType;
+        use abacus_core::llm::fallback_provider::FallbackProvider;
+
+        let provider_entries = cfg_mgr.parse_providers();
+        if !provider_entries.is_empty() {
+            // ── 新路径：多供应商配置 ──
+            let mut registered_ids: Vec<String> = Vec::new();
+            for entry in &provider_entries {
+                let api_key = entry.api_key.clone().unwrap_or_default();
+                let models: Vec<ModelId> = if entry.models.is_empty() {
+                    vec![ModelId(default_model.to_string())]
+                } else {
+                    entry.models.iter().map(|m| ModelId(m.name.clone())).collect()
+                };
+                match entry.provider_type {
+                    ProviderType::Anthropic => {
+                        let p = Arc::new(AnthropicProvider::new(
+                            api_key, models.first().cloned().unwrap_or(ModelId("claude-sonnet-4".into())),
+                            entry.base_url.clone(), None,
+                        ));
+                        core_loop.register_provider_group(&entry.id, models, p).await;
+                    }
+                    ProviderType::Deepseek => {
+                        use abacus_core::llm::providers::deepseek::DeepSeekProvider;
+                        let base = entry.base_url.clone()
+                            .map(|u| u.trim_end_matches("/v1").to_string());
+                        let p = Arc::new(DeepSeekProvider::with_config(
+                            api_key, models.first().cloned().unwrap_or(ModelId("deepseek-chat".into())),
+                            base, None, None,
+                        ));
+                        core_loop.register_provider_group(&entry.id, models, p).await;
+                    }
+                    ProviderType::OpenaiCompatible | ProviderType::Gemini => {
+                        let base = entry.base_url.clone()
+                            .unwrap_or_else(|| "https://api.openai.com/v1".into());
+                        let mut provider = OpenAICompatibleProvider::new(
+                            api_key, models.first().cloned().unwrap_or(ModelId("gpt-4o".into())),
+                            base, None, None, None,
+                        );
+                        if entry.base_url.is_none() {
+                            provider.set_discover_enabled(false);
+                        }
+                        let p = Arc::new(provider);
+                        core_loop.register_provider_group(&entry.id, models, p).await;
+                    }
+                }
+                registered_ids.push(entry.id.clone());
+                tracing::info!(provider = %entry.id, "registered provider group (server)");
+            }
+            // 构建 "primary" fallback chain
+            let chain_ids = cfg_mgr.get_list("fallback_chain").unwrap_or(registered_ids.clone());
+            if chain_ids.len() == 1 {
+                if let Some(p) = core_loop.get_provider(&chain_ids[0]).await {
+                    core_loop.register_provider("primary", p).await;
+                    core_loop.set_adapter("primary", &chain_ids[0]).await;
+                }
+            } else if chain_ids.len() >= 2 {
+                let pri = core_loop.get_provider(&chain_ids[0]).await;
+                let fb = core_loop.get_provider(&chain_ids[1]).await;
+                if let (Some(pri), Some(fb)) = (pri, fb) {
+                    let fallback = Arc::new(FallbackProvider::new(pri, fb, &chain_ids[0], &chain_ids[1]));
+                    core_loop.register_provider("primary", fallback).await;
+                    core_loop.set_adapter("primary", &chain_ids[0]).await;
+                }
+            }
+        } else {
+        // ── 旧路径：llm.* 单键配置（向后兼容）──
         let secrets = SecretsManager::new();
 
         let anthropic_base_url = cfg_mgr.get_str("llm.anthropic_base_url");
@@ -826,7 +892,6 @@ impl AbacusServer {
         let mut has_anthropic = false;
         let mut has_openai = false;
 
-        // 注册 Anthropic provider
         if let Some(api_key) = anthropic_api_key {
             let provider = Arc::new(AnthropicProvider::new(
                 api_key.to_string(),
@@ -837,8 +902,6 @@ impl AbacusServer {
             core_loop.register_provider("anthropic", provider.clone()).await;
             has_anthropic = true;
 
-            // H6 修复：仅当同时配置 OpenAI base_url 且 api_key 非空时才注册回退 provider；
-            // 空 key 注册等于注入一个保证 401 的 provider，污染 CapabilityHub 候选池。
             if let (Some(base_url), Some(oapi_key)) = (
                 openai_base_url,
                 openai_api_key.filter(|k| !k.is_empty()),
@@ -852,16 +915,11 @@ impl AbacusServer {
                 core_loop.register_provider("openai-compatible", oprovider.clone()).await;
                 has_openai = true;
 
-                // 双协议自动回退
                 let fallback = Arc::new(FallbackProvider::new(
                     provider, oprovider, "anthropic", "openai-compatible",
                 ));
                 core_loop.register_provider("primary", fallback).await;
-                // FallbackProvider id="primary" 的自动 adapter 为 NeutralAdapter（不识别内部实现）
-                // 显式绑定主协议 adapter：主协议为 Anthropic → AnthropicAdapter
                 core_loop.set_adapter("primary", "anthropic").await;
-            } else if openai_base_url.is_some() {
-                tracing::warn!("OPENAI_BASE_URL 已配置但 OPENAI_API_KEY 为空 — 跳过 OpenAI fallback 注册");
             }
         } else if let (Some(base_url), Some(api_key)) = (
             openai_base_url,
@@ -877,9 +935,7 @@ impl AbacusServer {
             has_openai = true;
         }
 
-        // DeepSeek fallback（仅当没有 Anthropic/OpenAI 配置时）
         if !has_anthropic && !has_openai {
-            // 优先环境变量，其次配置文件中的 llm.api_key
             let api_key_loaded = secrets.load_from_env("ABACUS_API_KEY", SecretType::ApiKey("deepseek".into()))
                 .await.is_ok()
                 || secrets.load_from_env("DEEPSEEK_API_KEY", SecretType::ApiKey("deepseek".into()))
@@ -902,6 +958,7 @@ impl AbacusServer {
                 core_loop.register_provider("no-api-key", Arc::new(abacus_core::NoApiKeyProvider)).await;
             }
         }
+        } // end of旧路径 else block
         // ─── MCIP 权限配置（来自 security.yaml）────────────────────────
         core_loop.configure_mcip_permissions(
             &cfg_mgr.get_list("mcip.exempt_prefixes").unwrap_or_default(),

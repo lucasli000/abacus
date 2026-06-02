@@ -611,6 +611,11 @@ use wasmtime::{Config, Engine, Linker, Module, Store, TypedFunc};
 /// - No WASI (no file/network access)
 /// - Memory limited by `max_memory_mb` from manifest
 /// - Pure sandboxed execution in linear memory
+/// WASM Plugin 加载器
+///
+/// **Status: 部分实装**——discover/verify/register 路径可用，但 execute 内部
+/// 尚未实现 wasmtime 实例化（返回 "plugin execution not yet implemented"）。
+/// 用户通过 `core.plugins.base_dir` 启用时工具会注册但调用会返回错误。
 pub struct PluginLoader {
     plugins: Arc<RwLock<HashMap<String, PluginInstance>>>,
     base_dir: PathBuf,

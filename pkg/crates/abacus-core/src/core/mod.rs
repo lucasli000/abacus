@@ -3333,6 +3333,20 @@ impl CoreLoop {
         }
     }
 
+    /// 根据模型名查找对应的 provider_id（用于仪表盘即时更新）
+    ///
+    /// 遍历 provider_groups，返回第一个支持该模型的 group id。
+    /// 未找到时返回 None（不影响实际执行，仅仪表盘展示延迟）。
+    pub async fn resolve_provider_id_for_model(&self, model_name: &str) -> Option<String> {
+        let groups = self.provider_groups.read().await;
+        for group in groups.iter() {
+            if group.supports(model_name) {
+                return Some(group.id.clone());
+            }
+        }
+        None
+    }
+
     /// 获取记忆宫殿引用（TUI 面板数据拉取用）
     pub fn memory_palace(&self) -> Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>> {
         self.memory_palace.clone()

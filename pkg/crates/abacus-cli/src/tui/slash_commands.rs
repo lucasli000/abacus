@@ -531,6 +531,17 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
             });
         });
     }
+    // P2#8: 切换后立即更新仪表盘的 active provider 显示
+    if let Some(ref engine) = s.engine_handle {
+        let core = engine.core.clone();
+        if let Some(provider_id) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                core.resolve_provider_id_for_model(name).await
+            })
+        }) {
+            s.active_provider_id = provider_id;
+        }
+    }
     s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
