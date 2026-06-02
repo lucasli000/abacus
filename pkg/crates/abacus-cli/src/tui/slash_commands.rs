@@ -484,15 +484,10 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     }
 
     // 默认分支: 切换模型
-    // PR4: Resolve through ModelPreference aliases first, then legacy shortcuts.
-    // Priority: preference alias > hardcoded shortcut > raw input
+    // V44: 不再硬编码 shortcut alias（从 ModelPreference + ProviderRegistry 动态解析）
     let input_str = args[0];
     let name = match lower.as_str() {
-        "pro" | "deepseek-v4-pro" => "deepseek-v4-pro",
-        "flash" | "deepseek-v4-flash" => "deepseek-v4-flash",
-        "qwen" | "qwen-plus" => "qwen-plus",
         "list" | "ls" => {
-            // PR4: `/model list` → delegate to engine for ProviderRegistry listing
             return engine_or(s, SlashCommand::ModelList);
         }
         _ => input_str,
