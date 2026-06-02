@@ -3484,7 +3484,21 @@ impl<'a> TurnPipeline<'a> {
     // ─── Phase 7: Persist & Build Result ────────────────────────────────────
 
     async fn persist_and_build_result(self, ctx: TurnContext) -> Result<TurnResult, KernelError> {
-        // V42: 空回复不再注入 "(max turns reached)" — 空就是空，TUI 不渲染空消息
+        // V43.6: 清除 ephemeral system 消息——它们是一次性内部指令，不应留在 context 中
+        // 问题：每轮可能注入 2-4 条 "[Abacus" system 消息（工具名检测/续写/预算提示），
+        // 13 轮后累积 80+ 条占大量 token，且对后续 LLM 调用毫无意义。
+        // 修复：turn 结束后删除所有 "[Abacus" 前缀的 system 消息。
+        {
+            let s = self.session.read().await;
+            let mut msgs = s.messages.write().await;
+            msgs.retain(|m| {
+                if m.role != MessageRole::System { return true; }
+                match &m.content {
+                    Some(MessageContent::Text(t)) => !t.starts_with("[Abacus"),
+                    _ => true,
+                }
+            });
+        }
 
         let latency = ctx.start_time.elapsed().as_millis() as u64;
         let session_id = { let s = self.session.read().await; s.session_id.clone() };
