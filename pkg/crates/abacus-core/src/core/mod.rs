@@ -3387,7 +3387,19 @@ impl CoreLoop {
     ///
     /// 遍历 provider_groups，返回第一个支持该模型的 group id。
     /// 未找到时返回 None（不影响实际执行，仅仪表盘展示延迟）。
+    /// 解析 model 所属 provider ID（TUI 显示 + slash cmd 同步用）
+    ///
+    /// V44: 优先走 ProviderRegistry（与 resolve_provider_with_hint 一致），
+    /// 确保 TUI 显示的 provider 和实际请求走的 provider 相同。
     pub async fn resolve_provider_id_for_model(&self, model_name: &str) -> Option<String> {
+        // 1. ProviderRegistry（新路由，与请求路径一致）
+        let qid = abacus_types::QualifiedModelId::parse(model_name);
+        if let Ok(resolved) = self.provider_registry.resolve_unqualified(qid.model_name()).await {
+            if let Some(ref pid) = resolved.provider {
+                return Some(pid.0.clone());
+            }
+        }
+        // 2. 旧路径 fallback（兼容）
         let groups = self.provider_groups.read().await;
         for group in groups.iter() {
             if group.supports(model_name) {
