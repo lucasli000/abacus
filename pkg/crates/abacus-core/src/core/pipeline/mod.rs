@@ -3222,10 +3222,11 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[Abacus 用户插入] 用户发来新消息：\n{}\n\n\
-                             约束：不要中断正在进行的工具调用序列。\
-                             完成当前步骤后，在下次文本输出中回应用户消息。\
-                             若用户要求停止，完成当前工具调用后立即停止并总结。",
+                            "[User mid-turn message]\n{}\n\n\
+                             CRITICAL: Do NOT restart or regenerate your previous output. \
+                             Continue from where you left off. Incorporate this message naturally \
+                             into your ongoing work. Do NOT repeat what you already said/did. \
+                             If user asks to stop, finish current tool call then stop with summary.",
                             combined
                         ))),
                         name: None,
