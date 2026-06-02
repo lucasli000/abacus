@@ -95,7 +95,22 @@ impl PatternCondition {
             }
             PatternCondition::PathOutsideCwd { field } => {
                 extract_field(args, field)
-                    .map(|v| !v.starts_with(cwd))
+                    .map(|v| {
+                        // 规范化路径（消除 .. 和 . 遍历，防止绕过）
+                        use std::path::{Component, PathBuf};
+                        let normalized = PathBuf::from(&v)
+                            .components()
+                            .fold(PathBuf::new(), |mut acc, c| {
+                                match c {
+                                    Component::ParentDir => { acc.pop(); }
+                                    Component::CurDir => {}
+                                    _ => acc.push(c),
+                                }
+                                acc
+                            });
+                        let norm_str = normalized.to_string_lossy();
+                        !norm_str.starts_with(cwd)
+                    })
                     .unwrap_or(false)
             }
             PatternCondition::All { conditions } => {
@@ -186,13 +201,16 @@ impl ToolActionClassifier {
     /// 加载内置硬编码规则
     fn load_builtin_rules(&mut self) {
         // ── Hard Deny: 绝对禁止 ──
+        // V44: rm -rf 用 AnyOf 覆盖常见变体（防子串精确匹配绕过）
         self.hard_deny.extend(vec![
             ActionPattern {
                 tool_id: "bash_exec".into(),
-                condition: PatternCondition::Contains {
-                    field: "command".into(),
-                    substring: "rm -rf /".into(),
-                },
+                condition: PatternCondition::AnyOf { conditions: vec![
+                    PatternCondition::Contains { field: "command".into(), substring: "rm -rf /".into() },
+                    PatternCondition::Contains { field: "command".into(), substring: "rm -rf /*".into() },
+                    PatternCondition::Contains { field: "command".into(), substring: "rm --recursive --force /".into() },
+                    PatternCondition::Contains { field: "command".into(), substring: "rm -r -f /".into() },
+                ]},
                 reason: "禁止删除根目录".into(),
             },
             ActionPattern {
@@ -292,10 +310,16 @@ impl ToolActionClassifier {
             allow: Vec<ActionPattern>,
         }
 
-        if let Ok(rules) = serde_yaml::from_str::<UserRules>(&content) {
-            self.hard_deny.extend(rules.hard_deny);
-            self.soft_deny.extend(rules.soft_deny);
-            self.allow_rules.extend(rules.allow);
+        match serde_yaml::from_str::<UserRules>(&content) {
+            Ok(rules) => {
+                self.hard_deny.extend(rules.hard_deny);
+                self.soft_deny.extend(rules.soft_deny);
+                self.allow_rules.extend(rules.allow);
+                tracing::info!("loaded user safety rules from {}", path.display());
+            }
+            Err(e) => {
+                tracing::warn!("failed to parse {}: {e}. User safety rules not loaded.", path.display());
+            }
         }
     }
 }

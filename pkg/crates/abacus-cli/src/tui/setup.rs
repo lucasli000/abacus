@@ -522,26 +522,20 @@ core:
         }
     }
 
-    // V43: 同步写入 providers.json（新格式，优先级高于 config.yaml providers 段）
-    // 确保 engine_init load_providers_json 能正确加载
-    let providers_json = format!(
-        r#"[
-  {{
-    "id": "primary",
-    "type": "{}",
-    "api_key": "{}",
-    "base_url": "{}",
-    "models": [
-      {{"name": "{}", "context_window": {}, "max_tokens": 16384}}
-    ]
-  }}
-]"#,
-        provider_type_str,
-        state.api_key,  // 原始值（非 YAML 转义）
-        raw_url,        // 原始 URL
-        if state.model_name.is_empty() { provider.default_model() } else { &state.model_name },
-        cw_tokens_opt.unwrap_or(128_000),
-    );
+    // V44: 用 serde_json 构建 providers.json（防止 JSON 注入/转义问题）
+    let model_name = if state.model_name.is_empty() {
+        provider.default_model().to_string()
+    } else {
+        state.model_name.clone()
+    };
+    let providers_entry = serde_json::json!([{
+        "id": "primary",
+        "type": provider_type_str,
+        "api_key": state.api_key,
+        "base_url": raw_url,
+        "models": [{"name": model_name, "context_window": cw_tokens_opt.unwrap_or(128_000), "max_tokens": 16384}]
+    }]);
+    let providers_json = serde_json::to_string_pretty(&providers_entry).unwrap_or_default();
     let providers_json_path = abacus_core::paths::providers_json();
     if let Err(e) = std::fs::write(&providers_json_path, &providers_json) {
         tracing::warn!("failed to write providers.json: {e}");

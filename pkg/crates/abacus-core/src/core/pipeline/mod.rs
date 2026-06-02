@@ -2604,7 +2604,8 @@ impl<'a> TurnPipeline<'a> {
                     use crate::core::action_classifier::ClassifyResult;
                     let safety_result = self.core.action_classifier.classify(tool_id.0.as_str(), &params);
                     if let ClassifyResult::Deny(ref reason) = safety_result {
-                        ctx.consecutive_blocks += 1;
+                        // V44 fix: Deny 不递增 consecutive_blocks（绝对禁止 ≠ 可覆盖拦截）
+                        // 仅 NeedsConfirm 递增——防止 3 次 hard_deny 误触发 force_confirm_all
                         Ok(ToolOutput {
                             tool_id: tool_id.clone(),
                             success: false,
