@@ -272,7 +272,21 @@ fn disclaimer_path() -> PathBuf {
 }
 
 /// 检测是否已有有效 API 配置
+///
+/// 优先检测 providers.json（V43 新格式），再 fallback 到环境变量和 config.yaml
 pub fn has_api_config() -> bool {
+    // V43: providers.json 存在且非空 → 已配置
+    let providers_path = abacus_core::paths::providers_json();
+    if providers_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&providers_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() && trimmed != "[]" {
+                return true;
+            }
+        }
+    }
+
+    // 环境变量检测（向后兼容）
     if std::env::var("ABACUS_API_KEY").is_ok()
         || std::env::var("DEEPSEEK_API_KEY").is_ok()
         || std::env::var("ANTHROPIC_API_KEY").is_ok()
@@ -280,9 +294,9 @@ pub fn has_api_config() -> bool {
     {
         return true;
     }
+
+    // config.yaml 中有 api_key（旧格式兼容检测）
     if let Ok(content) = std::fs::read_to_string(config_path()) {
-        // M3 fix: 跳过注释行，仅匹配非空 api_key 赋值行
-        // 防止高级配置注释块（含 # openai_api_key: ""）触发误报
         let has_real_key = content.lines().any(|line| {
             let trimmed = line.trim();
             !trimmed.starts_with('#')
@@ -476,51 +490,22 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         lines.join("\n")
     };
 
+    // V43: config.yaml 只管系统行为，不含 providers（由 providers.json 管理）
     let yaml = format!(
         r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
-# ║  ABACUS 配置文件 (config.yaml)                                              ║
-# ╠═══════════════════════════════════════════════════════════════════════════════╣
-# ║                                                                             ║
-# ║  providers:                   # 供应商列表（按优先级排序）                   ║
-# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
-# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
-# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
-# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
-# ║      models:                  # 模型列表（简写或详写）                       ║
-# ║        - model-name           # 简写：用 provider 默认参数                   ║
-# ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║
-# ║          context_window: N    #   上下文窗口（token 数）                     ║
-# ║          max_tokens: N        #   单次最大输出 token                         ║
-# ║          temperature: 0.0-2.0 #   生成温度                                  ║
-# ║          thinking: off|adaptive|low|medium|high|max                         ║
-# ║                                                                             ║
-# ║  core:                        # 全局运行参数                                 ║
-# ║    default_model: <model>     # 默认模型                                    ║
-# ║    stream: true               # 流式输出                                    ║
-# ║                                                                             ║
-# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
-# ║                                                                             ║
-# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
-# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
-# ║                                                                             ║
+# ║  ABACUS 配置文件 (config.yaml) — 系统行为配置                               ║
+# ║  LLM Provider 配置在 providers.json（同目录）                                ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
-
-# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
-providers:
-  - id: primary
-    type: {}
-    api_key: "{}"
-    base_url: "{}"
-    models:
-      - {}
 
 # ─── 全局设置 ───────────────────────────────────────────────────────────────────
 core:
   default_model: "{}"
+  temperature: 0.3
+  max_tokens: 16384
+  thinking: low
   stream: true
 {}  context_window_ratio: {:.4}
 {}"#,
-        provider_type_str, api_key_e, base_url, resolved_model,
         resolved_model, cw_line, cw_ratio, features_section,
     );
 

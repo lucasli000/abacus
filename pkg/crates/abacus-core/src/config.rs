@@ -203,15 +203,15 @@ impl ConfigManager {
             });
         }
 
-        // 2026-05-28: 解析 `providers` 数组（独立于 flatten，因为数组对象不适合点分键）
-        // 尝试从 YAML/JSON 中提取 providers 顶级字段
+        // V43: config.yaml 不再负责 providers 配置
+        // providers 统一由 providers.json 管理（load_providers_json）
+        // 旧 config.yaml 中的 providers: 段被忽略（向用户发 deprecation 提示）
         if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-            if let Some(providers_val) = raw.get("providers") {
-                if let Ok(entries) = serde_yaml::from_value::<Vec<abacus_types::ProviderEntry>>(providers_val.clone()) {
-                    self.provider_entries = entries;
-                } else {
-                    tracing::warn!("config: `providers` 格式解析失败，跳过");
-                }
+            if raw.get("providers").is_some() {
+                tracing::warn!(
+                    "config.yaml 中的 `providers` 段已废弃，请迁移到 ~/.abacus/providers.json。\
+                     此段将被忽略。"
+                );
             }
         }
 
