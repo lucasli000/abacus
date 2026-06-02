@@ -616,6 +616,10 @@ impl AbacusServer {
         let _ = cfg_mgr.load_file(paths::config_yaml());
         let _ = cfg_mgr.load_file(paths::security_yaml());
         cfg_mgr.load_dir(paths::conf_d_dir());
+        // V43.7: providers.json 优先（覆盖 config.yaml 中的 providers 字段）
+        if let Err(e) = cfg_mgr.load_providers_json(paths::providers_json()) {
+            tracing::warn!("providers.json load failed: {e}");
+        }
 
         let default_model = cfg_mgr.get_str("core.default_model")
             .unwrap_or(abacus_types::ModelId::AUTO);

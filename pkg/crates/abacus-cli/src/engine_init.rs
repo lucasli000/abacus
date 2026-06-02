@@ -87,7 +87,9 @@ pub async fn create_engine(
     let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
     // V43.7: providers.json 优先——JSON 格式的 provider/LLM 配置（覆盖 config.yaml 中的 providers）
-    let _ = cfg_mgr.load_providers_json(paths::providers_json());
+    if let Err(e) = cfg_mgr.load_providers_json(paths::providers_json()) {
+        tracing::warn!("providers.json load failed: {e}");
+    }
 
     // Validate config before using — warn on out-of-range values
     let validation_warnings = cfg_mgr.validate();
