@@ -1722,10 +1722,10 @@ fn render_streaming_blocks(
                             StreamingToolStatus::Failed => "✗",
                         };
                         let ctx = if call.context.is_empty() { String::new() } else { format!(" {}", call.context) };
-                        // V44: wrap 长 context（bar+4+mark+space = 7 overhead）
+                        // V44: wrap 长 context — 用 display_width 正确处理 CJK 全角
                         let avail_w = prose_width.saturating_sub(7);
-                        let ctx_chars: Vec<char> = ctx.chars().collect();
-                        if ctx_chars.len() <= avail_w {
+                        let ctx_display_w = crate::tui::util::display_width(&ctx);
+                        if ctx_display_w <= avail_w {
                             lines.push(Line::from(vec![
                                 bar.clone(),
                                 Span::raw("    "),
@@ -1733,25 +1733,24 @@ fn render_streaming_blocks(
                                 Span::styled(ctx, Style::default().fg(state.theme.accent)),
                             ]));
                         } else {
-                            // 第一行带 mark
-                            let first_chunk: String = ctx_chars[..avail_w].iter().collect();
-                            lines.push(Line::from(vec![
-                                bar.clone(),
-                                Span::raw("    "),
-                                Span::styled(mark, Style::default().fg(status_color)),
-                                Span::styled(first_chunk, Style::default().fg(state.theme.accent)),
-                            ]));
-                            // 后续行缩进对齐
-                            let mut pos = avail_w;
-                            while pos < ctx_chars.len() {
-                                let end = (pos + avail_w).min(ctx_chars.len());
-                                let chunk: String = ctx_chars[pos..end].iter().collect();
-                                lines.push(Line::from(vec![
-                                    bar.clone(),
-                                    Span::raw("      "),
-                                    Span::styled(chunk, Style::default().fg(state.theme.accent)),
-                                ]));
-                                pos = end;
+                            // 用 word_wrap_segments（display width aware）拆分
+                            let segments = crate::tui::util::word_wrap_segments(&ctx, avail_w);
+                            for (i, (seg_start, seg_end)) in segments.iter().enumerate() {
+                                let chunk = ctx[*seg_start..*seg_end].to_string();
+                                if i == 0 {
+                                    lines.push(Line::from(vec![
+                                        bar.clone(),
+                                        Span::raw("    "),
+                                        Span::styled(mark, Style::default().fg(status_color)),
+                                        Span::styled(chunk, Style::default().fg(state.theme.accent)),
+                                    ]));
+                                } else {
+                                    lines.push(Line::from(vec![
+                                        bar.clone(),
+                                        Span::raw("      "),
+                                        Span::styled(chunk, Style::default().fg(state.theme.accent)),
+                                    ]));
+                                }
                             }
                         }
                     }
