@@ -632,9 +632,7 @@ impl<'a> TurnPipeline<'a> {
             self.input, self.session, &preflight
         ).await;
 
-        // Progressive prompt injection（text + segments 同步）
-        // Fix 3: context ELEVATED/CRITICAL 时跳过渐进协议，避免增加额外 token 开销
-        //         直接注入覆盖指令让 LLM 输出精简结论
+        // V44: Progressive prompt → preamble（每轮变化，不破 prefix cache）
         {
             let ctx_pressure = {
                 let w = self.core.context_manager.window.read().await;
@@ -645,8 +643,7 @@ impl<'a> TurnPipeline<'a> {
                 else { "OK" }
             };
             if matches!(ctx_pressure, "ELEVATED" | "CRITICAL") {
-                // 上下文紧张：覆盖渐进协议，强制精简输出
-                sys_out.push_dynamic(&format!(
+                sys_out.push_preamble(&format!(
                     "[Progressive Override] Context pressure={ctx_pressure}. \
                      Skip staged/gated review — output key conclusions directly and concisely. \
                      Do NOT produce large structured documents this turn."
@@ -657,12 +654,13 @@ impl<'a> TurnPipeline<'a> {
                 if let Some((_priority, prompt_text)) = build_progressive_prompt(
                     ctrl.current_state(), ctrl.current_strategy(),
                 ) {
-                    sys_out.push_dynamic(&prompt_text);
+                    sys_out.push_preamble(&prompt_text);
                 }
             }
         }
 
-        // Model Self-Escalation prompt（flash models only，text + segments 同步）
+        // Model Self-Escalation prompt（flash models only）
+        // 内容固定（不含变量），保留在 system prompt 中（不破 cache，同 model 内字节稳定）
         if self.core.config.default_model.0.contains("flash") {
             sys_out.push_dynamic("[Model Routing]\n\
                 If this request requires deep multi-step reasoning, complex architecture analysis, \
@@ -673,12 +671,9 @@ impl<'a> TurnPipeline<'a> {
                 For all other requests, proceed normally without [ESCALATE].");
         }
 
-        // ─── EpistemicGuard 累积违规声明注入（text + segments 同步）─────────────
-        // 与 post_process EpistemicPostCheck 形成双层防护：
-        //   PostCheck  — 事后检测，修改输出（per-turn）
-        //   Declaration — 预防注入，约束生成（cumulative session 级）
+        // V44: EpistemicGuard declaration → preamble（累积变化，不破 prefix cache）
         if let Some(declaration) = self.core.epistemic_guard.declaration_if_needed().await {
-            sys_out.push_dynamic(&declaration);
+            sys_out.push_preamble(&declaration);
         }
 
         // ─── SM-2 到期复习注入（已删除）──────────────────────────────────
@@ -727,8 +722,23 @@ impl<'a> TurnPipeline<'a> {
             } else { None }
         } else { None };
 
+        // V44: 合并 dynamic_preamble (awareness/progressive/epistemic) + ICL primer
+        // 两者都写入 user_message_preamble → latest user message 顶部（不破 prefix cache）
+        let user_message_preamble: Option<String> = {
+            let mut parts: Vec<String> = Vec::new();
+            // 动态遥测（awareness + focus + progressive + epistemic）
+            if !sys_out.dynamic_preamble.is_empty() {
+                parts.push(sys_out.dynamic_preamble);
+            }
+            // ICL Primer（KB 检索结果）
+            if let Some(icl) = user_message_preamble {
+                parts.push(icl);
+            }
+            if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+        };
+
         let enriched_system = sys_out.text;
-        let dynamic_blocks = sys_out.segments.len().saturating_sub(1); // 稳定段之外的动态块数
+        let dynamic_blocks = sys_out.segments.len().saturating_sub(1);
         let system_segments = sys_out.segments;
 
         // Hook: PromptBuilt（system prompt 组装完成，adapter 应用前）

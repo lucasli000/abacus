@@ -121,12 +121,25 @@ pub struct SystemPromptOutput {
     pub text: String,
     /// 用于 Anthropic 多 block cache provider（分段，稳定段可缓存）
     pub segments: Vec<crate::llm::provider::SystemSegment>,
+    /// V44: 每轮变化的动态遥测（注入到 latest user message 顶部，不进 system prompt）
+    ///
+    /// ## 设计意图
+    /// DeepSeek 自动 prefix cache 要求 system message 字节稳定。
+    /// 每轮变化的内容（awareness/progressive/palace）移到 user message preamble，
+    /// system prompt 保持 100% 跨轮字节一致 → cache hit 95%+。
+    ///
+    /// ## 引用关系
+    /// - 写入: build_system_output() 中的 awareness/palace/focus
+    /// - 写入: pipeline setup() 中的 progressive/epistemic
+    /// - 消费: pipeline execute_loop 合并到 ctx.user_message_preamble
+    pub dynamic_preamble: String,
 }
 
 impl SystemPromptOutput {
     /// 向两端同时追加动态内容（保证 text 与 segments 同步）
     ///
     /// `cacheable = false`：动态内容（每轮可变）不参与 Anthropic block cache
+    /// 注意：V44 后大部分动态内容应用 push_preamble() 而非此方法
     pub fn push_dynamic(&mut self, content: &str) {
         if content.is_empty() { return; }
         self.text.push_str("\n\n");
@@ -135,6 +148,17 @@ impl SystemPromptOutput {
             text: content.to_string(),
             cacheable: false,
         });
+    }
+
+    /// V44: 追加动态内容到 preamble（不进 system prompt，不破 prefix cache）
+    ///
+    /// 消费方：pipeline execute_loop 合并到 ctx.user_message_preamble → latest user message 顶部
+    pub fn push_preamble(&mut self, content: &str) {
+        if content.is_empty() { return; }
+        if !self.dynamic_preamble.is_empty() {
+            self.dynamic_preamble.push('\n');
+        }
+        self.dynamic_preamble.push_str(content);
     }
 }
 
@@ -4084,18 +4108,24 @@ impl CoreLoop {
         // 移到末尾后：stable prefix（Kernel + abacusbr_core + Strategy + Constraints）byte-identical
         //   → DeepSeek 命中率应从 ~0% 提升到接近 prompt_tokens（按 64-token 块对齐）
         // 对 LLM 注意力的影响：focus 仍在 system prompt 内、紧邻用户消息（recency-adjacent），不弱于 primacy
+        // V44: awareness + focus → dynamic_preamble（不破 prefix cache）
+        // 这些内容每轮变化（turn number, ctx%, age），放 system prompt 会破坏 DeepSeek prefix cache
+        let mut dynamic_preamble = awareness_block;
+        if let Some(ref focus) = focus_block {
+            dynamic_preamble.push_str("\n\n");
+            dynamic_preamble.push_str(focus);
+        }
+
+        // system prompt 只保留跨轮稳定内容
         let assembled_with_context = {
             let mut s = assembled;
+            // catalog: session 内 byte-stable（工具注册后不变）
             if let Some(ref cat) = catalog_block {
                 s = format!("{}\n\n---\n\n{}", s, cat);
             }
-            // Awareness block 每轮变化（turn/tool_calls 递增）→ 放在动态段
-            s = format!("{}\n\n---\n\n{}", s, awareness_block);
 
             // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
-            // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
             // byte-stable（不含变量），被 prefix cache 覆盖
-            // 策略注入（从 policy.toml 加载，运行时可调）
             let policy = &self.config.policy;
             if !policy.guard.entropy_guard.is_empty() {
                 s.push_str("\n\n[Entropy Guard]\n");
@@ -4107,7 +4137,7 @@ impl CoreLoop {
             }
             s
         };
-        let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());
+        let text = assembled_with_context;
 
         // ─── 构建 segments（多 block，用于 Anthropic cache）────────────────────
         let mut segments = self.prompt_assembly.assemble_segments(
@@ -4119,30 +4149,11 @@ impl CoreLoop {
             false,
         );
 
-        // SessionFocus 应用到 segments —— 与 text 路径策略对齐（统一追加到末尾）
-        // 之前 text 路径保留 focus 在前（primacy）属于跨 provider 不一致，DeepSeek/OpenAI 已踩坑
-        //
-        // W3 (Task #101) 守护：focus 含 age 字段（render_with_age），每轮字节都变。
-        //   不能写到 cacheable=true 段——会破 prefix cache。
-        //   规则：
-        //     ① 末段是 cacheable=false → append（原行为）
-        //     ② 末段是 cacheable=true 或 segments 为空 → push 一个新 cacheable=false 段
-        if let Some(ref focus) = focus_block {
-            let needs_new_segment = match segments.last() {
-                Some(last) => last.cacheable,
-                None => true,
-            };
-            if needs_new_segment {
-                segments.push(crate::llm::provider::SystemSegment {
-                    text: format!("{}\n\n---", focus),
-                    cacheable: false,
-                });
-            } else if let Some(last) = segments.last_mut() {
-                last.text.push_str(&format!("\n\n---\n\n{}", focus));
-            }
-        }
+        // V44: focus 已移到 dynamic_preamble，segments 不再需要追加动态段
+        // Anthropic cache 效果：所有 segments 现在都可能是 cacheable（除 Tier3 injector 段）
+        // focus/awareness 不再破坏任何 segment 的 cache
 
-        SystemPromptOutput { text, segments }
+        SystemPromptOutput { text, segments, dynamic_preamble }
     }
 
     /// 向后兼容薄包装：返回 text（非 Anthropic provider 路径）
