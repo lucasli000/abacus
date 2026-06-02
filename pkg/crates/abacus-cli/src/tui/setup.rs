@@ -381,17 +381,7 @@ fn save_config(state: &SetupState) -> Result<(), String> {
             .to_string();
         stripped
     };
-    // H1 fix: 所有用户输入字段写入 YAML 前转义
-    let base_url   = yaml_escape(&raw_url);
-    let api_key_e  = yaml_escape(&state.api_key);
-    let model_e    = yaml_escape(if state.model_name.is_empty() {
-        provider.default_model()
-    } else {
-        &state.model_name
-    });
-
-    // model_e / api_key_e / base_url 已在上方转义，resolved_model 仅用于 cw_tokens 查找
-    let resolved_model = model_e.as_str();
+    // V44: api_key/model 已移到 providers.json，yaml 不再需要转义它们
 
     // 解析上下文配置
     // context_window 为空 → 不写入 config，引擎从 model catalog 自动取模型最大值
@@ -419,7 +409,7 @@ fn save_config(state: &SetupState) -> Result<(), String> {
 
     // 2026-05-28: 新格式 — providers 数组 + 固化配置指引头部
     let provider_type_str = if provider.is_openai_compatible() {
-        if base_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
+        if raw_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
     } else {
         "anthropic"
     };

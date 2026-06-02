@@ -22,7 +22,6 @@ use abacus_core::config::{ConfigManager, default_config};
 use abacus_core::core::{CoreConfig, CoreLoop, SessionState};
 use abacus_core::core::context::{ContextManager, SessionSnapshot, SessionStore};
 use abacus_core::core::progressive_gate::{GateConfig, ProgressiveGate};
-use abacus_core::llm::fallback_provider::FallbackProvider;
 use abacus_core::llm::providers::anthropic::AnthropicProvider;
 use abacus_core::llm::providers::openai_compatible::OpenAICompatibleProvider;
 use abacus_core::secrets::{SecretsManager, SecretType};

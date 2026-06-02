@@ -943,8 +943,8 @@ impl SessionFocus {
 /// focus.render_with_age(age) 每轮 byte 变化（age 增长 + 阶段刷新）。
 /// 必须放在尾部——DeepSeek/OpenAI 的 prefix cache 按 token 0 起的连续相同字节匹配，
 /// 任何前置 dynamic 注入会导致整段 system prompt cache miss（影响 ~80% 的 input cost）。
-///
-/// 与 `build_system_output` 中 segments 路径的处理对齐（行 1389+），保证跨 provider 一致。
+/// V44: 不再被 build_system_output 调用（focus 已移到 preamble），仅测试保留
+#[cfg(test)]
 fn compose_system_text_with_focus(assembled: String, focus: Option<&str>) -> String {
     match focus {
         Some(f) => format!("{}\n\n---\n\n{}", assembled, f),
@@ -4152,7 +4152,7 @@ impl CoreLoop {
         let text = assembled_with_context;
 
         // ─── 构建 segments（多 block，用于 Anthropic cache）────────────────────
-        let mut segments = self.prompt_assembly.assemble_segments(
+        let segments = self.prompt_assembly.assemble_segments(
             &injector_segments,
             deduction_block.as_deref(),
             Some(&preflight_block),
