@@ -83,46 +83,51 @@ Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning acro
 One command, auto-detects your platform:
 
 ```bash
-curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
+curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3/install.sh" | bash
 ```
 
 Default install path: `/usr/local/bin/abacus`. Custom path:
 
 ```bash
-INSTALL_DIR=~/.local/bin curl -fsSL https://github.com/lucasli000/abacus/releases/latest/download/install.sh | sh
+INSTALL_DIR=~/.local/bin curl -fsSL "https://github.com/lucasli000/abacus/releases/download/v1.3/install.sh" | bash
 ```
 
 ### Manual Download
 
-Download the binary for your platform from [Releases](https://github.com/lucasli000/abacus/releases/latest):
+Download from [Releases](https://github.com/lucasli000/abacus/releases/latest) and install:
 
 | Platform | File |
 |----------|------|
 | macOS Apple Silicon | `abacus-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` |
 | Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` |
 | Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` |
 
 ```bash
-# Example: macOS Apple Silicon
-tar -xzf abacus-aarch64-apple-darwin.tar.gz
+# macOS Apple Silicon
+curl -fsSL -o abacus.tar.gz "https://github.com/lucasli000/abacus/releases/download/v1.3/abacus-aarch64-apple-darwin.tar.gz"
+tar xzf abacus.tar.gz
 sudo mv abacus /usr/local/bin/
-chmod +x /usr/local/bin/abacus
+sudo xattr -cr /usr/local/bin/abacus   # Remove quarantine (macOS)
+rm abacus.tar.gz
 
 # Verify
 abacus --version
 ```
 
-### Homebrew (macOS)
+### Using gh CLI
+
+If you have GitHub CLI installed (works even when curl to GitHub fails):
 
 ```bash
-brew tap lucasli000/tap
-brew install abacus
+gh release download v1.3 -R lucasli000/abacus -p "abacus-aarch64-apple-darwin.tar.gz"
+tar xzf abacus-aarch64-apple-darwin.tar.gz
+sudo mv abacus /usr/local/bin/
+sudo xattr -cr /usr/local/bin/abacus
 ```
 
 ### From Source
 
-Requires Rust 1.75+:
+Requires Rust 1.75+ and protoc:
 
 ```bash
 git clone https://github.com/lucasli000/abacus.git
@@ -130,53 +135,35 @@ cd abacus/pkg
 cargo install --path crates/abacus-cli
 ```
 
-Or build with optimizations:
+### Upgrade
 
-```bash
-make build    # Release build
-make install  # Install to /usr/local/bin
-```
-
-### Verify Installation
-
-```bash
-$ abacus --version
-abacus 1.0.0 (3b43be7d 2026-05-30)
-
-$ which abacus
-/usr/local/bin/abacus
-```
-
-### Shell Completions
-
-```bash
-# Zsh (add to ~/.zshrc)
-eval "$(abacus completions zsh)"
-
-# Bash (add to ~/.bashrc)
-eval "$(abacus completions bash)"
-
-# Fish
-abacus completions fish | source
-```
+Same install command — only the binary is replaced, your `~/.abacus/` config and data are preserved.
 
 ### Uninstall
 
 ```bash
-rm /usr/local/bin/abacus
-rm -rf ~/.abacus  # Remove config + data (optional)
+sudo rm -f /usr/local/bin/abacus        # Remove binary
+rm -rf ~/.abacus                         # Remove config + data (optional)
 ```
 
 ### Supported Platforms
 
 | Platform | Architecture | Binary Size | Status |
 |----------|-------------|-------------|--------|
-| macOS | Apple Silicon (arm64) | ~19MB | ✅ Primary |
-| macOS | Intel (x86_64) | ~20MB | ✅ |
-| Linux | x86_64 (glibc) | ~22MB | ✅ |
-| Linux | aarch64 (glibc) | ~21MB | ✅ |
+| macOS | Apple Silicon (arm64) | ~9MB | ✅ Primary |
+| Linux | x86_64 (glibc) | ~11MB | ✅ |
+| Linux | aarch64 (glibc) | ~10MB | ✅ |
 
 > Binary is fully self-contained — no runtime dependencies. SQLite bundled, TLS via rustls, all resources embedded.
+
+### Troubleshooting Install
+
+| Problem | Solution |
+|---------|----------|
+| `curl: (56) 403` | GitHub CDN blocked — use `gh release download` or set proxy `export https_proxy=http://127.0.0.1:7890` |
+| `no such file or directory` | New Mac missing /usr/local/bin — `sudo mkdir -p /usr/local/bin` |
+| `killed` / macOS blocks binary | Run `sudo xattr -cr /usr/local/bin/abacus` then retry |
+| `codesign internal error` | Skip codesign — just use `xattr -cr` instead |
 
 ## Usage
 
@@ -247,27 +234,62 @@ abacus/pkg/
 
 ## Configuration
 
-First run launches an interactive setup wizard:
+### First Run — Setup Wizard
+
+First launch auto-detects missing config and triggers an interactive wizard:
+
+1. Select provider type (Anthropic / OpenAI / DeepSeek / OpenRouter / Custom)
+2. Paste API key
+3. Confirm base URL (Enter for default)
+
+This generates `~/.abacus/providers.json`. You can re-run the wizard anytime with `/config`.
+
+### providers.json (LLM Providers)
+
+```json
+[
+  {
+    "id": "deepseek",
+    "type": "deepseek",
+    "api_key": "sk-...",
+    "base_url": "https://api.deepseek.com",
+    "models": ["deepseek-v4-pro", "deepseek-v4-flash"]
+  },
+  {
+    "id": "openrouter",
+    "type": "openai-compatible",
+    "api_key": "env:OPENROUTER_API_KEY",
+    "base_url": "https://openrouter.ai/api/v1/",
+    "models": ["anthropic/claude-sonnet-4", "meta-llama/llama-3.3-70b-instruct:free"]
+  }
+]
+```
+
+- `api_key` supports `"env:VAR_NAME"` to read from environment variables
+- `type`: `openai-compatible` (covers most providers), `deepseek`, `anthropic`
+- Multiple providers can be configured simultaneously — switch with `/model provider:model`
+
+### config.yaml (Core Behavior)
+
+```yaml
+core:
+  default_model: "deepseek/deepseek-v4-pro"   # provider_id/model_name
+  temperature: 0.3
+  max_tokens: 16384
+  thinking: low          # off / low / medium / high
+  stream: true
+  context_window: 1000000
+```
+
+### File Layout
 
 ```
-┌─ Abacus Setup ──────────────────────────────┐
-│                                              │
-│  1. Choose LLM provider                     │
-│     → OpenAI / Anthropic / DeepSeek / ...   │
-│                                              │
-│  2. Enter API key                           │
-│                                              │
-│  3. Select default model                    │
-│                                              │
-│  4. Optional features                       │
-│     □ Meeting mode (multi-expert)           │
-│     □ Code graph (project indexing)         │
-│     □ Memory palace (long-term memory)      │
-│                                              │
-└──────────────────────────────────────────────┘
+~/.abacus/
+├── providers.json       # LLM provider config (API keys, models)
+├── config.yaml          # Core behavior settings
+├── safety_rules.yaml    # Custom safety rules (optional)
+└── data/                # Sessions, knowledge DBs, etc.
 ```
-
-Config stored at `~/.abacus/config.yaml`. Supports multiple providers simultaneously.
 
 ## Multi-Provider Support
 
