@@ -292,29 +292,33 @@ impl OpenAICompatibleProvider {
     ///
     /// 智能路径拼接：
     /// - base_url 已含 /v1 或 /v2 等版本路径 → 直接拼 /chat/completions
-    /// - base_url 以 /chat/completions 结尾 → 直接使用（用户给了完整 endpoint）
-    /// - 否则 → 拼 /v1/chat/completions（标准 OpenAI 格式）
+    /// 构建 chat completions endpoint URL
+    ///
+    /// 设计：base_url 直接追加 `/chat/completions`（用户配置的 base_url 必须包含版本路径）
+    /// 示例：
+    /// - `https://api.openai.com/v1` → `.../v1/chat/completions`
+    /// - `https://ark.cn-beijing.volces.com/api/coding` → `.../api/coding/chat/completions`
+    /// - `https://openrouter.ai/api/v1` → `.../api/v1/chat/completions`
+    ///
+    /// 唯一例外：已以 `/chat/completions` 结尾 → 直接使用（用户给了完整 endpoint）
     ///
     /// 引用关系：complete() 和 stream_complete() 调用
     fn completions_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         if base.ends_with("/chat/completions") {
             base.to_string()
-        } else if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") || base.ends_with("/v4") {
-            format!("{}/chat/completions", base)
         } else {
-            format!("{}/v1/chat/completions", base)
+            format!("{}/chat/completions", base)
         }
     }
 
     /// 构建 models endpoint URL（discover_models 用）
-    /// 同 completions_url 逻辑：自适应版本路径
     fn models_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") || base.ends_with("/v4") {
-            format!("{}/models", base)
+        if base.ends_with("/models") {
+            base.to_string()
         } else {
-            format!("{}/v1/models", base)
+            format!("{}/models", base)
         }
     }
 

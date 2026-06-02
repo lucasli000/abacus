@@ -344,9 +344,7 @@ pub async fn create_engine(
                 }
                 ProviderType::Deepseek => {
                     use abacus_core::llm::providers::deepseek::DeepSeekProvider;
-                    let base = entry.base_url.clone()
-                        .map(|u| u.trim_end_matches("/v1").trim_end_matches("/v2")
-                            .trim_end_matches("/v3").trim_end_matches("/v4").to_string());
+                    let base = entry.base_url.clone();
                     let default_ds_model = models.first().cloned()
                         .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
                     let p = Arc::new(DeepSeekProvider::with_config(
@@ -469,8 +467,7 @@ pub async fn create_engine(
         use abacus_core::llm::providers::deepseek::DeepSeekProvider;
         let clean_base = cfg_mgr.get_str("llm.base_url")
             .map(|s| {
-                let s = s.trim_end_matches("/v1").trim_end_matches("/v2")
-                    .trim_end_matches("/v3").trim_end_matches("/v4").trim();
+                let s = s.trim();
                 if s.is_empty() { None } else { Some(s.to_string()) }
             })
             .flatten();

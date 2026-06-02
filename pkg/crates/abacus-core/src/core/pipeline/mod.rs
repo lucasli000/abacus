@@ -150,6 +150,11 @@ struct TurnContext {
     /// 效果：达到 3 次时 force_confirm_all=true（后续所有工具调用走确认通道）
     /// 生命周期：turn 级别，每轮重置
     consecutive_blocks: u32,
+    /// V44: 实际使用的 model（含 override/escalation 后的最终值）
+    /// 引用：execute_loop 每次计算 effective_model 后更新此字段
+    /// 消费：persist_and_build_result → TurnStats.model_id（替代硬编码 config.default_model）
+    /// 解决：/model 切换后 TUI 显示回退到默认 model 的 bug
+    effective_model: ModelId,
     /// V41 Step 3: 连续拦截降级标记
     /// true 时所有后续工具调用强制走 NeedsConfirm，跳过 user_grant 和 MCIP Allowed
     /// 引用：execute_loop tool dispatch 在 MCIP 决策前检查
@@ -408,6 +413,7 @@ impl<'a> TurnPipeline<'a> {
             self.req_ctx.prefix_assistant_content.as_deref(),
         );
 
+        let cg_model_id = cg_model.0.clone();
         let req = LlmRequest {
             model: cg_model,
             messages,
@@ -484,7 +490,7 @@ impl<'a> TurnPipeline<'a> {
                 TurnStats {
                     turn_number, tool_calls: 0,
                     provider_id,
-                    model_id: self.core.config.default_model.0.clone(),
+                    model_id: cg_model_id,
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
                     cached_tokens: response.usage.cached_tokens,
@@ -960,6 +966,7 @@ impl<'a> TurnPipeline<'a> {
             dynamic_timeout_secs: estimated_timeout,
             consecutive_blocks: 0,
             force_confirm_all: false,
+            effective_model: self.core.config.default_model.clone(),
         })
     }
 
@@ -1325,6 +1332,26 @@ impl<'a> TurnPipeline<'a> {
                 .or(model_override)
                 .or(escalated)
                 .unwrap_or_else(|| self.core.config.default_model.clone());
+            // V44: 同步到 ctx，让 TurnStats 报告实际使用的 model（修复 /model 切换后显示回退 bug）
+            ctx.effective_model = effective_model.clone();
+            // V44: provider 热修正——当 effective_model 变化需要不同 provider 时，重新解析
+            // 场景：escalated_model 指向另一个 provider / 用户切换后首次进入 loop
+            // 代价：每轮一次 resolve（读锁，μs 级）；仅在 provider_id 确实不同时做重赋值
+            if let Some(new_pid) = self.core.resolve_provider_id_for_model(&effective_model.0).await {
+                if new_pid != ctx.provider_id {
+                    // Provider 需要切换
+                    if let Ok((pid, prov)) = self.core.resolve_provider_with_hint(None).await {
+                        tracing::info!(
+                            old_provider = %ctx.provider_id,
+                            new_provider = %pid,
+                            model = %effective_model.0,
+                            "execute_loop: provider hot-switch for model change"
+                        );
+                        ctx.provider_id = pid;
+                        ctx.provider = prov;
+                    }
+                }
+            }
             let effective_temperature = self.req_ctx.temperature
                 .or(ctx.complexity_temperature)
                 .unwrap_or(self.core.config.default_temperature);
@@ -3495,7 +3522,7 @@ impl<'a> TurnPipeline<'a> {
                     turn_number: ctx.turn_number,
                     tool_calls: ctx.total_tool_calls,
                     provider_id: ctx.provider_id.clone(),
-                    model_id: self.core.config.default_model.0.clone(),
+                    model_id: ctx.effective_model.0.clone(),
                     prompt_tokens: ctx.prompt_tokens,
                     completion_tokens: ctx.completion_tokens,
                     cached_tokens: ctx.cached_tokens,
@@ -3572,7 +3599,7 @@ impl<'a> TurnPipeline<'a> {
                     turn_number: ctx.turn_number,
                     tool_calls: ctx.total_tool_calls,
                     provider_id: ctx.provider_id,
-                    model_id: self.core.config.default_model.0.clone(),
+                    model_id: ctx.effective_model.0.clone(),
                     prompt_tokens: ctx.prompt_tokens,
                     completion_tokens: ctx.completion_tokens,
                     cached_tokens: ctx.cached_tokens,

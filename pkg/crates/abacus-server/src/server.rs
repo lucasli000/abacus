@@ -838,8 +838,7 @@ impl AbacusServer {
                     }
                     ProviderType::Deepseek => {
                         use abacus_core::llm::providers::deepseek::DeepSeekProvider;
-                        let base = entry.base_url.clone()
-                            .map(|u| u.trim_end_matches("/v1").to_string());
+                        let base = entry.base_url.clone();
                         let p = Arc::new(DeepSeekProvider::with_config(
                             api_key, models.first().cloned().unwrap_or(ModelId("deepseek-chat".into())),
                             base, None, None,

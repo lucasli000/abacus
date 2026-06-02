@@ -319,13 +319,14 @@ impl AnthropicProvider {
     }
 
     /// 构建 messages endpoint URL
-    /// 自适应：base_url 含 /v1 → 直接拼 /messages；否则拼 /v1/messages
+    /// base_url 直接追加 /messages（用户需配置含版本路径的 base_url）
+    /// 示例：`https://api.anthropic.com/v1` → `.../v1/messages`
     fn messages_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") || base.ends_with("/v2") {
-            format!("{}/messages", base)
+        if base.ends_with("/messages") {
+            base.to_string()
         } else {
-            format!("{}/v1/messages", base)
+            format!("{}/messages", base)
         }
     }
 

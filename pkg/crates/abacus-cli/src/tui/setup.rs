@@ -368,18 +368,8 @@ fn save_config(state: &SetupState) -> Result<(), String> {
     let raw_url = if state.base_url.is_empty() {
         "https://api.openai.com".to_string()
     } else {
-        // M4 fix: 先 trim 空白，再剥离版本路径后缀，再 trim 尾斜杠
-        let trimmed = state.base_url.trim();
-        let stripped = trimmed
-            .trim_end_matches('/')
-            .trim_end_matches("/v1")
-            .trim_end_matches("/v2")
-            .trim_end_matches("/v3")
-            .trim_end_matches("/v4")
-            .trim_end_matches('/')
-            .trim()
-            .to_string();
-        stripped
+        // base_url 保持用户输入原样（只 trim 空白和尾斜杠）
+        state.base_url.trim().trim_end_matches('/').to_string()
     };
     // V44: api_key/model 已移到 providers.json，yaml 不再需要转义它们
 
@@ -1000,8 +990,8 @@ fn fetch_model_list_sync(base_url: &str, api_key: &str) -> Vec<(String, Option<u
 ///
 /// 引用关系：被 fetch_model_list_sync 在检测到 Anthropic URL 时调用
 fn fetch_anthropic_models(base_url: &str, api_key: &str) -> Vec<(String, Option<u64>)> {
-    let base = base_url.trim_end_matches('/').trim_end_matches("/v1");
-    let url = format!("{}/v1/models", base);
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{}/models", base);
     match ureq::get(&url)
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")

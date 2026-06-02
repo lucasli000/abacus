@@ -285,23 +285,24 @@ impl DeepSeekProvider {
         }
     }
 
-    /// 自适应 completions URL（与 OpenAI Compatible 同逻辑）
+    /// completions URL：base_url 直接追加 /chat/completions
+    /// 用户配置的 base_url 必须包含版本路径（如 https://api.deepseek.com/v1）
     fn completions_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") {
-            format!("{}/chat/completions", base)
+        if base.ends_with("/chat/completions") {
+            base.to_string()
         } else {
-            format!("{}/v1/chat/completions", base)
+            format!("{}/chat/completions", base)
         }
     }
 
-    /// 自适应 models URL
+    /// models URL：base_url 直接追加 /models
     fn models_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/v1") || base.ends_with("/v2") || base.ends_with("/v3") {
-            format!("{}/models", base)
+        if base.ends_with("/models") {
+            base.to_string()
         } else {
-            format!("{}/v1/models", base)
+            format!("{}/models", base)
         }
     }
 
