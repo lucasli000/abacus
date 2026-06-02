@@ -1320,6 +1320,14 @@ pub struct CoreLoop {
     providers: RwLock<HashMap<String, Arc<dyn LlmProvider>>>,
     /// 厂商分组注册表（按模型名查找 provider）
     provider_groups: RwLock<Vec<ProviderGroup>>,
+    /// 统一 Provider Registry（model-aware routing, priority 消歧, QualifiedModelId 路由）
+    ///
+    /// ## 引用关系
+    /// - 创建：CoreLoop::new()（空 registry）
+    /// - 写入：register_provider_group() 双写（与 provider_groups 同步）
+    /// - 读取：resolve_provider_with_hint() 主路由（优先于 provider_groups 遍历）
+    /// - 销毁：随 CoreLoop drop（Arc 引用计数归零）
+    provider_registry: Arc<crate::llm::provider_registry::ProviderRegistry>,
     config: CoreConfig,
     /// Runtime config overrides written by config_set tool, read by pipeline.
     ///
@@ -1751,7 +1759,7 @@ impl CoreLoop {
         ).await;
         // TokenBudgetMonitor：context window 容量取 default_max_tokens * 2（保守估计）
         let token_budget_monitor = token_budget::TokenBudgetMonitor::new(config.default_max_tokens as usize * 2);
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -2180,6 +2188,15 @@ impl CoreLoop {
     /// - 内部: 持有 model_preference 字段的共享引用
     pub fn model_preference(&self) -> &Arc<RwLock<abacus_types::ModelPreference>> {
         &self.model_preference
+    }
+
+    /// 获取 ProviderRegistry（model-aware routing / 外部查询用）
+    ///
+    /// ## 引用关系
+    /// - 消费方: /models 命令（list_all）、TUI 面板
+    /// - 生命周期: 随 CoreLoop
+    pub fn provider_registry(&self) -> &Arc<crate::llm::provider_registry::ProviderRegistry> {
+        &self.provider_registry
     }
 
     /// 启用 CodeGraph 子系统（在 workspace 目录上创建索引）
@@ -3165,6 +3182,11 @@ impl CoreLoop {
         let id_str = id.into();
         let group = ProviderGroup::new(&id_str, models.clone(), provider.clone());
         self.provider_groups.write().await.push(group);
+
+        // 双写：同步注册到 ProviderRegistry（model-aware routing 主路径）
+        // priority 100 = 默认优先级；后续可通过 register_provider_group_with_priority 指定
+        let model_names: Vec<String> = models.iter().map(|m| m.0.clone()).collect();
+        self.provider_registry.register(&id_str, model_names, provider.clone(), 100).await;
 
         // 同时注册为普通 provider（包装后返回完整模型列表）
         let wrapped = Arc::new(GroupProvider {
@@ -4664,10 +4686,37 @@ Output JSON:
     /// ## 引用关系
     /// - 调用方: pipeline execute_loop（传递 req_ctx.forced_provider）
     /// - 设计: forced_provider 有值时跳过 "primary" fallback，直接查指定 group
+    ///
+    /// ## 路由优先级（V42 ProviderRegistry 接入后）
+    /// 0. forced_provider（如有）→ registry qualified lookup
+    /// 1. ProviderRegistry resolve（QualifiedModelId 路由 / priority 消歧）
+    /// 2. 旧 provider_groups 遍历（fallback，兼容未注册到 registry 的 provider）
+    /// 3. "primary" fallback
+    /// 4. CapabilityHub 路由
+    /// 5. 第一个已注册 provider
     pub(crate) async fn resolve_provider_with_hint(&self, forced: Option<&str>) -> Result<(String, Arc<dyn LlmProvider>), KernelError> {
         let model: String = self.model_override.read().await
             .as_ref().map(|m| m.0.clone())
             .unwrap_or_else(|| self.config.default_model.0.clone());
+
+        // ── Step 0: ProviderRegistry 主路由 ──────────────────────────────────
+        // 构造 QualifiedModelId：如果 forced 有值则作为 provider 限定；
+        // 如果 model 本身包含 ':' 则解析为 qualified 格式（如 "ark:deepseek-chat"）
+        let qid = if let Some(forced_id) = forced {
+            abacus_types::QualifiedModelId {
+                provider: Some(abacus_types::ProviderId(forced_id.to_string())),
+                model: ModelId(model.clone()),
+            }
+        } else {
+            abacus_types::QualifiedModelId::parse(&model)
+        };
+
+        // Registry resolve：qualified → exact match; unqualified → priority 消歧
+        if let Some((provider_id, provider)) = self.provider_registry.resolve(&qid).await {
+            return Ok((provider_id.0, provider));
+        }
+
+        // ── Step 1: 旧路径 fallback（兼容未注册到 registry 的 provider）────────
         let providers = self.providers.read().await;
 
         // V41: forced_provider 优先 — 多 provider 同名 model 时直接定位
@@ -4686,30 +4735,30 @@ Output JSON:
             tracing::warn!(forced_provider = %forced_id, "forced_provider not found, falling back to normal resolution");
         }
 
-        // 1. 厂商分组匹配：按模型名查找所属的 provider_group
-        //    这是多 provider 场景的主路由——default_model 是裸模型名，
-        //    需要在所有 provider_group 中查找哪个 group 支持该模型
+        // 提取裸模型名（去掉可能的 provider: 前缀，用于旧路径查找）
+        let bare_model = qid.model_name().to_string();
+
+        // 2. 厂商分组匹配：按模型名查找所属的 provider_group
         for group in self.provider_groups.read().await.iter() {
-            if group.supports(&model) {
+            if group.supports(&bare_model) {
                 return Ok((group.id.clone(), group.provider.clone()));
             }
         }
 
-        // 2. "primary" fallback chain（无分组匹配时的向后兼容）
-        //    注意：不能放在步骤 1 前面，否则永远走 primary 跳过分组匹配
+        // 3. "primary" fallback chain（无分组匹配时的向后兼容）
         if let Some(provider) = providers.get("primary") {
             return Ok(("primary".into(), provider.clone()));
         }
 
-        // 3. 精确匹配：按 provider_id 查（旧路径兼容）
-        if let Some(provider) = providers.get(&model) {
-            return Ok((model.clone(), provider.clone()));
+        // 4. 精确匹配：按 provider_id 查（旧路径兼容）
+        if let Some(provider) = providers.get(&bare_model) {
+            return Ok((bare_model.clone(), provider.clone()));
         }
 
-        // 4. CapabilityHub 路由
+        // 5. CapabilityHub 路由
         let request = CapabilityRequest {
             kind: CapabilityKind::LlmCompletion {
-                model: model.clone(),
+                model: bare_model.clone(),
                 capabilities: vec!["tools".into()],
             },
             context: Some(CapabilityContext { forced_provider: None, task_kind: None, session_id: None }),
@@ -4721,7 +4770,7 @@ Output JSON:
             }
         }
 
-        // 5. Fallback: 第一个已注册 provider
+        // 6. Fallback: 第一个已注册 provider
         if let Some((id, provider)) = providers.iter().next() {
             return Ok((id.clone(), provider.clone()));
         }

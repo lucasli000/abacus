@@ -517,8 +517,15 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
                     let preference = core.model_preference().read().await;
                     preference.resolve_alias(&model_input)
                 };
-                // Set override using the resolved model name
-                core.set_model_override(qid.model_name()).await;
+                // Set override: if qualified (provider:model), store full qualified string
+                // so resolve_provider_with_hint can parse and route through ProviderRegistry.
+                // If unqualified, store bare model name (backward compat).
+                let override_value = if qid.is_qualified() {
+                    format!("{}:{}", qid.provider.as_ref().unwrap().0, qid.model_name())
+                } else {
+                    qid.model_name().to_string()
+                };
+                core.set_model_override(&override_value).await;
                 // Persist selection
                 {
                     let mut pref = core.model_preference().write().await;
@@ -532,11 +539,21 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
         });
     }
     // P2#8: 切换后立即更新仪表盘的 active provider 显示
+    // 支持 provider:model 格式：优先从 QualifiedModelId 提取 provider，
+    // fallback 到旧的 provider_groups 遍历
     if let Some(ref engine) = s.engine_handle {
         let core = engine.core.clone();
+        let name_for_resolve = name.to_string();
         if let Some(provider_id) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                core.resolve_provider_id_for_model(name).await
+                let qid = abacus_types::QualifiedModelId::parse(&name_for_resolve);
+                if let Some(ref pid) = qid.provider {
+                    // Qualified: provider 直接从输入中解析
+                    Some(pid.0.clone())
+                } else {
+                    // Unqualified: fallback 到旧路径
+                    core.resolve_provider_id_for_model(&name_for_resolve).await
+                }
             })
         }) {
             s.active_provider_id = provider_id;

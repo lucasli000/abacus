@@ -28,6 +28,7 @@ pub mod thinking_resolver;
 pub mod tool_view;
 pub mod text_tool_parser;
 pub mod tool_catalog;
+pub mod provider_registry;
 
 pub use provider::*;
 pub use prompt_cache::*;
