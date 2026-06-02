@@ -55,8 +55,15 @@ const SUPPORTED_KEYS: &[&str] = &[
     // ── 上下文与压缩 ──
     "compress_level",
     "context_ratio",
+    "context_compress_ratio",
     "dedup_enabled",
     "turn_timeout",
+    // ── 执行超时（用户/LLM 可调）──
+    "bash_timeout",
+    "tool_timeout",
+    "subagent_timeout",
+    "confirm_timeout",
+    "max_turn_timeout",
     // ── 推演引擎 ──
     "deduction_observer_contamination",
     "deduction_cross_session",
@@ -182,6 +189,13 @@ impl ConfigToolExecutor {
             "context_ratio" => self.base_config.context_window_ratio.to_string(),
             "dedup_enabled" => self.base_config.tool_result_dedup_enabled.to_string(),
             "turn_timeout" => self.base_config.thresholds.turn_provider_timeout_secs.to_string(),
+            "bash_timeout" => self.base_config.thresholds.tool_bash_timeout_secs.to_string(),
+            "tool_timeout" => self.base_config.thresholds.tool_default_timeout_secs.to_string(),
+            "subagent_timeout" => self.base_config.thresholds.subagent_max_duration_secs.to_string(),
+            "confirm_timeout" => self.base_config.thresholds.confirm_timeout_secs.to_string(),
+            "max_turn_timeout" => self.base_config.thresholds.max_turn_timeout_secs
+                .map(|n| n.to_string()).unwrap_or_else(|| "1800".into()),
+            "context_compress_ratio" => format!("{:.2}", self.base_config.thresholds.context_compress_ratio),
             "max_escalations" => self.base_config.max_escalations.to_string(),
             "compress_level" => match self.base_config.default_compress_level {
                 CompressLevel::Brief => "brief".into(),
@@ -258,10 +272,21 @@ impl ConfigToolExecutor {
                     value
                 )))?;
             }
-            "turn_timeout" => {
+            "turn_timeout" | "bash_timeout" | "tool_timeout" | "subagent_timeout"
+            | "confirm_timeout" | "max_turn_timeout" => {
                 value.parse::<u64>().map_err(|_| KernelError::Other(format!(
-                    "invalid u64 value for 'turn_timeout': '{}'", value
+                    "invalid u64 value for '{}': '{}'", key, value
                 )))?;
+            }
+            "context_compress_ratio" => {
+                let v = value.parse::<f64>().map_err(|_| KernelError::Other(format!(
+                    "invalid f64 value for 'context_compress_ratio': '{}'", value
+                )))?;
+                if !(0.1..=0.95).contains(&v) {
+                    return Err(KernelError::Other(format!(
+                        "context_compress_ratio must be 0.1-0.95, got {}", v
+                    )));
+                }
             }
             // ── 推演引擎（bool）──
             "deduction_observer_contamination"
