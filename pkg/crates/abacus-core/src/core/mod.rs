@@ -5020,7 +5020,7 @@ Output JSON:
         // - short_mode_active 每次 build 重新计算（无持久副作用）
         // - 不影响 schema_stable 或 KV cache 命中（short 切换本身是 description 字段变化）
         let total_tools = tools.len();
-        let short_mode_active = total_tools > 12;
+        let short_mode_active = total_tools > self.config.thresholds.tool_prune_after_turns as usize;
         let last_invoked_for_short = if short_mode_active {
             Some(self.tool_last_invoked.read().await.clone())
         } else {
