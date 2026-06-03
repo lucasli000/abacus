@@ -21,6 +21,7 @@ pub mod provider;
 pub mod prompt_cache;
 pub mod providers;
 pub mod noop_provider;
+pub mod provider_registry;
 pub mod stream;
 pub mod model_cache;
 pub mod model_catalog;
