@@ -331,14 +331,17 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         if line.is_empty() {
             wrapped.push(WrappedLine { text: "", logical_line: li });
         } else {
-            // 按字符宽度拆分（兼容 CJK 双宽字符）
+            // 按字符宽度拆分（兼容 CJK 双宽字符 + tab 展开 + 零宽字符）
             let mut pos = 0;
             let chars: Vec<char> = line.chars().collect();
+            // 预计算每字符的显示宽度
+            let widths: Vec<usize> = chars.iter().map(|c| crate::tui::util::char_width(*c)).collect();
             while pos < chars.len() {
                 let mut w = 0usize;
                 let mut end = pos;
                 while end < chars.len() {
-                    let cw = if chars[end] as u32 > 0x7F { 2 } else { 1 };
+                    let cw = widths[end];
+                    if cw == 0 { end += 1; continue; } // 零宽字符不计入宽度但不跳过
                     if w + cw > wrap_width && end > pos { break; }
                     w += cw;
                     end += 1;
