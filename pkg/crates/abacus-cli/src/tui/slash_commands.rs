@@ -758,7 +758,7 @@ fn cmd_set(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
             s.runtime_max_tokens.unwrap_or(64000),
             s.runtime_context_ratio.unwrap_or(1.0),
             s.runtime_tool_limit.unwrap_or(50),
-            s.runtime_timeout.unwrap_or(300),
+            s.runtime_timeout.unwrap_or(600),
             s.runtime_router.unwrap_or(true),
             s.runtime_dedup.unwrap_or(false),
             s.thinking_depth,

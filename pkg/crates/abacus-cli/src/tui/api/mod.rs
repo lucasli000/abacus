@@ -80,7 +80,7 @@ impl EngineHandle {
                 Ok(Self {
                     core,
                     session,
-                    request_timeout_secs: Arc::new(tokio::sync::RwLock::new(300)),
+                    request_timeout_secs: Arc::new(tokio::sync::RwLock::new(600)),
                     session_swap_lock: Arc::new(RwLock::new(())),
                     inflight_guard: Arc::new(tokio::sync::Semaphore::new(2)),
                     team_session: Arc::new(RwLock::new(None)),
