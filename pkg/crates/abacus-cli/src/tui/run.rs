@@ -1966,6 +1966,36 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 // ═══ Meeting 模式: 多专家会诊 + Host 综合（流式连续流程） ═══
                                 AbacusMode::Meeting => {
                                     let stx = stream_tx.clone();
+                                    // 修复：Meeting 模式切换前保存未落档内容
+                                    if !state.streaming_text.is_empty() && !state.streaming_complete {
+                                        let ts = chrono::Local::now().format("%H:%M").to_string();
+                                        let mut parts: Vec<crate::tui::state::MsgContent> = Vec::new();
+                                        if !state.streaming_thinking.is_empty() {
+                                            let line_count = state.streaming_thinking.lines().count();
+                                            let first_line = state.streaming_thinking.lines()
+                                                .find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                                            let preview: String = first_line.chars().take(40).collect();
+                                            let summary = if preview.is_empty() {
+                                                format!("💭 {} lines", line_count)
+                                            } else {
+                                                format!("💭 {} lines · {}", line_count, preview)
+                                            };
+                                            parts.push(crate::tui::state::MsgContent::Block {
+                                                kind: crate::tui::state::BlockKind::Think,
+                                                summary,
+                                                collapsed: true,
+                                                detail: state.streaming_thinking.clone(),
+                                            });
+                                        }
+                                        if !state.streaming_text.is_empty() {
+                                            parts.push(crate::tui::state::MsgContent::Stream(
+                                                std::mem::take(&mut state.streaming_text)
+                                            ));
+                                        }
+                                        if !parts.is_empty() {
+                                            state.add_message(crate::tui::state::Message::new_session(parts, &ts));
+                                        }
+                                    }
                                     state.reset_streaming();
                                     state.is_streaming = true;
                                     tokio::spawn(async move {
@@ -1993,7 +2023,38 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 AbacusMode::Clarify => {
                                     if state.streaming_enabled {
                                         let stx = stream_tx.clone();
-                                        // 启动新流式：先清旧累积（reset_streaming），再设 is_streaming=true
+                                        // 启动新流式：先保存未落档的流式内容，再清旧累积
+                                        // 修复：用户在中途发消息时，上一轮 streaming 内容可能未落档
+                                        if !state.streaming_text.is_empty() && !state.streaming_complete {
+                                            // streaming 未完成但有内容 → 用户主动打断，保存为临时消息
+                                            let ts = chrono::Local::now().format("%H:%M").to_string();
+                                            let mut parts: Vec<crate::tui::state::MsgContent> = Vec::new();
+                                            if !state.streaming_thinking.is_empty() {
+                                                let line_count = state.streaming_thinking.lines().count();
+                                                let first_line = state.streaming_thinking.lines()
+                                                    .find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+                                                let preview: String = first_line.chars().take(40).collect();
+                                                let summary = if preview.is_empty() {
+                                                    format!("💭 {} lines", line_count)
+                                                } else {
+                                                    format!("💭 {} lines · {}", line_count, preview)
+                                                };
+                                                parts.push(crate::tui::state::MsgContent::Block {
+                                                    kind: crate::tui::state::BlockKind::Think,
+                                                    summary,
+                                                    collapsed: true,
+                                                    detail: state.streaming_thinking.clone(),
+                                                });
+                                            }
+                                            if !state.streaming_text.is_empty() {
+                                                parts.push(crate::tui::state::MsgContent::Stream(
+                                                    std::mem::take(&mut state.streaming_text)
+                                                ));
+                                            }
+                                            if !parts.is_empty() {
+                                                state.add_message(crate::tui::state::Message::new_session(parts, &ts));
+                                            }
+                                        }
                                         state.reset_streaming();
                                         state.is_streaming = true;
                                         tokio::spawn(async move {

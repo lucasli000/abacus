@@ -3389,6 +3389,51 @@ impl AppState {
     ///   "is_streaming=false 但 streaming_text 残留" 的双显示窗口（ST1）。
     ///   抽 helper 后 res_rx 与 chunk Complete/Error 三路径状态完全一致
     pub fn reset_streaming(&mut self) {
+        // 如果有未落档的 streaming 内容且 streaming_complete=true，先自动落档再清空
+        if self.streaming_complete && !self.streaming_text.is_empty() {
+            let ts = chrono::Local::now().format("%H:%M").to_string();
+            let text = std::mem::take(&mut self.streaming_text);
+            let thinking = std::mem::take(&mut self.streaming_thinking);
+            let tools = std::mem::take(&mut self.streaming_tools);
+            let timeline = std::mem::take(&mut self.streaming_timeline);
+            let trace_ids = std::mem::take(&mut self.streaming_trace_ids);
+
+            let mut parts: Vec<MsgContent> = Vec::new();
+            if !thinking.is_empty() {
+                let line_count = thinking.lines().count();
+                let preview: String = thinking.lines()
+                    .find(|l| !l.trim().is_empty()).unwrap_or("")
+                    .chars().take(40).collect();
+                let summary = if preview.is_empty() {
+                    format!("💭 {} lines", line_count)
+                } else {
+                    format!("💭 {} lines · {}", line_count, preview)
+                };
+                parts.push(MsgContent::Block {
+                    kind: BlockKind::Think,
+                    summary,
+                    collapsed: true,
+                    detail: thinking,
+                });
+            }
+            if !tools.is_empty() {
+                let tool_ids: Vec<u64> = trace_ids.iter().copied()
+                    .filter(|id| self.trace_events.iter().any(|e|
+                        e.id == *id && matches!(e.kind, TraceKind::ToolCall { .. })
+                    ))
+                    .collect();
+                if !tool_ids.is_empty() {
+                    parts.push(MsgContent::Trace {
+                        event_ids: tool_ids,
+                        collapsed: true,
+                        expanded_event_ids: std::collections::HashSet::new(),
+                    });
+                }
+            }
+            parts.push(MsgContent::Stream(text));
+            self.add_message(Message::new_session(parts, &ts));
+        }
+
         self.is_streaming = false;
         self.streaming_complete = false;
         self.streaming_text.clear();
