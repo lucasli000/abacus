@@ -61,7 +61,7 @@ use crate::knowledge_store::KnowledgeStore;
 use crate::memory_palace::DualPalaceMemory;
 
 use abacus_types::{
-    CapabilityContext, CapabilityKind, CapabilityRequest, KernelError, ModelId, ToolId, ToolOutput, TurnStats, UserProfile, UserRole,
+    CapabilityContext, CapabilityKind, CapabilityRequest, KernelError, ModelId, QualifiedModelId, ToolId, ToolOutput, TurnStats, UserProfile, UserRole,
 };
 use abacus_types::progressive::{
     AutonomyLevel, GateScope, UserResponse,
@@ -121,25 +121,12 @@ pub struct SystemPromptOutput {
     pub text: String,
     /// 用于 Anthropic 多 block cache provider（分段，稳定段可缓存）
     pub segments: Vec<crate::llm::provider::SystemSegment>,
-    /// V44: 每轮变化的动态遥测（注入到 latest user message 顶部，不进 system prompt）
-    ///
-    /// ## 设计意图
-    /// DeepSeek 自动 prefix cache 要求 system message 字节稳定。
-    /// 每轮变化的内容（awareness/progressive/palace）移到 user message preamble，
-    /// system prompt 保持 100% 跨轮字节一致 → cache hit 95%+。
-    ///
-    /// ## 引用关系
-    /// - 写入: build_system_output() 中的 awareness/palace/focus
-    /// - 写入: pipeline setup() 中的 progressive/epistemic
-    /// - 消费: pipeline execute_loop 合并到 ctx.user_message_preamble
-    pub dynamic_preamble: String,
 }
 
 impl SystemPromptOutput {
     /// 向两端同时追加动态内容（保证 text 与 segments 同步）
     ///
     /// `cacheable = false`：动态内容（每轮可变）不参与 Anthropic block cache
-    /// 注意：V44 后大部分动态内容应用 push_preamble() 而非此方法
     pub fn push_dynamic(&mut self, content: &str) {
         if content.is_empty() { return; }
         self.text.push_str("\n\n");
@@ -148,17 +135,6 @@ impl SystemPromptOutput {
             text: content.to_string(),
             cacheable: false,
         });
-    }
-
-    /// V44: 追加动态内容到 preamble（不进 system prompt，不破 prefix cache）
-    ///
-    /// 消费方：pipeline execute_loop 合并到 ctx.user_message_preamble → latest user message 顶部
-    pub fn push_preamble(&mut self, content: &str) {
-        if content.is_empty() { return; }
-        if !self.dynamic_preamble.is_empty() {
-            self.dynamic_preamble.push('\n');
-        }
-        self.dynamic_preamble.push_str(content);
     }
 }
 
@@ -571,10 +547,6 @@ pub struct CoreConfig {
     /// ## 何时启用
     /// 工具集 ≥ 30 且任务类型差异明显（code/debug/analysis）→ 启用可显著缩短 LLM 选择空间，
     /// 配合工具的 applicable_task_kinds 白名单使用。
-    /// Model Self-Escalation：是否允许 LLM 自动升级到同 provider 更强模型
-    /// **Default: false**（默认关闭——避免非预期的 model 切换和费用增加）
-    /// 启用方式：config.yaml `core.auto_escalation: true`
-    pub auto_escalation: bool,
     pub task_kind_routing_enabled: bool,
     /// Phase α-S：是否启用场景化工具加载（只发场景相关工具的完整 schema）
     ///
@@ -797,7 +769,6 @@ impl Default for CoreConfig {
             // Phase β-D 默认开启（Task #84）：按 task_kind 过滤工具，每轮省 1k-3k tokens
             // 引用关系：被 build_tool_definitions_for 在 routing_active 路径消费
             // 副作用：未标 applicable_task_kinds 的工具仍全可见——透明降级
-            auto_escalation: false,
             task_kind_routing_enabled: true,
             // Phase α-S 默认开启：场景化工具加载——按 task_kind 前缀过滤，每轮省 2k-5k tokens
             // 引用关系：被 build_tool_definitions_for（Phase α-S 分支）消费
@@ -948,8 +919,8 @@ impl SessionFocus {
 /// focus.render_with_age(age) 每轮 byte 变化（age 增长 + 阶段刷新）。
 /// 必须放在尾部——DeepSeek/OpenAI 的 prefix cache 按 token 0 起的连续相同字节匹配，
 /// 任何前置 dynamic 注入会导致整段 system prompt cache miss（影响 ~80% 的 input cost）。
-/// V44: 不再被 build_system_output 调用（focus 已移到 preamble），仅测试保留
-#[cfg(test)]
+///
+/// 与 `build_system_output` 中 segments 路径的处理对齐（行 1389+），保证跨 provider 一致。
 fn compose_system_text_with_focus(assembled: String, focus: Option<&str>) -> String {
     match focus {
         Some(f) => format!("{}\n\n---\n\n{}", assembled, f),
@@ -1349,14 +1320,6 @@ pub struct CoreLoop {
     providers: RwLock<HashMap<String, Arc<dyn LlmProvider>>>,
     /// 厂商分组注册表（按模型名查找 provider）
     provider_groups: RwLock<Vec<ProviderGroup>>,
-    /// 统一 Provider Registry（model-aware routing, priority 消歧, QualifiedModelId 路由）
-    ///
-    /// ## 引用关系
-    /// - 创建：CoreLoop::new()（空 registry）
-    /// - 写入：register_provider_group() 双写（与 provider_groups 同步）
-    /// - 读取：resolve_provider_with_hint() 主路由（优先于 provider_groups 遍历）
-    /// - 销毁：随 CoreLoop drop（Arc 引用计数归零）
-    provider_registry: Arc<crate::llm::provider_registry::ProviderRegistry>,
     config: CoreConfig,
     /// Runtime config overrides written by config_set tool, read by pipeline.
     ///
@@ -1366,7 +1329,7 @@ pub struct CoreLoop {
     /// - 读取：pipeline 消费点 + ConfigToolExecutor (config_get) + get_effective_* helpers
     /// - 销毁：随 CoreLoop drop（Arc 引用计数归零）
     pub runtime_overrides: crate::tool::builtin::config::RuntimeOverrides,
-    model_override: RwLock<Option<ModelId>>,
+    model_override: RwLock<Option<QualifiedModelId>>,
     deduction_engine: Arc<DeductionEngine>,
     sandbox_engine: Arc<SandboxOrchestrator>,
     /// Task #81：自动化引擎（Pipeline / Cron / Trigger）—— 默认空运行
@@ -1788,7 +1751,7 @@ impl CoreLoop {
         ).await;
         // TokenBudgetMonitor：context window 容量取 default_max_tokens * 2（保守估计）
         let token_budget_monitor = token_budget::TokenBudgetMonitor::new(config.default_max_tokens as usize * 2);
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -2217,15 +2180,6 @@ impl CoreLoop {
     /// - 内部: 持有 model_preference 字段的共享引用
     pub fn model_preference(&self) -> &Arc<RwLock<abacus_types::ModelPreference>> {
         &self.model_preference
-    }
-
-    /// 获取 ProviderRegistry（model-aware routing / 外部查询用）
-    ///
-    /// ## 引用关系
-    /// - 消费方: /models 命令（list_all）、TUI 面板
-    /// - 生命周期: 随 CoreLoop
-    pub fn provider_registry(&self) -> &Arc<crate::llm::provider_registry::ProviderRegistry> {
-        &self.provider_registry
     }
 
     /// 启用 CodeGraph 子系统（在 workspace 目录上创建索引）
@@ -3210,16 +3164,7 @@ impl CoreLoop {
     ) {
         let id_str = id.into();
         let group = ProviderGroup::new(&id_str, models.clone(), provider.clone());
-        let mut groups = self.provider_groups.write().await;
-        // V43: priority 按注册顺序递增（config 中第 1 个=100, 第 2 个=101...）
-        // 同名模型冲突时 lower priority wins → config 数组顺序即偏好顺序
-        let priority = 100u32 + groups.len() as u32;
-        groups.push(group);
-        drop(groups);
-
-        // 双写：同步注册到 ProviderRegistry（model-aware routing + 歧义检测）
-        let model_names: Vec<String> = models.iter().map(|m| m.0.clone()).collect();
-        self.provider_registry.register(&id_str, model_names, provider.clone(), priority).await;
+        self.provider_groups.write().await.push(group);
 
         // 同时注册为普通 provider（包装后返回完整模型列表）
         let wrapped = Arc::new(GroupProvider {
@@ -3277,7 +3222,8 @@ impl CoreLoop {
     /// 运行时热切换模型（TUI /model 命令调用）
     /// 2026-05-28: 改为 async 避免在 tokio runtime 内调 blocking_write panic
     pub async fn set_model_override(&self, model: impl Into<String>) {
-        *self.model_override.write().await = Some(ModelId(model.into()));
+        let qid = QualifiedModelId::parse(&model.into());
+        *self.model_override.write().await = Some(qid);
     }
 
     pub async fn clear_model_override(&self) {
@@ -3358,73 +3304,27 @@ impl CoreLoop {
         // 注：palace_enabled 由 build_system_output 中的 awareness 层读取
     }
 
-    /// 读取 threshold 值——优先 runtime override，fallback 到 config.thresholds
-    ///
-    /// ## 引用关系
-    /// - 调用方: pipeline 中所有读取 timeout/threshold 的位置
-    /// - 数据源: runtime_overrides (config_set 写入) > config.thresholds (启动时固定)
-    pub fn threshold_u64(&self, key: &str) -> u64 {
-        if let Some(v) = crate::tool::builtin::config::read_override_u64(&self.runtime_overrides, key) {
-            return v;
-        }
-        match key {
-            "turn_timeout" => self.config.thresholds.turn_provider_timeout_secs,
-            "bash_timeout" => self.config.thresholds.tool_bash_timeout_secs,
-            "tool_timeout" => self.config.thresholds.tool_default_timeout_secs,
-            "subagent_timeout" => self.config.thresholds.subagent_max_duration_secs,
-            "confirm_timeout" => self.config.thresholds.confirm_timeout_secs,
-            "max_turn_timeout" => self.config.thresholds.max_turn_timeout_secs.unwrap_or(1800),
-            _ => 0,
-        }
-    }
-
-    pub fn threshold_f64(&self, key: &str) -> f64 {
-        if let Some(v) = crate::tool::builtin::config::read_override_f64(&self.runtime_overrides, key) {
-            return v;
-        }
-        match key {
-            "context_compress_ratio" => self.config.thresholds.context_compress_ratio,
-            _ => 0.0,
-        }
-    }
-
-    /// 根据模型名查找对应的 provider_id（用于仪表盘即时更新）
-    ///
-    /// 遍历 provider_groups，返回第一个支持该模型的 group id。
-    /// 未找到时返回 None（不影响实际执行，仅仪表盘展示延迟）。
-    /// 解析 model 所属 provider ID（TUI 显示 + slash cmd 同步用）
-    ///
-    /// V44: 优先走 ProviderRegistry（与 resolve_provider_with_hint 一致），
-    /// 确保 TUI 显示的 provider 和实际请求走的 provider 相同。
-    pub async fn resolve_provider_id_for_model(&self, model_name: &str) -> Option<String> {
-        // 1. ProviderRegistry（新路由，与请求路径一致）
-        let qid = abacus_types::QualifiedModelId::parse(model_name);
-        if let Ok(resolved) = self.provider_registry.resolve_unqualified(qid.model_name()).await {
-            if let Some(ref pid) = resolved.provider {
-                return Some(pid.0.clone());
-            }
-        }
-        // 2. 旧路径 fallback（兼容）
-        let groups = self.provider_groups.read().await;
-        for group in groups.iter() {
-            if group.supports(model_name) {
-                return Some(group.id.clone());
-            }
-        }
-        None
-    }
-
     /// 获取记忆宫殿引用（TUI 面板数据拉取用）
     pub fn memory_palace(&self) -> Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>> {
         self.memory_palace.clone()
     }
 
-    /// 读取当前运行时模型覆盖（pipeline execute_loop 内用）
-    ///
-    /// 引用关系：pipeline/mod.rs execute_loop effective_model 优先级链
-    /// 生命周期：set_model_override 设入 → 本函数读出 → clear_model_override 清空
-    pub(crate) async fn get_model_override(&self) -> Option<ModelId> {
-        self.model_override.read().await.clone()
+    /// V43: 统一模型选择点
+    pub(crate) async fn resolve_effective_model(
+        &self,
+        req_model: Option<&ModelId>,
+        escalated: Option<&ModelId>,
+    ) -> ModelId {
+        if let Some(m) = req_model {
+            return m.clone();
+        }
+        if let Some(qid) = self.model_override.read().await.as_ref() {
+            return qid.model.clone();
+        }
+        if let Some(esc) = escalated {
+            return esc.clone();
+        }
+        self.config.default_model.clone()
     }
 
     /// 获取沙箱引擎引用（CLI turnkey 命令使用）
@@ -3510,14 +3410,16 @@ impl CoreLoop {
     }
 
     /// List supported models from all registered providers.
-    /// 列出所有已注册 model（格式: "provider:model"）
-    /// 用户可用返回的格式直接传给 /model 命令
     pub async fn list_models(&self) -> Vec<String> {
-        let all = self.provider_registry.list_all().await;
-        let mut models: Vec<String> = all.iter()
-            .map(|(pid, mid)| format!("{}:{}", pid.0, mid.0))
-            .collect();
+        let providers = self.providers.read().await;
+        let mut models: Vec<String> = Vec::new();
+        for (_, p) in providers.iter() {
+            for m in p.supported_models() {
+                models.push(m.0);
+            }
+        }
         models.sort();
+        models.dedup();
         models
     }
 
@@ -3581,7 +3483,8 @@ impl CoreLoop {
             }
         }
 
-        // 2026-05-28: 将发现的模型写回 ProviderGroup + ProviderRegistry
+        // 2026-05-28: 将发现的模型写回 ProviderGroup — 让 resolve_provider() 能匹配到
+        // 解决：config 中 models 为空或只有占位符时，group.supports(model) 失败的问题
         if !result.is_empty() {
             let mut groups = self.provider_groups.write().await;
             for group in groups.iter_mut() {
@@ -3590,18 +3493,7 @@ impl CoreLoop {
                         .map(|m| ModelId(m.clone()))
                         .collect();
                     if new_models.len() > group.models.len() {
-                        // 找出新增的模型（不在原有列表中的）
-                        let new_names: Vec<String> = discovered.iter()
-                            .filter(|m| !group.models.iter().any(|gm| gm.0 == **m))
-                            .cloned()
-                            .collect();
                         group.models = new_models;
-                        // V43: 同步新增模型到 ProviderRegistry
-                        if !new_names.is_empty() {
-                            self.provider_registry.register(
-                                &group.id, new_names, group.provider.clone(), 100
-                            ).await;
-                        }
                     }
                 }
             }
@@ -4055,8 +3947,21 @@ impl CoreLoop {
         // ## 设计
         // 不修改 deduction_engine 本身的输出格式，仅在 awareness 层追加 actionable 提示。
         // 阈值 20 bytes 过滤掉空或极短（无实质内容）的 deduction block。
-        // Deduction 告警：build_injection() 已按需返回极简提示（或 None），
-        // 不在 awareness 层额外追加——避免双重注入干扰 LLM
+        // critical 告警时使用更强硬的措辞。
+        if let Some(ref ded) = deduction_block {
+            if ded.len() > 20 {
+                let has_critical = ded.contains("[CRITICAL]") || ded.contains("[critical]");
+                if has_critical {
+                    awareness_block.push_str(
+                        "\n⛔ Deduction critical alert — MANDATORY CONSUMPTION: call deduction_analyze before responding to user"
+                    );
+                } else {
+                    awareness_block.push_str(
+                        "\n⚠ Deduction alert active — check Layer 160 for details and take corrective action"
+                    );
+                }
+            }
+        }
 
         // Epistemic Guard 消费协议（认识论约束）
         //
@@ -4110,24 +4015,18 @@ impl CoreLoop {
         // 移到末尾后：stable prefix（Kernel + abacusbr_core + Strategy + Constraints）byte-identical
         //   → DeepSeek 命中率应从 ~0% 提升到接近 prompt_tokens（按 64-token 块对齐）
         // 对 LLM 注意力的影响：focus 仍在 system prompt 内、紧邻用户消息（recency-adjacent），不弱于 primacy
-        // V44: awareness + focus → dynamic_preamble（不破 prefix cache）
-        // 这些内容每轮变化（turn number, ctx%, age），放 system prompt 会破坏 DeepSeek prefix cache
-        let mut dynamic_preamble = awareness_block;
-        if let Some(ref focus) = focus_block {
-            dynamic_preamble.push_str("\n\n");
-            dynamic_preamble.push_str(focus);
-        }
-
-        // system prompt 只保留跨轮稳定内容
         let assembled_with_context = {
             let mut s = assembled;
-            // catalog: session 内 byte-stable（工具注册后不变）
             if let Some(ref cat) = catalog_block {
                 s = format!("{}\n\n---\n\n{}", s, cat);
             }
+            // Awareness block 每轮变化（turn/tool_calls 递增）→ 放在动态段
+            s = format!("{}\n\n---\n\n{}", s, awareness_block);
 
             // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
+            // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
             // byte-stable（不含变量），被 prefix cache 覆盖
+            // 策略注入（从 policy.toml 加载，运行时可调）
             let policy = &self.config.policy;
             if !policy.guard.entropy_guard.is_empty() {
                 s.push_str("\n\n[Entropy Guard]\n");
@@ -4139,10 +4038,10 @@ impl CoreLoop {
             }
             s
         };
-        let text = assembled_with_context;
+        let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());
 
         // ─── 构建 segments（多 block，用于 Anthropic cache）────────────────────
-        let segments = self.prompt_assembly.assemble_segments(
+        let mut segments = self.prompt_assembly.assemble_segments(
             &injector_segments,
             deduction_block.as_deref(),
             Some(&preflight_block),
@@ -4151,11 +4050,30 @@ impl CoreLoop {
             false,
         );
 
-        // V44: focus 已移到 dynamic_preamble，segments 不再需要追加动态段
-        // Anthropic cache 效果：所有 segments 现在都可能是 cacheable（除 Tier3 injector 段）
-        // focus/awareness 不再破坏任何 segment 的 cache
+        // SessionFocus 应用到 segments —— 与 text 路径策略对齐（统一追加到末尾）
+        // 之前 text 路径保留 focus 在前（primacy）属于跨 provider 不一致，DeepSeek/OpenAI 已踩坑
+        //
+        // W3 (Task #101) 守护：focus 含 age 字段（render_with_age），每轮字节都变。
+        //   不能写到 cacheable=true 段——会破 prefix cache。
+        //   规则：
+        //     ① 末段是 cacheable=false → append（原行为）
+        //     ② 末段是 cacheable=true 或 segments 为空 → push 一个新 cacheable=false 段
+        if let Some(ref focus) = focus_block {
+            let needs_new_segment = match segments.last() {
+                Some(last) => last.cacheable,
+                None => true,
+            };
+            if needs_new_segment {
+                segments.push(crate::llm::provider::SystemSegment {
+                    text: format!("{}\n\n---", focus),
+                    cacheable: false,
+                });
+            } else if let Some(last) = segments.last_mut() {
+                last.text.push_str(&format!("\n\n---\n\n{}", focus));
+            }
+        }
 
-        SystemPromptOutput { text, segments, dynamic_preamble }
+        SystemPromptOutput { text, segments }
     }
 
     /// 向后兼容薄包装：返回 text（非 Anthropic provider 路径）
@@ -4197,7 +4115,7 @@ Output JSON:
         );
 
         let req = LlmRequest {
-            model: self.config.default_model.clone(),
+            model: self.resolve_effective_model(None, None).await,
             messages: vec![Message {
                 role: MessageRole::User,
                 content: Some(MessageContent::Text(review_prompt)),
@@ -4713,64 +4631,19 @@ Output JSON:
     /// ## 引用关系
     /// - 调用方: pipeline execute_loop（传递 req_ctx.forced_provider）
     /// - 设计: forced_provider 有值时跳过 "primary" fallback，直接查指定 group
-    ///
-    /// ## 路由优先级（V42 ProviderRegistry 接入后）
-    /// 0. forced_provider（如有）→ registry qualified lookup
-    /// 1. ProviderRegistry resolve（QualifiedModelId 路由 / priority 消歧）
-    /// 2. 旧 provider_groups 遍历（fallback，兼容未注册到 registry 的 provider）
-    /// 3. "primary" fallback
-    /// 4. CapabilityHub 路由
-    /// 5. 第一个已注册 provider
     pub(crate) async fn resolve_provider_with_hint(&self, forced: Option<&str>) -> Result<(String, Arc<dyn LlmProvider>), KernelError> {
-        let raw_model: String = self.model_override.read().await
-            .as_ref().map(|m| m.0.clone())
-            .unwrap_or_else(|| self.config.default_model.0.clone());
-
-        // V44: "auto" / 空 model 不静默降级——直接报错让用户感知配置问题
-        let model = if raw_model == "auto" || raw_model.is_empty() {
-            return Err(KernelError::Provider(
-                "未配置有效模型。请检查 providers.json 是否存在且至少包含一个可用 provider 和 model。\
-                 运行 /config 重新配置。".to_string()
-            ));
-        } else {
-            raw_model
-        };
-
-        // ── Step 0: ProviderRegistry 主路由 ──────────────────────────────────
-        // 构造 QualifiedModelId：如果 forced 有值则作为 provider 限定；
-        // 如果 model 本身包含 ':' 则解析为 qualified 格式（如 "ark:deepseek-chat"）
-        let qid = if let Some(forced_id) = forced {
-            abacus_types::QualifiedModelId {
-                provider: Some(abacus_types::ProviderId(forced_id.to_string())),
-                model: ModelId(model.clone()),
-            }
-        } else {
-            abacus_types::QualifiedModelId::parse(&model)
-        };
-
-        // Registry resolve：qualified → exact match; unqualified → priority 消歧 + 歧义检测
-        if qid.provider.is_some() {
-            // Qualified：精确路由
-            if let Some((provider_id, provider)) = self.provider_registry.resolve(&qid).await {
-                return Ok((provider_id.0, provider));
-            }
-        } else {
-            // Unqualified：先做歧义检测，再 resolve
-            let model_name = &qid.model.0;
-            match self.provider_registry.resolve_unqualified(model_name).await {
-                Ok(qualified) => {
-                    if let Some((provider_id, provider)) = self.provider_registry.resolve(&qualified).await {
-                        return Ok((provider_id.0, provider));
-                    }
+        let model: String = {
+            let mo = self.model_override.read().await;
+            if let Some(qm) = mo.as_ref() {
+                if let Some(ref p) = qm.provider {
+                    format!("{}:{}", p.0, qm.model.0)
+                } else {
+                    qm.model.0.clone()
                 }
-                Err(ambiguity_msg) => {
-                    // 歧义或未找到——log 并 fallback 到旧路径（first-wins）
-                    tracing::warn!("{}", ambiguity_msg);
-                }
+            } else {
+                self.resolve_effective_model(None, None).await.0
             }
-        }
-
-        // ── Step 1: 旧路径 fallback（兼容未注册到 registry 的 provider）────────
+        };
         let providers = self.providers.read().await;
 
         // V41: forced_provider 优先 — 多 provider 同名 model 时直接定位
@@ -4789,30 +4662,27 @@ Output JSON:
             tracing::warn!(forced_provider = %forced_id, "forced_provider not found, falling back to normal resolution");
         }
 
-        // 提取裸模型名（去掉可能的 provider: 前缀，用于旧路径查找）
-        let bare_model = qid.model_name().to_string();
-
-        // 2. 厂商分组匹配：按模型名查找所属的 provider_group
-        for group in self.provider_groups.read().await.iter() {
-            if group.supports(&bare_model) {
-                return Ok((group.id.clone(), group.provider.clone()));
-            }
-        }
-
-        // 3. "primary" fallback chain（无分组匹配时的向后兼容）
+        // 0. 优先使用 FallbackProvider（双协议自动回退）
         if let Some(provider) = providers.get("primary") {
             return Ok(("primary".into(), provider.clone()));
         }
 
-        // 4. 精确匹配：按 provider_id 查（旧路径兼容）
-        if let Some(provider) = providers.get(&bare_model) {
-            return Ok((bare_model.clone(), provider.clone()));
+        // 1. 精确匹配：按 provider_id 查
+        if let Some(provider) = providers.get(&model) {
+            return Ok((model.clone(), provider.clone()));
         }
 
-        // 5. CapabilityHub 路由
+        // 2. 厂商分组匹配：模型名是否属于某个分组
+        for group in self.provider_groups.read().await.iter() {
+            if group.supports(&model) {
+                return Ok((group.id.clone(), group.provider.clone()));
+            }
+        }
+
+        // 3. CapabilityHub 路由
         let request = CapabilityRequest {
             kind: CapabilityKind::LlmCompletion {
-                model: bare_model.clone(),
+                model: model.clone(),
                 capabilities: vec!["tools".into()],
             },
             context: Some(CapabilityContext { forced_provider: None, task_kind: None, session_id: None }),
@@ -4824,7 +4694,7 @@ Output JSON:
             }
         }
 
-        // 6. Fallback: 第一个已注册 provider
+        // 4. Fallback: 第一个已注册 provider
         if let Some((id, provider)) = providers.iter().next() {
             return Ok((id.clone(), provider.clone()));
         }

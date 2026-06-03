@@ -60,7 +60,7 @@ main() {
     local mirror_url="https://gh-proxy.com/https://github.com/${REPO}/releases/download/v${version}/${filename}"
 
     tmp="$(mktemp -d)"
-    trap 'rm -rf "${tmp:-}"' EXIT
+    trap 'rm -rf "$tmp"' EXIT
 
     echo "Downloading: ${url}"
     if ! curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$tmp/${filename}" 2>/dev/null; then

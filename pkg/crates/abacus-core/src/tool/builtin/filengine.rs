@@ -146,7 +146,7 @@ impl FilengineSession {
             open_context: None,
             undo_logger: None,
             bash_default_timeout: 30,
-            bash_max_timeout: 0, // 0 = no limit (server adaptive_timeout_secs floors at 300s)
+            bash_max_timeout: 120,
             // 默认与 allowed_roots() / RoleCapabilities::default() 保持一致
             fs_roots: allowed_roots(),
             bash_policy: BashPolicyLevel::DevTools,
@@ -389,14 +389,7 @@ async fn fs_edit(args: Value, session: &mut FilengineSession) -> Result<Value, S
     // 计算 old_string 在文件中的起始行号（1-based）
     // 消费方：TUI diff 渲染用此值将相对行号映射为文件实际行号
     let start_line = content[..byte_offset].chars().filter(|&c| c == '\n').count() + 1;
-    // 只替换第一处匹配（与 find 的语义一致；replace_all 需显式参数）
-    let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
-    let new_content = if replace_all {
-        content.replace(old, new)
-    } else {
-        content.replacen(old, new, 1)
-    };
-    fs::write(&p, new_content).await.map_err(|e| format!("write: {e}"))?;
+    fs::write(&p, content.replace(old, new)).await.map_err(|e| format!("write: {e}"))?;
     session.track_write(path);
     Ok(json!({"edited": true, "path": path, "start_line": start_line}))
 }
@@ -424,9 +417,8 @@ async fn fs_search(args: Value, session: &mut FilengineSession) -> Result<Value,
     let p = if root.is_empty() { session.cwd.clone() } else { NativeFilengine::resolve(root, session)? };
     let g = glob::Pattern::new(pattern).map_err(|e| format!("glob: {e}"))?;
     let mut out = Vec::new();
-    // Recursive search with depth limit (default 10, prevents node_modules等大目录 DoS)
-    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-    for entry in walkdir::WalkDir::new(&p).max_depth(max_depth).into_iter().filter_map(|e| e.ok()) {
+    // Recursive search using walkdir (was single-level, fixed for recursive)
+    for entry in walkdir::WalkDir::new(&p).into_iter().filter_map(|e| e.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
         if g.matches(&name) {
             out.push(entry.path().to_string_lossy().to_string());
@@ -1292,15 +1284,9 @@ fn classify_tar(parts: &[&str]) -> BashDecision {
 
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let command = get_str(&args, "command")?;
-    let requested = args.get("timeout").and_then(|v| v.as_u64())
-        .unwrap_or(session.bash_default_timeout);
-    // 0 = no limit; otherwise cap at bash_max_timeout (but 0 means unlimited)
-    let timeout = if session.bash_max_timeout == 0 {
-        requested
-    } else {
-        requested.min(session.bash_max_timeout)
-    };
-    let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+    let timeout = args.get("timeout").and_then(|v| v.as_u64())
+        .unwrap_or(session.bash_default_timeout)
+        .min(session.bash_max_timeout);
     let workdir = args.get("workdir").and_then(|v| v.as_str())
         .map(|p| NativeFilengine::resolve(p, session))
         .unwrap_or(Ok(session.cwd.clone()))?;
@@ -1314,101 +1300,27 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
     // 唯一保留的安全防线：DANGEROUS_COMMANDS 系统级命令由 pipeline 在 MCIP 阶段拦截。
     let _ = session.bash_policy; // consumed by pipeline's classify call
 
-    // ── B: background 模式 ──────────────────────────────────────────────
-    // 长时间命令（打包/编译/下载）通过 background=true 异步执行
-    // 返回 PID + 输出文件路径，LLM 后续通过 bash_exec 轮询或 kill 终止
-    if background {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tag = format!("abacus_bg_{ts}");
-        let out_path = format!("/tmp/{tag}.out");
-        let pid_path = format!("/tmp/{tag}.pid");
-
-        // 后台执行：nohup 保证进程与父进程解耦
-        // stdout/stderr 重定向到 out_path，PID 写入 pid_path
-        let bg_script = format!(
-            "nohup sh -c {} > '{}' 2>&1 & echo $! > '{}'",
-            command, out_path, pid_path
-        );
-
-        TokioCmd::new("sh")
-            .arg("-c")
-            .arg(&bg_script)
-            .current_dir(&workdir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("bg spawn: {e}"))?;
-
-        // 等 500ms 让 PID 文件写入
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        let pid = std::fs::read_to_string(&pid_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok());
-
-        // 如果 pid_path 未写入，再等 1s
-        let pid = if pid.is_none() {
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            std::fs::read_to_string(&pid_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u32>().ok())
-        } else { pid };
-
-        let pid_str = pid.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into());
-        return Ok(json!({
-            "background": true,
-            "pid": pid,
-            "output_file": out_path,
-            "status": "running",
-            "hint": format!("检查输出: bash_exec command='cat {}'; 终止: bash_exec command='kill -9 {}';", out_path, pid_str)
-        }));
-    }
-
-    // ── C: 流式心跳模式 ──────────────────────────────────────────────
-    // 为长时间命令提供每 30s 的进度心跳，避免 server 层 300s 超时断连
-    // 通过 async 竞态实现：wait_with_output vs 30s 心跳 tick
     let child = TokioCmd::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(&workdir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // P1-4: 创建新进程组（便于超时后 kill 整组，包括子进程的子进程）
         .process_group(0)
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
 
-    let start = std::time::Instant::now();
-    // 心跳间隔：timeout/10，10s~30s
-    let heartbeat_secs = (timeout / 10).max(10).min(30);
+    // P1-4: 保存 pid 用于超时后 kill
+    let child_id = child.id();
 
-    // 通过 oneshot channel 隔离所有权: wait_with_output 在 spawn 内消费 child
-    let (tx, mut rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
-        let _ = tx.send(child.wait_with_output().await);
-    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout),
+        child.wait_with_output(),
+    ).await;
 
-    let result = loop {
-        let tick = tokio::time::sleep(std::time::Duration::from_secs(heartbeat_secs));
-        tokio::pin!(tick);
-
-        tokio::select! {
-            output = &mut rx => {
-                break output.unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "channel closed")));
-            }
-            _ = &mut tick => {
-                let elapsed = start.elapsed().as_secs();
-                tracing::info!("bash_exec heartbeat: {command:.50} running {elapsed}s");
-                continue;
-            }
-        }
-    };
-
-    let elapsed = start.elapsed().as_secs();
     match result {
-        Ok(output) => {
+        Ok(Ok(output)) => {
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             Ok(json!({
@@ -1416,13 +1328,26 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
                 "stdout": stdout,
                 "stderr": stderr,
                 "command": command,
-                "elapsed_secs": elapsed,
             }))
         }
-        Err(e) => Err(format!("exec: {e}")),
+        Ok(Err(e)) => Err(format!("exec: {e}")),
+        Err(_) => {
+            // P1-4: 超时后 kill 进程组（防止僵尸进程）
+            if let Some(pid) = child_id {
+                #[cfg(unix)]
+                unsafe {
+                    // kill 整个进程组（负 pid = process group）
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = pid; // Windows: tokio child drop 会 kill
+                }
+            }
+            Err(format!("timeout after {timeout}s (process killed)"))
+        }
     }
 }
-
 
 // ─── ToolExecutor wrapper ─────────────────────────────────────────
 
@@ -1628,9 +1553,8 @@ pub fn schemas() -> Vec<ToolSchema> {
         // 不需要 schema 级 blanket confirm（否则 `find`/`ls | grep` 等安全命令也弹确认）
         schema("bash_exec", "执行 shell 命令并返回输出",
             json!({"command": {"type":"string", "description":"shell命令"},
-                   "timeout": {"type":"number", "description":"超时秒数(默认30,0=不限制)"},
-                   "workdir": {"type":"string", "description":"工作目录(默认session.cwd)"},
-                   "background": {"type":"boolean", "description":"true=后台运行,返回pid;适合长时间打包/编译任务,通过 kill(pid) 手动终止"}}),
+                   "timeout": {"type":"number", "description":"超时秒数(默认30,最大120)"},
+                   "workdir": {"type":"string", "description":"工作目录(默认session.cwd)"}}),
             &["command"], false, 96, "1s", "medium"),
     ];
 
@@ -2176,7 +2100,7 @@ mod tests {
             filengine: Arc::new(RwLock::new(session)),
             turn_number: 7,
             bash_default_timeout: 30,
-            bash_max_timeout: 0, // 0 = no limit (server adaptive_timeout_secs floors at 300s)
+            bash_max_timeout: 120,
             tool_default_timeout: 60,
             role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };
@@ -2316,7 +2240,7 @@ mod tests {
             filengine: Arc::new(RwLock::new(session)),
             turn_number: 1,
             bash_default_timeout: 30,
-            bash_max_timeout: 0, // 0 = no limit (server adaptive_timeout_secs floors at 300s)
+            bash_max_timeout: 120,
             tool_default_timeout: 60,
             role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };

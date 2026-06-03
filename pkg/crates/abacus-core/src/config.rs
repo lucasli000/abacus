@@ -133,40 +133,6 @@ impl ConfigManager {
         Self { merged, provider_entries: Vec::new() }
     }
 
-    /// 从 providers.json 加载 provider 配置（优先于 config.yaml 中的 providers 字段）
-    ///
-    /// ## 文件格式
-    /// ```json
-    /// [
-    ///   {
-    ///     "id": "primary",
-    ///     "type": "openai-compatible",
-    ///     "api_key": "sk-xxx",
-    ///     "base_url": "https://api.deepseek.com/v1",
-    ///     "models": [{"name": "deepseek-chat", "context_window": 128000}]
-    ///   }
-    /// ]
-    /// ```
-    ///
-    /// ## 引用关系
-    /// - 调用方: engine_init.rs（在 load_file(config_yaml) 之后调用）
-    /// - 写入: self.provider_entries（覆盖 config.yaml 中的 providers）
-    pub fn load_providers_json(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
-        let path = path.as_ref();
-        if !path.exists() {
-            return Ok(()); // 文件不存在 → 静默跳过（向后兼容）
-        }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read providers.json: {e}"))?;
-        let entries: Vec<abacus_types::ProviderEntry> = serde_json::from_str(&content)
-            .map_err(|e| format!("providers.json parse error: {e}"))?;
-        if !entries.is_empty() {
-            tracing::info!(count = entries.len(), "loaded providers from providers.json");
-            self.provider_entries = entries;
-        }
-        Ok(())
-    }
-
     /// 从配置文件加载 (自动检测 JSON/YAML 由扩展名决定)
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
         let content = std::fs::read_to_string(&path)
@@ -203,15 +169,15 @@ impl ConfigManager {
             });
         }
 
-        // V43: config.yaml 不再负责 providers 配置
-        // providers 统一由 providers.json 管理（load_providers_json）
-        // 旧 config.yaml 中的 providers: 段被忽略（向用户发 deprecation 提示）
+        // 2026-05-28: 解析 `providers` 数组（独立于 flatten，因为数组对象不适合点分键）
+        // 尝试从 YAML/JSON 中提取 providers 顶级字段
         if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-            if raw.get("providers").is_some() {
-                tracing::warn!(
-                    "config.yaml 中的 `providers` 段已废弃，请迁移到 ~/.abacus/providers.json。\
-                     此段将被忽略。"
-                );
+            if let Some(providers_val) = raw.get("providers") {
+                if let Ok(entries) = serde_yaml::from_value::<Vec<abacus_types::ProviderEntry>>(providers_val.clone()) {
+                    self.provider_entries = entries;
+                } else {
+                    tracing::warn!("config: `providers` 格式解析失败，跳过");
+                }
             }
         }
 

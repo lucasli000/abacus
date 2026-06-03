@@ -318,18 +318,6 @@ impl AnthropicProvider {
         }
     }
 
-    /// 构建 messages endpoint URL
-    /// base_url 直接追加 /messages（用户需配置含版本路径的 base_url）
-    /// 示例：`https://api.anthropic.com/v1` → `.../v1/messages`
-    fn messages_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/messages") {
-            base.to_string()
-        } else {
-            format!("{}/messages", base)
-        }
-    }
-
     fn build_request(&self, req: &LlmRequest) -> AnthropicRequest {
         // KV 缓存优化: 多段 system prompt，稳定段标记 cache_control
         // Anthropic 按 block 级别缓存 — 稳定 block 内容不变时缓存命中
@@ -775,7 +763,7 @@ impl LlmProvider for AnthropicProvider {
         let resp = loop {
             let mut req_builder = self
                 .client
-                .post(self.messages_url())
+                .post(format!("{}/v1/messages", self.base_url))
                 .timeout(self.request_timeout) // H8: per-request timeout 替代 Client.builder.timeout
                 .header("x-api-key", self.api_key.as_str())
                 .header("anthropic-version", Self::API_VERSION)
@@ -888,7 +876,7 @@ impl LlmProvider for AnthropicProvider {
 
         let mut req_builder = self
             .client
-            .post(self.messages_url())
+            .post(format!("{}/v1/messages", self.base_url))
             .timeout(self.request_timeout) // H8: per-request timeout
             .header("x-api-key", self.api_key.as_str())
             .header("anthropic-version", Self::API_VERSION)

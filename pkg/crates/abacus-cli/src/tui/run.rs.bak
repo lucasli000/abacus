@@ -248,12 +248,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             // 生命周期：仅首次连接出现（随引擎启动一次性提醒）；重连会重发，不频繁。
             // 引用关系：/help 有完整复制节，用户可查体。
             // 复制提示已在 /help 中有完整说明，不在连接时打扰用户
-            // FIX: 从实际 provider 列表取首模型，而非 config 的硬编码 fallback
-            let first_model_name = e.core.list_models().await.first()
-                .cloned()
-                .unwrap_or_else(|| e.core.config().default_model.0.clone());
-            state.model_name = first_model_name.clone();
-            state.theme.apply_model_brand(&first_model_name);
+            let actual_model = e.core.config().default_model.0.clone();
+            state.model_name = actual_model.clone();
+            state.theme.apply_model_brand(&actual_model);
             // V40: 同步 context 到 TUI state
             // model_max_context = LLM 物理上限（model_spec 定义）
             // context_window = 系统设定有效窗口（首次由 Complete stats.context_max 覆盖）
@@ -410,13 +407,6 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     state.available_models = models;
                     state.available_providers = provider_groups;
                     state.provider_statuses = provider_statuses.clone();
-                    // FIX: discover 后同步 model_name — 覆盖引擎初始化时 config 的硬编码 fallback
-                    if let Some(first) = state.available_models.first() {
-                        if state.model_name == "deepseek-v4-flash" || state.model_name.is_empty() {
-                            state.model_name = first.clone();
-                            state.theme.apply_model_brand(first);
-                        }
-                    }
                     // 启动时 active_provider_id 为空（仅在首次 Complete 回传后填充）
                     // 从 discover 结果中取第一个 available provider 作初始值
                     if state.active_provider_id.is_empty() {

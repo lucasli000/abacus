@@ -35,26 +35,17 @@ pub fn global_dir() -> PathBuf {
         .join(".abacus")
 }
 
-// ─── 数据目录（记忆/知识库/日志统一归档）────────────────────────────────
-// 所有持久化数据统一到 ~/.abacus/data/
+// ─── 全局共享 SQLite ────────────────────────────────────────────────────
 
-/// 数据存储根目录
-pub fn data_dir() -> PathBuf {
-    let d = global_dir().join("data");
-    let _ = std::fs::create_dir_all(&d);
-    d
-}
-
-pub fn knowledge_db() -> PathBuf { data_dir().join("knowledge.db") }
-pub fn palace_db() -> PathBuf { data_dir().join("palace.db") }
-pub fn memory_db() -> PathBuf { data_dir().join("memory.db") }
-pub fn deduction_metrics_db() -> PathBuf { data_dir().join("deduction_metrics.db") }
-pub fn task_logs_db() -> PathBuf { data_dir().join("task_logs.db") }
+pub fn knowledge_db() -> PathBuf { global_dir().join("knowledge.db") }
+pub fn palace_db() -> PathBuf { global_dir().join("palace.db") }
+pub fn memory_db() -> PathBuf { global_dir().join("memory.db") }
+pub fn deduction_metrics_db() -> PathBuf { global_dir().join("deduction_metrics.db") }
+pub fn task_logs_db() -> PathBuf { global_dir().join("task_logs.db") }
 
 // ─── 全局配置 / 历史 / 全局 memory ──────────────────────────────────────
 
 pub fn config_yaml() -> PathBuf { global_dir().join("config.yaml") }
-pub fn providers_json() -> PathBuf { global_dir().join("providers.json") }
 pub fn models_yaml() -> PathBuf { global_dir().join("models.yaml") }
 pub fn security_yaml() -> PathBuf { global_dir().join("security.yaml") }
 pub fn abacusbr_md() -> PathBuf { global_dir().join("abacusbr.md") }

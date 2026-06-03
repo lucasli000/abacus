@@ -147,20 +147,9 @@ struct TurnContext {
     dynamic_timeout_secs: u64,
     /// V41: 安全分类器连续拦截计数
     /// 引用：工具执行前 ToolActionClassifier 返回 NeedsConfirm/Deny 时递增
-    /// 效果：达到 3 次时 force_confirm_all=true（后续所有工具调用走确认通道）
+    /// 效果：达到 3 次时自动重新开启 progressive gate（降级到逐步确认）
     /// 生命周期：turn 级别，每轮重置
     consecutive_blocks: u32,
-    /// V44: 实际使用的 model（含 override/escalation 后的最终值）
-    /// 引用：execute_loop 每次计算 effective_model 后更新此字段
-    /// 消费：persist_and_build_result → TurnStats.model_id（替代硬编码 config.default_model）
-    /// 解决：/model 切换后 TUI 显示回退到默认 model 的 bug
-    effective_model: ModelId,
-    /// V41 Step 3: 连续拦截降级标记
-    /// true 时所有后续工具调用强制走 NeedsConfirm，跳过 user_grant 和 MCIP Allowed
-    /// 引用：execute_loop tool dispatch 在 MCIP 决策前检查
-    /// 激活：consecutive_blocks >= 3
-    /// 销毁：随 TurnContext（turn 结束）
-    force_confirm_all: bool,
 }
 
 /// Encapsulates the full lifecycle of a single conversational turn.
@@ -404,13 +393,9 @@ impl<'a> TurnPipeline<'a> {
 
         // V35-1: continue_gated 路径同步注入 prefix message（与 execute_loop 对齐）
         // 优先级与 execute_loop 一致：req_ctx.model > model_override > default
-        let cg_model_raw = self.req_ctx.model.clone()
-            .or(self.core.get_model_override().await)
-            .unwrap_or_else(|| self.core.config.default_model.clone());
-        // 提取裸 model name（去掉 "provider:" 前缀）
-        let cg_model = {
-            let qid = abacus_types::QualifiedModelId::parse(&cg_model_raw.0);
-            ModelId(qid.model_name().to_string())
+        let cg_model = match self.req_ctx.model.clone() {
+            Some(m) => m,
+            None => self.core.resolve_effective_model(None, None).await,
         };
         maybe_inject_prefix_message(
             &mut messages,
@@ -418,7 +403,6 @@ impl<'a> TurnPipeline<'a> {
             self.req_ctx.prefix_assistant_content.as_deref(),
         );
 
-        let cg_model_id = cg_model.0.clone();
         let req = LlmRequest {
             model: cg_model,
             messages,
@@ -441,7 +425,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（provider 层有 120s 请求超时，此处防 misconfigure 或挂起）
-        let timeout_secs = self.core.threshold_u64("turn_timeout");
+        let timeout_secs = self.core.config.thresholds.turn_provider_timeout_secs;
         let provider_timeout = std::time::Duration::from_secs(timeout_secs);
         let response = match tokio::time::timeout(provider_timeout, provider.complete_cancellable(req, self.cancel_token())).await {
             Ok(result) => result?,
@@ -495,7 +479,7 @@ impl<'a> TurnPipeline<'a> {
                 TurnStats {
                     turn_number, tool_calls: 0,
                     provider_id,
-                    model_id: cg_model_id,
+                    model_id: self.core.resolve_effective_model(None, None).await.0,
                     prompt_tokens: response.usage.prompt_tokens,
                     completion_tokens: response.usage.completion_tokens,
                     cached_tokens: response.usage.cached_tokens,
@@ -575,30 +559,23 @@ impl<'a> TurnPipeline<'a> {
 
         let turn_number = { let s = self.session.read().await; s.turn_count + 1 };
 
-        // V43.2: context_window 跟随当前活跃模型（per-model + per-provider）
-        // 优先级链：req_ctx.model > model_override(/model) > default_model
-        // Spec 查询：qualified_specs (provider+model) > specs (model) > default
-        {
-            let model_override = self.core.get_model_override().await;
-            let effective_model = self.req_ctx.model.clone()
-                .or(model_override)
-                .unwrap_or_else(|| self.core.config.default_model.clone());
-            // 解析 provider_id 用于 qualified spec lookup
-            let provider_id = self.core.resolve_provider_id_for_model(&effective_model.0).await;
-            let spec = if let Some(ref catalog) = self.core.config.model_catalog {
-                if let Some(ref pid) = provider_id {
-                    catalog.lookup_qualified(pid, &effective_model)
-                } else {
-                    catalog.lookup_or_default(&effective_model)
-                }
-            } else if let Some(ref s) = self.core.config.model_spec {
-                std::sync::Arc::new(s.clone())
-            } else {
-                std::sync::Arc::new(abacus_types::ModelSpec::default())
-            };
-            let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
+        // V43: 窗口初始化 + 模型切换时热更新
+        let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
+        if let Some(ref spec) = self.core.config.model_spec {
             let available = ((spec.context_window as f64 * ratio) as usize).max(128_000);
-            self.core.context_manager.set_window(available, spec.context_window);
+            if turn_number == 1 {
+                self.core.context_manager.set_window(available, spec.context_window);
+            } else {
+                // 模型切换后更新窗口：取当前 effective_model 的 model_spec
+                let effective = self.core.resolve_effective_model(None, None).await;
+                let model_spec = self.core.model_catalog.lookup(&effective);
+                if let Some(new_spec) = model_spec {
+                    if new_spec.context_window != spec.context_window {
+                        let new_available = ((new_spec.context_window as f64 * ratio) as usize).max(128_000);
+                        self.core.context_manager.set_window(new_available, new_spec.context_window);
+                    }
+                }
+            }
         }
 
         // Progressive Output: complexity analysis + strategy decision（RequestContext 可跳过）
@@ -643,7 +620,9 @@ impl<'a> TurnPipeline<'a> {
             self.input, self.session, &preflight
         ).await;
 
-        // V44: Progressive prompt → preamble（每轮变化，不破 prefix cache）
+        // Progressive prompt injection（text + segments 同步）
+        // Fix 3: context ELEVATED/CRITICAL 时跳过渐进协议，避免增加额外 token 开销
+        //         直接注入覆盖指令让 LLM 输出精简结论
         {
             let ctx_pressure = {
                 let w = self.core.context_manager.window.read().await;
@@ -654,7 +633,8 @@ impl<'a> TurnPipeline<'a> {
                 else { "OK" }
             };
             if matches!(ctx_pressure, "ELEVATED" | "CRITICAL") {
-                sys_out.push_preamble(&format!(
+                // 上下文紧张：覆盖渐进协议，强制精简输出
+                sys_out.push_dynamic(&format!(
                     "[Progressive Override] Context pressure={ctx_pressure}. \
                      Skip staged/gated review — output key conclusions directly and concisely. \
                      Do NOT produce large structured documents this turn."
@@ -665,14 +645,14 @@ impl<'a> TurnPipeline<'a> {
                 if let Some((_priority, prompt_text)) = build_progressive_prompt(
                     ctrl.current_state(), ctrl.current_strategy(),
                 ) {
-                    sys_out.push_preamble(&prompt_text);
+                    sys_out.push_dynamic(&prompt_text);
                 }
             }
         }
 
-        // Model Self-Escalation prompt（flash models only）
-        // 内容固定（不含变量），保留在 system prompt 中（不破 cache，同 model 内字节稳定）
-        if self.core.config.default_model.0.contains("flash") {
+        // Model Self-Escalation prompt（flash models only，text + segments 同步）
+        let effective_for_esc = self.core.resolve_effective_model(None, None).await;
+        if effective_for_esc.0.contains("flash") {
             sys_out.push_dynamic("[Model Routing]\n\
                 If this request requires deep multi-step reasoning, complex architecture analysis, \
                 security auditing, or tasks where accuracy is critical over speed:\n\
@@ -682,9 +662,12 @@ impl<'a> TurnPipeline<'a> {
                 For all other requests, proceed normally without [ESCALATE].");
         }
 
-        // V44: EpistemicGuard declaration → preamble（累积变化，不破 prefix cache）
+        // ─── EpistemicGuard 累积违规声明注入（text + segments 同步）─────────────
+        // 与 post_process EpistemicPostCheck 形成双层防护：
+        //   PostCheck  — 事后检测，修改输出（per-turn）
+        //   Declaration — 预防注入，约束生成（cumulative session 级）
         if let Some(declaration) = self.core.epistemic_guard.declaration_if_needed().await {
-            sys_out.push_preamble(&declaration);
+            sys_out.push_dynamic(&declaration);
         }
 
         // ─── SM-2 到期复习注入（已删除）──────────────────────────────────
@@ -733,23 +716,8 @@ impl<'a> TurnPipeline<'a> {
             } else { None }
         } else { None };
 
-        // V44: 合并 dynamic_preamble (awareness/progressive/epistemic) + ICL primer
-        // 两者都写入 user_message_preamble → latest user message 顶部（不破 prefix cache）
-        let user_message_preamble: Option<String> = {
-            let mut parts: Vec<String> = Vec::new();
-            // 动态遥测（awareness + focus + progressive + epistemic）
-            if !sys_out.dynamic_preamble.is_empty() {
-                parts.push(sys_out.dynamic_preamble);
-            }
-            // ICL Primer（KB 检索结果）
-            if let Some(icl) = user_message_preamble {
-                parts.push(icl);
-            }
-            if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
-        };
-
         let enriched_system = sys_out.text;
-        let dynamic_blocks = sys_out.segments.len().saturating_sub(1);
+        let dynamic_blocks = sys_out.segments.len().saturating_sub(1); // 稳定段之外的动态块数
         let system_segments = sys_out.segments;
 
         // Hook: PromptBuilt（system prompt 组装完成，adapter 应用前）
@@ -923,19 +891,25 @@ impl<'a> TurnPipeline<'a> {
         // - 消费: execute_loop 中每次 provider.complete_cancellable() 的 tokio::time::timeout
         // - 数据源: thinking level（主因子，决定 LLM 单次推理上限）
         let estimated_timeout = {
-            // V43.1: 统一 per-call timeout 为 600s
-            // 原因：thinking 模型（deepseek-v4-flash 等）推理时间不可预测，
-            // Medium 任务也可能需要 5+ 分钟。300s 导致频繁误杀。
-            // 无 thinking 的纯 completion 也给足余量（避免大上下文慢响应被截）。
-            let t: u64 = if let Some(ref ti) = complexity_thinking {
+            // 基准：按 thinking depth 决定单次 LLM 调用超时
+            let t = if let Some(ref ti) = complexity_thinking {
                 match ti {
-                    abacus_types::ThinkingIntent::Off => 300, // 无思考：300s 足够
-                    _ => 600, // 有思考：统一 600s
+                    abacus_types::ThinkingIntent::Effort(e) => match e {
+                        abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => 600,
+                        abacus_types::EffortLevel::Medium => 300,
+                        abacus_types::EffortLevel::Low => 180,
+                        _ => 300,
+                    },
+                    abacus_types::ThinkingIntent::Adaptive => 300,
+                    abacus_types::ThinkingIntent::Budget(_) => 600,
+                    abacus_types::ThinkingIntent::Off => 120,
                 }
             } else {
-                300 // 无 thinking intent（纯 completion）
+                // 无 thinking（纯 completion）— 120s 足够
+                120
             };
-            t.min(self.core.threshold_u64("turn_timeout"))
+            // 上限：provider 级别超时（默认 600s）
+            t.min(self.core.config.thresholds.turn_provider_timeout_secs)
         };
 
         Ok(TurnContext {
@@ -970,8 +944,6 @@ impl<'a> TurnPipeline<'a> {
             time_warning_emitted: false,
             dynamic_timeout_secs: estimated_timeout,
             consecutive_blocks: 0,
-            force_confirm_all: false,
-            effective_model: self.core.config.default_model.clone(),
         })
     }
 
@@ -1332,38 +1304,10 @@ impl<'a> TurnPipeline<'a> {
             // 用户 /model 命令设置的运行时覆盖（应高于 escalated 优先级）
             // 不把 model_override 放进 req_ctx.model（那是 per-request），而是作为 session 级默认
             // 优先级：req_ctx.model（显式单请求覆盖）> model_override（用户 /model 设置）> escalated > default
-            let model_override = self.core.get_model_override().await;
-            let effective_model_raw = self.req_ctx.model.clone()
-                .or(model_override)
-                .or(escalated)
-                .unwrap_or_else(|| self.core.config.default_model.clone());
-            // V44: 提取裸 model name——去掉 "provider:" 前缀（API 只接受裸名）
-            // 例：ModelId("DS:deepseek-v4-flash") → ModelId("deepseek-v4-flash")
-            let effective_model = {
-                let qid = abacus_types::QualifiedModelId::parse(&effective_model_raw.0);
-                ModelId(qid.model_name().to_string())
-            };
-            // V44: 同步到 ctx，让 TurnStats 报告实际使用的 model（修复 /model 切换后显示回退 bug）
-            ctx.effective_model = effective_model.clone();
-            // V44: provider 热修正——仅首轮(loop_iter==0)检查一次
-            // setup 阶段已经用 model_override 解析了 provider，多轮 loop 内 model 不会变
-            // （escalation 在 handle_model_escalation 中有独立的 provider 重解析）
-            if loop_iter == 0 {
-                // 用 resolve_provider_with_hint（读 model_override，含 qualified 路由）做权威解析
-                // 只有结果与 setup 不同时才切换（避免 priority 歧义导致误切）
-                if let Ok((resolved_pid, resolved_prov)) = self.core.resolve_provider_with_hint(None).await {
-                    if resolved_pid != ctx.provider_id {
-                        tracing::info!(
-                            old_provider = %ctx.provider_id,
-                            new_provider = %resolved_pid,
-                            model = %effective_model.0,
-                            "execute_loop: provider hot-switch for model change"
-                        );
-                        ctx.provider_id = resolved_pid;
-                        ctx.provider = resolved_prov;
-                    }
-                }
-            }
+            let effective_model = self.core.resolve_effective_model(
+                self.req_ctx.model.as_ref(),
+                escalated.as_ref(),
+            ).await;
             let effective_temperature = self.req_ctx.temperature
                 .or(ctx.complexity_temperature)
                 .unwrap_or(self.core.config.default_temperature);
@@ -1734,18 +1678,6 @@ impl<'a> TurnPipeline<'a> {
                 Err(e) => {
                     let err_str = e.to_string();
                     let is_net = is_network_error(&err_str);
-                    // V44: auth 错误(401/403)不 retry——重试不会修复 key 问题，直接报错
-                    let is_auth_error = err_str.contains("401") || err_str.contains("403")
-                        || err_str.contains("Unauthorized") || err_str.contains("Forbidden")
-                        || err_str.contains("Authentication");
-                    if is_auth_error {
-                        if let Some(ref stx) = self.stream_tx {
-                            let _ = stx.send(crate::llm::stream::StreamChunk::Error(
-                                format!("⚠️ 认证失败：{}。请检查 API Key 配置（/config）。", e)
-                            ));
-                        }
-                        return Err(KernelError::Provider(format!("Authentication failed: {}", e)));
-                    }
 
                     ctx.provider_retries += 1;
                     if ctx.provider_retries <= 2 {
@@ -2066,11 +1998,9 @@ impl<'a> TurnPipeline<'a> {
                     break;
                 }
 
-                // Model Self-Escalation (flash → pro) — 默认关闭，config.yaml `core.auto_escalation: true` 启用
-                if self.core.config.auto_escalation {
-                    if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
-                        return Ok(Some(result));
-                    }
+                // Model Self-Escalation (flash → pro)
+                if let Some(result) = self.handle_model_escalation(ctx, &text).await? {
+                    return Ok(Some(result));
                 }
 
                 // Progressive Output gate check
@@ -2124,7 +2054,7 @@ impl<'a> TurnPipeline<'a> {
             // 因为 agentic 循环中多次 tool call + LLM 调用总时间自然累加
             if !ctx.time_warning_emitted {
                 let elapsed = ctx.turn_started_at.elapsed();
-                let turn_budget_secs = self.core.threshold_u64("max_turn_timeout");
+                let turn_budget_secs = self.core.config.thresholds.max_turn_timeout_secs.unwrap_or(1800);
                 let budget = std::time::Duration::from_secs(turn_budget_secs);
                 if elapsed > budget.mul_f64(0.6) {
                     ctx.time_warning_emitted = true;
@@ -2657,8 +2587,7 @@ impl<'a> TurnPipeline<'a> {
                     use crate::core::action_classifier::ClassifyResult;
                     let safety_result = self.core.action_classifier.classify(tool_id.0.as_str(), &params);
                     if let ClassifyResult::Deny(ref reason) = safety_result {
-                        // V44 fix: Deny 不递增 consecutive_blocks（绝对禁止 ≠ 可覆盖拦截）
-                        // 仅 NeedsConfirm 递增——防止 3 次 hard_deny 误触发 force_confirm_all
+                        ctx.consecutive_blocks += 1;
                         Ok(ToolOutput {
                             tool_id: tool_id.clone(),
                             success: false,
@@ -2670,32 +2599,22 @@ impl<'a> TurnPipeline<'a> {
                     } else {
 
                     // 授权检查：优先于session 永久授权和本 turn 单次授权，匹配则跳过 MCIP 策略
-                    // V41 Step 3: force_confirm_all 激活后，忽略 user_grant（强制确认所有操作）
-                    let is_user_granted = if ctx.force_confirm_all {
-                        false
-                    } else {
+                    let is_user_granted = {
                         let s = self.session.read().await;
                         let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
                         grants.contains(tool_id.0.as_str())
-                    } || (!ctx.force_confirm_all && self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str()));
+                    } || self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str());
 
                     // V41: safety NeedsConfirm 升级为 MCIP NeedsConfirm（复用已有确认通道）
-                    let decision = if ctx.force_confirm_all && !is_user_granted {
-                        // 降级模式：所有工具强制确认
-                        McipDecision::NeedsConfirm("[降级] 连续拦截后所有操作需确认".into())
-                    } else if is_user_granted {
+                    let decision = if is_user_granted {
                         McipDecision::Allowed
                     } else if let ClassifyResult::NeedsConfirm(reason) = &safety_result {
                         ctx.consecutive_blocks += 1;
-                        // 连续 3 次拦截 → 降级执行策略（V41 Step 3）
-                        // 行为：force_confirm_all=true，后续所有工具调用强制走 NeedsConfirm
-                        // 引用关系：下方 MCIP 决策前检查 ctx.force_confirm_all
-                        if ctx.consecutive_blocks >= 3 && !ctx.force_confirm_all {
-                            ctx.force_confirm_all = true;
-                            tracing::warn!("连续 {} 次安全拦截，降级到逐步确认模式", ctx.consecutive_blocks);
+                        // 连续 3 次拦截 → 通知用户降级（实际行为：后续走 MCIP confirm 通道）
+                        if ctx.consecutive_blocks == 3 {
                             if let Some(ref stx) = self.stream_tx {
                                 let _ = stx.send(crate::llm::stream::StreamChunk::TextDelta(
-                                    "\n⚠️ 连续多次操作被安全策略拦截，已切换到逐步确认模式\n".into()
+                                    format!("\n⚠️ 连续 {} 次操作被安全策略拦截\n", ctx.consecutive_blocks)
                                 ));
                             }
                         }
@@ -3275,11 +3194,10 @@ impl<'a> TurnPipeline<'a> {
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
-                            "[User mid-turn message]\n{}\n\n\
-                             CRITICAL: Do NOT restart or regenerate your previous output. \
-                             Continue from where you left off. Incorporate this message naturally \
-                             into your ongoing work. Do NOT repeat what you already said/did. \
-                             If user asks to stop, finish current tool call then stop with summary.",
+                            "[Abacus 用户插入] 用户发来新消息：\n{}\n\n\
+                             约束：不要中断正在进行的工具调用序列。\
+                             完成当前步骤后，在下次文本输出中回应用户消息。\
+                             若用户要求停止，完成当前工具调用后立即停止并总结。",
                             combined
                         ))),
                         name: None,
@@ -3319,35 +3237,11 @@ impl<'a> TurnPipeline<'a> {
         if !text.starts_with("[ESCALATE]") && !text.starts_with("[escalate]") {
             return Ok(None);
         }
-        // V44: 不再 hardcode escalation target——从同 provider 的 model 列表选择更强模型
-        // 规则：当前 model 含 "flash"/"mini"/"lite" → 尝试同 provider 的 "pro"/"max" 变体
-        // 找不到 → 放弃 escalation（不跨 provider 切换，避免 auth 错误）
-        let current_model = ctx.effective_model.0.clone();
-        let escalate_to = {
-            let groups = self.core.provider_groups.read().await;
-            let mut target: Option<String> = None;
-            for group in groups.iter() {
-                if group.supports(&current_model) {
-                    // 在同 provider 中找更强的 model
-                    for m in &group.models {
-                        let name = m.0.as_str();
-                        if name != current_model && (name.contains("pro") || name.contains("max") || name.contains("plus")) {
-                            target = Some(name.to_string());
-                            break;
-                        }
-                    }
-                    break;
-                }
-            }
-            match target {
-                Some(t) => t,
-                None => return Ok(None), // 同 provider 无更强 model，放弃 escalation
-            }
-        };
-        // 如果当前已经是 pro/max 级别，不再 escalate
-        if current_model.contains("pro") || current_model.contains("max") {
+        let effective_for_esc = self.core.resolve_effective_model(None, None).await;
+        if effective_for_esc.0.contains("pro") {
             return Ok(None);
         }
+        let escalate_to = "deepseek-v4-pro";
 
         // Task #96：Budget check —— 防止 cache 振荡
         // 引用关系：SessionState.escalation_count 跨 turn 持续；CoreConfig.max_escalations 阈值
@@ -3448,7 +3342,7 @@ impl<'a> TurnPipeline<'a> {
         };
         maybe_inject_prefix_message(
             &mut messages,
-            &escalate_to,
+            escalate_to,
             self.req_ctx.prefix_assistant_content.as_deref(),
         );
         let escalated_req = LlmRequest {
@@ -3472,7 +3366,7 @@ impl<'a> TurnPipeline<'a> {
         };
 
         // 5-minute hard timeout 安全网（escalation 路径同样受保护）
-        let provider_timeout = std::time::Duration::from_secs(self.core.threshold_u64("turn_timeout"));
+        let provider_timeout = std::time::Duration::from_secs(self.core.config.thresholds.turn_provider_timeout_secs);
         let escalation_result = match tokio::time::timeout(provider_timeout, ctx.provider.complete_cancellable(escalated_req, self.cancel_token())).await {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -3510,7 +3404,7 @@ impl<'a> TurnPipeline<'a> {
                 // 发送 ModelEscalation 事件（前端 + LLM 双向感知）
                 if let Some(ref stx) = self.stream_tx {
                     let _ = stx.send(crate::llm::stream::StreamChunk::ModelEscalation {
-                        from_model: current_model.to_string(),
+                        from_model: self.core.resolve_effective_model(None, None).await.0,
                         to_model: escalate_to.to_string(),
                         reason: "LLM self-escalation for deeper reasoning".into(),
                     });
@@ -3572,7 +3466,7 @@ impl<'a> TurnPipeline<'a> {
                     turn_number: ctx.turn_number,
                     tool_calls: ctx.total_tool_calls,
                     provider_id: ctx.provider_id.clone(),
-                    model_id: ctx.effective_model.0.clone(),
+                    model_id: self.core.resolve_effective_model(None, None).await.0,
                     prompt_tokens: ctx.prompt_tokens,
                     completion_tokens: ctx.completion_tokens,
                     cached_tokens: ctx.cached_tokens,
@@ -3598,21 +3492,7 @@ impl<'a> TurnPipeline<'a> {
     // ─── Phase 7: Persist & Build Result ────────────────────────────────────
 
     async fn persist_and_build_result(self, ctx: TurnContext) -> Result<TurnResult, KernelError> {
-        // V43.6: 清除 ephemeral system 消息——它们是一次性内部指令，不应留在 context 中
-        // 问题：每轮可能注入 2-4 条 "[Abacus" system 消息（工具名检测/续写/预算提示），
-        // 13 轮后累积 80+ 条占大量 token，且对后续 LLM 调用毫无意义。
-        // 修复：turn 结束后删除所有 "[Abacus" 前缀的 system 消息。
-        {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
-            msgs.retain(|m| {
-                if m.role != MessageRole::System { return true; }
-                match &m.content {
-                    Some(MessageContent::Text(t)) => !t.starts_with("[Abacus"),
-                    _ => true,
-                }
-            });
-        }
+        // V42: 空回复不再注入 "(max turns reached)" — 空就是空，TUI 不渲染空消息
 
         let latency = ctx.start_time.elapsed().as_millis() as u64;
         let session_id = { let s = self.session.read().await; s.session_id.clone() };
@@ -3649,7 +3529,7 @@ impl<'a> TurnPipeline<'a> {
                     turn_number: ctx.turn_number,
                     tool_calls: ctx.total_tool_calls,
                     provider_id: ctx.provider_id,
-                    model_id: ctx.effective_model.0.clone(),
+                    model_id: self.core.resolve_effective_model(None, None).await.0,
                     prompt_tokens: ctx.prompt_tokens,
                     completion_tokens: ctx.completion_tokens,
                     cached_tokens: ctx.cached_tokens,

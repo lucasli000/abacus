@@ -326,35 +326,45 @@ impl PromptAssembly {
             layers.entry(230).or_default().push(br_core);
         }
 
-        // V44: Layer 3 (200): Strategy — 精简 ~45%（语义等价）
+        // Layer 3 (200): Strategy + AntiPattern
         layers.entry(200).or_default().push(
-            "## Tools\n\
-            Use function calling for all tool invocations. Parameters are JSON objects.\n\
-            - Shell: `bash_exec` {\"command\": \"...\"}  |  Read: `fs_read` {\"path\": \"...\"}\n\
-            - Search: `fs_search` (glob) / `fs_grep` (regex)\n\
-            - NEVER write tool names in text — always emit tool_call.\n\n\
-            ## Strategy\n\
-            - Gather info (tools) → act → verify. Dependency order for chains.\n\
-            - Failure: diagnose root cause before switching approach.\n\
-            - Large tasks: verifiable milestones with progress reports.\n\
-            - Parallel independent tools. Complete max per turn.\n\
-            - Autonomous: if next step is clear, do it. Ask only when genuinely blocked.\n\
-            - Protect key decisions: call context_pin.".into());
-        // V44: Layer 4 (190): Constraints — 精简 ~40%
+            "## Tool Usage\n\
+            You have access to tools via function calling. To use a tool, emit a tool_call with the tool name and JSON parameters — do NOT write tool names or commands in your text response. The system will execute the tool and return results.\n\
+            - To run shell commands: call `bash_exec` with {\"command\": \"...\"}. Do NOT write shell commands in code blocks.\n\
+            - To read files: call `fs_read` with {\"path\": \"/absolute/path\"}. Do NOT write `cat` or `head` in text.\n\
+            - To search files: call `fs_search` (by filename glob) or `fs_grep` (by content regex).\n\
+            - All parameters are JSON objects, not CLI flags. Never use --flag syntax.\n\n\
+            ## Execution Strategy\n\
+            - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
+            - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
+            - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
+            - Large tasks: break into verifiable milestones. Report progress at each milestone.\n\
+            - Maximize single-turn throughput: call multiple tools in parallel when independent. Complete as much as possible before responding.\n\
+            - Prefer autonomous execution over asking: if the next step is unambiguous, do it. Only ask when genuinely blocked.\n\
+            - Context management: when you make important decisions or receive critical user confirmations, call context_pin to protect that turn from compression.".into());
         layers.entry(190).or_default().push(
             "## Constraints\n\
-            - NEVER: tool names in text | fabricated paths/APIs | placeholder code (TODO/pass/...)\n\
-            - NEVER: \"I believe/think\" without tool verification | --flag syntax in params\n\
-            - Output >50 lines → structured sections with headers.\n\
-            - Error: retry with fix (max 2), then report diagnosis.".into());
+            - NEVER write tool names or commands in text/code blocks — always use function calling.\n\
+            - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\
+            - NEVER skip tool verification by saying \"I believe\" or \"I think\" — use the tool.\n\
+            - NEVER produce placeholder code (TODO, ..., pass) — write complete implementations.\n\
+            - NEVER use CLI flag syntax (--flag) in tool parameters — use JSON key-value pairs.\n\
+            - When output exceeds 50 lines: use structured sections with clear headers.\n\
+            - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
 
-        // V44: Layer 188: Task Completion — 精简 ~50%
+        // Layer 188: 任务完成摘要规则——稳定前缀的一部分（不随 task_kind 变化）
+        // 当 LLM 确认交付完成时，在回复末尾附上单行摘要，供 checkpoint 记录
+        // 格式固定，便于 pipeline 解析提取
         layers.entry(188).or_default().push(
-            "## Completion\n\
-            When task fully delivered (not mid-work), append:\n\
+            "## Task Completion\n\
+            When you have fully delivered what the user requested (task complete, not mid-task), \
+            append at the very end of your response:\n\
             ---\n\
-            ✓ [≤80 chars summary, user's language]\n\n\
-            Only on true completion. Must start with `✓ `. Factual and specific.".into()
+            ✓ [one-sentence summary: what was done / what was delivered, ≤80 chars, same language as user]\n\n\
+            Rules:\n\
+            - Only output this when the task is truly complete — not when asking questions, not mid-execution.\n\
+            - The summary line must start exactly with `✓ ` (checkmark + space).\n\
+            - Keep it factual and specific: \"✓ 重构认证模块，JWT 替代 session token，cargo check 通过\"".into()
         );
 
         // Layer 185: 任务相关子场景——动态内容，放在 Constraints(190) 之后
@@ -509,16 +519,19 @@ impl PromptAssembly {
             layers.entry(230).or_default().push(br_core);
         }
 
-        // V44: segments 路径 — 与 assemble() 语义对齐（精简版）
         layers.entry(200).or_default().push(
-            "## Strategy\n\
-            - Gather info (tools) → act → verify. Dependency order for chains.\n\
-            - Failure: diagnose root cause before switching approach.\n\
-            - Large tasks: verifiable milestones with progress reports.".into());
+            "## Execution Strategy\n\
+            - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
+            - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
+            - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
+            - Large tasks: break into verifiable milestones. Report progress at each milestone.".into());
         layers.entry(190).or_default().push(
             "## Constraints\n\
-            - NEVER: fabricated paths/APIs | placeholder code | \"I believe\" without verification\n\
-            - Output >50 lines → structured sections. Error: retry(2) then report.".into());
+            - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\
+            - NEVER skip tool verification by saying \"I believe\" or \"I think\" — use the tool.\n\
+            - NEVER produce placeholder code (TODO, ..., pass) — write complete implementations.\n\
+            - When output exceeds 50 lines: use structured sections with clear headers.\n\
+            - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
 
         // Layer 185: 任务相关子场景（动态块，任务切换时内容变化）
         // clone：task_kind 后续还需用于构建 HookContext

@@ -338,9 +338,17 @@ impl<'a> TurnPipeline<'a> {
             let tool_set_hash: i64 = registry_tools.iter().fold(0i64, |acc, t| {
                 acc.wrapping_add(t.id.0.bytes().fold(0i64, |a, b| a.wrapping_mul(31).wrapping_add(b as i64)))
             });
+            // FIX: usage_pct 用 effective 窗口（model_limit × ratio）做分母
+            // 而非 window.max_tokens (set_window clamp 后值)，避免 usage_pct > 100%
+            let ratio = self.core.config.context_window_ratio.clamp(0.1, 1.0);
             let window = self.core.context_manager.window.read().await;
-            let pct = window.usage_pct();
-            let max_tok = window.max_tokens;
+            let effective_max = ((window.model_limit as f64 * ratio) as usize).max(128_000);
+            let pct = if effective_max > 0 {
+                (window.current_tokens as f64 / effective_max as f64) * 100.0
+            } else {
+                window.usage_pct()
+            };
+            let max_tok = effective_max;
             let cur_tok = window.current_tokens;
             drop(window);
             let was_compressed_bool = {
@@ -564,7 +572,7 @@ impl<'a> TurnPipeline<'a> {
         );
 
         let request = LlmRequest {
-            model: self.core.config.default_model.clone(),
+            model: self.core.resolve_effective_model(None, None).await,
             messages: vec![Message {
                 role: MessageRole::User,
                 content: Some(MessageContent::Text(prompt)),
@@ -838,7 +846,7 @@ impl<'a> TurnPipeline<'a> {
                         msgs.clone()
                     };
                     let retry_req = LlmRequest {
-                        model: self.req_ctx.model.clone().unwrap_or_else(|| self.core.config.default_model.clone()),
+                        model: self.req_ctx.model.clone().unwrap_or(self.core.resolve_effective_model(None, None).await),
                         messages,
                         system: Some(ctx.enriched_system.clone()),
                         system_segments: ctx.system_segments.clone(),

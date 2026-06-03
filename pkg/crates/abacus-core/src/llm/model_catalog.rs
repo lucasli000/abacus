@@ -30,15 +30,12 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ModelCatalog {
     specs: HashMap<ModelId, Arc<ModelSpec>>,
-    /// V43: provider-aware 索引——解决同名模型跨 provider 配置不同 context_window 的覆盖问题
-    /// Key: (provider_id, model_id)
-    qualified_specs: HashMap<(String, ModelId), Arc<ModelSpec>>,
 }
 
 impl ModelCatalog {
     /// 空 catalog——主要用于测试场景注入「无任何已知模型」状态
     pub fn empty() -> Self {
-        Self { specs: HashMap::new(), qualified_specs: HashMap::new() }
+        Self { specs: HashMap::new() }
     }
 
     /// 内置已知模型表。版本随 Abacus release 维护。
@@ -190,7 +187,7 @@ impl ModelCatalog {
             );
         }
 
-        Self { specs, qualified_specs: HashMap::new() }
+        Self { specs }
     }
 
     /// 精确查询。未命中返回 None。
@@ -202,15 +199,6 @@ impl ModelCatalog {
     /// 用于运行时未声明的实验性模型——不阻塞调用，但 thinking 自动降级。
     pub fn lookup_or_default(&self, id: &ModelId) -> Arc<ModelSpec> {
         self.lookup(id).unwrap_or_else(|| Arc::new(ModelSpec::default()))
-    }
-
-    /// Provider-aware 查询：解决同名模型跨 provider 配置不同 spec 的覆盖问题
-    /// 优先级：qualified_specs (provider+model) > specs (model only) > default
-    pub fn lookup_qualified(&self, provider_id: &str, model: &ModelId) -> Arc<ModelSpec> {
-        self.qualified_specs.get(&(provider_id.to_string(), model.clone()))
-            .cloned()
-            .or_else(|| self.specs.get(model).cloned())
-            .unwrap_or_else(|| Arc::new(ModelSpec::default()))
     }
 
     /// 注入/覆盖单条 spec（YAML merge 路径或测试构造）
@@ -302,8 +290,8 @@ impl ModelCatalog {
     ///
     /// ## 参数
     /// - `entry`: 模型配置条目
-    /// - `provider_id`: 所属 provider ID（写入 qualified_specs 索引）
-    pub fn merge_model_entry(&mut self, entry: &abacus_types::ModelEntry, provider_id: Option<&str>) {
+    /// - `_provider_id`: 所属 provider ID（预留，用于未来按 provider 分组查询）
+    pub fn merge_model_entry(&mut self, entry: &abacus_types::ModelEntry, _provider_id: Option<&str>) {
         let id = ModelId(entry.name.clone());
         let mut spec = self.lookup(&id)
             .map(|arc| (*arc).clone())
@@ -342,12 +330,7 @@ impl ModelCatalog {
                 _ => {} // 未知值忽略
             }
         }
-        let spec_arc = Arc::new(spec);
-        // V43: 同时写入 qualified_specs（provider-aware 索引）
-        if let Some(pid) = provider_id {
-            self.qualified_specs.insert((pid.to_string(), id.clone()), spec_arc.clone());
-        }
-        self.specs.insert(id, spec_arc);
+        self.specs.insert(id, Arc::new(spec));
     }
 
     /// 已注册模型数（不区分内置 vs 覆盖）

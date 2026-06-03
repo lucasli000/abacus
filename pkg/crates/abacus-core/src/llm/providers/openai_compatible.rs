@@ -288,40 +288,6 @@ impl OpenAICompatibleProvider {
         self.discover_enabled = enabled;
     }
 
-    /// 构建 chat/completions 的完整 URL
-    ///
-    /// 智能路径拼接：
-    /// - base_url 已含 /v1 或 /v2 等版本路径 → 直接拼 /chat/completions
-    /// 构建 chat completions endpoint URL
-    ///
-    /// 设计：base_url 直接追加 `/chat/completions`（用户配置的 base_url 必须包含版本路径）
-    /// 示例：
-    /// - `https://api.openai.com/v1` → `.../v1/chat/completions`
-    /// - `https://ark.cn-beijing.volces.com/api/coding` → `.../api/coding/chat/completions`
-    /// - `https://openrouter.ai/api/v1` → `.../api/v1/chat/completions`
-    ///
-    /// 唯一例外：已以 `/chat/completions` 结尾 → 直接使用（用户给了完整 endpoint）
-    ///
-    /// 引用关系：complete() 和 stream_complete() 调用
-    fn completions_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
-            base.to_string()
-        } else {
-            format!("{}/chat/completions", base)
-        }
-    }
-
-    /// 构建 models endpoint URL（discover_models 用）
-    fn models_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/models") {
-            base.to_string()
-        } else {
-            format!("{}/models", base)
-        }
-    }
-
     fn build_request(&self, req: &LlmRequest) -> ChatRequest {
         let messages: Vec<ChatMessage> = self.build_messages(req);
 
@@ -558,7 +524,7 @@ impl LlmProvider for OpenAICompatibleProvider {
             let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
             let result = self
                 .client
-                .post(self.completions_url())
+                .post(format!("{}/v1/chat/completions", self.base_url))
                 .timeout(self.request_timeout) // H8: per-request timeout
                 .header(&self.auth_header, auth_value)
                 .header("Content-Type", "application/json")
@@ -614,19 +580,18 @@ impl LlmProvider for OpenAICompatibleProvider {
             if status.as_u16() == 401 {
                 return Err(KernelError::Unauthorized(body_text));
             }
-            // V43.4: 清洗错误响应——HTML 页面只取 title，不暴露原始 HTML/JS
-            let clean_body = if body_text.contains("<html") || body_text.contains("<!DOCTYPE") {
-                let title = body_text.find("<title>")
-                    .and_then(|s| body_text[s+7..].find("</title>").map(|e| &body_text[s+7..s+7+e]));
-                title.unwrap_or("(HTML error page)").to_string()
+            // V18：openai-compatible 路径错误增强
+            let summary = body.messages.iter().enumerate()
+                .map(|(i, m)| format!("  [{}] role={}", i, m.role))
+                .collect::<Vec<_>>().join("\n");
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
             } else {
-                let mut end = body_text.len().min(300);
-                while end < body_text.len() && !body_text.is_char_boundary(end) { end += 1; }
-                body_text[..end].to_string()
+                String::new()
             };
             let enriched = format!(
-                "HTTP {} from {}: {}",
-                status.as_u16(), self.base_url, clean_body
+                "{}\n--- REQ DUMP (V18 openai-compat) ---\nbase_url={}\nmessages:\n{}{}",
+                body_text, self.base_url, summary, wire_hint
             );
             return Err(KernelError::ApiError {
                 status: status.as_u16(),
@@ -694,7 +659,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self
             .client
-            .post(self.completions_url())
+            .post(format!("{}/v1/chat/completions", self.base_url))
             .timeout(self.request_timeout) // H8: per-request timeout
             .header(&self.auth_header, auth_value)
             .header("Content-Type", "application/json")
@@ -706,24 +671,21 @@ impl LlmProvider for OpenAICompatibleProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            // V43.4: 清洗 HTML 响应——只保留有意义的错误信息，不展示原始 HTML/JS
-            let clean_body = if body_text.contains("<html") || body_text.contains("<!DOCTYPE") {
-                // HTML 响应 → 提取 title 或前 100 字符纯文本
-                let title = body_text.find("<title>")
-                    .and_then(|s| body_text[s+7..].find("</title>").map(|e| &body_text[s+7..s+7+e]));
-                title.unwrap_or("(HTML error page)").to_string()
-            } else {
-                // JSON/text → 截断到 200 字符
-                let mut end = body_text.len().min(200);
-                while end < body_text.len() && !body_text.is_char_boundary(end) { end += 1; }
-                body_text[..end].to_string()
-            };
             let _ = tx.send(StreamEvent::Error(
-                format!("HTTP {}: {}", status.as_u16(), clean_body)
+                format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
             ));
+            // V18：openai-compatible streaming 错误增强
+            let summary = body.messages.iter().enumerate()
+                .map(|(i, m)| format!("  [{}] role={}", i, m.role))
+                .collect::<Vec<_>>().join("\n");
+            let wire_hint = if cfg!(debug_assertions) {
+                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+            } else {
+                String::new()
+            };
             let enriched = format!(
-                "HTTP {} from {}: {}",
-                status.as_u16(), self.base_url, clean_body
+                "{}\n--- REQ DUMP (V18 openai-compat stream) ---\nbase_url={}\nmessages:\n{}{}",
+                body_text, self.base_url, summary, wire_hint
             );
             return Err(KernelError::ApiError { status: status.as_u16(), body: enriched });
         }
@@ -868,7 +830,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self.client
-            .get(self.models_url())
+            .get(format!("{}/v1/models", self.base_url))
             .timeout(std::time::Duration::from_secs(15)) // discover 短超时（不让首次启动卡死）
             .header(&self.auth_header, auth_value)
             .send()

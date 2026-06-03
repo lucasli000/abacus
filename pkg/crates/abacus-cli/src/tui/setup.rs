@@ -272,21 +272,7 @@ fn disclaimer_path() -> PathBuf {
 }
 
 /// 检测是否已有有效 API 配置
-///
-/// 优先检测 providers.json（V43 新格式），再 fallback 到环境变量和 config.yaml
 pub fn has_api_config() -> bool {
-    // V43: providers.json 存在且非空 → 已配置
-    let providers_path = abacus_core::paths::providers_json();
-    if providers_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&providers_path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() && trimmed != "[]" {
-                return true;
-            }
-        }
-    }
-
-    // 环境变量检测（向后兼容）
     if std::env::var("ABACUS_API_KEY").is_ok()
         || std::env::var("DEEPSEEK_API_KEY").is_ok()
         || std::env::var("ANTHROPIC_API_KEY").is_ok()
@@ -294,9 +280,9 @@ pub fn has_api_config() -> bool {
     {
         return true;
     }
-
-    // config.yaml 中有 api_key（旧格式兼容检测）
     if let Ok(content) = std::fs::read_to_string(config_path()) {
+        // M3 fix: 跳过注释行，仅匹配非空 api_key 赋值行
+        // 防止高级配置注释块（含 # openai_api_key: ""）触发误报
         let has_real_key = content.lines().any(|line| {
             let trimmed = line.trim();
             !trimmed.starts_with('#')
@@ -368,10 +354,30 @@ fn save_config(state: &SetupState) -> Result<(), String> {
     let raw_url = if state.base_url.is_empty() {
         "https://api.openai.com".to_string()
     } else {
-        // base_url 保持用户输入原样（只 trim 空白和尾斜杠）
-        state.base_url.trim().trim_end_matches('/').to_string()
+        // M4 fix: 先 trim 空白，再剥离版本路径后缀，再 trim 尾斜杠
+        let trimmed = state.base_url.trim();
+        let stripped = trimmed
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches("/v2")
+            .trim_end_matches("/v3")
+            .trim_end_matches("/v4")
+            .trim_end_matches('/')
+            .trim()
+            .to_string();
+        stripped
     };
-    // V44: api_key/model 已移到 providers.json，yaml 不再需要转义它们
+    // H1 fix: 所有用户输入字段写入 YAML 前转义
+    let base_url   = yaml_escape(&raw_url);
+    let api_key_e  = yaml_escape(&state.api_key);
+    let model_e    = yaml_escape(if state.model_name.is_empty() {
+        provider.default_model()
+    } else {
+        &state.model_name
+    });
+
+    // model_e / api_key_e / base_url 已在上方转义，resolved_model 仅用于 cw_tokens 查找
+    let resolved_model = model_e.as_str();
 
     // 解析上下文配置
     // context_window 为空 → 不写入 config，引擎从 model catalog 自动取模型最大值
@@ -399,7 +405,7 @@ fn save_config(state: &SetupState) -> Result<(), String> {
 
     // 2026-05-28: 新格式 — providers 数组 + 固化配置指引头部
     let provider_type_str = if provider.is_openai_compatible() {
-        if raw_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
+        if base_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
     } else {
         "anthropic"
     };
@@ -470,25 +476,52 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         lines.join("\n")
     };
 
-    // V44: config.yaml 只管系统行为；default_model 不写入（自动从 providers.json 第一个推导）
-    // 若用户想指定特定模型可手动加 `core.default_model: provider_id/model_name`
     let yaml = format!(
         r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
-# ║  ABACUS 配置文件 (config.yaml) — 系统行为配置                               ║
-# ║  LLM Provider 配置在 providers.json（同目录）                                ║
-# ║  默认模型 = providers.json 第一个 provider 的第一个 model（无需手动指定）      ║
+# ║  ABACUS 配置文件 (config.yaml)                                              ║
+# ╠═══════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                             ║
+# ║  providers:                   # 供应商列表（按优先级排序）                   ║
+# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
+# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
+# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
+# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
+# ║      models:                  # 模型列表（简写或详写）                       ║
+# ║        - model-name           # 简写：用 provider 默认参数                   ║
+# ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║
+# ║          context_window: N    #   上下文窗口（token 数）                     ║
+# ║          max_tokens: N        #   单次最大输出 token                         ║
+# ║          temperature: 0.0-2.0 #   生成温度                                  ║
+# ║          thinking: off|adaptive|low|medium|high|max                         ║
+# ║                                                                             ║
+# ║  core:                        # 全局运行参数                                 ║
+# ║    default_model: <model>     # 默认模型                                    ║
+# ║    stream: true               # 流式输出                                    ║
+# ║                                                                             ║
+# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
+# ║                                                                             ║
+# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
+# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
+# ║                                                                             ║
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
+
+# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
+providers:
+  - id: primary
+    type: {}
+    api_key: "{}"
+    base_url: "{}"
+    models:
+      - {}
 
 # ─── 全局设置 ───────────────────────────────────────────────────────────────────
 core:
-  # default_model: auto  # 取消注释可指定，格式: provider_id/model_name
-  temperature: 0.3
-  max_tokens: 16384
-  thinking: low
+  default_model: "{}"
   stream: true
 {}  context_window_ratio: {:.4}
 {}"#,
-        cw_line, cw_ratio, features_section,
+        provider_type_str, api_key_e, base_url, resolved_model,
+        resolved_model, cw_line, cw_ratio, features_section,
     );
 
     let dir = config_dir();
@@ -503,26 +536,6 @@ core:
             let _ = std::fs::set_permissions(config_path(), perms);
         }
     }
-
-    // V44: 用 serde_json 构建 providers.json（防止 JSON 注入/转义问题）
-    let model_name = if state.model_name.is_empty() {
-        provider.default_model().to_string()
-    } else {
-        state.model_name.clone()
-    };
-    let providers_entry = serde_json::json!([{
-        "id": "primary",
-        "type": provider_type_str,
-        "api_key": state.api_key,
-        "base_url": raw_url,
-        "models": [{"name": model_name, "context_window": cw_tokens_opt.unwrap_or(128_000), "max_tokens": 16384}]
-    }]);
-    let providers_json = serde_json::to_string_pretty(&providers_entry).unwrap_or_default();
-    let providers_json_path = abacus_core::paths::providers_json();
-    if let Err(e) = std::fs::write(&providers_json_path, &providers_json) {
-        tracing::warn!("failed to write providers.json: {e}");
-    }
-
     Ok(())
 }
 
@@ -990,8 +1003,8 @@ fn fetch_model_list_sync(base_url: &str, api_key: &str) -> Vec<(String, Option<u
 ///
 /// 引用关系：被 fetch_model_list_sync 在检测到 Anthropic URL 时调用
 fn fetch_anthropic_models(base_url: &str, api_key: &str) -> Vec<(String, Option<u64>)> {
-    let base = base_url.trim_end_matches('/');
-    let url = format!("{}/models", base);
+    let base = base_url.trim_end_matches('/').trim_end_matches("/v1");
+    let url = format!("{}/v1/models", base);
     match ureq::get(&url)
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")

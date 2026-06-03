@@ -285,27 +285,6 @@ impl DeepSeekProvider {
         }
     }
 
-    /// completions URL：base_url 直接追加 /chat/completions
-    /// 用户配置的 base_url 必须包含版本路径（如 https://api.deepseek.com/v1）
-    fn completions_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
-            base.to_string()
-        } else {
-            format!("{}/chat/completions", base)
-        }
-    }
-
-    /// models URL：base_url 直接追加 /models
-    fn models_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        if base.ends_with("/models") {
-            base.to_string()
-        } else {
-            format!("{}/models", base)
-        }
-    }
-
     /// Return a reference to the pricing model.
     pub fn pricing(&self) -> &Pricing {
         &self.pricing
@@ -640,7 +619,7 @@ impl LlmProvider for DeepSeekProvider {
         let resp = loop {
             let result = self
                 .client
-                .post(self.completions_url())
+                .post(format!("{}/v1/chat/completions", self.base_url))
                 .timeout(self.request_timeout) // H8: per-request timeout
                 .header("Authorization", format!("Bearer {}", self.api_key.as_str()))
                 .header("Content-Type", "application/json")
@@ -762,7 +741,7 @@ impl LlmProvider for DeepSeekProvider {
 
         let resp = self
             .client
-            .post(self.completions_url())
+            .post(format!("{}/v1/chat/completions", self.base_url))
             .timeout(self.request_timeout) // H8: per-request timeout
             .header("Authorization", format!("Bearer {}", self.api_key.as_str()))
             .header("Content-Type", "application/json")
@@ -1035,7 +1014,7 @@ impl LlmProvider for DeepSeekProvider {
             return Ok(self.supported_models());
         }
         let resp = self.client
-            .get(self.models_url())
+            .get(format!("{}/v1/models", self.base_url))
             .timeout(std::time::Duration::from_secs(15))
             .header("Authorization", format!("Bearer {}", self.api_key.as_str()))
             .send()

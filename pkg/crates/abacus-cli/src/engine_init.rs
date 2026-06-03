@@ -23,22 +23,33 @@ use abacus_core::skill::SkillEngine;
 use abacus_core::capability::CapabilityHub;
 use abacus_types::{KernelError, ModelId};
 
-// V44: 精简 Kernel prompt — 语义等价，信息密度提升 ~45%
-// 旧: ~280 tokens | 新: ~150 tokens
-// 原则: 结构化 bullet ≤15 tok/条; 删除 LLM 已知的常识; 保留所有行为约束
 const DEFAULT_SYSTEM_PROMPT: &str = "\
-You are Abacus — autonomous agent kernel in user's local environment. Not Claude/GPT/any specific LLM.
+You are Abacus — an autonomous agent kernel running in the user's local environment.
+You are NOT Claude, NOT ChatGPT, NOT any specific LLM. You are Abacus, an independent agent.
 
-# Rules
-- Act through tools. Verify via tools, never assume.
-- Multi-step: decompose → execute → verify each → synthesize.
-- Language: follow user (default Chinese conversation, English code).
-- Output: answer-first, no intro/filler/emoji/apology. Concise and direct.
-- Code: include file path. No placeholder (TODO/pass/...).
-- Errors: actual error + diagnosis. Retry with fix (max 2), then report.
-- Identity: \"I am Abacus, an autonomous agent kernel.\" Never mention underlying LLM.
-- Safety: destructive ops (rm -rf/DROP/force-push) require explicit confirmation.
-- Never fabricate tool names or API endpoints — verify existence first.";
+## Core Behavior
+- Execute tasks through available tools. Prefer tool verification over memory/assumption.
+- Multi-step tasks: decompose → execute sequentially → verify each step → synthesize.
+- When uncertain: use tools to verify rather than speculate.
+- Language: follow the user's language. Default Chinese for conversation, English for code.
+
+## Output Rules
+- No self-introduction, no filler phrases, no \"I'll help you with that\".
+- No emoji unless the user explicitly requests it.
+- Lead with the answer or action, not the reasoning.
+- Code: always include file path context. Never generate placeholder code.
+- Errors: report the actual error and your diagnosis, not a generic apology.
+- Keep responses concise and direct. No unnecessary padding or meta-commentary.
+
+## Identity
+- If asked \"who are you\", answer: \"I am Abacus, an autonomous agent kernel.\"
+- Never claim to be Claude, GPT, or any other model. Your identity is Abacus.
+- The underlying LLM is an implementation detail — do not mention it unless asked about architecture.
+
+## Safety
+- Never execute destructive operations (rm -rf, DROP TABLE, force push) without explicit confirmation.
+- Never fabricate tool names or API endpoints.
+- If a tool returns an error, diagnose and retry with corrected parameters — don't give up immediately.";
 
 /// In-memory session store for CLI (no persistence needed for single session).
 struct CliSessionStore;
@@ -71,14 +82,10 @@ pub async fn create_engine(
     // 配置加载顺序：默认内置层 < models.yaml < config.yaml < security.yaml < conf.d/*.yaml < 环境变量
     // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
     use abacus_core::paths;
-    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 模型能力声明
+    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 凭证 + 模型参数
     let _ = cfg_mgr.load_file(paths::config_yaml());      // config.yaml — Abacus 行为配置
     let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
-    // V43.7: providers.json 优先——JSON 格式的 provider/LLM 配置（覆盖 config.yaml 中的 providers）
-    if let Err(e) = cfg_mgr.load_providers_json(paths::providers_json()) {
-        tracing::warn!("providers.json load failed: {e}");
-    }
 
     // Validate config before using — warn on out-of-range values
     let validation_warnings = cfg_mgr.validate();
@@ -86,14 +93,8 @@ pub async fn create_engine(
         tracing::warn!("config validation: {}", w);
     }
 
-    // Model — 优先级链: config.yaml core.default_model > providers.json 第一个 model > CLI 参数
-    // V44: 不再硬编码默认模型——从 providers.json 自动推导
-    let auto_model: Option<String> = cfg_mgr.parse_providers()
-        .first()
-        .and_then(|entry| entry.models.first())
-        .map(|m| m.name.clone());
-    let resolved_model = cfg_mgr.get_str("core.default_model")
-        .unwrap_or_else(|| auto_model.as_deref().unwrap_or(model));
+    // Model — prefer config over parameter
+    let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
 
     let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(200);
     // V29.14 (Risk 3): max_turns 过高时记录 tracing::warn, 提示 token 费用风险
@@ -202,7 +203,6 @@ pub async fn create_engine(
         model_catalog,
         tool_visibility_threshold: abacus_types::VisibilityTier::D,
         // Task #84/#87：按任务类型路由工具（减少 LLM 上下文噪声 1k-3k tokens/turn）
-        auto_escalation: cfg_mgr.get_bool("core.auto_escalation").unwrap_or(false),
         task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
         // 频率剪枝：N turn 未调用的工具隐藏（None = 关闭）
         tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
@@ -345,7 +345,9 @@ pub async fn create_engine(
                 }
                 ProviderType::Deepseek => {
                     use abacus_core::llm::providers::deepseek::DeepSeekProvider;
-                    let base = entry.base_url.clone();
+                    let base = entry.base_url.clone()
+                        .map(|u| u.trim_end_matches("/v1").trim_end_matches("/v2")
+                            .trim_end_matches("/v3").trim_end_matches("/v4").to_string());
                     let default_ds_model = models.first().cloned()
                         .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
                     let p = Arc::new(DeepSeekProvider::with_config(
@@ -468,7 +470,8 @@ pub async fn create_engine(
         use abacus_core::llm::providers::deepseek::DeepSeekProvider;
         let clean_base = cfg_mgr.get_str("llm.base_url")
             .map(|s| {
-                let s = s.trim();
+                let s = s.trim_end_matches("/v1").trim_end_matches("/v2")
+                    .trim_end_matches("/v3").trim_end_matches("/v4").trim();
                 if s.is_empty() { None } else { Some(s.to_string()) }
             })
             .flatten();

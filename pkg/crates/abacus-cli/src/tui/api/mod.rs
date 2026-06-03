@@ -140,64 +140,6 @@ impl EngineHandle {
         *self.meeting_handle.write().await = None;
     }
 
-    /// V43: 重载 providers.json 并重新注册所有 provider
-    ///
-    /// ## 引用关系
-    /// - 调用方: run.rs SlashCommand::ReloadProviders 处理分支
-    /// - 依赖: abacus_core::paths::providers_json() + engine_init 注册逻辑
-    ///
-    /// ## 设计
-    /// 当前实现：解析 JSON 并使用通用 OpenAI Compatible provider 注册所有条目
-    /// （Anthropic/DeepSeek 等特殊 provider 仍需重启；但大多数兼容 API 可热加载）
-    ///
-    /// ## 返回
-    /// Ok(provider_count) 或 Err(error_message)
-    pub async fn reload_providers(&self) -> Result<usize, String> {
-        use abacus_core::paths;
-        use abacus_core::config::ConfigManager;
-        use std::collections::HashMap;
-        use std::sync::Arc;
-
-        let json_path = paths::providers_json();
-        if !json_path.exists() {
-            return Err("providers.json 不存在".into());
-        }
-
-        let mut cfg = ConfigManager::new(HashMap::new());
-        cfg.load_providers_json(&json_path).map_err(|e| e.to_string())?;
-
-        let provider_entries = cfg.parse_providers();
-        let count = provider_entries.len();
-        if count == 0 {
-            return Err("providers.json 中无有效 provider 配置".into());
-        }
-
-        // 热注册：所有 provider 统一走 OpenAI Compatible（最大兼容性）
-        use abacus_core::llm::providers::openai_compatible::OpenAICompatibleProvider;
-        use abacus_types::ModelId;
-
-        for entry in &provider_entries {
-            let api_key = entry.api_key.clone().unwrap_or_default();
-            let models: Vec<ModelId> = entry.models.iter()
-                .map(|m| ModelId(m.name.clone()))
-                .collect();
-            let base = entry.base_url.clone().unwrap_or_default();
-            let default_model = models.first().cloned()
-                .unwrap_or_else(|| ModelId("auto".into()));
-
-            let provider = OpenAICompatibleProvider::new(
-                api_key, default_model, base, None, None, None,
-            );
-            let p = Arc::new(provider);
-            self.core.register_provider_group(&entry.id, models, p).await;
-        }
-
-        // 重新发现模型
-        self.core.discover_all_models().await;
-
-        Ok(count)
-    }
-
     /// MCIP 授权后重运同一 turn
     ///
     /// ## 流程
