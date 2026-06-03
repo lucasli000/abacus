@@ -587,7 +587,7 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     //   引用: validation.rs NumericRange max=200 上限不变; engine_init.rs unwrap_or(20) 兜底不变
     defaults.insert("core.max_turns".into(), ConfigValue::Number(25.0));
     defaults.insert("core.max_tool_calls".into(), ConfigValue::Number(8.0));
-    defaults.insert("core.default_model".into(), ConfigValue::String("deepseek-v4-flash".into()));
+    defaults.insert("core.default_model".into(), ConfigValue::String("auto".into()));
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
     defaults.insert("core.max_tokens".into(), ConfigValue::Number(64000.0));
     // [DEPRECATED] 旧版思考配置 key，保留默认值供兼容层 get_bool/get_str 调用使用。
@@ -693,7 +693,7 @@ mod tests {
         let manager = ConfigManager::new(defaults);
         // V29.13: max_turns default 5 → 25 (工具生态扩展后 5 轮易撞线)
         assert_eq!(manager.get_number("core.max_turns"), Some(25.0));
-        assert_eq!(manager.get_str("core.default_model"), Some("deepseek-v4-flash"));
+        assert_eq!(manager.get_str("core.default_model"), Some("auto"));
     }
 
     #[test]
