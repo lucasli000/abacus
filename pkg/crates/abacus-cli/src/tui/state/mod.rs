@@ -3395,7 +3395,7 @@ impl AppState {
             let text = std::mem::take(&mut self.streaming_text);
             let thinking = std::mem::take(&mut self.streaming_thinking);
             let tools = std::mem::take(&mut self.streaming_tools);
-            let timeline = std::mem::take(&mut self.streaming_timeline);
+            let _timeline = std::mem::take(&mut self.streaming_timeline);
             let trace_ids = std::mem::take(&mut self.streaming_trace_ids);
 
             let mut parts: Vec<MsgContent> = Vec::new();
