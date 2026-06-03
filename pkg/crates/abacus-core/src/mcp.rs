@@ -903,7 +903,73 @@ impl crate::tool::ToolExecutor for PluginToolExecutor {
     }
 }
 
-#[cfg(test)]
+/// McpWatcher — MCP 运行时热发现
+///
+/// 定期轮询已注册的 MCP client 的可用工具，增量注册新工具到 ToolRegistry。
+/// 用于运行时新增 MCP server 或 server 动态添加 tool 的场景。
+pub struct McpWatcher {
+    registry: crate::tool::ToolRegistry,
+    poll_interval: std::time::Duration,
+}
+
+impl McpWatcher {
+    pub fn new(registry: crate::tool::ToolRegistry) -> Self {
+        Self {
+            registry,
+            poll_interval: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// 设置轮询间隔
+    pub fn with_poll_interval(mut self, secs: u64) -> Self {
+        self.poll_interval = std::time::Duration::from_secs(secs);
+        self
+    }
+
+    /// 对单个 MCP client 执行一次热发现，增量注册新工具
+    ///
+    /// 返回本次新增的工具数
+    pub async fn rediscover(&self, client: &McpClient) -> Result<usize, String> {
+        let tools = client.discover_tools().await
+            .map_err(|e| format!("mcp rediscover: {e}"))?;
+
+        let mut added = 0usize;
+        for handle in tools {
+            let id = handle.id.clone();
+            // 检查是否已注册（避免重复）
+            if self.registry.get(&id).await.is_some() {
+                continue;
+            }
+            self.registry.register(handle).await;
+            added += 1;
+        }
+        Ok(added)
+    }
+
+    /// 启动后台轮询任务（返回 JoinHandle，可 await 或 abort）
+    pub fn start_watching(
+        self,
+        clients: Vec<Arc<McpClient>>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(self.poll_interval);
+            loop {
+                interval.tick().await;
+                for client in &clients {
+                    if let Err(e) = self.rediscover(client).await {
+                        tracing::warn!(
+                            server_id = %client.config.server_id.0,
+                            error = %e,
+                            "McpWatcher rediscover failed"
+                        );
+                    }
+                }
+            }
+        })
+    }
+}
+
+
 mod tests {
     use super::*;
     use abacus_types::ServerId;

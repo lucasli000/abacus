@@ -541,6 +541,12 @@ pub enum ToolCategory {
     Mcp,
     /// LLM introspection（deduction.* / magchain.*）
     Introspection,
+    /// HTTP 请求（http_request）
+    Http,
+    /// JSON 处理（json_process）
+    Json,
+    /// 文件对比（diff）
+    Diff,
 }
 
 /// ToolCategorizer — 按类别分批注入工具定义给 LLM
@@ -564,7 +570,7 @@ impl ToolCategorizer {
                 vec![ToolCategory::FileSystem, ToolCategory::CodeExec, ToolCategory::Lsp]
             }
             "data_analysis" | "research" => {
-                vec![ToolCategory::Network, ToolCategory::Knowledge, ToolCategory::CodeExec]
+                vec![ToolCategory::Network, ToolCategory::Knowledge, ToolCategory::CodeExec, ToolCategory::Json]
             }
             "web_development" | "frontend" => {
                 vec![ToolCategory::FileSystem, ToolCategory::CodeExec, ToolCategory::Lsp]
@@ -586,6 +592,7 @@ impl ToolCategorizer {
                     ToolCategory::Database, ToolCategory::Lsp,
                     ToolCategory::Session, ToolCategory::Config,
                     ToolCategory::Introspection,
+                    ToolCategory::Http, ToolCategory::Json, ToolCategory::Diff,
                 ]
             }
         }

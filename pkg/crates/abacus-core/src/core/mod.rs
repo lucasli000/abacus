@@ -2319,6 +2319,18 @@ impl CoreLoop {
                 crate::tool::builtin::orchestrate::register(&self.registry).await;
                 crate::tool::builtin::orchestrate::register_executors(&self.registry).await;
             }
+            "lsp" => {
+                // LSP 自适应加载：需要 workspace_root 才能初始化 LSP manager
+                // 如果尚未 enable_lsp，hot-load 只注册 schema（executor 后续补）
+                let lsp_mgr = self.lsp_manager.read().await;
+                if lsp_mgr.is_some() {
+                    crate::tool::builtin::lsp::register(&self.registry).await;
+                    // executor 在 enable_lsp 时已注册，hot-load 只恢复 schema
+                    tracing::debug!("lsp: schema hot-loaded (executor via enable_lsp)");
+                } else {
+                    tracing::debug!("lsp: cannot hot-load, LSP not enabled (call enable_lsp first)");
+                }
+            }
             _ => {
                 tracing::warn!(subsystem = name, "unknown subsystem for hot-load");
             }
@@ -3571,7 +3583,31 @@ impl CoreLoop {
         session: &RwLock<SessionState>,
         ctx: RequestContext,
     ) -> Result<TurnResult, KernelError> {
+        // 每轮处理前：根据 input intent 自动触发未加载的 skill
+        self.auto_load_skills_for_intent(input).await;
         TurnPipeline::with_context(self, input, session, ctx).run().await
+    }
+
+    /// 根据用户输入 intent 自动加载匹配的 skill
+    async fn auto_load_skills_for_intent(&self, input: &str) {
+        let engine = self.skill_engine.read().await;
+        let candidates = engine.evaluate(input, None);
+        let to_load: Vec<_> = candidates.into_iter()
+            .filter(|c| c.confidence > 0.6)
+            .map(|c| c.id)
+            .collect();
+        drop(engine);
+
+        for skill_id in to_load {
+            let mut engine = self.skill_engine.write().await;
+            // 检查 skill 是否已加载（通过 SkillEngine 的公开方法）
+            // loaded 字段是私有的，但 load 是幂等的（已加载时直接返回 Ok）
+            // 所以直接调 load 即可，内部会去重
+            if let Some(ref executor) = *self.skill_workflow_executor.read().await {
+                let _ = engine.load(&skill_id, &self.registry, executor.clone()).await;
+                tracing::info!(skill_id = %skill_id.0, "auto-loaded skill by intent match");
+            }
+        }
     }
 
     /// 向后兼容入口：等价于 process(input, session, RequestContext::default())

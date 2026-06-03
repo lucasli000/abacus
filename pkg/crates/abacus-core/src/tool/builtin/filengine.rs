@@ -280,7 +280,10 @@ impl FilengineExecutor for NativeFilengine {
             "fs_ls"    => fs_ls(args, session).await,
             "fs_tree"  => fs_tree(args, session).await,
             "fs_mkdir" => fs_mkdir(args, session).await,
+            "http_request" => http_request(args, session).await,
             "web_fetch" => web_fetch(args, session).await,
+            "json_process" => json_process(args, session).await,
+            "diff" => diff_compare(args, session).await,
             "web_search" => web_search(args, session).await,
             "fs_cwd"   => Ok(json!({"cwd": session.cwd.to_string_lossy()})),
             "fs_status" => Ok(session.summary()),
@@ -517,6 +520,288 @@ async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value
         };
         Ok(json!({"status": status, "content_type": content_type, "body": text}))
     }
+}
+
+async fn http_request(args: Value, _session: &mut FilengineSession) -> Result<Value, String> {
+    let url = get_str(&args, "url")?;
+    let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+    let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(60).max(5);
+    let headers = args.get("headers").and_then(|v| v.as_object());
+    let body = args.get("body").and_then(|v| v.as_str());
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("unsupported protocol: {}（仅支持 http/https）",
+            url.split("://").next().unwrap_or("unknown")));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout))
+        .build().map_err(|e| format!("client: {e}"))?;
+
+    let mut req = match method.as_str() {
+        "GET" => client.get(url),
+        "POST" => {
+            let mut r = client.post(url);
+            if let Some(b) = body { r = r.body(b.to_string()); }
+            r
+        }
+        "PUT" => {
+            let mut r = client.put(url);
+            if let Some(b) = body { r = r.body(b.to_string()); }
+            r
+        }
+        "DELETE" => client.delete(url),
+        "PATCH" => {
+            let mut r = client.patch(url);
+            if let Some(b) = body { r = r.body(b.to_string()); }
+            r
+        }
+        "HEAD" => client.head(url),
+        _ => return Err(format!("unsupported HTTP method: {method}（支持 GET/POST/PUT/DELETE/PATCH/HEAD）")),
+    };
+
+    if let Some(hdrs) = headers {
+        for (k, v) in hdrs {
+            if let Some(val) = v.as_str() {
+                req = req.header(k.as_str(), val);
+            }
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| format!("request: {e}"))?;
+    let status = resp.status().as_u16();
+    let resp_headers: std::collections::HashMap<String, String> = resp.headers().iter()
+        .filter_map(|(k, v)| Some((k.to_string(), v.to_str().ok()?.to_string())))
+        .collect();
+    let content_type = resp_headers.get("content-type").cloned().unwrap_or_default();
+    let body_bytes = resp.bytes().await.map_err(|e| format!("body: {e}"))?;
+    let max_bytes = args.get("max_response_bytes").and_then(|v| v.as_u64()).unwrap_or(512_000) as usize;
+    let truncated = body_bytes.len() > max_bytes;
+
+    let body_text = if content_type.contains("application/json") || content_type.contains("text/") {
+        let s = if truncated {
+            format!("[truncated {} bytes] {}", body_bytes.len(), String::from_utf8_lossy(&body_bytes[..max_bytes]))
+        } else {
+            String::from_utf8_lossy(&body_bytes).to_string()
+        };
+        Some(s)
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "status": status,
+        "content_type": content_type,
+        "headers": resp_headers,
+        "body": body_text,
+        "body_bytes": body_bytes.len(),
+        "truncated": truncated,
+    }))
+}
+
+async fn json_process(args: Value, _session: &mut FilengineSession) -> Result<Value, String> {
+    let operation = get_str(&args, "operation")?;
+    let input_str = get_str(&args, "input")?;
+    let input: Value = serde_json::from_str(input_str)
+        .map_err(|e| format!("invalid JSON input: {e}"))?;
+
+    match operation {
+        "format" => {
+            let pretty = serde_json::to_string_pretty(&input)
+                .map_err(|e| format!("format: {e}"))?;
+            Ok(json!({"result": pretty, "operation": "format"}))
+        }
+        "validate" => {
+            // 能走到这里说明 input 已经是合法 JSON
+            Ok(json!({"valid": true, "operation": "validate"}))
+        }
+        "query" => {
+            let query_path = get_str(&args, "query")?;
+            // 简易 jq-like 路径查询：支持 .key .key[0] .key.subkey
+            let result = json_query(&input, query_path)?;
+            Ok(json!({"result": result, "operation": "query", "query": query_path}))
+        }
+        "transform" => {
+            let template_str = get_str(&args, "transform_template")?;
+            let template: Value = serde_json::from_str(template_str)
+                .map_err(|e| format!("invalid transform template: {e}"))?;
+            let result = json_transform(&input, &template)?;
+            Ok(json!({"result": result, "operation": "transform"}))
+        }
+        _ => Err(format!("unknown operation: {operation}（支持 query/transform/validate/format）")),
+    }
+}
+
+/// 简易 JSON 路径查询（支持 .key, .key[0], .key.subkey, [0].key）
+fn json_query(input: &Value, path: &str) -> Result<Value, String> {
+    let path = path.trim();
+    if path.is_empty() || path == "." {
+        return Ok(input.clone());
+    }
+    let path = path.strip_prefix('.').unwrap_or(path);
+
+    let mut current = input;
+    for segment in path.split('.') {
+        let segment = segment.trim();
+        if segment.is_empty() { continue; }
+
+        // 检查是否有数组索引
+        if let Some(idx_start) = segment.find('[') {
+            let key = &segment[..idx_start];
+            let idx_str = &segment[idx_start+1..segment.find(']').ok_or_else(|| format!("unclosed bracket in {segment}"))?];
+            let idx: usize = idx_str.parse().map_err(|_| format!("invalid index: {idx_str}"))?;
+
+            if !key.is_empty() {
+                current = current.get(key).ok_or_else(|| format!("key not found: {key}"))?;
+            }
+            current = current.get(idx).ok_or_else(|| format!("index out of bounds: {idx}"))?;
+        } else {
+            current = current.get(segment).ok_or_else(|| format!("key not found: {segment}"))?;
+        }
+    }
+    Ok(current.clone())
+}
+
+/// JSON 变换：用模板从 input 中提取字段
+fn json_transform(input: &Value, template: &Value) -> Result<Value, String> {
+    match template {
+        Value::Object(map) => {
+            let mut result = serde_json::Map::new();
+            for (k, v) in map {
+                match v {
+                    Value::String(path) => {
+                        if path.starts_with('.') {
+                            let val = json_query(input, path)?;
+                            result.insert(k.clone(), val);
+                        } else {
+                            result.insert(k.clone(), Value::String(path.clone()));
+                        }
+                    }
+                    Value::Object(_) => {
+                        result.insert(k.clone(), json_transform(input, v)?);
+                    }
+                    other => {
+                        result.insert(k.clone(), other.clone());
+                    }
+                }
+            }
+            Ok(Value::Object(result))
+        }
+        _ => Err(format!("transform template must be an object, got {:?}", template)),
+    }
+}
+
+async fn diff_compare(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
+    let kind = get_str(&args, "kind")?;
+    let context_lines = args.get("context_lines").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
+    let (text_a, text_b) = match kind {
+        "file" => {
+            let path_a = get_str(&args, "path_a")?;
+            let path_b = get_str(&args, "path_b")?;
+            let resolved_a = crate::tool::builtin::filengine::NativeFilengine::resolve(path_a, session)
+                .map_err(|e| format!("resolve path_a: {e}"))?;
+            let resolved_b = crate::tool::builtin::filengine::NativeFilengine::resolve(path_b, session)
+                .map_err(|e| format!("resolve path_b: {e}"))?;
+            let a = tokio::fs::read_to_string(&resolved_a).await
+                .map_err(|e| format!("read path_a: {e}"))?;
+            let b = tokio::fs::read_to_string(&resolved_b).await
+                .map_err(|e| format!("read path_b: {e}"))?;
+            (a, b)
+        }
+        "text" => {
+            let a = get_str(&args, "text_a")?;
+            let b = get_str(&args, "text_b")?;
+            (a.to_string(), b.to_string())
+        }
+        _ => return Err(format!("unknown kind: {kind}（支持 file/text）")),
+    };
+
+    let lines_a: Vec<&str> = text_a.lines().collect();
+    let lines_b: Vec<&str> = text_b.lines().collect();
+
+    // 简单的 LCS-based diff
+    let changes = simple_diff(&lines_a, &lines_b, context_lines);
+
+    Ok(json!({"kind": kind, "changes": changes, "lines_a": lines_a.len(), "lines_b": lines_b.len()}))
+}
+
+/// 简易逐行 diff（LCS 算法）
+fn simple_diff<'a>(a: &[&'a str], b: &[&'a str], context: usize) -> Vec<Value> {
+    let m = a.len();
+    let n = b.len();
+    // LCS DP
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            if a[i-1] == b[j-1] {
+                dp[i][j] = dp[i-1][j-1] + 1;
+            } else {
+                dp[i][j] = dp[i-1][j].max(dp[i][j-1]);
+            }
+        }
+    }
+
+    // 回溯
+    let mut changes: Vec<Value> = Vec::new();
+    let mut i = m;
+    let mut j = n;
+    let mut ops: Vec<(i32, usize, String)> = Vec::new(); // (type, line, text)
+    // type: 0=keep, 1=delete, 2=insert
+
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i-1] == b[j-1] {
+            ops.push((0, i-1, a[i-1].to_string()));
+            i -= 1; j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j-1] >= dp[i-1][j]) {
+            ops.push((2, j-1, b[j-1].to_string()));
+            j -= 1;
+        } else if i > 0 {
+            ops.push((1, i-1, a[i-1].to_string()));
+            i -= 1;
+        }
+    }
+    ops.reverse();
+
+    // 压缩为 hunks
+    let mut in_hunk = false;
+    let mut hunk_changes: Vec<Value> = Vec::new();
+    let mut keep_count = 0;
+
+    for (_idx, (typ, line, text)) in ops.iter().enumerate() {
+        match typ {
+            0 => { // keep
+                if in_hunk {
+                    keep_count += 1;
+                    if keep_count > context {
+                        // 结束当前 hunk
+                        changes.push(json!(hunk_changes));
+                        hunk_changes = Vec::new();
+                        in_hunk = false;
+                        keep_count = 0;
+                    } else {
+                        hunk_changes.push(json!({"type": "keep", "line_a": line, "line_b": line, "text": text}));
+                    }
+                }
+            }
+            1 => { // delete
+                in_hunk = true;
+                keep_count = 0;
+                hunk_changes.push(json!({"type": "delete", "line_a": line, "text": text}));
+            }
+            2 => { // insert
+                in_hunk = true;
+                keep_count = 0;
+                hunk_changes.push(json!({"type": "insert", "line_b": line, "text": text}));
+            }
+            _ => {}
+        }
+    }
+    if in_hunk {
+        changes.push(json!(hunk_changes));
+    }
+
+    changes
 }
 
 async fn web_search(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
@@ -1527,6 +1812,14 @@ pub fn schemas() -> Vec<ToolSchema> {
         schema("fs_mkdir", "递归创建目录（含所有父目录）",
             json!({"path": {"type":"string", "description": "要创建的目录绝对路径"}}),
             &["path"], false, 32, "5ms", "low"),
+        schema("http_request", "全 HTTP 客户端（GET/POST/PUT/DELETE/PATCH/HEAD，支持自定义 headers 和 body）",
+            json!({"url": {"type":"string", "description":"完整 URL"},
+                   "method": {"type":"string", "description":"HTTP 方法（GET/POST/PUT/DELETE/PATCH/HEAD，默认 GET）"},
+                   "headers": {"type":"object", "description":"自定义请求头（如 {Authorization: Bearer xxx}）"},
+                   "body": {"type":"string", "description":"请求体（POST/PUT/PATCH 时使用）"},
+                   "timeout": {"type":"number", "description":"超时秒数(默认60)"},
+                   "max_response_bytes": {"type":"integer", "description":"最大响应体字节数(默认512000)"}}),
+            &["url"], false, 128, "1s", "medium"),
         schema("web_fetch", "HTTP GET 请求获取网页内容",
             json!({"url": {"type":"string", "description":"完整 URL"},
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"},
@@ -1539,6 +1832,20 @@ pub fn schemas() -> Vec<ToolSchema> {
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"},
                    "deep": {"type":"boolean", "description":"true 时抓取前3条结果页面正文并附在 pages 字段（默认 false）"}}),
             &["query"], false, 128, "2s", "low"),
+        schema("json_process", "JSON 查询/变换/验证/格式化（jq-like 语法）",
+            json!({"operation": {"type":"string", "description":"操作类型: query(查询) / transform(变换) / validate(验证) / format(格式化)"},
+                   "input": {"type":"string", "description":"输入 JSON 字符串"},
+                   "query": {"type":"string", "description":"jq-like 查询路径（如 .data.items[0].name；operation=query 时必填）"},
+                   "transform_template": {"type":"string", "description":"变换模板（operation=transform 时使用，如 {name: .name, email: .email}）"}}),
+            &["operation", "input"], false, 64, "10ms", "low"),
+        schema("diff", "文件/目录/字符串对比（结构化输出差异行）",
+            json!({"kind": {"type":"string", "description":"对比类型: file(文件对比) / text(字符串对比)"},
+                   "path_a": {"type":"string", "description":"文件 A 路径（kind=file 时必填）"},
+                   "path_b": {"type":"string", "description":"文件 B 路径（kind=file 时必填）"},
+                   "text_a": {"type":"string", "description":"文本 A（kind=text 时必填）"},
+                   "text_b": {"type":"string", "description":"文本 B（kind=text 时必填）"},
+                   "context_lines": {"type":"integer", "description":"上下文行数（默认 3）"}}),
+            &["kind"], false, 96, "50ms", "low"),
         schema("fs_grep", "搜索文件内容（正则匹配，返回匹配行+文件路径+行号）",
             json!({"pattern": {"type":"string", "description":"正则表达式（如 fn main|class.*Error）"},
                    "path": {"type":"string", "description":"搜索根目录绝对路径（默认当前工作目录）"},
@@ -1569,7 +1876,10 @@ pub fn schemas() -> Vec<ToolSchema> {
             "fs_search"  => set_short(s, "Glob pattern file search"),
             "fs_ls"      => set_short(s, "List directory contents"),
             "fs_mkdir"   => set_short(s, "Create directory recursively"),
+            "http_request" => set_short(s, "Full HTTP client (GET/POST/PUT/DELETE)"),
             "web_fetch"  => set_short(s, "HTTP GET web content"),
+            "json_process" => set_short(s, "JSON query/transform/validate"),
+            "diff" => set_short(s, "File/text diff comparison"),
             "web_search" => set_short(s, "Search engine query"),
             "fs_grep"    => set_short(s, "Regex content search in files"),
             "bash_exec"  => set_short(s, "Execute shell command"),

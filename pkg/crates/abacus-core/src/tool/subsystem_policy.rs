@@ -107,9 +107,9 @@ pub fn builtin_subsystems() -> Vec<SubsystemDecl> {
         },
         SubsystemDecl {
             name: "lsp",
-            mode: RegistrationMode::Lazy,
+            mode: RegistrationMode::Adaptive { min_hit_rate: 0.25 },
             tool_prefix: "lsp_",
-            description: "LSP integration (10 tools) — needs enable_lsp",
+            description: "LSP integration (10 tools) — adaptive (热重载)",
         },
         SubsystemDecl {
             name: "mcp",
