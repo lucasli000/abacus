@@ -829,7 +829,11 @@ fn cmd_set(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
                 s.runtime_timeout = Some(v);
                 if let Some(ref handle) = s.engine_handle {
                     let core = handle.core.clone();
-                    tokio::spawn(async move { core.set_timeout(v).await; });
+                    let timeout = handle.request_timeout_secs.clone();
+                    tokio::spawn(async move {
+                        *timeout.write().await = v;
+                        core.set_timeout(v).await;
+                    });
                 }
                 s.add_toast(format!("timeout → {}s", v), std::time::Duration::from_secs(2));
             } else {

@@ -36,6 +36,8 @@ pub enum ApiResult<T> {
 pub struct EngineHandle {
     pub core: Arc<CoreLoop>,
     pub session: Arc<RwLock<SessionState>>,
+    /// 请求超时秒数（可运行时调整）
+    pub request_timeout_secs: Arc<tokio::sync::RwLock<u64>>,
     /// 保证 create_session 写与 send_chat_message 读互斥
     pub session_swap_lock: Arc<RwLock<()>>,
     /// 限制并发请求数，防止快速输入导致请求堆积。
@@ -78,6 +80,7 @@ impl EngineHandle {
                 Ok(Self {
                     core,
                     session,
+                    request_timeout_secs: Arc::new(tokio::sync::RwLock::new(300)),
                     session_swap_lock: Arc::new(RwLock::new(())),
                     inflight_guard: Arc::new(tokio::sync::Semaphore::new(2)),
                     team_session: Arc::new(RwLock::new(None)),
@@ -188,14 +191,15 @@ pub async fn send_chat_message(
     // Gap A 修复：per-turn RequestContext 透传让 state.thinking_depth 运行时切换生效
     // 引用关系：process_turn_cancellable_with_context 定义于 core/mod.rs:2250
     let work = handle.core.process_turn_cancellable_with_context(message, &handle.session, req_ctx, cancel.clone());
-    let timeout = tokio::time::sleep(Duration::from_secs(300));
+    let timeout_secs = *handle.request_timeout_secs.read().await;
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
             cancel.cancel(); // 真正中断 in-flight reqwest
-            return ApiResult::Err("请求超时 (300s)，已取消并释放连接".to_string());
+            return ApiResult::Err(format!("请求超时 ({}s)，已取消并释放连接", timeout_secs));
         }
     };
 
@@ -240,14 +244,15 @@ pub async fn send_chat_message_streaming(
         req_ctx,
         cancel.clone(),
     );
-    let timeout = tokio::time::sleep(Duration::from_secs(300));
+    let timeout_secs = *handle.request_timeout_secs.read().await;
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
             cancel.cancel();
-            let _ = stream_tx.send(StreamChunk::Error("timeout after 300s".into()));
+            let _ = stream_tx.send(StreamChunk::Error(format!("timeout after {}s", timeout_secs).into()));
             return ApiResult::Err("request timed out after 300s".to_string());
         }
     };
