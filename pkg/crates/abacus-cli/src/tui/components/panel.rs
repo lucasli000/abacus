@@ -534,171 +534,196 @@ fn compute_timeline_groups(state: &AppState) -> Vec<crate::tui::state::TimelineG
 
 fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::layout::{Layout, Constraint, Direction};
-    // 三区块布局（V40: Stockroom 合并进 Scene）：
-    // 1. Stockroom + 统计标题行（记忆/工具/技能 + ctx%/cost 内嵌）
-    // 2. Timeline（现场时间线）
-    // 3. Focus（当前焦点）
-    //
-    // 统计数据不再单独占一区块——作为 Stockroom 区块的标题/尾行嵌入
-    let sep = ratatui::widgets::Paragraph::new(ratatui::text::Line::styled(
-        " ╌╌╌╌╌╌╌╌",
-        ratatui::style::Style::default().fg(state.theme.muted).add_modifier(ratatui::style::Modifier::DIM),
-    ));
-
-    // Stockroom 固定高度——填满有价值的统计信息（不留白）
-    let dyn_focus = if state.is_streaming { Constraint::Fill(2) } else { Constraint::Fill(1) };
-    let secs = Layout::default().direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),         // Stockroom（6行统计数据）
-            Constraint::Length(1),      // 分隔线
-            Constraint::Fill(1),        // Timeline
-            Constraint::Length(1),      // 分隔线
-            dyn_focus,                  // Focus
-        ])
-        .split(area);
-
-    render_stockroom_with_stats(f, state, secs[0]);
-    f.render_widget(sep.clone(), secs[1]);
-    render_timeline_grouped(f, state, secs[2]);
-    f.render_widget(sep, secs[3]);
-    render_focus_panel(f, state, secs[4]);
-}
-
-/// Stockroom + 统计合并渲染：记忆/工具/技能信息 + ctx%/in/out/cost 内嵌为标题行
-///
-/// 引用关系：被 render_tab_scene 第一区块调用
-/// 生命周期：每帧渲染
-fn render_stockroom_with_stats(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    use ratatui::text::{Line, Span};
     use ratatui::widgets::Paragraph;
+    use ratatui::text::Line;
     use ratatui::style::{Style, Modifier};
-    use crate::tui::state::ToolStatus;
     use crate::tui::components::bars::format_ctx;
 
-    let muted = Style::default().fg(state.theme.muted);
+    let sep = Paragraph::new(Line::styled(
+        " ╌╌╌╌╌╌╌╌",
+        Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
+    ));
+    let w = (area.width as usize).saturating_sub(4).max(10);
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
-    let txt = Style::default().fg(state.theme.text);
-    let gold = Style::default().fg(state.theme.gold);
+
+    // 判断 Focus 是否需要显示（流式/Plan/Team/Meeting 时有内容）
+    let focus_active = state.is_streaming
+        || state.processing_phase.starts_with("\u{1f4cb}")
+        || state.processing_phase.starts_with("\u{1f916}")
+        || state.mode == crate::tui::state::AbacusMode::Meeting;
+
+    // 4 段布局：Stockroom + 分隔线 + Timeline + (Focus 有条件)
+    let secs = if focus_active {
+        Layout::default().direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(9),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(area)
+    } else {
+        Layout::default().direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(9),
+                Constraint::Length(1),
+                Constraint::Fill(1),
+            ])
+            .split(area)
+    };
+
+    // ── Stockroom 区块 ──
     let mut lines: Vec<Line> = Vec::new();
 
-    // ── 上下文进度条（2 行：bar + 明细）──
+    // LLM 版块
+    render_section_header(&mut lines, t("panel.llm"), w, &state.theme);
+    let provider_label = if state.active_provider_id.is_empty() { "\u{2014}" } else { &state.active_provider_id };
+    let (status_icon, status_color) = match state.provider_statuses.iter()
+        .find(|(id, _, _)| id == &state.active_provider_id)
     {
-        let raw_used = if state.ctx_live_tokens > 0 {
-            state.ctx_live_tokens as usize
-        } else {
-            state.session_tokens.latest_prompt_tokens as usize
-        };
-        let max_ctx = state.context_window;
-        let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
-        let pct = if max_ctx > 0 && used > 0 { used * 100 / max_ctx } else { 0 };
-        let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };
-        let inp = state.session_tokens.prompt_tokens;
-        let out = state.session_tokens.completion_tokens;
-        let cached = state.session_tokens.cached_tokens;
-        let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
+        Some((_, true, _)) => ("\u{25cf}", state.theme.success),
+        Some((_, false, _)) => ("\u{2717}", state.theme.error),
+        None => ("\u{00b7}", state.theme.muted),
+    };
+    let model_display = abacus_types::lookup_model_or_default(&state.model_name).display_name;
+    lines.push(Line::from(vec![
+        Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
+        Span::styled(provider_label, Style::default().fg(status_color)),
+        Span::raw("  "),
+        Span::styled(model_display, Style::default().fg(state.theme.accent)),
+        Span::raw("  "),
+        Span::styled(t("panel.thinking"), Style::default().fg(state.theme.muted)),
+        Span::styled(format!(":{}", state.thinking_depth), Style::default().fg(state.theme.muted)),
+    ]));
 
-        // ─ Context ─── 标题行
-        let header_fill = (area.width as usize).saturating_sub(12).min(12);
-        lines.push(Line::from(vec![
-            Span::styled("  ─ ", dim),
-            Span::styled("Context", muted),
-            Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
-        ]));
+    let raw_used = if state.ctx_live_tokens > 0 {
+        state.ctx_live_tokens as usize
+    } else {
+        state.session_tokens.latest_prompt_tokens as usize
+    };
+    let max_ctx = state.context_window;
+    let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
+    let pct = if max_ctx > 0 && used > 0 { used * 100 / max_ctx } else { 0 };
+    let pc = if pct >= 80 { state.theme.error } else if pct >= 50 { state.theme.gold } else { state.theme.success };
+    let bw = w.saturating_sub(14).min(12);
+    let filled = (pct * bw / 100).min(bw);
+    let inp = state.session_tokens.prompt_tokens;
+    let out = state.session_tokens.completion_tokens;
+    let cached = state.session_tokens.cached_tokens;
+    let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
+    let cost = state.session_tokens.cost_cny;
+    lines.push(Line::from(vec![
+        Span::styled("    ", dim),
+        Span::styled(format!("{}{}", "\u{2593}".repeat(filled), "\u{2591}".repeat(bw - filled)), Style::default().fg(pc)),
+        Span::styled(format!("  {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {}/{}", format_ctx(used), format_ctx(max_ctx)), Style::default().fg(state.theme.muted)),
+    ]));
+    let mut tok_parts = vec![
+        Span::styled("    ", dim),
+        Span::styled(format!("{} {}  {} {}  {} {}%", t("panel.input"), format_ctx(inp as usize), t("panel.output"), format_ctx(out as usize), t("panel.cache"), cpct), Style::default().fg(state.theme.muted)),
+    ];
+    if cost > 0.001 {
+        tok_parts.push(Span::styled(format!("  {} \u{00a5}{:.2}", t("panel.cost"), cost), Style::default().fg(state.theme.gold)));
+    }
+    lines.push(Line::from(tok_parts));
 
-        // 进度条（缩进 4 格）
-        let bw = (area.width as usize).saturating_sub(10).min(12);
-        let filled = (pct * bw / 100).min(bw);
-        let bar_str = format!("{}{}", "━".repeat(filled), "╌".repeat(bw - filled));
+    // Tools 版块
+    render_section_header(&mut lines, t("panel.tools"), w, &state.theme);
+    let hc = state.tool_health.len();
+    let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
+    let mcp_count = state.tool_health.keys().filter(|k| k.starts_with("mcp__")).count();
+    let tc = state.tool_records.len();
+    let sc = state.tool_records.iter().filter(|r| matches!(r.status, crate::tui::state::ToolStatus::Success)).count();
+    let rate = if tc > 0 { sc * 100 / tc } else { 100 };
+    lines.push(Line::from(vec![
+        Span::styled("    ", dim),
+        Span::styled(format!("{} {} {}  {} {}", t("panel.builtin"), avail.saturating_sub(mcp_count), t("panel.external"), mcp_count, t("panel.success")), Style::default().fg(state.theme.text)),
+        Span::styled(format!(" {}%", rate), if rate >= 80 { Style::default().fg(state.theme.success) } else { Style::default().fg(state.theme.gold) }),
+    ]));
+    let mcp_calls = state.tool_records.iter().filter(|r| r.name.starts_with("mcp__")).count();
+    let skill_calls = state.tool_records.iter().filter(|r| !r.name.contains("__") && !r.name.starts_with("mcp_")).count();
+    let agent_count = state.experts.len();
+    let mut call_parts = vec![
+        Span::styled("    ", dim),
+        Span::styled(format!("{} {}", t("panel.calls"), tc), Style::default().fg(state.theme.text)),
+    ];
+    if mcp_calls > 0 { call_parts.push(Span::styled(format!("  {} {}", t("panel.external"), mcp_calls), Style::default().fg(state.theme.muted))); }
+    if skill_calls > 0 { call_parts.push(Span::styled(format!("  {} {}", t("panel.workflow"), skill_calls), Style::default().fg(state.theme.muted))); }
+    if agent_count > 0 { call_parts.push(Span::styled(format!("  {} {}", t("panel.agent"), agent_count), Style::default().fg(state.theme.muted))); }
+    lines.push(Line::from(call_parts));
+
+    // Local 版块
+    render_section_header(&mut lines, t("panel.local"), w, &state.theme);
+    if let Some(ref mlx) = state.mlx_health {
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled(bar_str, Style::default().fg(pc)),
-            Span::styled(format!("  {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+            Span::styled(if mlx.embedding_running { format!("\u{2713} {}", t("panel.embedding")) } else { format!("\u{2717} {}", t("panel.embedding")) }, if mlx.embedding_running { Style::default().fg(state.theme.success) } else { Style::default().fg(state.theme.error) }),
+            Span::styled("  ", dim),
+            Span::styled(if mlx.reranker_running { format!("\u{2713} {}", t("panel.reranker")) } else { format!("\u{2717} {}", t("panel.reranker")) }, if mlx.reranker_running { Style::default().fg(state.theme.success) } else { Style::default().fg(state.theme.error) }),
+            Span::styled(format!("  {} {}", t("panel.mode"), mlx.mode), Style::default().fg(state.theme.muted)),
         ]));
-
-        // token 明细（缩进 4 格，空格分隔）
-        let in_str = format_ctx(inp as usize);
-        let out_str = if state.is_streaming { "...".to_string() } else { format_ctx(out as usize) };
-        let mut tok_parts = vec![
+        lines.push(Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled(format!("in {}", in_str), muted),
-            Span::styled(format!("  out {}", out_str), muted),
-        ];
-        if cpct > 0 {
-            tok_parts.push(Span::styled(format!("  c {}%", cpct), Style::default().fg(state.theme.success)));
-        }
-        lines.push(Line::from(tok_parts));
+            Span::styled(format!("{} {}  {} {}", t("panel.chunks"), mlx.knowledge_chunks, t("panel.cache"), mlx.embeddings_cached), Style::default().fg(state.theme.text)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled("\u{00b7} \u{672a}\u{8fde}\u{63a5}", Style::default().fg(state.theme.muted)),
+        ]));
     }
 
-
-    // 空行分隔
-    lines.push(Line::raw(""));
-
-    // ─ Session ─── 标题行
-    {
-        let header_fill = (area.width as usize).saturating_sub(12).min(12);
-        lines.push(Line::from(vec![
-            Span::styled("  ─ ", dim),
-            Span::styled("Session", muted),
-            Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
-        ]));
-
-        let hc = state.tool_health.len();
-        let tc = state.tool_records.len();
-        let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
-        let sc = state.tool_records.iter().filter(|r| matches!(r.status, ToolStatus::Success)).count();
-        let rate = if tc > 0 { sc * 100 / tc } else { 100 };
-        let comp = state.session_tokens.compress_count;
-
-        // 工具行（缩进 4 格）
-        let mut tool_parts = vec![
-            Span::styled("    ", dim),
-            Span::styled(format!("⚙ {}/{}", avail, hc.max(1)), txt),
-            Span::styled(format!("  {}%", rate), if rate >= 80 {
-                Style::default().fg(state.theme.success)
-            } else { Style::default().fg(state.theme.gold) }),
-        ];
-        if state.session_tokens.cost_cny > 0.001 {
-            tool_parts.push(Span::styled(format!("  ¥{:.2}", state.session_tokens.cost_cny), gold));
-        }
-        lines.push(Line::from(tool_parts));
-
-        // 效率行（缩进 4 格）
-        let est_turns = if state.turn_count > 0 && state.context_window > 0 {
-            let tok_per_turn = (state.session_tokens.total_tokens as usize).max(1) / (state.turn_count as usize).max(1);
-            if tok_per_turn > 0 {
-                let remaining = state.context_window.saturating_sub(state.ctx_live_tokens as usize);
-                Some(remaining / tok_per_turn)
-            } else { None }
-        } else { None };
-
-        lines.push(Line::from(vec![
-            Span::styled("    ", dim),
-            Span::styled(format!("▴ {} cmp", comp), muted),
-            Span::styled(
-                est_turns.map(|t| format!("  ~{} left", t)).unwrap_or_default(),
-                if est_turns.unwrap_or(99) < 5 { Style::default().fg(state.theme.error) } else { muted },
-            ),
-        ]));
-
-        // ── 记忆宫殿摘要（1行：行为 N + 知识 N）──
-        if let Some(ref snap) = state.palace_data {
-            let mut parts = vec![Span::styled("    ", dim)];
-            if snap.behavior_count > 0 {
-                parts.push(Span::styled(format!("◈ {}b", snap.behavior_count), gold));
+    // Palace 版块
+    render_section_header(&mut lines, t("panel.palace"), w, &state.theme);
+    if let Some(ref snap) = state.palace_data {
+        let mut k_parts = vec![Span::styled("    ", dim)];
+        if snap.knowledge_total > 0 {
+            k_parts.push(Span::styled(format!("{} {}", t("panel.knowledge"), snap.knowledge_total), Style::default().fg(state.theme.text)));
+            for (domain, cnt) in snap.knowledge_domains.iter().take(3) {
+                let d: String = domain.chars().take(8).collect();
+                k_parts.push(Span::styled(format!("  {}:{}", d, cnt), Style::default().fg(state.theme.muted)));
             }
-            if snap.knowledge_total > 0 {
-                if snap.behavior_count > 0 { parts.push(Span::styled(" ", dim)); }
-                parts.push(Span::styled(format!("◇ {}k", snap.knowledge_total), muted));
-            }
-            if snap.behavior_count > 0 || snap.knowledge_total > 0 {
-                lines.push(Line::from(parts));
+            if snap.knowledge_due > 0 {
+                k_parts.push(Span::styled(format!("  {} {}", t("panel.due"), snap.knowledge_due), Style::default().fg(state.theme.gold)));
             }
         }
+        if k_parts.len() > 1 { lines.push(Line::from(k_parts)); }
+        let mut b_parts = vec![Span::styled("    ", dim)];
+        if snap.behavior_count > 0 {
+            b_parts.push(Span::styled(format!("{} {}", t("panel.behavior"), snap.behavior_count), Style::default().fg(state.theme.text)));
+            b_parts.push(Span::styled(format!("  {} {}", t("panel.active"), snap.behavior_active), Style::default().fg(state.theme.muted)));
+            if !snap.behavior_top_tags.is_empty() {
+                let tags: Vec<String> = snap.behavior_top_tags.iter().map(|(tag, _)| tag.chars().take(6).collect()).collect();
+                b_parts.push(Span::styled(format!("  {}: {}", t("panel.high_freq"), tags.join(",")), Style::default().fg(state.theme.muted)));
+            }
+        }
+        if b_parts.len() > 1 { lines.push(Line::from(b_parts)); }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("    ", dim),
+            Span::styled("\u{00b7} \u{52a0}\u{8f7d}\u{4e2d}", Style::default().fg(state.theme.muted)),
+        ]));
     }
 
-    let vis = area.height as usize;
-    if lines.len() > vis { lines.truncate(vis); }
-    f.render_widget(Paragraph::new(lines), area);
+    f.render_widget(Paragraph::new(lines), secs[0]);
+    f.render_widget(sep.clone(), secs[1]);
+    render_timeline_grouped(f, state, secs[2]);
+
+    if focus_active {
+        f.render_widget(sep, secs[3]);
+        render_focus_panel(f, state, secs[4]);
+    }
+}
+
+fn render_section_header(lines: &mut Vec<Line>, label: &str, width: usize, theme: &crate::tui::theme::Theme) {
+    let dim = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
+    let fill = width.saturating_sub(label.len() + 5).min(14);
+    lines.push(Line::from(vec![
+        Span::styled("  \u{2500} ", dim),
+        Span::styled(label.to_string(), Style::default().fg(theme.muted)),
+        Span::styled(format!(" {}", "\u{2500}".repeat(fill)), dim),
+    ]));
 }
 
 /// Timeline — 现场时间线
@@ -717,25 +742,20 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     let txt   = Style::default().fg(state.theme.text);
     let mut lines: Vec<Line> = Vec::new();
 
-    // 标题行（与 Stockroom/Focus 统一格式）
-    let header_fill = w.saturating_sub(10).min(12);
-    lines.push(Line::from(vec![
-        Span::styled("  ─ ", dim),
-        Span::styled("Timeline", muted),
-        Span::styled(format!(" {}", "─".repeat(header_fill)), dim),
-    ]));
+    // 统一标题行
+    render_section_header(&mut lines, t("panel.timeline"), w, &state.theme);
 
     let groups = compute_timeline_groups(state);
     if groups.is_empty() {
         if state.messages.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("    ", dim),
-                Span::styled("输入问题开始对话", dim),
+                Span::styled("\u{8f93}\u{5165}\u{95ee}\u{9898}\u{5f00}\u{59cb}\u{5bf9}\u{8bdd}", dim),
             ]));
         } else {
             lines.push(Line::from(vec![
                 Span::styled("    ", dim),
-                Span::styled("· 等待输入", muted),
+                Span::styled("\u{00b7} \u{7b49}\u{5f85}\u{8f93}\u{5165}", muted),
             ]));
         }
     } else {
@@ -744,14 +764,12 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
             let is_last = gi == gl - 1;
             let tc = if g.is_active && is_last { state.theme.accent } else { state.theme.muted };
             let ts = if g.timestamp.is_empty() { String::new() } else { format!("{} ", g.timestamp) };
-            // 阶段行（4 格缩进）
             lines.push(Line::from(vec![
                 Span::styled("    ", dim),
-                Span::styled("▸ ", Style::default().fg(tc)),
+                Span::styled("\u{25b8} ", Style::default().fg(tc)),
                 Span::styled(ts, dim),
                 Span::styled(g.label.clone(), Style::default().fg(tc)),
             ]));
-            // 工具行（6 格缩进）
             for l in &g.lines {
                 let t: String = l.chars().take(w.saturating_sub(4)).collect();
                 lines.push(Line::from(vec![
@@ -760,7 +778,6 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
                 ]));
             }
         }
-        // 滚动处理
         let vis = area.height as usize;
         if lines.len() > vis {
             let end = lines.len().saturating_sub(state.timeline_scroll_offset);
@@ -769,7 +786,7 @@ fn render_timeline_grouped(f: &mut ratatui::Frame, state: &AppState, area: Rect)
             if state.timeline_scroll_offset > 0 && !lines.is_empty() {
                 lines[0] = Line::from(vec![
                     Span::styled("    ", dim),
-                    Span::styled(format!("↑ {} 更多", state.timeline_scroll_offset), dim),
+                    Span::styled(format!("\u{2191} {} \u{66f4}\u{591a}", state.timeline_scroll_offset), dim),
                 ]);
             }
         }
@@ -973,29 +990,75 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 场景 E：空闲
+    // 场景 E：空闲（展示会话快照）
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    render_header(&format!("Focus · 澄清 · {}轮", state.turn_count), &mut lines, w);
+    render_header(&format!("Focus \u{00b7} {} {}", t("panel.round"), state.turn_count), &mut lines, w);
 
-    if !state.session_summary.is_empty() {
-        for l in state.session_summary.lines().take(3) {
-            let t: String = l.chars().take(w).collect();
-            lines.push(Line::from(vec![
-                Span::styled("    ", dim),
-                Span::styled(t, txt),
-            ]));
-        }
-    } else {
+    if let Some(ref goal) = state.session_goal {
+        let g: String = goal.chars().take(w.saturating_sub(8)).collect();
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
-            Span::styled("输入问题开始对话", dim),
+            Span::styled(format!("\u{1f4cb} {}: {}", t("panel.session_goal"), g), txt),
         ]));
     }
+
+    if state.turn_count > 0 {
+        if let Some(user_msg) = state.messages.iter().rev().find(|m| matches!(m.role, crate::tui::state::MsgRole::User)) {
+            let text: String = user_msg.parts.iter()
+                .filter_map(|p| if let crate::tui::state::MsgContent::Stream(s) = p { Some(s.as_str()) } else { None })
+                .collect::<Vec<_>>().join(" ");
+            let preview: String = text.chars().take(w.saturating_sub(10)).collect();
+            if !preview.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", dim),
+                    Span::styled(format!("\u{1f4ac} {}: {}", t("panel.last_user"), preview), txt),
+                ]));
+            }
+        }
+        if let Some(ai_msg) = state.messages.iter().rev().find(|m| matches!(m.role, crate::tui::state::MsgRole::Session)) {
+            let text: String = ai_msg.parts.iter()
+                .filter_map(|p| if let crate::tui::state::MsgContent::Stream(s) = p { Some(s.as_str()) } else { None })
+                .collect::<Vec<_>>().join(" ");
+            let preview: String = text.chars().take(w.saturating_sub(10)).collect();
+            if !preview.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    ", dim),
+                    Span::styled(format!("\u{1f916} {}: {}", t("panel.last_ai"), preview), txt),
+                ]));
+            }
+        }
+    }
+
+    let tc = state.tool_records.len();
+    let sc = state.tool_records.iter().filter(|r| matches!(r.status, crate::tui::state::ToolStatus::Success)).count();
+    let mut model_parts = vec![Span::styled("    ", dim)];
+    let mut models: Vec<(String, u32)> = state.session_tokens.per_model.iter()
+        .map(|(id, stats)| (id.clone(), stats.turns))
+        .collect();
+    models.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
+    for (i, (id, turns)) in models.iter().enumerate() {
+        if i >= 2 {
+            model_parts.push(Span::styled(format!("+{}", models.len() - 2), Style::default().fg(state.theme.muted)));
+            break;
+        }
+        let name = abacus_types::lookup_model_or_default(id).display_name;
+        let short: String = name.chars().take(12).collect();
+        model_parts.push(Span::styled(format!("{} {} {}", short, turns, t("panel.round")), Style::default().fg(state.theme.accent)));
+        if i == 0 && models.len() > 1 { model_parts.push(Span::styled("  ", dim)); }
+    }
+    if tc > 0 {
+        model_parts.push(Span::styled(format!("  {} {} {}%", t("panel.calls"), tc, sc * 100 / tc), Style::default().fg(state.theme.muted)));
+    }
+    if state.session_tokens.cost_cny > 0.001 {
+        model_parts.push(Span::styled(format!("  \u{00a5}{:.2}", state.session_tokens.cost_cny), Style::default().fg(state.theme.gold)));
+    }
+    lines.push(Line::from(model_parts));
+
     if let Some((hint, at)) = &state.transition_hint {
         if at.elapsed().as_secs() < 5 {
             let t: String = hint.chars().take(w).collect();
             lines.push(Line::from(vec![
-                Span::styled("    → ", Style::default().fg(state.theme.accent)),
+                Span::styled("    \u{2192} ", Style::default().fg(state.theme.accent)),
                 Span::styled(t, txt),
             ]));
         }

@@ -277,8 +277,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     let total: u32 = domains.iter().map(|(_, c)| c).sum();
                     state.palace_data = Some(crate::tui::state::PalaceSnapshot {
                         behavior_count: behavior,
+                        behavior_active: 0,
+                        behavior_top_tags: Vec::new(),
                         knowledge_domains: domains,
                         knowledge_total: total,
+                        knowledge_due: 0,
                     });
                 }
             }

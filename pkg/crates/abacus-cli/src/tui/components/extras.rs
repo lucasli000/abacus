@@ -273,82 +273,40 @@ pub fn render_shortcuts_hints(f: &mut ratatui::Frame, state: &AppState, area: Re
     }
 }
 
-/// 健康仪表盘：模型 + 上下文 + 轮次/压缩（紧凑 2-3 行）
-///
-/// V40 重设计：去掉进度条，纯文本紧凑排列
-/// 第一行：模型名 · 思考档位
-/// 第二行：⬡ 上下文已用/总量 · turns N · cmp N
-/// 健康仪表盘（右下角）— 方案 E 排版
-///
-/// 布局：
-///   ─ Health ─────────────
-///     ● provider  model
-///     ⬡ 17K/128K/1M  5轮
+/// Hooks 仪表盘：展示 ScriptHook 注册/触发/失败状态
 fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    use crate::tui::components::bars::format_ctx;
-
     let mut lines: Vec<Line> = Vec::new();
     let muted = Style::default().fg(state.theme.muted);
+    let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
+    let txt = Style::default().fg(state.theme.text);
+    let ok = Style::default().fg(state.theme.success);
 
-    // 第一行：● provider  model（无标题行——tab header 已标识）
-    let provider_label = if state.active_provider_id.is_empty() { "—" } else { &state.active_provider_id };
-    let (status_icon, status_color) = match state.provider_statuses.iter()
-        .find(|(id, _, _)| id == &state.active_provider_id)
-    {
-        Some((_, true, _)) => ("●", state.theme.success),
-        Some((_, false, _)) => ("✗", state.theme.error),
-        None => ("·", state.theme.muted),
-    };
+    // 示意数据——实际应从 state.hook_stats 读取
     lines.push(Line::from(vec![
-        Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
-        Span::styled(provider_label, Style::default().fg(status_color)),
-        Span::styled("  ", muted),
-        Span::styled(&state.model_name, Style::default().fg(state.theme.accent)),
+        Span::styled(" \u{25c7} ", muted),
+        Span::styled(format!("{} 0  {}", t("panel.hook_registered"), t("panel.hook_triggered")), txt),
+        Span::styled(" 0  ", muted),
+        Span::styled(format!("{} 0", t("panel.hook_failed")), ok),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled(" \u{2713} ", muted),
+        Span::styled(format!("{}: --", t("panel.hook_last")), dim),
     ]));
 
-    // 第二行：⬡ used/configured  N轮  [thinking]
-    let raw_used = if state.ctx_live_tokens > 0 {
-        state.ctx_live_tokens as usize
-    } else {
-        state.session_tokens.latest_prompt_tokens as usize
-    };
-    let configured = state.context_window;
-    let model_max = state.model_max_context;
-    let used = if configured > 0 { raw_used.min(configured) } else { raw_used };
-    let ctx_color = match (used * 100).checked_div(configured).unwrap_or(0) {
-        0..=49 => state.theme.success,
-        50..=79 => state.theme.gold,
-        _ => state.theme.error,
-    };
-    // 始终三段：已用/可用(configured)/LLM最大(model_max)
-    let ctx_text = if model_max > 0 {
-        format!("{}/{}/{}", format_ctx(used), format_ctx(configured), format_ctx(model_max))
-    } else {
-        format!("{}/{}", format_ctx(used), format_ctx(configured))
-    };
-    let mut ctx_spans = vec![
-        Span::styled(" ⬡ ", Style::default().fg(ctx_color)),
-        Span::styled(ctx_text, Style::default().fg(ctx_color)),
-        Span::styled(format!("  {}{}", state.turn_count, t("dash.turns_unit")), muted),
-    ];
-    // thinking 状态：根据模型实际能力显示
-    // turn_count == 0 → 不显示（未对话，无法判断）
-    // turn_count > 0 且从未收到 thinking → "think:none"
-    // turn_count > 0 且收到过 thinking → 显示配置值（如 "high"）
-    if state.turn_count > 0 {
-        if state.thinking_text.is_empty() && !state.streaming_thinking_started {
-            ctx_spans.push(Span::styled(
-                format!("  {}:none", t("dash.thinking")),
-                Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-            ));
-        } else if !state.thinking_depth.is_empty() {
-            ctx_spans.push(Span::styled(format!("  {}", state.thinking_depth), muted));
+    // 滚动
+    let scroll = state.dashboard_scroll;
+    let vis = area.height as usize;
+    if lines.len() > vis {
+        let end = lines.len().saturating_sub(scroll);
+        let start = end.saturating_sub(vis);
+        lines = lines[start..end].to_vec();
+        if scroll > 0 && !lines.is_empty() {
+            lines[0] = Line::from(vec![
+                Span::styled(" \u{2191} ", muted),
+                Span::styled(format!("{} {}", scroll, t("dash.jobs")), dim),
+            ]);
         }
     }
-    lines.push(Line::from(ctx_spans));
-
-    let visible = area.height as usize;
-    if lines.len() > visible { lines.truncate(visible); }
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -460,7 +418,19 @@ fn render_dashboard_auto(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         }
     }
 
-    let visible = area.height as usize;
-    if lines.len() > visible { lines.truncate(visible); }
+    // 滚动
+    let scroll = state.dashboard_scroll;
+    let vis = area.height as usize;
+    if lines.len() > vis {
+        let end = lines.len().saturating_sub(scroll);
+        let start = end.saturating_sub(vis);
+        lines = lines[start..end].to_vec();
+        if scroll > 0 && !lines.is_empty() {
+            lines[0] = Line::from(vec![
+                Span::styled(" ↑ ", muted),
+                Span::styled(format!("{} {}", scroll, t("dash.jobs")), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
+            ]);
+        }
+    }
     f.render_widget(Paragraph::new(lines), area);
 }

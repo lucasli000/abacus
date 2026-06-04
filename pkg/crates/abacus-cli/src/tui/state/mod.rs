@@ -808,10 +808,26 @@ pub enum PlanExecutionStrategy {
 pub struct PalaceSnapshot {
     /// 行为宫殿条目总数
     pub behavior_count: usize,
+    /// 行为宫殿活跃条目数（confidence >= 0.1）
+    pub behavior_active: usize,
+    /// 行为宫殿高频 tag（按 frequency 降序，取 top 3）
+    pub behavior_top_tags: Vec<(String, u32)>,
     /// 知识宫殿按 domain 聚合：(domain_name, entry_count)
     pub knowledge_domains: Vec<(String, u32)>,
     /// 知识宫殿总条目数
     pub knowledge_total: u32,
+    /// 知识宫殿待复习条目数（SM-2 next_review <= now）
+    pub knowledge_due: usize,
+}
+
+/// MLX 本地模型健康状态
+#[derive(Debug, Clone, Default)]
+pub struct MlxHealth {
+    pub embedding_running: bool,
+    pub reranker_running: bool,
+    pub knowledge_chunks: u32,
+    pub embeddings_cached: u32,
+    pub mode: String,
 }
 
 pub struct AppState {
@@ -1097,6 +1113,8 @@ pub struct AppState {
     pub panel_tab: PanelTab,
     /// V40: 仪表盘当前 tab
     pub dashboard_tab: DashboardTab,
+    /// V40: 仪表盘内容滚动偏移
+    pub dashboard_scroll: usize,
     /// V40: 自动化模块健康快照（由 JobRunner 推送更新）
     pub auto_health: abacus_core::auto::AutoHealth,
     /// 面板 tab 键盘焦点（None = 焦点不在面板）
@@ -1209,6 +1227,8 @@ pub struct AppState {
     pub engine_handle: Option<EngineHandle>,
     /// 记忆宫殿本体数据快照（从 core 异步拉取，用于仓库 Tab palace 层级展示）
     pub palace_data: Option<PalaceSnapshot>,
+    /// MLX 本地模型健康状态（每 turn 刷新）
+    pub mlx_health: Option<MlxHealth>,
     /// Channel sender for engine responses
     pub engine_tx: Option<mpsc::UnboundedSender<crate::tui::api::EngineResponse>>,
     /// Text pending for async engine submission
@@ -2469,6 +2489,7 @@ impl AppState {
             panel_visible: true,
             panel_tab: PanelTab::Timeline,
             dashboard_tab: DashboardTab::Health,
+            dashboard_scroll: 0,
             auto_health: abacus_core::auto::AutoHealth::default(),
             panel_focus: None,
             stream_cursor: 0,
@@ -2506,6 +2527,7 @@ impl AppState {
             accumulated_elapsed: std::time::Duration::ZERO,
             engine_handle: None,
             palace_data: None,
+            mlx_health: None,
             engine_tx: None,
             pending_text: None,
             completion_candidates: Vec::new(),
@@ -2594,6 +2616,15 @@ impl AppState {
     /// - `panel_visible == false` → 跳过 Panel
     /// - 非 Clarify 模式或 `commands.is_empty()` → 跳过 CommandHint
     /// - 极端情况（两者都跳过）→ 留在 Input
+    /// 切换仪表盘 tab（Health ↔ Auto）
+    pub fn cycle_dashboard_tab(&mut self) {
+        self.dashboard_tab = match self.dashboard_tab {
+            DashboardTab::Health => DashboardTab::Auto,
+            DashboardTab::Auto => DashboardTab::Health,
+        };
+        self.dashboard_scroll = 0;
+    }
+
     pub fn cycle_focus(&mut self) {
         let chat_with_commands =
             matches!(self.mode, AbacusMode::Clarify) && !self.commands.is_empty();
