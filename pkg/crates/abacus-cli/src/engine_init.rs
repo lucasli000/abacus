@@ -586,6 +586,21 @@ pub async fn create_engine(
         }
     }
 
+    // ─── 脚本钩子加载（magchain.hooks）───────────────────────────────
+    // 从 config.yaml 读取 magchain.hooks 列表，注册为 PipelineHook。
+    // 支持 rhai:// / sh:// / py:// 三种运行时。
+    if let Some(hook_configs) = cfg_mgr.get_typed::<Vec<abacus_core::script_hook::HookConfig>>("magchain.hooks") {
+        for cfg in hook_configs {
+            match abacus_core::script_hook::ScriptHook::from_config(cfg) {
+                Ok(hook) => {
+                    let priority = hook.priority();
+                    core.add_pipeline_hook(priority, std::sync::Arc::new(hook)).await;
+                }
+                Err(e) => tracing::warn!(error = %e, "script hook registration failed, skipping"),
+            }
+        }
+    }
+
     // ─── MCP server 列表（默认禁用）──────────────────────────────────
     // 读取 mcp.servers (Vec<McpConfig>)；空或缺失则跳过。
     // 单 server discover 失败不中断启动；MCIP policy 默认 NeedsConfirm。
