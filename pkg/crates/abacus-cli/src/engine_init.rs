@@ -276,6 +276,14 @@ pub async fn create_engine(
         abacus_core::memory_palace::DualPalaceMemory::with_store(palace_sqlite.clone())
     ));
 
+    // 注入 NgramEmbedder（零依赖本地 embedding，启动 palace 语义检索）
+    {
+        let embedder: Arc<dyn abacus_core::memory_palace::MemoryEmbedder> =
+            Arc::new(abacus_core::memory_palace::NgramEmbedder::new());
+        let p = palace.read().await;
+        p.set_embedder(embedder).await;
+    }
+
     // 预热：从 SQLite 恢复记忆。warmup() 内部用 write lock on palace.knowledge.entries 等，
     // 与外层 RwLock<DualPalaceMemory> 的读锁无竞态（两层 RwLock 相互独立）。
     if let Some(ref store) = palace_sqlite {
