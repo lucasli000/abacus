@@ -648,7 +648,6 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     // Tools 版块
     render_section_header(&mut lines, t("panel.tools"), w, &state.theme);
-    let hc = state.tool_health.len();
     let avail = state.tool_health.values().filter(|h| !h.blocked_by_env).count();
     let mcp_count = state.tool_health.keys().filter(|k| k.starts_with("mcp__")).count();
     let tc = state.tool_records.len();

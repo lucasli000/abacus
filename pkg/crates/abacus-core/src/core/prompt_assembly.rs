@@ -25,7 +25,6 @@ use std::path::Path;
 
 use crate::core::injector::{DynamicInjector, PromptSegment};
 use crate::core::task_analyzer::TaskKind;
-use crate::paths;
 use serde::Deserialize;
 use serde_json::Value;
 

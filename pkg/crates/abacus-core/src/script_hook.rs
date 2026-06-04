@@ -136,7 +136,7 @@ impl PipelineHook for ScriptHook {
             ScriptRuntime::Shell(cmd) => {
                 let envs = build_event_env(event);
                 // 保留 PATH 等基础环境变量，仅覆盖 ABACUS_* 事件变量
-                let mut child = Command::new("sh")
+                let child = Command::new("sh")
                     .arg("-c")
                     .arg(cmd)
                     .envs(envs)
@@ -158,7 +158,7 @@ impl PipelineHook for ScriptHook {
             }
             ScriptRuntime::Python(code) => {
                 let envs = build_event_env(event);
-                let mut child = Command::new("python3")
+                let child = Command::new("python3")
                     .arg("-c")
                     .arg(code)
                     .envs(envs)

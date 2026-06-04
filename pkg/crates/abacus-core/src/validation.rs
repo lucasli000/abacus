@@ -193,7 +193,7 @@ impl ConfigRule for ConfigDirCheck {
     fn key(&self) -> &str { "system.config_dir" }
     fn severity(&self) -> Severity { Severity::Warning }
     fn validate(&self, _value: Option<&ConfigValue>) -> Result<(), ValidationError> {
-        let home = std::env::var("HOME")
+        let _home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let config_dir = crate::paths::global_dir();
