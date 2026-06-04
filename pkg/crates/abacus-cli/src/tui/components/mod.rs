@@ -59,6 +59,28 @@ use crate::tui::theme::{TextRole, Theme};
 // 共享消息行构建 (避免 render_messages / render_messages_in_card 重复)
 // ════════════════════════════════════════════════════════════════
 
+/// 超长行自动折行，最多 2 个 visual line，超时第二行尾部用 … 截断
+fn wrap_or_truncate(text: &str, max_width: usize, indent_width: usize) -> Vec<String> {
+    let usable = max_width.saturating_sub(indent_width).max(4);
+    let segments = crate::tui::util::word_wrap_segments(text, usable);
+    if segments.len() <= 2 {
+        return segments.iter().map(|&(a, b)| text[a..b].to_string()).collect();
+    }
+    // 取前两段，第二段末尾用 … 截断
+    let s1 = &text[segments[0].0..segments[0].1];
+    let s2_start = segments[1].0;
+    let truncated_end = text[s2_start..].char_indices()
+        .scan(0usize, |w, (i, ch)| {
+            let cw = crate::tui::util::char_width(ch);
+            if *w + cw > usable.saturating_sub(1) { return None; }
+            *w += cw;
+            Some(s2_start + i + ch.len_utf8())
+        })
+        .last()
+        .unwrap_or(segments[1].1);
+    vec![s1.to_string(), format!("{}…", &text[s2_start..truncated_end])]
+}
+
 /// 代码块超过此行数时折叠（Ctrl+E 展开全部）
 const CODE_BLOCK_MAX_LINES: u32 = 20;
 
@@ -88,7 +110,7 @@ fn build_message_lines(
     let bar_indent = 2usize; // │ + 1空格
     // 内容宽度分离：正文用 6/7（右侧留白提升可读性），代码/表格用全宽（不能被错误折行）
     let full_usable = (max_width as usize).saturating_sub(bar_indent + 1);
-    let prose_width = full_usable * 6 / 7;
+    let prose_width = if full_usable > 80 { full_usable * 6 / 7 } else { full_usable };
     let code_width  = full_usable;
     // content_width 保留供 Block/Trace 等非 Stream 路径使用（这些内容暂用 prose 宽）
     let content_width = prose_width;
@@ -112,7 +134,7 @@ fn build_message_lines(
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled("输入问题开始对话，/help 查看命令", hint_style),
+            Span::styled(t("msg.welcome"), hint_style),
         ]));
         return lines;
     }
@@ -130,18 +152,19 @@ fn build_message_lines(
         let mut bi: usize = 0;
         let is_user = matches!(msg.role, MsgRole::User);
         let (_display_name, role_color, role_icon) = match &msg.role {
-            MsgRole::User => ("You", theme.user, "🙋"),
-            MsgRole::Session => ("Abacus", theme.session, "🤖"),
-            MsgRole::Expert(name) => (name.as_str(), theme.expert, "🧠"),
+            MsgRole::User => ("You", theme.user, ">"),
+            MsgRole::Session => ("Abacus", theme.session, "●"),
+            MsgRole::Expert(name) => (name.as_str(), theme.expert, "◆"),
         };
 
         // ── 色条（贯穿该消息所有行）── ▎ 稍粗，突出消息边界
         let bar = Span::styled("▎", Style::default().fg(role_color));
 
-        // ── 消息间分隔线（首条消息除外）──
+        // ── 消息间分隔线（首条消息除外）——自适应宽度
         if visible_idx > 0 {
+            let sep_len = content_width.saturating_sub(2).max(8);
             let sep = Span::styled(
-                "  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌",
+                format!("  {}", "╌".repeat(sep_len)),
                 Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
             );
             lines.push(Line::from(vec![bar.clone(), sep]));
@@ -240,10 +263,17 @@ fn build_message_lines(
                         }
 
                         let rline = markdown::styled_line_to_ratatui(styled, &bar, theme);
-                        // V27: 表格行已在 markdown 层完成宽度收缩,且 box-drawing 字符不可拆分
-                        // → 豁免 word-wrap,直接 push;否则会把 │┌┴┘ 切成两半导致渲染断裂
+                        // Word-wrap：对超宽行按 content_width 拆分
+                        // Table 含 box-drawing 字符不可拆分→超宽时直接整行截断
                         if styled.line_type == LineType::Table {
-                            lines.push(rline);
+                            let tw = rline.spans.iter().map(|s| crate::tui::util::display_width(s.content.as_ref())).sum::<usize>();
+                            if tw <= code_width { lines.push(rline); continue; }
+                            let truncated = crate::tui::util::truncate_to_width(
+                                &styled.spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+                                code_width.saturating_sub(2),
+                            );
+                            let style = rline.spans.first().map(|s| s.style).unwrap_or(Style::default().fg(theme.text));
+                            lines.push(Line::from(vec![bar.clone(), Span::styled(format!("{}…", truncated.trim_end()), style)]));
                             continue;
                         }
                         // Word-wrap：对超宽行按 content_width 拆分
@@ -271,12 +301,12 @@ fn build_message_lines(
                             // 否则 segment + bar + indent 之和超出 inner.width，终端截断
                             let indent_display_w = crate::tui::util::display_width(indent_str);
                             let seg_max_w = (max_width as usize).saturating_sub(1 + indent_display_w);
-                            let segments = crate::tui::util::word_wrap_segments(&full_text, seg_max_w);
-                            for (seg_start, seg_end) in segments {
+                            let segments = wrap_or_truncate(&full_text, seg_max_w, 0);
+                            for seg_text in &segments {
                                 lines.push(Line::from(vec![
                                     bar.clone(),
                                     Span::raw(indent_str.to_string()),
-                                    Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
+                                    Span::styled(seg_text.clone(), text_style),
                                 ]));
                             }
                         }
@@ -307,12 +337,12 @@ fn build_message_lines(
                     // V11: ToolCall 失败时染红，给错误调用以视觉警示
                     //   通过 summary 首字符 ✗ 检测（归档时按 ToolStatus::Failed 写入）
                     let (icon, block_color) = match kind {
-                        BlockKind::Think => ("💭", theme.accent),
+                        BlockKind::Think => ("~", theme.accent),
                         BlockKind::ToolCall => {
                             if summary.starts_with('✗') {
-                                ("⚙", theme.error)
+                                ("!", theme.error)
                             } else {
-                                ("⚙", theme.gold)
+                                (">", theme.gold)
                             }
                         }
                         BlockKind::Checklist => ("☐", theme.success),
@@ -554,9 +584,9 @@ fn build_message_lines(
         // Breathing space
         lines.push(Line::raw(""));
 
-        // Header: ┃ 🤖 Abacus     输出中  · now
+        // Header: ┃ ● Abacus     输出中  · now
         // stream_cursor > 0 意味着 TextDelta 已到达，状态固定为"输出中"
-        let badge_text = "🤖 Abacus";
+        let badge_text = "● Abacus";
         let badge = Span::styled(
             badge_text,
             Style::default().fg(theme.session).add_modifier(Modifier::BOLD),
@@ -1248,17 +1278,17 @@ pub fn render_messages_in_card(
                         .find(|(_, s, _, _)| *s == StreamingToolStatus::Running)
                         .map(|(n, _, _, _)| n.as_str())
                         .unwrap_or("tool");
-                    Span::styled(format!("⚙ {}", running_name), Style::default().fg(state.theme.gold))
+                    Span::styled(format!("> {}", running_name), Style::default().fg(state.theme.gold))
                 } else if !state.streaming_thinking.is_empty() && !state.streaming_text_started {
                     // Thinking 阶段
-                    Span::styled("💭 thinking", Style::default().fg(state.theme.accent))
+                    Span::styled("~ thinking", Style::default().fg(state.theme.accent))
                 } else {
                     Span::raw("")
                 }
             };
 
             // Header 构建：badge_text + gap + status_badge + "  · now"
-            let badge_text = "🤖 Abacus";
+            let badge_text = "● Abacus";
             let badge_span = Span::styled(
                 badge_text,
                 Style::default().fg(state.theme.session).add_modifier(Modifier::BOLD),
@@ -1289,7 +1319,7 @@ pub fn render_messages_in_card(
         // Phase 1: 宽度与 build_message_lines 对齐（prose=6/7, code=full）
         let bar_indent_stream = 2usize;
         let full_usable_stream = (inner.width as usize).saturating_sub(bar_indent_stream + 1);
-        let prose_width = full_usable_stream * 6 / 7;
+        let prose_width = if full_usable_stream > 80 { full_usable_stream * 6 / 7 } else { full_usable_stream };
         let code_width  = full_usable_stream;
 
         // ── 正文文本推迟到最后渲染，避免被工具调用夹在中间 ──
@@ -1439,11 +1469,11 @@ pub fn render_messages_in_card(
                     let full_text: String = styled.spans.iter().map(|s| s.text.as_str()).collect();
                     let text_style = styled.spans.first().map(|s| s.style)
                         .unwrap_or(Style::default().fg(state.theme.text));
-                    let segments = crate::tui::util::word_wrap_segments(&full_text, wrap_width);
-                    for (seg_start, seg_end) in segments {
+                    let segments = wrap_or_truncate(&full_text, wrap_width, 0);
+                    for seg_text in segments {
                         lines.push(Line::from(vec![
                             bar.clone(), Span::raw(indent_str.to_string()),
-                            Span::styled(full_text[seg_start..seg_end].to_string(), text_style),
+                            Span::styled(seg_text, text_style),
                         ]));
                     }
                 }
@@ -1624,7 +1654,7 @@ fn render_streaming_blocks(
                     lines.push(Line::from(vec![
                         bar.clone(),
                         Span::styled("  ╭─ ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                        Span::styled("💭 ", Style::default().fg(state.theme.accent)),
+                        Span::styled("~ ", Style::default().fg(state.theme.accent)),
                         Span::styled(preview, Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
                         Span::styled(format!("  {}", meta), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                     ]));
@@ -1642,19 +1672,18 @@ fn render_streaming_blocks(
                     // 顶部边界线
                     lines.push(Line::from(vec![
                         bar.clone(),
-                        Span::styled("  ╭─ 💭 thinking", Style::default().fg(state.theme.accent).add_modifier(Modifier::DIM)),
+                        Span::styled("  ╭─ ~ thinking", Style::default().fg(state.theme.accent).add_modifier(Modifier::DIM)),
                         Span::styled(dur.clone(), Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                     ]));
 
                     // 内容行
                     for line in visible_lines {
-                        let segments = crate::tui::util::word_wrap_segments(line, wrap_w);
-                        for (seg_start, seg_end) in &segments {
-                            let text = &line[*seg_start..*seg_end];
+                        let segments = wrap_or_truncate(line, wrap_w, 4);
+                        for seg_text in &segments {
                             lines.push(Line::from(vec![
                                 bar.clone(),
                                 Span::styled("  │ ", Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
-                                Span::styled(text.to_string(), Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
+                                Span::styled(seg_text.clone(), Style::default().fg(state.theme.muted).add_modifier(Modifier::ITALIC)),
                             ]));
                         }
                     }
@@ -1695,7 +1724,7 @@ fn render_streaming_blocks(
 
                 lines.push(Line::from(vec![
                     bar.clone(),
-                    Span::styled(format!("  ⚙ {}{}", tool_name, count_text), Style::default().fg(state.theme.muted)),
+                    Span::styled(format!("  > {}{}", tool_name, count_text), Style::default().fg(state.theme.muted)),
                     Span::styled(format!(" {}", status_mark), Style::default().fg(status_color)),
                     Span::styled(dur_text, Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM)),
                 ]));

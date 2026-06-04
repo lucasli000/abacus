@@ -1558,11 +1558,10 @@ fn cmd_feedback(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
         return CmdResult::Consumed;
     }
     let text = args.join(" ");
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = format!("{}/.abacus", home);
-    let _ = std::fs::create_dir_all(&dir); // Ensure directory exists
-    let path = format!("{}/feedback.log", dir);
-    let entry = format!("[{}] {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), text);
+    let dir = abacus_core::paths::global_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("data/feedback.log");
+    let entry = format!("[{}] {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), text);
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
             use std::io::Write;

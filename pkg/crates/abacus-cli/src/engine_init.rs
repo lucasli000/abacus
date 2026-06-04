@@ -83,6 +83,7 @@ pub async fn create_engine(
     // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
     use abacus_core::paths;
     let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 凭证 + 模型参数
+    let _ = cfg_mgr.load_file(paths::providers_yaml());   // providers.yaml — LLM 供应商 + 密钥（优先于 config.yaml 内嵌 providers）
     let _ = cfg_mgr.load_file(paths::config_yaml());      // config.yaml — Abacus 行为配置
     let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
@@ -233,8 +234,8 @@ pub async fn create_engine(
         scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
         policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
         thresholds: abacus_core::core::ThresholdConfig::default(),
-        prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
-        subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
+        prompt_roles_path: Some(paths::prompt_roles_toml()),
+        subscenes_path: Some(paths::subscenes_toml()),
         // Deduction engine capabilities（默认全开）
         deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
         deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),

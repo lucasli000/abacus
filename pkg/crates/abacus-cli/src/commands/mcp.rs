@@ -4,10 +4,7 @@ use crate::OutputFormatter;
 pub async fn handle_mcp(args: &super::McpArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
     match &args.action {
         super::McpAction::Add { server_id, command, env } => {
-            let config_path = dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".abacus")
-                .join("mcp_servers.yaml");
+            let config_path = abacus_core::paths::mcp_servers_yaml();
             // 防御性：parent() 在根路径下为 None，回退到当前目录
             if let Some(parent) = config_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -27,10 +24,7 @@ pub async fn handle_mcp(args: &super::McpArgs, formatter: &mut Box<dyn OutputFor
             formatter.format_message("mcp", &format!("   config saved to {}", config_path.display()), None);
         }
         super::McpAction::Remove { server_id } => {
-            let config_path = dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".abacus")
-                .join("mcp_servers.yaml");
+            let config_path = abacus_core::paths::mcp_servers_yaml();
             if config_path.exists() {
                 let content = std::fs::read_to_string(&config_path)?;
                 let filtered: Vec<&str> = content.lines()

@@ -254,24 +254,22 @@ impl SetupState {
 }
 
 fn config_dir() -> PathBuf {
-    std::env::var("ABACUS_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".abacus")
-        })
+    abacus_core::paths::global_dir()
 }
 
 fn config_path() -> PathBuf {
-    config_dir().join("config.yaml")
+    abacus_core::paths::config_yaml()
+}
+
+fn providers_path() -> PathBuf {
+    abacus_core::paths::providers_yaml()
 }
 
 fn disclaimer_path() -> PathBuf {
-    config_dir().join("disclaimer_ack")
+    abacus_core::paths::disclaimer_ack()
 }
 
-/// 检测是否已有有效 API 配置
+/// 检测是否已有有效 API 配置（config.yaml 或 providers.yaml）
 pub fn has_api_config() -> bool {
     if std::env::var("ABACUS_API_KEY").is_ok()
         || std::env::var("DEEPSEEK_API_KEY").is_ok()
@@ -280,6 +278,20 @@ pub fn has_api_config() -> bool {
     {
         return true;
     }
+    // 检测 providers.yaml（新格式，仅含 LLM 配置）
+    if let Ok(content) = std::fs::read_to_string(providers_path()) {
+        let has_real_key = content.lines().any(|line| {
+            let trimmed = line.trim();
+            !trimmed.starts_with('#')
+                && trimmed.contains("api_key:")
+                && !trimmed.contains("api_key: \"\"")
+                && !trimmed.contains("api_key: ''")
+        });
+        if has_real_key {
+            return true;
+        }
+    }
+    // 回退检测 config.yaml（旧格式）
     if let Ok(content) = std::fs::read_to_string(config_path()) {
         // M3 fix: 跳过注释行，仅匹配非空 api_key 赋值行
         // 防止高级配置注释块（含 # openai_api_key: ""）触发误报
@@ -403,13 +415,49 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         None    => String::new(),
     };
 
-    // 2026-05-28: 新格式 — providers 数组 + 固化配置指引头部
+    // ── 构建 providers.yaml（LLM 供应商配置） ──
+    // 职责分离：providers.yaml 仅包含 provider 定义，config.yaml 仅包含系统参数。
     let provider_type_str = if provider.is_openai_compatible() {
         if base_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
     } else {
         "anthropic"
     };
 
+    let providers_yaml = format!(
+        "# ╔═══════════════════════════════════════════════════════════════════════════════╗\n\
+         # ║  ABACUS LLM 供应商配置 (providers.yaml)                                       ║\n\
+         # ╠═══════════════════════════════════════════════════════════════════════════════╣\n\
+         # ║                                                                             ║\n\
+         # ║  providers:                   # 供应商列表（按优先级排序）                   ║\n\
+         # ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║\n\
+         # ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║\n\
+         # ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║\n\
+         # ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║\n\
+         # ║      models:                  # 模型列表（简写或详写）                       ║\n\
+         # ║        - model-name           # 简写：用 provider 默认参数                   ║\n\
+         # ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║\n\
+         # ║          context_window: N    #   上下文窗口（token 数）                     ║\n\
+         # ║          max_tokens: N        #   单次最大输出 token                         ║\n\
+         # ║          temperature: 0.0-2.0 #   生成温度                                  ║\n\
+         # ║          thinking: off|adaptive|low|medium|high|max                         ║\n\
+         # ║                                                                             ║\n\
+         # ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║\n\
+         # ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║\n\
+         # ║                                                                             ║\n\
+         # ╚═══════════════════════════════════════════════════════════════════════════════╝\n\
+         \n\
+         # ─── 供应商配置 ─────────────────────────────────────────────────────────────────\n\
+         providers:\n\
+           - id: primary\n\
+             type: {}\n\
+             api_key: \"{}\"\n\
+             base_url: \"{}\"\n\
+             models:\n\
+               - {}\n",
+        provider_type_str, api_key_e, base_url, resolved_model,
+    );
+
+    // ── 构建 config.yaml（系统参数，不含 providers） ──
     // 生成可选功能注释
     let features_section = {
         let labels = ["skill_workflow", "auto_engine", "wasm_plugins", "mcp_servers"];
@@ -476,57 +524,33 @@ fn save_config(state: &SetupState) -> Result<(), String> {
         lines.join("\n")
     };
 
-    let yaml = format!(
-        r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
-# ║  ABACUS 配置文件 (config.yaml)                                              ║
-# ╠═══════════════════════════════════════════════════════════════════════════════╣
-# ║                                                                             ║
-# ║  providers:                   # 供应商列表（按优先级排序）                   ║
-# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
-# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
-# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
-# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
-# ║      models:                  # 模型列表（简写或详写）                       ║
-# ║        - model-name           # 简写：用 provider 默认参数                   ║
-# ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║
-# ║          context_window: N    #   上下文窗口（token 数）                     ║
-# ║          max_tokens: N        #   单次最大输出 token                         ║
-# ║          temperature: 0.0-2.0 #   生成温度                                  ║
-# ║          thinking: off|adaptive|low|medium|high|max                         ║
-# ║                                                                             ║
-# ║  core:                        # 全局运行参数                                 ║
-# ║    default_model: <model>     # 默认模型                                    ║
-# ║    stream: true               # 流式输出                                    ║
-# ║                                                                             ║
-# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
-# ║                                                                             ║
-# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
-# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
-# ║                                                                             ║
-# ╚═══════════════════════════════════════════════════════════════════════════════╝
-
-# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
-providers:
-  - id: primary
-    type: {}
-    api_key: "{}"
-    base_url: "{}"
-    models:
-      - {}
-
-# ─── 全局设置 ───────────────────────────────────────────────────────────────────
-core:
-  default_model: "{}"
-  stream: true
-{}  context_window_ratio: {:.4}
-{}"#,
-        provider_type_str, api_key_e, base_url, resolved_model,
+    let config_yaml = format!(
+        "# ╔═══════════════════════════════════════════════════════════════════════════════╗\n\
+         # ║  ABACUS 系统配置 (config.yaml)                                               ║\n\
+         # ╠═══════════════════════════════════════════════════════════════════════════════╣\n\
+         # ║                                                                             ║\n\
+         # ║  core:                        # 全局运行参数                                 ║\n\
+         # ║    default_model: <model>     # 默认模型（需与 providers.yaml 中一致）       ║\n\
+         # ║    stream: true               # 流式输出                                    ║\n\
+         # ║                                                                             ║\n\
+         # ║  LLM 配置见 providers.yaml（本文件不包含提供商信息）                         ║\n\
+         # ║                                                                             ║\n\
+         # ╚═══════════════════════════════════════════════════════════════════════════════╝\n\
+         \n\
+         # ─── 全局设置 ───────────────────────────────────────────────────────────────────\n\
+         core:\n\
+           default_model: \"{}\"\n\
+           stream: true\n\
+         {}  context_window_ratio: {:.4}\n\
+         {}",
         resolved_model, cw_line, cw_ratio, features_section,
     );
 
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    std::fs::write(config_path(), &yaml).map_err(|e| format!("写入失败: {e}"))?;
+    std::fs::write(config_path(), &config_yaml).map_err(|e| format!("写入 config.yaml 失败: {e}"))?;
+    std::fs::write(providers_path(), &providers_yaml)
+        .map_err(|e| format!("写入 providers.yaml 失败: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -534,6 +558,11 @@ core:
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
             let _ = std::fs::set_permissions(config_path(), perms);
+        }
+        if let Ok(meta) = std::fs::metadata(providers_path()) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(providers_path(), perms);
         }
     }
     Ok(())

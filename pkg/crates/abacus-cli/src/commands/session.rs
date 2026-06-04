@@ -3,9 +3,7 @@ use crate::OutputFormatter;
 use super::SessionAction;
 
 pub async fn handle_session(args: &super::SessionArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
-    let db_path = dirs::home_dir()
-        .map(|h| h.join(".abacus/sessions.db"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".abacus/sessions.db"));
+    let db_path = abacus_core::paths::sessions_db();
 
     match &args.action {
         SessionAction::List => {

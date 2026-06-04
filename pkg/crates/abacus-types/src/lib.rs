@@ -97,7 +97,7 @@ pub mod user_profile {
         pub fn default_path() -> std::path::PathBuf {
             dirs::home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".abacus").join("profile.json")
+                .join(".abacus/config/profile.json")
         }
 
         pub fn load_default() -> Self { Self::load(Self::default_path()) }

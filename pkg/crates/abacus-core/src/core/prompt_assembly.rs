@@ -25,6 +25,7 @@ use std::path::Path;
 
 use crate::core::injector::{DynamicInjector, PromptSegment};
 use crate::core::task_analyzer::TaskKind;
+use crate::paths;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -136,11 +137,9 @@ impl PromptAssembly {
         let mut br = abacusbr_prompt.into();
         if br.is_empty() {
             // 全局加载：~/.abacus/abacusbr.md
-            if let Ok(home) = std::env::var("HOME") {
-                let path = Path::new(&home).join(".abacus").join("abacusbr.md");
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    br = content;
-                }
+            let path = crate::paths::abacusbr_md();
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                br = content;
             }
             // fallback：CWD/abacusbr.md（无全局文件时）
             if br.is_empty() {
@@ -740,18 +739,14 @@ fn parse_subscenes(text: &str) -> HashMap<String, String> {
 fn load_subscene_map() -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = default_subscene_map();
 
-    let path = std::env::var("HOME")
-        .map(|h| Path::new(&h).join(".abacus").join("subscenes.toml"))
-        .ok();
-    if let Some(ref path) = path {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(config) = toml::from_str::<SubsceneConfig>(&content) {
-                for (key, values) in config.mappings {
-                    if values.is_empty() {
-                        map.remove(&key);
-                    } else {
-                        map.insert(key, values);
-                    }
+    let path = crate::paths::subscenes_toml();
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(config) = toml::from_str::<SubsceneConfig>(&content) {
+            for (key, values) in config.mappings {
+                if values.is_empty() {
+                    map.remove(&key);
+                } else {
+                    map.insert(key, values);
                 }
             }
         }

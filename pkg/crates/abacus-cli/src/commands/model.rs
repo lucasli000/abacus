@@ -11,11 +11,7 @@ use std::path::PathBuf;
 /// - 已存在 → 解析为 yaml::Value，更新/插入 available_models 字段，atomic 写回
 /// - 解析失败 → 备份原文件为 .bak，写入新内容
 fn write_available_models_to_config(models: &[String]) -> Result<PathBuf> {
-    let cfg_path = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".abacus")
-        .join("config.yaml");
+    let cfg_path = abacus_core::paths::config_yaml();
 
     if let Some(parent) = cfg_path.parent() {
         std::fs::create_dir_all(parent)?;

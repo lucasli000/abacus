@@ -179,10 +179,7 @@ impl ToolAgentRegistry {
     ///   summary_template: "{icon} {name} · 分析了 {count} 项 → {summary}"
     /// ```
     pub fn load_user_definitions(&mut self) {
-        let path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".abacus")
-            .join("subagents.yaml");
+        let path = crate::paths::global_dir().join("config/subagents.yaml");
         if !path.exists() {
             return;
         }

@@ -68,10 +68,7 @@ impl TrajectoryStore {
 
     /// 创建默认配置的 TrajectoryStore
     pub fn default_store() -> Self {
-        let path = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".abacus")
-            .join("trajectories.jsonl");
+        let path = crate::paths::global_dir().join("data/trajectories.jsonl");
         Self::new(path, 50)
     }
 

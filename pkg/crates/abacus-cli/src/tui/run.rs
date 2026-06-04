@@ -2147,7 +2147,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.is_streaming = true;
                                 // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🔍 Reviewing {}...", kind.label());
+                                state.processing_phase = format!("review/{}", kind.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
                                 state.pending_review_parses = state.pending_review_parses.saturating_add(1);
@@ -2188,7 +2188,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "📋 Planning + executing...".into();
+                                state.processing_phase = "planning".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_plan_and_execute_streaming(&engine, &task, stx, plan_req_ctx).await {
@@ -2220,7 +2220,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "🤖 Multi-agent executing...".into();
+                                state.processing_phase = "team".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_team_message(&engine, &task, stx).await {
@@ -2252,7 +2252,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🤖 {} processing...", role.label());
+                                state.processing_phase = format!("team/{}", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     use crate::tui::api::send_role_message_streaming;
@@ -2323,9 +2323,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     // 2026-05-28: bracketed paste — 粘贴内容整块插入输入栏（保留换行）
                     // 不触发 submit，用户粘贴后可编辑再手动 Enter 发送
                     Event::Paste(text) => {
-                        // O(1) 插入代替逐字符 O(N²)
-                        state.input.insert_str(state.cursor_pos, &text);
-                        state.cursor_pos += text.len();
+                        // 规范化粘贴文本：CRLF→LF，strip tabs→spaces
+                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        state.input.insert_str(state.cursor_pos, &normalized);
+                        state.cursor_pos += normalized.len();
                         state.recalculate_cursor();
                         state.rendered_lines_dirty.set(true);
                         // 2026-05-28: 粘贴 > 5 行时自动打开全屏编辑器

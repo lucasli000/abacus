@@ -798,9 +798,9 @@ impl Default for CoreConfig {
             policy: Arc::new(policy::PolicyConfig::load()),
             // 三层阈值体系
             thresholds: ThresholdConfig::default(),
-            // 提示词引擎配置路径（默认 ~/.abacus/）
-            prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
-            subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
+            // 提示词引擎配置路径（默认 ~/.abacus/config/）
+            prompt_roles_path: Some(crate::paths::prompt_roles_toml()),
+            subscenes_path: Some(crate::paths::subscenes_toml()),
             escalation_model: None,
             // ─── 推演引擎 ──
             deduction_observer_contamination: true,
@@ -2189,7 +2189,8 @@ impl CoreLoop {
     /// - 调用方: engine_init.rs（启动时如果 workspace 存在且 code_graph.enabled=true 则调用）
     /// - 内部: 创建 CodeGraphManager 并写入 self.code_graph_manager
     pub async fn enable_code_graph(&self, workspace: &std::path::Path) {
-        let db_path = workspace.join(".abacus/codegraph.db");
+        // 项目级 codegraph.db 放项目目录下 .abacus/codegraph.db（项目自身目录，非全局）
+        let db_path = crate::paths::global_dir().join("data/codegraph.db");
         // 确保父目录存在
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -5169,9 +5170,8 @@ fn strip_xml_tool_tags(text: &str) -> String {
 pub(crate) fn load_role_caps() -> abacus_types::RoleCapabilities {
     use abacus_types::{BashPolicyLevel, RoleCapabilities, SearchProvider};
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let config_path = std::path::PathBuf::from(&home)
-        .join(".abacus")
+    let config_path = crate::paths::global_dir()
+        .join("config")
         .join("roles")
         .join("default.toml");
 

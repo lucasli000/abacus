@@ -46,13 +46,9 @@ impl ModelCache {
         }
     }
 
-    /// 默认 cache 路径：~/.abacus/models.cache.json
+    /// 默认 cache 路径：~/.abacus/data/models.cache.json
     pub fn default_path() -> PathBuf {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(".abacus")
-            .join("models.cache.json")
+        crate::paths::models_cache_json()
     }
 
     /// 从磁盘加载；文件不存在或解析失败返回 Ok(None)（视为 cold start）

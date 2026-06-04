@@ -137,9 +137,7 @@ impl PolicyConfig {
     /// 加载策略配置。优先级：~/.abacus/policy.toml > 内置默认值。
     /// 文件不存在或解析失败时静默 fallback 到默认值（不阻塞启动）。
     pub fn load() -> Self {
-        let path = dirs::home_dir()
-            .map(|h| h.join(".abacus").join("policy.toml"))
-            .unwrap_or_default();
+        let path = crate::paths::policy_toml();
 
         if path.exists() {
             match std::fs::read_to_string(&path) {

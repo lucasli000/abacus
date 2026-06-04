@@ -3,9 +3,7 @@ use crate::OutputFormatter;
 use super::ConfigAction;
 
 pub async fn handle_config(args: &super::ConfigArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
-    let config_path = dirs::home_dir()
-        .map(|h| h.join(".abacus/config.yaml"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".abacus/config.yaml"));
+    let config_path = abacus_core::paths::config_yaml();
 
     match &args.action {
         ConfigAction::ListKeys => {

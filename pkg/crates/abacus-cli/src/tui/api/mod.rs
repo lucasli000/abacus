@@ -253,7 +253,7 @@ pub async fn send_chat_message_streaming(
         _ = &mut timeout => {
             cancel.cancel();
             let _ = stream_tx.send(StreamChunk::Error(format!("timeout after {}s", timeout_secs).into()));
-            return ApiResult::Err("request timed out after 300s".to_string());
+            return ApiResult::Err(format!("request timed out after {}s", timeout_secs));
         }
     };
 

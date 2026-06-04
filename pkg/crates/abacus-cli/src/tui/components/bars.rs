@@ -8,7 +8,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::tui::i18n::t;
 use crate::tui::state::{AppState, Focus, InputState};
@@ -76,16 +76,16 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // Mode 标签不在 TopBar 重复显示（StatusBar 已有唯一模式指示）
 
     // V35: 策略执行徽章 — Plan/Team 策略运行时显示在模式标签旁
-    // 检测依据: processing_phase 前缀（run.rs 写入时已加前缀 📋/🤖）
+    // 检测依据: processing_phase 前缀（run.rs 写入时已加前缀 plan/team）
     // 引用关系: run.rs 设置 state.processing_phase → 此处读取
-    if state.processing_phase.starts_with("📋") {
+    if state.processing_phase.starts_with("planning") {
         left.push(Span::styled(
-            format!(" [📋 {}]", t("mode.plan")),
+            format!(" [PLAN]"),
             Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD),
         ));
-    } else if state.processing_phase.starts_with("🤖") {
+    } else if state.processing_phase.starts_with("team") {
         left.push(Span::styled(
-            format!(" [🤖 {}]", t("mode.team")),
+            format!(" [TEAM]"),
             Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
         ));
     }
@@ -164,8 +164,8 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     if !phase_shown && !state.processing_phase.is_empty() {
         // 策略运行时用 accent 色，普通状态用 muted
-        let phase_style = if state.processing_phase.starts_with("📋")
-            || state.processing_phase.starts_with("🤖") {
+        let phase_style = if state.processing_phase.starts_with("planning")
+            || state.processing_phase.starts_with("team") {
             Style::default().fg(state.theme.accent)
         } else {
             muted_dim
@@ -321,58 +321,56 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let wrap_width = inner.width.saturating_sub(0) as usize; // 可用渲染宽度
 
     // Soft-wrap：将每个逻辑行按 wrap_width 拆分为多个视觉行
+    // WrappedLine 用指针差值直接计算在 state.input 中的字节范围（零误差）
     struct WrappedLine<'a> {
         text: &'a str,
-        logical_line: usize, // 对应原始的第几行
+        logical_line: usize,
+        byte_start: usize,
+        byte_end: usize,
     }
+    let input_ptr = state.input.as_ptr() as usize;
     let logical_lines: Vec<&str> = state.input.lines().collect();
     let mut wrapped: Vec<WrappedLine> = Vec::new();
     for (li, line) in logical_lines.iter().enumerate() {
         if line.is_empty() {
-            wrapped.push(WrappedLine { text: "", logical_line: li });
+            let byte_off = line.as_ptr() as usize - input_ptr;
+            wrapped.push(WrappedLine { text: "", logical_line: li, byte_start: byte_off, byte_end: byte_off });
         } else {
-            // 按字符宽度拆分（兼容 CJK 双宽字符 + tab 展开 + 零宽字符）
-            let mut pos = 0;
             let chars: Vec<char> = line.chars().collect();
-            // 预计算每字符的显示宽度
             let widths: Vec<usize> = chars.iter().map(|c| crate::tui::util::char_width(*c)).collect();
+            let mut pos = 0;
             while pos < chars.len() {
                 let mut w = 0usize;
                 let mut end = pos;
                 while end < chars.len() {
                     let cw = widths[end];
-                    if cw == 0 { end += 1; continue; } // 零宽字符不计入宽度但不跳过
+                    if cw == 0 { end += 1; continue; }
                     if w + cw > wrap_width && end > pos { break; }
                     w += cw;
                     end += 1;
                 }
                 let start_byte: usize = chars[..pos].iter().map(|c| c.len_utf8()).sum();
                 let end_byte: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
-                wrapped.push(WrappedLine { text: &line[start_byte..end_byte], logical_line: li });
+                let seg = &line[start_byte..end_byte];
+                let byte_off = seg.as_ptr() as usize - input_ptr;
+                wrapped.push(WrappedLine {
+                    text: seg,
+                    logical_line: li,
+                    byte_start: byte_off,
+                    byte_end: byte_off + seg.len(),
+                });
                 pos = end;
             }
         }
     }
 
-    // 滚动：保证光标所在视觉行可见
+    // 滚动：用字节范围定位光标所在的 visual line
     let cursor_wrapped_idx = {
-        let mut idx = 0;
-        let mut char_count = 0;
+        let mut idx = wrapped.len().saturating_sub(1);
         for (wi, wl) in wrapped.iter().enumerate() {
-            if wl.logical_line == state.cursor_line {
-                let line_start_pos: usize = logical_lines[..state.cursor_line].iter().map(|l| l.len() + 1).sum();
-                let col_in_line = state.cursor_pos.saturating_sub(line_start_pos);
-                let wl_char_len = wl.text.chars().count();
-                if col_in_line <= char_count + wl_char_len {
-                    idx = wi;
-                    break;
-                }
-                char_count += wl_char_len;
+            if state.cursor_pos >= wl.byte_start && state.cursor_pos <= wl.byte_end {
                 idx = wi;
-            } else if wl.logical_line > state.cursor_line {
                 break;
-            } else {
-                idx = wi;
             }
         }
         idx
@@ -464,12 +462,35 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     ];
     input_lines.push(Line::from(bottom_spans));
 
+    // 清空 inner 区域防残影（text_area_h 变化时旧行内容残留）
+    f.render_widget(Clear, inner);
+
     f.render_widget(Paragraph::new(input_lines), inner);
 
-    // 始终显示光标
+    // 光标定位：考虑 soft-wrap——visual line 可能不是逻辑行起点
     {
-        let cursor_x = inner.x + state.cursor_col as u16;
-        let cursor_y = inner.y + 1 + cursor_visible_line as u16;
+        let cursor_visual_line = cursor_visible_line;
+        // 计算光标所在 WrappedLine 在其逻辑行内的起始 display width
+        let visual_col_offset = if cursor_wrapped_idx < wrapped.len() {
+            let wl = &wrapped[cursor_wrapped_idx];
+            // 指针差值得到段在逻辑行内的字节偏移
+            let line_ptr = logical_lines[wl.logical_line].as_ptr() as usize;
+            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr - input_ptr);
+            // 逐字符累加 display width，不超过 seg 的字节边界
+            let mut bw = 0usize;
+            let mut dw = 0usize;
+            for c in logical_lines[wl.logical_line].chars() {
+                let cw = crate::tui::util::char_width(c);
+                let new_bw = bw + c.len_utf8();
+                if new_bw > seg_offset_bytes { break; }
+                bw = new_bw;
+                dw += cw;
+            }
+            dw
+        } else { 0 };
+        let col_in_visual = state.cursor_col.saturating_sub(visual_col_offset);
+        let cursor_x = inner.x + col_in_visual as u16;
+        let cursor_y = inner.y + 1 + cursor_visual_line as u16;
         f.set_cursor_position((cursor_x, cursor_y));
     }
 }

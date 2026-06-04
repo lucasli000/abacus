@@ -613,6 +613,7 @@ impl AbacusServer {
         // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
         use abacus_core::paths;
         let _ = cfg_mgr.load_file(paths::models_yaml());
+        let _ = cfg_mgr.load_file(paths::providers_yaml());
         let _ = cfg_mgr.load_file(paths::config_yaml());
         let _ = cfg_mgr.load_file(paths::security_yaml());
         cfg_mgr.load_dir(paths::conf_d_dir());
@@ -664,18 +665,13 @@ impl AbacusServer {
             ..Default::default()
         });
 
-        // Phase 3：模型能力 catalog——builtin + ~/.abacus/models.yaml 覆盖
+        // Phase 3：模型能力 catalog——builtin + ~/.abacus/config/models.yaml 覆盖
         let mut catalog = abacus_core::llm::ModelCatalog::builtin();
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok();
-        if let Some(home) = home {
-            let yaml_path = std::path::PathBuf::from(home).join(".abacus").join("models.yaml");
-            match catalog.merge_yaml(&yaml_path) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
-                Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
-            }
+        let yaml_path = paths::models_yaml();
+        match catalog.merge_yaml(&yaml_path) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
+            Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
         }
         let model_catalog = Some(std::sync::Arc::new(catalog));
 
@@ -716,8 +712,8 @@ impl AbacusServer {
             scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
             policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
             thresholds: abacus_core::core::ThresholdConfig::default(),
-            prompt_roles_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/prompt_roles.toml")),
-            subscenes_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/subscenes.toml")),
+            prompt_roles_path: Some(abacus_core::paths::prompt_roles_toml()),
+            subscenes_path: Some(abacus_core::paths::subscenes_toml()),
             // 推演引擎
             deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
             deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),
@@ -797,11 +793,7 @@ impl AbacusServer {
             // P70: PII 脱敏 — 递归清洗 output 中的信用卡/Email/SSN
             core_loop.add_middleware(70, Arc::new(PiiRedactor::new())).await;
             // P100: 持久化审计 — SQLite 落盘，跨 session 可查；失败降级静默
-            let audit_path = std::env::var("HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                .join(".abacus")
-                .join("audit.db");
+            let audit_path = abacus_core::paths::global_dir().join("data/audit.db");
             match PersistentAuditLogger::new(audit_path, 10_000) {
                 Ok(logger) => { core_loop.add_middleware(100, Arc::new(logger)).await; }
                 Err(e) => { tracing::warn!("PersistentAuditLogger init failed, audit disabled: {e}"); }

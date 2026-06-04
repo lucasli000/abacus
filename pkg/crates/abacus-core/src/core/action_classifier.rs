@@ -268,12 +268,9 @@ impl ToolActionClassifier {
         ]);
     }
 
-    /// 加载用户自定义规则（~/.abacus/safety_rules.yaml）
+    /// 加载用户自定义规则（~/.abacus/config/safety_rules.yaml）
     fn load_user_rules(&mut self) {
-        let path = dirs::home_dir()
-            .unwrap_or_default()
-            .join(".abacus")
-            .join("safety_rules.yaml");
+        let path = crate::paths::global_dir().join("config/safety_rules.yaml");
         if !path.exists() {
             return;
         }

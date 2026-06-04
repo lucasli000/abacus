@@ -15,12 +15,10 @@ pub fn build_doctor_report() -> Vec<String> {
     lines.push("Abacus System Check".to_string());
     lines.push("─────────────────────────".to_string());
 
-    let data_dir = dirs::home_dir()
-        .map(|h| h.join(".abacus"))
-        .unwrap_or_default();
+    let data_dir = abacus_core::paths::global_dir();
 
     // Config file
-    let config_path = data_dir.join("config.yaml");
+    let config_path = abacus_core::paths::config_yaml();
     lines.push(if config_path.exists() {
         format!("[✓] Config: {}", config_path.display())
     } else {
@@ -35,7 +33,7 @@ pub fn build_doctor_report() -> Vec<String> {
     });
 
     // Session database
-    let db_path = data_dir.join("sessions.db");
+    let db_path = abacus_core::paths::sessions_db();
     lines.push(if db_path.exists() {
         let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
         format!("[✓] Session DB: {} ({} bytes)", db_path.display(), size)
@@ -44,7 +42,7 @@ pub fn build_doctor_report() -> Vec<String> {
     });
 
     // Plugin directory
-    let plugin_dir = data_dir.join("plugins");
+    let plugin_dir = abacus_core::paths::global_dir().join("plugins");
     lines.push(if plugin_dir.exists() {
         let count = std::fs::read_dir(&plugin_dir).map(|d| d.count()).unwrap_or(0);
         format!("[✓] Plugins: {} found", count)

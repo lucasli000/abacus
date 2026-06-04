@@ -196,7 +196,7 @@ impl ConfigRule for ConfigDirCheck {
         let home = std::env::var("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        let config_dir = home.join(".abacus");
+        let config_dir = crate::paths::global_dir();
         if !config_dir.exists() {
             return Err(ValidationError {
                 key: "system.config_dir".into(),
