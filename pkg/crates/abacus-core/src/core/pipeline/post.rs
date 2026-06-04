@@ -385,15 +385,18 @@ impl<'a> TurnPipeline<'a> {
         // 生命周期：每 turn post_process 阶段写入一次，异步不阻塞输出
         if let Some(ref palace) = self.core.memory_palace {
             let p = palace.read().await;
-            // 行为模式记录：供 classify_input / recommend_next_tools 学习
+            // 行为模式记录
             let tags = vec![
                 ctx.classification.kind.label().to_string(),
                 if ctx.total_tool_calls > 0 { "used_tools".into() } else { "direct_answer".into() },
             ];
             p.record_interaction(self.input, &tags).await;
-            // 工具效果记录：与 EffectivenessTracker 互补，面向行为推荐而非评分
             for output in &ctx.all_tool_outputs {
                 p.record_tool_behavior(&output.tool_id.0, output.success).await;
+            }
+            // P1：每 20 turn 从 Palace 自动发现高频工具组合 → 注册 ToolAgent
+            if ctx.turn_number > 0 && ctx.turn_number % 20 == 0 {
+                self.core.subagent_registry.auto_discover_from_palace(&*p).await;
             }
         }
 

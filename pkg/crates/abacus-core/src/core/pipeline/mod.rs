@@ -2229,12 +2229,12 @@ impl<'a> TurnPipeline<'a> {
                 .map(|tc| tc.function.name.as_str())
                 .collect();
             // V41: 先尝试全量匹配；失败则部分匹配（拆分为 agent 路径 + 普通路径）
-            let toolagent_match = self.core.subagent_registry.match_batch(&tool_ids_for_match);
+            let toolagent_match = self.core.subagent_registry.match_batch(&tool_ids_for_match).await;
             let partial_match = if toolagent_match.is_none() {
-                self.core.subagent_registry.match_partial(&tool_ids_for_match)
+                self.core.subagent_registry.match_partial(&tool_ids_for_match).await
             } else { None };
 
-            if let Some(agent_def) = toolagent_match {
+            if let Some((_priority, agent_def)) = toolagent_match {
                 // ── ToolAgent 批量执行路径 ──
                 let agent_id = agent_def.id.clone();
                 let agent_icon = agent_def.icon.clone();

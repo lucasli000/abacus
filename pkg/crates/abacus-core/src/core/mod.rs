@@ -1632,9 +1632,9 @@ impl CoreLoop {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let action_classifier = action_classifier::ToolActionClassifier::new(cwd_for_classifier);
-        let mut subagent_registry = subagent::ToolAgentRegistry::new();
-        subagent_registry.register_builtins();
-        subagent_registry.load_user_definitions();
+        let subagent_registry = subagent::ToolAgentRegistry::new();
+        subagent_registry.register_builtins().await;
+        subagent_registry.load_user_definitions().await;
         let mut prompt_assembly = PromptAssembly::new(
             &config.system_prompt,
             "", // auto-load from abacusbr.md
@@ -2453,7 +2453,9 @@ impl CoreLoop {
                 "palace-demoted (visible-but-failing tool hidden from LLM)"
             );
             // 段 L2：用 apply_palace_demote_at 让 K4 试探放行机制启动
-            tracker.apply_palace_demote_at(id, current_turn);
+            tracker.apply_palace_demote_at(id.clone(), current_turn);
+            // P0 修复：同步写入 registry 让 list_visible 立即生效
+            self.registry.mark_cooling(&id, 120).await;
         }
         demoted
     }
