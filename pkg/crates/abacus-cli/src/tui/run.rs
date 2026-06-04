@@ -623,6 +623,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
 
                         // V28: 落档完成,现在清流式累积字段(streaming_text/thinking/tools/trace_ids)
+                        // 手动落档后提前清空 streaming_text，避免 reset_streaming 内部
+                        // 的自动落档守卫(streaming_complete && !streaming_text.is_empty())
+                        // 二次 add_message 导致消息重复渲染。
+                        state.streaming_text.clear();
                         state.reset_streaming();
 
                         let response_tool_count = response.tool_records.len();

@@ -330,24 +330,21 @@ impl DeepSeekProvider {
         // V3.1+/V4 服务端默认 thinking=enabled；客户端必须显式发 `{type: "disabled"}` 关闭，
         // 否则与 build_messages 中 effective_thinking_enabled=false 不一致 → 400。
         // R1/reasoner thinking 永远 on，发 disabled 会被拒——不在 default-enabled 修复范围。
+        // 2026-06-04 修复：删除 has_tools 降级逻辑。
+        // 官方文档明确说明 thinking mode 支持 tool calls：
+        //   https://api-docs.deepseek.com/guides/thinking_mode
+        //   400 错误的真正原因是多轮未回传 reasoning_content，而非 thinking+tool 同时存在。
+        //   build_messages 中已有 reasoning_content 回传逻辑，不受影响。
         let is_v4_default_enabled_series = (model_str_for_decision.contains("deepseek-v4")
             || model_str_for_decision.contains("deepseek-v3")
             || model_str_for_decision == "deepseek-chat") // V3 官方 model ID
             && !model_str_for_decision.contains("reasoner")
             && !model_str_for_decision.contains("r1");
-        // DeepSeek 官方限制：thinking 模式与 tool calls 不兼容，同时存在会返回 400。
-        // 有工具时强制 disable thinking；无工具时按 intent 决定。
-        // 引用关系：tools 已在上方计算；effective_thinking_enabled 依赖此 override
-        let has_tools = tools.is_some();
         let thinking = if is_reasoning_model_pre {
             match intent_ref {
-                Some(i) if i.is_enabled() && !has_tools => {
-                    // thinking 启用 + 无工具：正常开启
+                Some(i) if i.is_enabled() => {
+                    // thinking 启用：正常开启（无论是否有 tools）
                     Some(serde_json::json!({"type": "enabled"}))
-                }
-                Some(i) if i.is_enabled() && has_tools => {
-                    // thinking 启用 + 有工具：降级 disable（避免 400）
-                    Some(serde_json::json!({"type": "disabled"}))
                 }
                 Some(_) => {
                     // intent 是 Off → 显式 disable
@@ -362,8 +359,8 @@ impl DeepSeekProvider {
         } else {
             None
         };
-        // thinking 实际是否启用（工具降级后重新判断，驱动 build_messages 和 reasoning_effort）
-        let effective_thinking_enabled = effective_thinking_enabled && !has_tools;
+        // thinking 实际是否启用（驱动 build_messages 和 reasoning_effort）
+        // 不再因 has_tools 降级——thinking 和 tools 可以同时发送。
 
         // D2: client-side clamp。官方文档规则：low/medium→high, xhigh→max。
         // 把规则前移到 client，让 wire 上发的字符串与 server 真实执行档位一致。
