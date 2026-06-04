@@ -1088,7 +1088,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
 
     // ════════════════════════════════════════════════════════════
-    // 🧠 记忆宫殿 — palace 本体结构 + 本轮调用记录
+    // 记忆宫殿 — palace 本体结构 + 本轮调用记录
     // ════════════════════════════════════════════════════════════
     lines.push(Line::from(Span::styled(format!("{}", t("panel.knowledge")), ab)));
     if let Some(ref snap) = state.palace_data {
@@ -1121,7 +1121,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // 🔧 工具仓 — 注册能力 + 健康度 + 本轮调用
+    // 工具仓 — 注册能力 + 健康度 + 本轮调用
     // ════════════════════════════════════════════════════════════
     lines.push(sep.clone());
     lines.push(Line::from(Span::styled(t("panel.tools"), ab)));
@@ -1156,7 +1156,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // ⚡ 技能引擎 — 可复用工作流调用
+    // 技能引擎 — 可复用工作流调用
     // ════════════════════════════════════════════════════════════
     lines.push(sep.clone());
     lines.push(Line::from(Span::styled(t("panel.workflow"), ab)));
