@@ -478,7 +478,7 @@ pub enum MultiTurnReplay {
 ///
 /// ## 引用关系
 /// - 创建：`abacus-core::llm::model_catalog::ModelCatalog::builtin()`（内置）+
-///   `merge_yaml(~/.abacus/models.yaml)`（用户覆盖）
+///   `merge_toml(~/.abacus/models.toml)`（用户覆盖）
 /// - 消费：各 provider 的 `resolve_thinking(&ThinkingIntent, &ModelSpec)`
 ///
 /// ## 生命周期

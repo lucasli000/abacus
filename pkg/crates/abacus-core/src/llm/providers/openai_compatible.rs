@@ -288,6 +288,46 @@ impl OpenAICompatibleProvider {
         self.discover_enabled = enabled;
     }
 
+    /// 拼接 chat completions 端点 URL
+    ///
+    /// ## 智能检测 base_url 末尾是否已含版本段
+    /// - 末尾是 `/v1`/`/v2`/`/v3`/`/v4` → 直接 append `/chat/completions`
+    ///   （覆盖 ARK `https://ark.cn-beijing.volces.com/api/coding/v3` 这类
+    ///    "已含版本号" 的端点）
+    /// - 末尾是 `/chat/completions` → 原样返回（用户已写完整路径）
+    /// - 其他（OpenAI 标准 `https://api.openai.com`）→ append `/v1/chat/completions`
+    fn chat_completions_url(&self) -> String {
+        let base = &self.base_url;
+        let last_segment = base.rsplit('/').next().unwrap_or("");
+        if last_segment.starts_with('v') && last_segment.len() <= 3
+            && last_segment[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            // 已含 /vN
+            format!("{base}/chat/completions")
+        } else if base.ends_with("/chat/completions") {
+            // 完整路径
+            base.clone()
+        } else {
+            // OpenAI 标准
+            format!("{base}/v1/chat/completions")
+        }
+    }
+
+    /// 拼接 models 列表端点 URL（与 chat_completions_url 规则一致）
+    fn models_list_url(&self) -> String {
+        let base = &self.base_url;
+        let last_segment = base.rsplit('/').next().unwrap_or("");
+        if last_segment.starts_with('v') && last_segment.len() <= 3
+            && last_segment[1..].chars().all(|c| c.is_ascii_digit())
+        {
+            format!("{base}/models")
+        } else if base.ends_with("/models") {
+            base.clone()
+        } else {
+            format!("{base}/v1/models")
+        }
+    }
+
     fn build_request(&self, req: &LlmRequest) -> ChatRequest {
         let messages: Vec<ChatMessage> = self.build_messages(req);
 
@@ -513,8 +553,11 @@ impl LlmProvider for OpenAICompatibleProvider {
         // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
         #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
-            let _ = std::fs::write("/tmp/abacus_wire_last.json",
-                format!("// PROVIDER: openai-compatible\n// BASE_URL: {}\n{}", self.base_url, json));
+            crate::llm::wire_trace::write_wire_trace(
+                "openai-compatible",
+                &self.base_url,
+                &format!("// PROVIDER: openai-compatible\n// BASE_URL: {}\n{}", self.base_url, json),
+            );
         }
 
         let mut retries: u64 = 0;
@@ -524,7 +567,7 @@ impl LlmProvider for OpenAICompatibleProvider {
             let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
             let result = self
                 .client
-                .post(format!("{}/v1/chat/completions", self.base_url))
+                .post(self.chat_completions_url())
                 .timeout(self.request_timeout) // H8: per-request timeout
                 .header(&self.auth_header, auth_value)
                 .header("Content-Type", "application/json")
@@ -585,7 +628,7 @@ impl LlmProvider for OpenAICompatibleProvider {
                 .map(|(i, m)| format!("  [{}] role={}", i, m.role))
                 .collect::<Vec<_>>().join("\n");
             let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+                format!("\n(完整 JSON 见 {})", crate::llm::wire_trace::wire_trace_path("openai-compatible").display())
             } else {
                 String::new()
             };
@@ -652,14 +695,17 @@ impl LlmProvider for OpenAICompatibleProvider {
         // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
         #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
-            let _ = std::fs::write("/tmp/abacus_wire_last.json",
-                format!("// PROVIDER: openai-compatible (streaming)\n// BASE_URL: {}\n{}", self.base_url, json));
+            crate::llm::wire_trace::write_wire_trace(
+                "openai-compatible (streaming)",
+                &self.base_url,
+                &format!("// PROVIDER: openai-compatible (streaming)\n// BASE_URL: {}\n{}", self.base_url, json),
+            );
         }
 
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self
             .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
+            .post(self.chat_completions_url())
             .timeout(self.request_timeout) // H8: per-request timeout
             .header(&self.auth_header, auth_value)
             .header("Content-Type", "application/json")
@@ -671,15 +717,17 @@ impl LlmProvider for OpenAICompatibleProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamEvent::Error(
+            if tx.send(StreamEvent::Error(
                 format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
-            ));
+            )).is_err() {
+                tracing::debug!("stream consumer gone before HTTP error");
+            }
             // V18：openai-compatible streaming 错误增强
             let summary = body.messages.iter().enumerate()
                 .map(|(i, m)| format!("  [{}] role={}", i, m.role))
                 .collect::<Vec<_>>().join("\n");
             let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+                format!("\n(完整 JSON 见 {})", crate::llm::wire_trace::wire_trace_path("openai-compatible").display())
             } else {
                 String::new()
             };
@@ -701,28 +749,41 @@ impl LlmProvider for OpenAICompatibleProvider {
         let mut thinking_tokens_stream = 0u64;
 
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
+        // 🟡#7 治本：stream_alive 标志 + per-token send 失败时跳出循环
+        // 之前 `let _ = tx.send(...)` 把 consumer 断开当成"正常完成"——
+        // 后面继续读 chunk 浪费 CPU/网络。治本：首次 send 失败 → 标记 stream 死亡 → 跳出
+        let mut stream_alive = true;
         loop {
             let chunk = match tokio::time::timeout(std::time::Duration::from_secs(45), byte_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
                     tracing::warn!("stream idle timeout (45s), treating as complete");
-                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    if tx.send(StreamEvent::Error("stream idle timeout (45s)".into())).is_err() {
+                        tracing::debug!("stream consumer gone, stopping");
+                        stream_alive = false;  // 标记死亡，下面 Usage/Done 不再尝试 send
+                    }
                     break;
                 }
             };
+            if !stream_alive { break; }
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(
+                    // 优先尝试推送 error 事件；consumer 已断开就只 log + 返回 Err
+                    if tx.send(StreamEvent::Error(
                         format!("stream interrupted: {e}")
-                    ));
+                    )).is_err() {
+                        tracing::debug!("stream consumer gone during error: {e}");
+                    }
                     return Err(KernelError::Provider(format!("stream read: {e}")));
                 }
             };
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-            while let Some(newline_pos) = buffer.find('\n') {
+            'parse: while let Some(newline_pos) = buffer.find('\n') {
+                // 🟡#7 治本：stream 死亡就跳出整个 parse 循环
+                if !stream_alive { break 'parse; }
                 let line = buffer[..newline_pos].trim().to_string();
                 buffer = buffer[newline_pos + 1..].to_string();
 
@@ -730,7 +791,12 @@ impl LlmProvider for OpenAICompatibleProvider {
 
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
-                        let _ = tx.send(StreamEvent::Done);
+                        // consumer 断开则提前停止——Done 才是真结束标志
+                        if tx.send(StreamEvent::Done).is_err() {
+                            tracing::debug!("stream consumer gone before Done, stopping");
+                            stream_alive = false;
+                            break 'parse;  // skip Usage/Done
+                        }
                         break;
                     }
                     if let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(data) {
@@ -740,14 +806,21 @@ impl LlmProvider for OpenAICompatibleProvider {
                                     if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                                         if !content.is_empty() {
                                             full_text.push_str(content);
-                                            let _ = tx.send(StreamEvent::TextDelta(content.to_string()));
+                                            // 🟡#7 治本：per-token 失败就标记 stream 死亡
+                                            // 后续 chunk 读但不再 send（避免无意义的网络/解析消耗）
+                                            if tx.send(StreamEvent::TextDelta(content.to_string())).is_err() {
+                                                tracing::debug!("stream consumer gone mid-stream; will stop sending");
+                                                stream_alive = false;
+                                            }
                                         }
                                     }
                                     // 2026-05-28: GLM/Kimi reasoning_content 流式收集
                                     if let Some(rc) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
                                         if !rc.is_empty() {
                                             reasoning_buf.push_str(rc);
-                                            let _ = tx.send(StreamEvent::ThinkingDelta(rc.to_string()));
+                                            if tx.send(StreamEvent::ThinkingDelta(rc.to_string())).is_err() {
+                                                stream_alive = false;
+                                            }
                                         }
                                     }
                                 }
@@ -772,10 +845,18 @@ impl LlmProvider for OpenAICompatibleProvider {
                     }
                 }
             }
+            // 🟡#7 治本：parse 完一个 chunk 后若 stream 已死，不再读下一个
+            if !stream_alive { break; }
         }
 
-        let _ = tx.send(StreamEvent::Usage { prompt_tokens, completion_tokens });
-        let _ = tx.send(StreamEvent::Done);
+        // 推送 Usage + Done；consumer 已断开则 log 但不阻塞返回 LlmResponse
+        // （返回 response 仍需供调用方做 cost 计算等）
+        if tx.send(StreamEvent::Usage { prompt_tokens, completion_tokens }).is_err() {
+            tracing::debug!("stream consumer gone before Usage");
+        }
+        if tx.send(StreamEvent::Done).is_err() {
+            tracing::debug!("stream consumer gone before final Done");
+        }
 
         Ok(LlmResponse {
             model: ModelId(body.model),
@@ -830,7 +911,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         }
         let auth_value = format!("{}{}", self.auth_prefix, self.api_key.as_str());
         let resp = self.client
-            .get(format!("{}/v1/models", self.base_url))
+            .get(self.models_list_url())
             .timeout(std::time::Duration::from_secs(15)) // discover 短超时（不让首次启动卡死）
             .header(&self.auth_header, auth_value)
             .send()
@@ -1113,5 +1194,55 @@ mod tests {
         ));
         let body = p.build_request(&r);
         insta::assert_json_snapshot!(snapshot_openai_fields(&body));
+    }
+
+    // ── URL auto-detection 测试 ──────────────────────────────────────
+
+    fn make_provider_with_base(base: &str) -> OpenAICompatibleProvider {
+        OpenAICompatibleProvider::new(
+            "sk-test".into(),
+            ModelId("gpt-5".into()),
+            base.into(),
+            None,
+            None,
+            Some(60),
+        )
+    }
+
+    #[test]
+    fn url_openai_standard_appends_v1() {
+        let p = make_provider_with_base("https://api.openai.com");
+        assert_eq!(p.chat_completions_url(), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(p.models_list_url(), "https://api.openai.com/v1/models");
+    }
+
+    #[test]
+    fn url_ark_already_has_v3() {
+        // 用户场景：ARK base_url 已含 /v3
+        let p = make_provider_with_base("https://ark.cn-beijing.volces.com/api/coding/v3");
+        assert_eq!(p.chat_completions_url(), "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions");
+        assert_eq!(p.models_list_url(), "https://ark.cn-beijing.volces.com/api/coding/v3/models");
+    }
+
+    #[test]
+    fn url_already_has_full_path() {
+        // 极端：用户直接给完整 chat/completions URL
+        let p = make_provider_with_base("https://example.com/api/v1/chat/completions");
+        assert_eq!(p.chat_completions_url(), "https://example.com/api/v1/chat/completions");
+    }
+
+    #[test]
+    fn url_trailing_slash_normalized() {
+        // 末尾 / 应被 strip
+        let p = make_provider_with_base("https://api.openai.com/");
+        assert_eq!(p.chat_completions_url(), "https://api.openai.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn url_v2_and_v4_also_recognized() {
+        let p2 = make_provider_with_base("https://api.example.com/api/v2");
+        assert_eq!(p2.chat_completions_url(), "https://api.example.com/api/v2/chat/completions");
+        let p4 = make_provider_with_base("https://api.example.com/v4");
+        assert_eq!(p4.chat_completions_url(), "https://api.example.com/v4/chat/completions");
     }
 }

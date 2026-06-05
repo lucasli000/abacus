@@ -2,6 +2,8 @@
 /target/
 /pkg/target/
 **/*.rs.bk
+# Local builds (unsigned macOS binaries fail Gatekeeper; let GitHub Actions build)
+/pkg/dist/
 
 # Environment & secrets
 .env

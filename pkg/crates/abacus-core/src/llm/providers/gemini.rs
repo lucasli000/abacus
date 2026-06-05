@@ -522,9 +522,11 @@ impl LlmProvider for GeminiProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamEvent::Error(
+            if tx.send(StreamEvent::Error(
                 format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
-            ));
+            )).is_err() {
+                tracing::debug!("stream consumer gone before HTTP error");
+            }
             if matches!(status.as_u16(), 401 | 403) {
                 return Err(KernelError::Unauthorized(body_text));
             }
@@ -546,16 +548,20 @@ impl LlmProvider for GeminiProvider {
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
                     tracing::warn!("stream idle timeout (45s), treating as complete");
-                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    if tx.send(StreamEvent::Error("stream idle timeout (45s)".into())).is_err() {
+                        tracing::debug!("stream consumer gone, stopping");
+                    }
                     break;
                 }
             };
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(
+                    if tx.send(StreamEvent::Error(
                         format!("stream interrupted: {e}")
-                    ));
+                    )).is_err() {
+                        tracing::debug!("stream consumer gone during error: {e}");
+                    }
                     return Err(KernelError::Provider(format!("stream read: {e}")));
                 }
             };
@@ -597,11 +603,15 @@ impl LlmProvider for GeminiProvider {
             }
         }
 
-        let _ = tx.send(StreamEvent::Usage {
+        if tx.send(StreamEvent::Usage {
             prompt_tokens,
             completion_tokens: completion_tokens + thoughts_tokens,
-        });
-        let _ = tx.send(StreamEvent::Done);
+        }).is_err() {
+            tracing::debug!("stream consumer gone before Usage");
+        }
+        if tx.send(StreamEvent::Done).is_err() {
+            tracing::debug!("stream consumer gone before final Done");
+        }
 
         let thinking_opt = if full_thinking.is_empty() { None } else { Some(full_thinking) };
 

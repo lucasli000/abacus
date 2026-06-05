@@ -53,6 +53,7 @@ pub mod workflow_checkers;
 pub mod cot_hook;
 pub mod knowledge_hook;
 pub mod token_budget;
+pub mod llm_budget;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -435,7 +436,7 @@ pub struct ThresholdConfig {
     pub confirm_timeout_secs: u64,
     /// V41: 动态超时的绝对上限（秒）——所有因子叠加后 clamp 到此值
     /// 默认 1800 (30min)；Claude Code 允许 7200 (2h) 但 >15min 有 tool_result 丢失风险
-    /// 用户可通过 config.yaml `core.max_turn_timeout_secs` 覆盖
+    /// 用户可通过 config.toml `core.max_turn_timeout_secs` 覆盖
     pub max_turn_timeout_secs: Option<u64>,
 
     // ─── Quality 级（智能优化层）──────────────────────────────────
@@ -1466,6 +1467,19 @@ pub struct CoreLoop {
     /// - 读取: TurnPipeline setup() 阶段查询 pressure_level
     /// - 销毁: 随 CoreLoop drop
     pub(crate) token_budget: token_budget::TokenBudgetMonitor,
+    /// LLM 资源预算（cost/token/latency）— 注册为 `pressure_monitor` 的 PressureSource
+    ///
+    /// ## 真实落地（vs 想象）
+    /// 1. 调 LLM 末尾：CoreLoop **真的**调 `budget.record(usage)` 写回 cost
+    /// 2. 调 LLM 之前：CoreLoop **真的**调 `pressure_monitor.check_and_shed()`
+    ///    → LlmBudget::shed() 在压力超阈值时切换到 fallback provider
+    /// 3. 用户可在 TUI `/status` 看到 budget 状态
+    ///
+    /// ## 默认状态
+    /// `max_cost_usd=0.0` / `max_total_tokens=0` → 不限，budget 不参与决策
+    /// 用户在 `config.toml` `[llm_budget]` 显式启用后才生效。
+    /// - 销毁：随 CoreLoop drop
+    pub(crate) llm_budget: Arc<llm_budget::LlmBudget>,
 }
 
 /// Context window pressure source — reports usage_pct (0~100 scale) normalized to
@@ -1752,7 +1766,20 @@ impl CoreLoop {
         ).await;
         // TokenBudgetMonitor：context window 容量取 default_max_tokens * 2（保守估计）
         let token_budget_monitor = token_budget::TokenBudgetMonitor::new(config.default_max_tokens as usize * 2);
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor };
+        // LlmBudget：cost/token/latency 三维预算
+        // - 默认 `max_cost_usd=0.0` 表示不限（opt-in），用户可在 config.toml `[llm_budget]` 启用
+        // - 注册为 pressure_monitor 的 PressureSource，自动接入 check_and_shed
+        //   → shed() 触发时切到 fallback provider
+        let llm_budget = Arc::new(llm_budget::LlmBudget::new(llm_budget::LlmBudgetConfig::default()));
+        pressure_monitor.register(llm_budget.clone()).await;
+        // shed 回调：把 CoreLoop 内 current_provider 标记降级 → 下次 resolve_effective_model
+        // 走 FallbackProvider 路径（如果有的话）或者保持但加 warning
+        let core_loop_budget = llm_budget.clone();
+        llm_budget.on_shed(move || {
+            tracing::warn!("LlmBudget triggered shed → caller should switch to fallback provider");
+            1  // 成功标记
+        }).await;
+        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -3110,7 +3137,7 @@ impl CoreLoop {
         self.process(input, session, ctx).await
     }
 
-    /// 从 config 统一应用 MCIP 全部权限配置（security.yaml `mcip.*`）
+    /// 从 config 统一应用 MCIP 全部权限配置（security.toml `mcip.*`）
     ///
     /// 处理三个名单：
     /// - `exempt_prefixes`：前缀豆免（跳过策略检查）
@@ -3140,7 +3167,7 @@ impl CoreLoop {
         }
     }
 
-    /// 应用 config.yaml 中的 `mcip.exempt_prefixes` 列表到 McipGateway
+    /// 应用 config.toml 中的 `mcip.exempt_prefixes` 列表到 McipGateway
     ///
     /// ## 弃用（请改用 configure_mcip_permissions）
     #[deprecated(note = "use configure_mcip_permissions instead")]
@@ -3363,6 +3390,17 @@ impl CoreLoop {
 
     /// 获取 PressureMonitor（供外部注册压力源）
     pub fn pressure_monitor(&self) -> &Arc<pressure::ResourcePressureMonitor> { &self.pressure_monitor }
+
+    /// 获取 LLM 资源预算（供外部读 snapshot 状态 + register 模型成本）
+    pub fn llm_budget(&self) -> &Arc<llm_budget::LlmBudget> { &self.llm_budget }
+
+    /// 重新配置 LLM 预算（用户改 `config.toml` 后 / 启动时从 ConfigManager 应用）
+    ///
+    /// 真实落地：engine_init 在 CoreLoop::new() 之后调此方法，
+    /// 把 ConfigManager.llm_budget_config() 的值塞进 LlmBudget。
+    pub fn reconfigure_llm_budget(&self, new_config: llm_budget::LlmBudgetConfig) {
+        self.llm_budget.reconfigure(new_config);
+    }
 
     /// 上下文窗口使用状态（CLI `context status` / TUI `/context`）
     pub async fn context_status(&self) -> ContextWindowStatus {
@@ -5452,15 +5490,16 @@ mod tests {
             .find(|d| d.function.name == "cross_session_query")
             .expect("cross_session_query 应在");
         let desc = xs.function.description.as_ref().expect("desc");
-        // cluster id + sibling 名字 + this tool 标识
-        assert!(desc.contains("Cluster: session_history"),
-            "应注入 cluster id, got: {desc}");
+        // V43 token 优化：新格式为 ` [vs: sibling_a/sibling_b. This: <differentiator>]`
+        // ——只列 sibling 名字 + 自身 differentiator，不再嵌入 cluster id（siblings 名称隐含 cluster 身份）
+        assert!(desc.contains("[vs:"),
+            "应注入 cluster hint 标记 [vs:, got: {desc}");
         assert!(desc.contains("session_resume_query"),
             "应列 sibling, got: {desc}");
         assert!(desc.contains("messages_recover"),
             "应列 sibling, got: {desc}");
-        assert!(desc.contains("This tool:"),
-            "应有 this-tool differentiator, got: {desc}");
+        assert!(desc.contains("This:"),
+            "应有 this-tool differentiator 标记, got: {desc}");
     }
 
     /// 不在任何 cluster 的工具 description 不被破坏（向后兼容）

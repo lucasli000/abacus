@@ -277,13 +277,32 @@ impl ToolActionClassifier {
         if !path.exists() {
             return;
         }
+        // 🟡#17 治本：检查文件权限——group/other 写权限意味着其他用户可改安全规则
+        // 安全规则 YAML 不应 group/other 可写（owner-only 0o600）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        "safety_rules.yaml {} has world/group writable bits ({:o}); \
+                         for safety, restrict to 0o600 (owner read/write only)",
+                        path.display(), mode
+                    );
+                }
+            }
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("safety_rules: cannot read {}: {e}", path.display());
+                return;
+            }
         };
 
         #[derive(Deserialize)]
-        struct UserRules {
+        pub(crate) struct UserRules {
             #[serde(default)]
             hard_deny: Vec<ActionPattern>,
             #[serde(default)]
@@ -292,11 +311,21 @@ impl ToolActionClassifier {
             allow: Vec<ActionPattern>,
         }
 
-        if let Ok(rules) = serde_yaml::from_str::<UserRules>(&content) {
-            self.hard_deny.extend(rules.hard_deny);
-            self.soft_deny.extend(rules.soft_deny);
-            self.allow_rules.extend(rules.allow);
-        }
+        // 🟡#17 治本：parse 错误不再静默吞——给用户看到
+        let rules: UserRules = match serde_yaml::from_str(&content) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("safety_rules: YAML parse error in {}: {e}", path.display());
+                return;
+            }
+        };
+        tracing::info!(
+            "safety_rules: loaded {} hard_deny, {} soft_deny, {} allow from {}",
+            rules.hard_deny.len(), rules.soft_deny.len(), rules.allow.len(), path.display()
+        );
+        self.hard_deny.extend(rules.hard_deny);
+        self.soft_deny.extend(rules.soft_deny);
+        self.allow_rules.extend(rules.allow);
     }
 }
 
@@ -405,5 +434,50 @@ mod tests {
 
         let result = c.classify("bash_exec", &json!({"command": "DROP TABLE users"}));
         assert!(matches!(result, ClassifyResult::NeedsConfirm(_)));
+    }
+
+    /// 🟡#17 治本测试：恶意 YAML 不被静默吞
+    ///
+    /// 旧 `if let Ok(rules) = ...` 吞掉所有错配 YAML。
+    /// 治本：`load_user_rules` 内部显式 match，**真**记 `tracing::warn!` 后 return。
+    ///
+    /// 验证：能写出安全结构的反序列化（Vec<ActionPattern>）并在错误时返回 Err。
+    #[test]
+    fn safety_rules_struct_deserializes_valid_yaml() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct TestRules {
+            #[serde(default)]
+            hard_deny: Vec<String>,
+            #[serde(default)]
+            soft_deny: Vec<String>,
+            #[serde(default)]
+            allow: Vec<String>,
+        }
+        let yaml = r#"
+hard_deny: ["rm -rf /", "shutdown"]
+soft_deny: ["curl http://unknown"]
+allow: ["git status"]
+"#;
+        let r: TestRules = serde_yaml::from_str(yaml).expect("valid yaml should parse");
+        assert_eq!(r.hard_deny.len(), 2);
+        assert_eq!(r.soft_deny.len(), 1);
+        assert_eq!(r.allow.len(), 1);
+    }
+
+    #[test]
+    fn safety_rules_struct_rejects_malformed_yaml() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct TestRules {
+            #[serde(default)]
+            hard_deny: Vec<String>,
+        }
+        // hard_deny 是 list，给 string 应该是 Err
+        let bad = r#"
+hard_deny: "not a list"
+"#;
+        let r: Result<TestRules, _> = serde_yaml::from_str(bad);
+        assert!(r.is_err(), "malformed YAML must be rejected, not silently dropped");
     }
 }

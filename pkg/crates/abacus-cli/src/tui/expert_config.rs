@@ -23,20 +23,11 @@ use std::path::PathBuf;
 
 /// ~/.abacus/experts.yaml
 pub fn experts_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".abacus")
-        .join("experts.yaml")
+    abacus_core::paths::global_dir().join("config/experts.yaml")
 }
 
 fn ensure_abacus_dir() -> std::io::Result<()> {
-    let dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".abacus");
-    if !dir.exists() {
-        std::fs::create_dir_all(&dir)?;
-    }
-    Ok(())
+    abacus_core::paths::ensure_global_dirs()
 }
 
 // ─── 数据类型 ─────────────────────────────────────────────────────────────

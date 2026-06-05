@@ -194,7 +194,7 @@ pub enum ModelAction {
         #[arg(long)]
         path: Option<std::path::PathBuf>,
 
-        /// 同时把 union 写入 ~/.abacus/config.yaml 的 [available_models] 段
+        /// 同时把 union 写入 ~/.abacus/config.toml 的 [available_models] 段
         /// （首次配置默认行为；可手动用此 flag 触发刷新）
         #[arg(long)]
         write_config: bool,

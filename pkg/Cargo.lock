@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abacus-cli"
-version = "1.0.0"
+version = "1.5.0"
 dependencies = [
  "abacus-core",
  "abacus-orchestrator",
@@ -35,6 +35,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.1.14",
@@ -44,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-core"
-version = "1.0.0"
+version = "1.5.0"
 dependencies = [
  "abacus-types",
  "async-trait",
@@ -99,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-orchestrator"
-version = "1.0.0"
+version = "1.5.0"
 dependencies = [
  "abacus-core",
  "abacus-types",
@@ -116,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-server"
-version = "1.0.0"
+version = "1.5.0"
 dependencies = [
  "abacus-core",
  "abacus-orchestrator",
@@ -133,6 +134,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-util",
+ "toml",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
@@ -143,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-types"
-version = "1.0.0"
+version = "1.5.0"
 dependencies = [
  "dirs 5.0.1",
  "serde",

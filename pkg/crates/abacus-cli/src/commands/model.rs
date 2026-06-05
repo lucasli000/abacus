@@ -4,50 +4,48 @@ use crate::engine_init;
 use super::ModelAction;
 use std::path::PathBuf;
 
-/// 把 available_models 列表写入 ~/.abacus/config.yaml 的顶层 `available_models` 字段
+/// 把 available_models 列表写入 ~/.abacus/config.toml 的顶层 `available_models` 字段
 ///
 /// 行为：
-/// - 不存在 config.yaml → 创建（仅含 available_models）
-/// - 已存在 → 解析为 yaml::Value，更新/插入 available_models 字段，atomic 写回
+/// - 不存在 config.toml → 创建（仅含 available_models）
+/// - 已存在 → 解析为 toml::Value，更新/插入 available_models 字段，atomic 写回
 /// - 解析失败 → 备份原文件为 .bak，写入新内容
 fn write_available_models_to_config(models: &[String]) -> Result<PathBuf> {
     let cfg_path = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".abacus")
-        .join("config.yaml");
+        .join("config.toml");
 
     if let Some(parent) = cfg_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut root: serde_yaml::Value = if cfg_path.exists() {
+    let mut root: toml::Value = if cfg_path.exists() {
         let content = std::fs::read_to_string(&cfg_path)?;
-        match serde_yaml::from_str(&content) {
+        match toml::from_str(&content) {
             Ok(v) => v,
             Err(_) => {
                 // 解析失败：备份后从空开始
-                let bak = cfg_path.with_extension("yaml.bak");
+                let bak = cfg_path.with_extension("toml.bak");
                 let _ = std::fs::copy(&cfg_path, &bak);
-                serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+                toml::Value::Table(toml::map::Map::new())
             }
         }
     } else {
-        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        toml::Value::Table(toml::map::Map::new())
     };
 
-    if let serde_yaml::Value::Mapping(ref mut map) = root {
-        let yaml_models: Vec<serde_yaml::Value> = models.iter()
-            .map(|m| serde_yaml::Value::String(m.clone()))
+    if let toml::Value::Table(ref mut map) = root {
+        let arr: Vec<toml::Value> = models.iter()
+            .map(|m| toml::Value::String(m.clone()))
             .collect();
-        map.insert(
-            serde_yaml::Value::String("available_models".into()),
-            serde_yaml::Value::Sequence(yaml_models),
-        );
+        map.insert("available_models".into(), toml::Value::Array(arr));
     }
 
-    let serialized = serde_yaml::to_string(&root)?;
-    let tmp = cfg_path.with_extension("yaml.tmp");
+    let serialized = toml::to_string_pretty(&root)
+        .map_err(|e| color_eyre::eyre::eyre!("TOML serialize error: {e}"))?;
+    let tmp = cfg_path.with_extension("toml.tmp");
     std::fs::write(&tmp, serialized)?;
     std::fs::rename(&tmp, &cfg_path)?;
     Ok(cfg_path)
@@ -122,7 +120,7 @@ pub async fn handle_model(args: &super::ModelArgs, formatter: &mut Box<dyn Outpu
                     formatter.format_message("model",
                         &format!("Cache written to: {}", cache_path.display()), None);
 
-                    // --write-config: 把 union 写入 ~/.abacus/config.yaml [available_models]
+                    // --write-config: 把 union 写入 ~/.abacus/config.toml [available_models]
                     if *write_config {
                         match write_available_models_to_config(&cache.all_models()) {
                             Ok(path) => formatter.format_message("model",

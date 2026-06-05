@@ -254,17 +254,15 @@ impl SetupState {
 }
 
 fn config_dir() -> PathBuf {
-    std::env::var("ABACUS_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".abacus")
-        })
+    abacus_core::paths::global_dir()
 }
 
 fn config_path() -> PathBuf {
-    config_dir().join("config.yaml")
+    config_dir().join("config.toml")
+}
+
+fn provider_toml_path() -> PathBuf {
+    config_dir().join("provider.toml")
 }
 
 fn disclaimer_path() -> PathBuf {
@@ -272,6 +270,10 @@ fn disclaimer_path() -> PathBuf {
 }
 
 /// 检测是否已有有效 API 配置
+///
+/// 检查顺序：
+/// 1. 环境变量（ABACUS_API_KEY / DEEPSEEK_API_KEY / ANTHROPIC_API_KEY）
+/// 2. provider.toml 文件存在且包含 api_key
 pub fn has_api_config() -> bool {
     if std::env::var("ABACUS_API_KEY").is_ok()
         || std::env::var("DEEPSEEK_API_KEY").is_ok()
@@ -280,18 +282,20 @@ pub fn has_api_config() -> bool {
     {
         return true;
     }
-    if let Ok(content) = std::fs::read_to_string(config_path()) {
-        // M3 fix: 跳过注释行，仅匹配非空 api_key 赋值行
-        // 防止高级配置注释块（含 # openai_api_key: ""）触发误报
-        let has_real_key = content.lines().any(|line| {
-            let trimmed = line.trim();
-            !trimmed.starts_with('#')
-                && trimmed.contains("api_key:")
-                && !trimmed.contains("api_key: \"\"")
-                && !trimmed.contains("api_key: ''")
-        });
-        if has_real_key {
-            return true;
+    let provider_path = provider_toml_path();
+    if provider_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&provider_path) {
+            let has_key = content.lines().any(|line| {
+                let trimmed = line.trim();
+                !trimmed.starts_with('#')
+                    && trimmed.contains("api_key")
+                    && trimmed.contains('=')
+                    && !trimmed.ends_with("\"\"")
+                    && !trimmed.ends_with("''")
+            });
+            if has_key {
+                return true;
+            }
         }
     }
     false
@@ -304,9 +308,14 @@ pub fn disclaimer_accepted() -> bool {
 
 fn accept_disclaimer() {
     if let Some(parent) = disclaimer_path().parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            // 🟡#23：仅首次配置运行，不能因此 panic——给个 warning
+            eprintln!("⚠ abacus: cannot create config dir {}: {e}", parent.display());
+        }
     }
-    let _ = std::fs::write(disclaimer_path(), "accepted");
+    if let Err(e) = std::fs::write(disclaimer_path(), "accepted") {
+        eprintln!("⚠ abacus: cannot write disclaimer ack: {e}");
+    }
 }
 
 /// 解析上下文大小输入（单位 k token）
@@ -340,21 +349,12 @@ fn parse_context_k(s: &str) -> Option<u64> {
     })
 }
 
-/// YAML 字符串值转义（H1 fix）
-/// 转义双引号、反斜杠、换行，防止用户输入破坏 YAML 结构
-fn yaml_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-     .replace('"', "\\\"")
-     .replace('\n', "\\n")
-     .replace('\r', "\\r")
-}
 
 fn save_config(state: &SetupState) -> Result<(), String> {
     let provider = state.provider();
     let raw_url = if state.base_url.is_empty() {
         "https://api.openai.com".to_string()
     } else {
-        // M4 fix: 先 trim 空白，再剥离版本路径后缀，再 trim 尾斜杠
         let trimmed = state.base_url.trim();
         let stripped = trimmed
             .trim_end_matches('/')
@@ -367,166 +367,85 @@ fn save_config(state: &SetupState) -> Result<(), String> {
             .to_string();
         stripped
     };
-    // H1 fix: 所有用户输入字段写入 YAML 前转义
-    let base_url   = yaml_escape(&raw_url);
-    let api_key_e  = yaml_escape(&state.api_key);
-    let model_e    = yaml_escape(if state.model_name.is_empty() {
-        provider.default_model()
+    let base_url = raw_url.clone();
+    let api_key  = state.api_key.clone();
+    let resolved_model = if state.model_name.is_empty() {
+        provider.default_model().to_string()
     } else {
-        &state.model_name
-    });
+        state.model_name.clone()
+    };
 
-    // model_e / api_key_e / base_url 已在上方转义，resolved_model 仅用于 cw_tokens 查找
-    let resolved_model = model_e.as_str();
-
-    // 解析上下文配置
-    // context_window 为空 → 不写入 config，引擎从 model catalog 自动取模型最大值
     let cw_tokens_opt: Option<u64> = parse_context_k(&state.context_window)
         .map(|n| n.max(128_000));
     let cw_ratio = if state.context_window_use.is_empty() {
-        1.0f64 // 空 = 全用（不压缩）
+        1.0f64
     } else {
-        let cw_base = cw_tokens_opt.unwrap_or(u64::MAX); // 无上限时按用户指定值直接用
+        let cw_base = cw_tokens_opt.unwrap_or(u64::MAX);
         let use_tokens = parse_context_k(&state.context_window_use)
             .unwrap_or(128_000)
             .max(128_000);
         if cw_base == u64::MAX {
-            1.0 // 无法计算比例，全用
+            1.0
         } else {
             (use_tokens as f64 / cw_base as f64).min(1.0)
         }
     };
 
-    // context_window 行：仅在用户明确填写时写入；空 = 引擎从 model catalog 自动取
-    let cw_line = match cw_tokens_opt {
-        Some(n) => format!("  context_window: {}\n", n),
-        None    => String::new(),
-    };
-
-    // 2026-05-28: 新格式 — providers 数组 + 固化配置指引头部
     let provider_type_str = if provider.is_openai_compatible() {
         if base_url.contains("deepseek.com") { "deepseek" } else { "openai-compatible" }
     } else {
         "anthropic"
     };
 
-    // 生成可选功能注释
-    let features_section = {
-        let labels = ["skill_workflow", "auto_engine", "wasm_plugins", "mcp_servers"];
-        let comments = [
-            "# Skill Workflow — 将 Skill 工作流注册为工具，支持多步骤编排",
-            "# AutoEngine — 后台定时/条件触发任务调度器",
-            "# WASM Plugins — WebAssembly 沙箱，运行第三方插件",
-            "# MCP Servers — 连接外部数据源和服务的 MCP 协议",
-        ];
-        let mut lines: Vec<String> = Vec::new();
-        lines.push("\n# ─── 可选功能 ─────────────────────────────────────────────────────────────────\n".to_string());
-        for (i, label) in labels.iter().enumerate() {
-            let enabled = state.feature_toggles[i];
-            lines.push(comments[i].to_string());
-            match *label {
-                "skill_workflow" => {
-                    if enabled {
-                        lines.push("core.skill_workflow_enabled: true".to_string());
-                    } else {
-                        lines.push("# core.skill_workflow_enabled: false".to_string());
-                    }
-                }
-                "auto_engine" => {
-                    lines.push("# auto:".to_string());
-                    lines.push(if enabled {
-                        "#   persist_path: ~/.abacus/auto.db".to_string()
-                    } else {
-                        "#   # persist_path: ~/.abacus/auto.db".to_string()
-                    });
-                }
-                "wasm_plugins" => {
-                    lines.push("# core.plugins:".to_string());
-                    lines.push(if enabled {
-                        "#   base_dir: ~/.abacus/plugins".to_string()
-                    } else {
-                        "#   # base_dir: ~/.abacus/plugins".to_string()
-                    });
-                    lines.push(if enabled {
-                        "#   signing_required: true".to_string()
-                    } else {
-                        "#   # signing_required: true".to_string()
-                    });
-                }
-                "mcp_servers" => {
-                    lines.push("# mcp:".to_string());
-                    lines.push("#   servers:".to_string());
-                    if enabled {
-                        lines.push("#     - id: example-server".to_string());
-                        lines.push("#       transport: stdio".to_string());
-                        lines.push("#       command: npx".to_string());
-                        lines.push("#       args: [\"-y\", \"@modelcontextprotocol/server-example\"]".to_string());
-                    } else {
-                        lines.push("#     # 示例：".to_string());
-                        lines.push("#     # - id: my-server".to_string());
-                        lines.push("#     #   transport: stdio".to_string());
-                        lines.push("#     #   command: npx".to_string());
-                        lines.push("#     #   args: [\"-y\", \"@modelcontextprotocol/server-example\"]".to_string());
-                    }
-                }
-                _ => {}
-            }
-            lines.push(String::new());
-        }
-        lines.join("\n")
+    // ── 写入 provider.toml（供应商配置，TOML 格式） ──
+    save_provider_toml(
+        &provider_toml_path(),
+        provider_type_str,
+        &api_key,
+        &base_url,
+        &resolved_model,
+    )?;
+
+    // ── 写入 config.toml（全局行为配置，不含 providers） ──
+    //
+    // 用 toml::Value 程序化构建 → toml::to_string_pretty 输出
+    // 完全消除 YAML 缩进敏感 + 字符串转义漏洞。
+    // 保留用户原值：若 config.toml 已存在，先 load 一次以保留未识别字段。
+    let mut root: toml::Value = if config_path().exists() {
+        std::fs::read_to_string(config_path())
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()))
+    } else {
+        toml::Value::Table(toml::map::Map::new())
     };
 
-    let yaml = format!(
-        r#"# ╔═══════════════════════════════════════════════════════════════════════════════╗
-# ║  ABACUS 配置文件 (config.yaml)                                              ║
-# ╠═══════════════════════════════════════════════════════════════════════════════╣
-# ║                                                                             ║
-# ║  providers:                   # 供应商列表（按优先级排序）                   ║
-# ║    - id: <唯一标识>           # 供应商 ID（用于 /model 切换）                ║
-# ║      type: <协议类型>         # anthropic | openai-compatible | deepseek     ║
-# ║      api_key: <密钥>         # 明文 或 env:ENV_VAR（从环境变量读取）         ║
-# ║      base_url: <端点>        # API 地址（可选，各 type 有默认值）            ║
-# ║      models:                  # 模型列表（简写或详写）                       ║
-# ║        - model-name           # 简写：用 provider 默认参数                   ║
-# ║        - name: model-name     # 详写：覆盖参数（未指定的用默认值）           ║
-# ║          context_window: N    #   上下文窗口（token 数）                     ║
-# ║          max_tokens: N        #   单次最大输出 token                         ║
-# ║          temperature: 0.0-2.0 #   生成温度                                  ║
-# ║          thinking: off|adaptive|low|medium|high|max                         ║
-# ║                                                                             ║
-# ║  core:                        # 全局运行参数                                 ║
-# ║    default_model: <model>     # 默认模型                                    ║
-# ║    stream: true               # 流式输出                                    ║
-# ║                                                                             ║
-# ║  fallback_chain: [id1, id2]   # 回退链（不可达时按序尝试下一个）             ║
-# ║                                                                             ║
-# ║  TUI: /model <provider>/<model> 切换 | /model list 查看可用                 ║
-# ║  参数规则: 未指定的参数使用 provider/模型内置默认值                          ║
-# ║                                                                             ║
-# ╚═══════════════════════════════════════════════════════════════════════════════╝
+    // core 段
+    {
+        let core = ensure_table(&mut root, "core");
+        core.insert("default_model".into(), toml::Value::String(resolved_model.clone()));
+        core.insert("stream".into(), toml::Value::Boolean(true));
+        if let Some(n) = cw_tokens_opt {
+            core.insert("context_window".into(), toml::Value::Integer(n as i64));
+        }
+        core.insert("context_window_ratio".into(), toml::Value::Float(cw_ratio));
+    }
 
-# ─── 供应商配置 ─────────────────────────────────────────────────────────────────
-providers:
-  - id: primary
-    type: {}
-    api_key: "{}"
-    base_url: "{}"
-    models:
-      - {}
-
-# ─── 全局设置 ───────────────────────────────────────────────────────────────────
-core:
-  default_model: "{}"
-  stream: true
-{}  context_window_ratio: {:.4}
-{}"#,
-        provider_type_str, api_key_e, base_url, resolved_model,
-        resolved_model, cw_line, cw_ratio, features_section,
-    );
+    // 可选 feature 段（按 UI 勾选状态写最小可用模板）
+    {
+        let core = ensure_table(&mut root, "core");
+        // core.skill_workflow_enabled
+        let skill_enabled = state.feature_toggles.get(0).copied().unwrap_or(false);
+        core.insert("skill_workflow_enabled".into(), toml::Value::Boolean(skill_enabled));
+        // 其它三个 feature 走空 section 占位（用户可后续手工编辑）
+    }
 
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
-    std::fs::write(config_path(), &yaml).map_err(|e| format!("写入失败: {e}"))?;
+    let serialized = toml::to_string_pretty(&root)
+        .map_err(|e| format!("config.toml 序列化失败: {e}"))?;
+    std::fs::write(config_path(), &serialized)
+        .map_err(|e| format!("写入 config.toml 失败: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -534,6 +453,164 @@ core:
             let mut perms = meta.permissions();
             perms.set_mode(0o600);
             let _ = std::fs::set_permissions(config_path(), perms);
+        }
+    }
+
+    // 首次配置后：补全其它默认配置模板（用户可后续编辑）
+    // 静默失败：若文件已存在则跳过
+    ensure_default_configs()?;
+
+    Ok(())
+}
+
+/// 首次配置后补全默认配置文件（不覆盖已有文件）
+///
+/// 生成：
+/// - `security.toml`  ：MCIP / 沙箱 / 输入长度等安全相关默认值 + 注释
+/// - `models.toml`    ：模型能力 catalog 覆盖示例（注释为主）
+/// - `mcp_servers.toml`：MCP server 列表（空 + 注释）
+///
+/// ## 行为
+/// - 文件存在 → 跳过（用户可能手工编辑过）
+/// - 父目录不存在 → 自动创建
+/// - 失败 → 返回 `Err` 但不 panic（让 setup wizard 继续）
+fn ensure_default_configs() -> Result<(), String> {
+    use abacus_core::paths;
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+
+    // security.toml — 安全 / MCIP 权限 / 沙箱
+    let security_path = paths::security_toml();
+    if !security_path.exists() {
+        let template = r#"# Abacus 安全配置 (security.toml)
+# 所有 safety / mcip / sandbox 相关配置
+# 引用关系：engine_init 启动时 load_file() 读入
+# 修改后下次启动生效（或通过 /reload 命令热加载部分字段）
+
+[safety]
+# max_input_length = 100000   # 单条消息最大字符数
+# max_tool_calls = 500        # 单任务最大工具调用数
+# allowed_roots = ["~/"]      # 文件工具可访问的根目录列表
+
+[mcip]
+# exempt_prefixes = []        # 工具名豆免前缀（命中后跳过权限检查）
+# allow_tools = []            # 白名单（精确匹配）
+# deny_tools = []             # 黑名单（永久拒绝）
+
+[sandbox]
+# max_retries_per_step = 2
+# default_timeout_secs = 120
+# verify_model = "deepseek-v4-flash"  # 沙箱结果回查使用的模型
+
+[server]
+# max_sessions = 1000
+# rate_limit_per_sec = 60
+# silent_router_enabled = true
+"#;
+        std::fs::write(&security_path, template)
+            .map_err(|e| format!("写入 security.toml 失败: {e}"))?;
+    }
+
+    // models.toml — 模型能力 catalog 覆盖
+    let models_path = paths::models_toml();
+    if !models_path.exists() {
+        let template = r#"# Abacus 模型能力覆盖 (models.toml)
+# 覆盖内置 ModelCatalog 的 per-model 参数（context_window / max_output_tokens / thinking_capabilities）
+# 适用场景：用户自有 endpoint / 第三方代理 / 内置模型规格过时
+# 引用关系：engine_init 启动时 ModelCatalog::merge_toml() 合并
+
+# [models."custom-local-llama-3"]
+# context_window = 32000
+# max_output_tokens = 4096
+# thinking_capabilities = { supported_modes = ["enabled_toggle"], default_mode = "enabled_toggle", multi_turn_replay = "reasoning_content" }
+"#;
+        std::fs::write(&models_path, template)
+            .map_err(|e| format!("写入 models.toml 失败: {e}"))?;
+    }
+
+    // mcp_servers.toml — MCP server 列表
+    let mcp_path = dir.join("mcp_servers.toml");
+    if !mcp_path.exists() {
+        let template = r#"# Abacus MCP 服务器配置 (mcp_servers.toml)
+# 通过 `abacus mcp add <id> --command <cmd>` 自动追加
+# 或手工编辑添加 [[servers]] 条目
+
+# [[servers]]
+# id = "example-server"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-example"]
+# env = { KEY = "value" }
+"#;
+        std::fs::write(&mcp_path, template)
+            .map_err(|e| format!("写入 mcp_servers.toml 失败: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// 在 toml::Value::Table 中按 key 取/建子 table，返回可变引用
+fn ensure_table<'a>(root: &'a mut toml::Value, key: &str) -> &'a mut toml::map::Map<String, toml::Value> {
+    if !root.is_table() {
+        *root = toml::Value::Table(toml::map::Map::new());
+    }
+    let table = root.as_table_mut().expect("just ensured is_table");
+    if !table.contains_key(key) {
+        table.insert(key.to_string(), toml::Value::Table(toml::map::Map::new()));
+    }
+    table.get_mut(key)
+        .and_then(|v| v.as_table_mut())
+        .expect("just inserted as table")
+}
+
+/// 写入 provider.toml（供应商配置，TOML 格式）
+///
+/// TOML 无缩进问题，`[[providers]]` 语法天然支持多 provider 数组。
+/// 用 `toml::Value` 程序化构建以彻底消除字符串注入漏洞——`api_key` 可能含
+/// `"` / `\` / 换行等特殊字符，原 `format!` 模板会把这些原样写进 TOML，
+/// 后续 `load_provider_file` 解析失败 → 用户密钥静默丢失。
+fn save_provider_toml(
+    path: &std::path::Path,
+    provider_type: &str,
+    api_key: &str,
+    base_url: &str,
+    model: &str,
+) -> Result<(), String> {
+    let mut primary = toml::map::Map::new();
+    primary.insert("id".into(), toml::Value::String("primary".into()));
+    primary.insert("type".into(), toml::Value::String(provider_type.into()));
+    primary.insert("api_key".into(), toml::Value::String(api_key.into()));
+    primary.insert("base_url".into(), toml::Value::String(base_url.into()));
+    primary.insert(
+        "models".into(),
+        toml::Value::Array(vec![toml::Value::String(model.into())]),
+    );
+
+    let mut root = toml::map::Map::new();
+    root.insert(
+        "providers".into(),
+        toml::Value::Array(vec![toml::Value::Table(primary)]),
+    );
+
+    let header = "# Abacus 供应商配置 (provider.toml)\n\
+                  # 所有 LLM provider 及其模型参数均在此文件配置\n\
+                  # 格式：TOML — 无缩进问题，[[providers]] 支持多供应商\n\
+                  \n";
+    let body = toml::to_string_pretty(&toml::Value::Table(root))
+        .map_err(|e| format!("provider.toml 序列化失败: {e}"))?;
+    let toml_content = format!("{header}{body}");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    std::fs::write(path, &toml_content).map_err(|e| format!("写入 provider.toml 失败: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(path, perms);
         }
     }
     Ok(())
@@ -1149,7 +1226,7 @@ fn render_features_page(f: &mut Frame, state: &SetupState) {
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " 以下功能可按需启用，也可之后通过 /set 或 config.yaml 更改",
+            " 以下功能可按需启用，也可之后通过 /set 或 config.toml 更改",
             Style::default().fg(theme.muted),
         ))),
         parts[0],

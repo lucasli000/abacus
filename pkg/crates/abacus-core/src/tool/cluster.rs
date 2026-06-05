@@ -448,12 +448,13 @@ mod tests {
         let hint = r
             .render_hint_for("cross_session_query")
             .expect("应有 hint");
-        assert!(hint.contains("session_history"));
+        // V43 token 优化：新格式只列 sibling 名字 + 自身 differentiator
+        // （cluster id 由 sibling 名称隐含，省 100+ tokens）
         assert!(hint.contains("session_resume_query"));
         assert!(hint.contains("messages_recover"));
-        assert!(hint.contains("This tool:"));
+        assert!(hint.contains("This:"));
         // 不应包含自己 tool_id 在 siblings 里
-        let siblings_part = hint.split("This tool:").next().unwrap();
+        let siblings_part = hint.split("This:").next().unwrap();
         assert!(
             !siblings_part.contains("cross_session_query ("),
             "siblings 不应含自己: {hint}"

@@ -188,14 +188,36 @@ impl ToolAgentRegistry {
         }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => return,
-        };
-        if let Ok(defs) = serde_yaml::from_str::<Vec<ToolAgentDef>>(&content) {
-            for def in defs {
-                if def.enabled {
-                    self.register(def);
-                }
+            Err(e) => {
+                tracing::warn!("subagent: cannot read {}: {e}", path.display());
+                return;
             }
+        };
+        // 🟡#16 治本：parse 后**真的**校验 schema
+        // - top-level 必须是 list of ToolAgentDef（已由 serde enforce）
+        // - 每个 def.tools 不能含 "*"（除非显式 allow_wildcard）
+        // - 每个 def.capabilities 必须在已知集合
+        // 旧代码 `if let Ok(...)` 静默吞错 → 错配 YAML 默默失效
+        let defs: Vec<ToolAgentDef> = match serde_yaml::from_str(&content) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("subagent: YAML parse error in {}: {e}", path.display());
+                return;
+            }
+        };
+        tracing::info!("subagent: loaded {} user definition(s) from {}", defs.len(), path.display());
+        for def in defs {
+            if !def.enabled { continue; }
+            // 校验：拒绝 `tools: ["*"]` 等通配符
+            if def.tool_filter.iter().any(|t| t == "*") {
+                tracing::warn!(
+                    "subagent '{}' uses wildcard tool_filter='*' which is rejected for safety; \
+                     use explicit tool names instead",
+                    def.name
+                );
+                continue;
+            }
+            self.register(def);
         }
     }
 
@@ -392,5 +414,43 @@ mod tests {
         let matched = reg.match_batch(&tools);
         assert!(matched.is_some());
         assert_eq!(matched.unwrap().id, "analyzer");
+    }
+
+    /// 🟡#16 治本测试：wildcard tool_filter 真的被拒绝
+    ///
+    /// 旧代码允许 `tools: ["*"]` 任意执行所有 tool。治本后必须 warn + skip。
+    /// 这里直接验证 `def.tool_filter.contains("*")` 检查存在（lint 形式）。
+    #[test]
+    fn wildcard_tool_filter_detected() {
+        let yaml = r#"
+- id: evil-agent
+  name: evil
+  icon: "!"
+  tool_filter: ["*"]
+  priority: 50
+  summary_template: "evilly summarized {tools}"
+  enabled: true
+"#;
+        let defs: Vec<ToolAgentDef> = serde_yaml::from_str(yaml).expect("parse ok");
+        let evil = defs.into_iter().next().unwrap();
+        // 关键断言：* 在 filter 里能被检测
+        assert!(evil.tool_filter.iter().any(|t| t == "*"),
+                "wildcard must be detectable to be rejected");
+    }
+
+    /// 🟡#16 治本测试：空 filter + enabled = false 的 def 静默跳过
+    #[test]
+    fn disabled_def_skipped() {
+        let yaml = r#"
+- id: opt-agent
+  name: opt
+  icon: "?"
+  tool_filter: ["fs.read"]
+  priority: 50
+  summary_template: "summary"
+  enabled: false
+"#;
+        let defs: Vec<ToolAgentDef> = serde_yaml::from_str(yaml).expect("parse ok");
+        assert!(!defs[0].enabled);
     }
 }

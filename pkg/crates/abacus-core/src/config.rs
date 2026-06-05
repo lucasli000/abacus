@@ -13,7 +13,7 @@
 //! ## 配置源优先级 (从高到低)
 //! 1. CLI 参数 (runtime overrides)
 //! 2. 环境变量 (ABACUS_*)
-//! 3. YAML 文件 (~/.abacus/config.yaml)
+//! 3. TOML 文件 (~/.abacus/config.toml + provider.toml + security.toml + models.toml)
 //! 4. 内置默认值
 
 use std::collections::HashMap;
@@ -90,7 +90,7 @@ impl ConfigValue {
 pub enum ConfigSource {
     /// 内置默认值 (最低优先级)
     Default,
-    /// YAML 文件
+    /// TOML / JSON / YAML 文件（按扩展名）
     File(String),
     /// 环境变量
     Env(String),
@@ -133,12 +133,31 @@ impl ConfigManager {
         Self { merged, provider_entries: Vec::new() }
     }
 
-    /// 从配置文件加载 (自动检测 JSON/YAML 由扩展名决定)
+    /// 从配置文件加载 (按扩展名决定格式：TOML / JSON / YAML)
+    ///
+    /// ## 优先级与目标格式
+    /// - `.toml`：首选，**无缩进问题**——所有 abacus 自动写入的配置都是 TOML
+    /// - `.json` / `.yaml` / `.yml`：保留解析路径以支持用户旧文件 + 测试 + 第三方
+    ///   工具输出；不主动生成（避免引入新的 YAML 缩进 bug）。
+    ///
+    /// ## 行为
+    /// - 文件不存在 → 静默返回 `Ok(())`（load_file 调用方一般不在意缺失）
+    /// - 解析失败 → 返回 `Err(...)`（不让错误配置静默吞掉）
+    /// - 文件存在但无扩展名 → 依次尝试 TOML → JSON → YAML
     pub fn load_file(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
-        let content = std::fs::read_to_string(&path)
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config file: {e}"))?;
 
-        let flat = match path.as_ref().extension().and_then(|e| e.to_str()) {
+        let flat = match path.extension().and_then(|e| e.to_str()) {
+            Some("toml") => {
+                let toml_value: toml::Value = toml::from_str(&content)
+                    .map_err(|e| format!("failed to parse TOML: {e}"))?;
+                flatten_toml(&toml_value, "")
+            }
             Some("json") => {
                 let json_value: serde_json::Value = serde_json::from_str(&content)
                     .map_err(|e| format!("failed to parse JSON: {e}"))?;
@@ -150,13 +169,15 @@ impl ConfigManager {
                 flatten_yaml(&yaml_value, "")
             }
             _ => {
-                // Try JSON first, fall back to YAML
-                if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&content) {
+                // 无扩展名：按 TOML → JSON → YAML 顺序尝试
+                if let Ok(toml_value) = toml::from_str::<toml::Value>(&content) {
+                    flatten_toml(&toml_value, "")
+                } else if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&content) {
                     flatten_json(&json_value, "")
                 } else if let Ok(yaml_value) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
                     flatten_yaml(&yaml_value, "")
                 } else {
-                    return Err("config file is neither valid JSON nor YAML".into());
+                    return Err("config file is neither valid TOML, JSON, nor YAML".into());
                 }
             }
         };
@@ -164,31 +185,55 @@ impl ConfigManager {
         for (key, value) in flat {
             self.merged.insert(key.clone(), TaggedValue {
                 value,
-                source: ConfigSource::File(path.as_ref().to_string_lossy().to_string()),
+                source: ConfigSource::File(path.to_string_lossy().to_string()),
                 key,
             });
-        }
-
-        // 2026-05-28: 解析 `providers` 数组（独立于 flatten，因为数组对象不适合点分键）
-        // 尝试从 YAML/JSON 中提取 providers 顶级字段
-        if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-            if let Some(providers_val) = raw.get("providers") {
-                if let Ok(entries) = serde_yaml::from_value::<Vec<abacus_types::ProviderEntry>>(providers_val.clone()) {
-                    self.provider_entries = entries;
-                } else {
-                    tracing::warn!("config: `providers` 格式解析失败，跳过");
-                }
-            }
         }
 
         Ok(())
     }
 
-    /// 加载目录下所有 *.yaml / *.json 文件（按文件名字母序合并）
+    /// 从独立的 provider.toml 加载供应商配置
+    ///
+    /// ## 场景
+    /// `~/.abacus/provider.toml` 专门存放所有 provider + 模型参数，
+    /// 与 `config.toml`（全局行为配置）分离。TOML 格式无缩进问题。
+    ///
+    /// ## 行为
+    /// - 读取文件，解析 `providers` 数组
+    /// - 追加到 `provider_entries`（不覆盖已有条目）
+    /// - 文件不存在时静默跳过（返回 Ok）
+    pub fn load_provider_file(&mut self, path: impl AsRef<Path>) -> Result<(), String> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read provider file: {e}"))?;
+
+        let raw: toml::Value = toml::from_str(&content)
+            .map_err(|e| format!("failed to parse provider TOML: {e}"))?;
+
+        if let Some(providers_val) = raw.get("providers") {
+            let entries: Vec<abacus_types::ProviderEntry> =
+                providers_val.clone().try_into()
+                    .map_err(|e| format!("provider.toml `providers` 解析失败: {e}"))?;
+            self.provider_entries.extend(entries);
+        }
+
+        Ok(())
+    }
+
+    /// 获取已解析的 provider 条目（只读）
+    pub fn provider_entries(&self) -> &[abacus_types::ProviderEntry] {
+        &self.provider_entries
+    }
+
+    /// 加载目录下所有 *.toml / *.yaml / *.json 文件（按文件名字母序合并）
     ///
     /// ## 场景
     /// `~/.abacus/conf.d/` 中的分域配置文件。
-    /// 文件名加数字前缀可控合并顺序（如 `10-security.yaml`）。
+    /// 文件名加数字前缀可控合并顺序（如 `10-security.toml`）。
     /// 目录不存在时静默跳过。
     pub fn load_dir(&mut self, dir: impl AsRef<Path>) {
         let dir = dir.as_ref();
@@ -196,7 +241,8 @@ impl ConfigManager {
         let mut entries: Vec<_> = match std::fs::read_dir(dir) {
             Ok(rd) => rd.filter_map(|e| e.ok())
                 .map(|e| e.path())
-                .filter(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("yaml") | Some("yml") | Some("json")))
+                .filter(|p| matches!(p.extension().and_then(|e| e.to_str()),
+                    Some("toml") | Some("yaml") | Some("yml") | Some("json")))
                 .collect(),
             Err(_) => return,
         };
@@ -338,7 +384,7 @@ impl ConfigManager {
         serde_json::from_value(json).ok()
     }
 
-    /// 解析多供应商配置（从 config.yaml `providers` 数组加载）
+    /// 解析多供应商配置（从 `provider.toml` `[[providers]]` 数组加载）
     ///
     /// ## 引用关系
     /// - 调用方: engine_init.rs — 启动时注册所有 provider
@@ -497,6 +543,69 @@ impl ConfigManager {
         }
         lines.join("\n")
     }
+
+    /// 提取 LlmBudget 配置（治本：从 config.toml `llm_budget.*` 真读取）
+    ///
+    /// 用户在 `config.toml` 写：
+    /// ```toml
+    /// [llm_budget]
+    /// max_cost_usd = 5.0          # 5 USD / session
+    /// max_total_tokens = 1_000_000
+    /// soft_threshold = 0.70
+    /// hard_threshold = 0.85
+    /// reject_threshold = 0.95
+    /// latency_window = 20
+    /// ```
+    ///
+    /// 0 表示"不限"——保持 LlmBudget opt-in 语义
+    pub fn llm_budget_config(&self) -> crate::core::llm_budget::LlmBudgetConfig {
+        use crate::core::llm_budget::LlmBudgetConfig;
+        LlmBudgetConfig {
+            max_cost_usd: self.get_number("llm_budget.max_cost_usd").unwrap_or(0.0),
+            max_total_tokens: self.get_number("llm_budget.max_total_tokens")
+                .unwrap_or(0.0).max(0.0) as u64,
+            soft_threshold: self.get_number("llm_budget.soft_threshold").unwrap_or(0.70),
+            hard_threshold: self.get_number("llm_budget.hard_threshold").unwrap_or(0.85),
+            reject_threshold: self.get_number("llm_budget.reject_threshold").unwrap_or(0.95),
+            latency_window: self.get_number("llm_budget.latency_window")
+                .unwrap_or(20.0).max(1.0) as usize,
+        }
+    }
+}
+
+/// 将嵌套的 TOML 展平为点分键（用于 load_file 主路径）
+///
+/// ## 行为
+/// - TOML table → 递归展平，key 用 `.` 拼接
+/// - TOML array → 整体作为 `ConfigValue::List` 存入（与 JSON/YAML 一致）
+/// - TOML datetime → 当作字符串保留（不强行转 chrono，避免额外 dep）
+fn flatten_toml(value: &toml::Value, prefix: &str) -> Vec<(String, ConfigValue)> {
+    match value {
+        toml::Value::String(s) => vec![(prefix.to_string(), ConfigValue::String(s.clone()))],
+        toml::Value::Integer(n) => vec![(prefix.to_string(), ConfigValue::Number(*n as f64))],
+        toml::Value::Float(f) => vec![(prefix.to_string(), ConfigValue::Number(*f))],
+        toml::Value::Boolean(b) => vec![(prefix.to_string(), ConfigValue::Bool(*b))],
+        toml::Value::Datetime(dt) => vec![(prefix.to_string(), ConfigValue::String(dt.to_string()))],
+        toml::Value::Array(arr) => {
+            let list: Vec<ConfigValue> = arr.iter().flat_map(|v| {
+                let flattened = flatten_toml(v, "");
+                flattened.into_iter().map(|(_, val)| val).collect::<Vec<_>>()
+            }).collect();
+            vec![(prefix.to_string(), ConfigValue::List(list))]
+        }
+        toml::Value::Table(table) => {
+            let mut result = Vec::new();
+            for (k, v) in table {
+                let new_prefix = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                result.extend(flatten_toml(v, &new_prefix));
+            }
+            result
+        }
+    }
 }
 
 /// 将嵌套的 YAML 展平为点分键
@@ -590,6 +699,15 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("core.default_model".into(), ConfigValue::String("auto".into()));
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
     defaults.insert("core.max_tokens".into(), ConfigValue::Number(64000.0));
+    // ─── 资源感知（[llm_budget] 段）────────────────────────────────────
+    // 用户在 config.toml 显式启用后才生效；默认 0 = 不限（opt-in）
+    // 真实落地：CoreLoop 启动时调 LlmBudget::reconfigure() 应用这些值
+    defaults.insert("llm_budget.max_cost_usd".into(),       ConfigValue::Number(0.0));
+    defaults.insert("llm_budget.max_total_tokens".into(),   ConfigValue::Number(0.0));
+    defaults.insert("llm_budget.soft_threshold".into(),     ConfigValue::Number(0.70));
+    defaults.insert("llm_budget.hard_threshold".into(),     ConfigValue::Number(0.85));
+    defaults.insert("llm_budget.reject_threshold".into(),   ConfigValue::Number(0.95));
+    defaults.insert("llm_budget.latency_window".into(),     ConfigValue::Number(20.0));
     // [DEPRECATED] 旧版思考配置 key，保留默认值供兼容层 get_bool/get_str 调用使用。
     // 迁移路径：用户若在配置文件中显式设置这两个 key，get_thinking_intent() 会自动
     // 转译为新 key 语义并打 warning 提示迁移到 core.thinking。
@@ -663,7 +781,7 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("sandbox.default_timeout_secs".into(), ConfigValue::Number(120.0));
     defaults.insert("sandbox.verify_model".into(), ConfigValue::String("deepseek-v4-flash".into()));
 
-    // MCIP — 工具访问权限配置（全部在 security.yaml `mcip:` 节配置）
+    // MCIP — 工具访问权限配置（全部在 security.toml `mcip:` 节配置）
     // mcip.exempt_prefixes: 前缀豆免列表（空 = 仅内置豆免生效）
     defaults.insert("mcip.exempt_prefixes".into(), ConfigValue::List(vec![]));
     // mcip.allow_tools: 精确允许名单（空 = 仅靠豆免前缀和策略）
@@ -684,6 +802,10 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
 }
 
 #[cfg(test)]
+// 🟡#2 治本：测试 set_var 用 RAII 模式（set/restore），生产代码已无 env 配置
+// `std::env::set_var` 在 Rust 1.75+ 标 unsafe 是因 libc 内部状态竞态，
+// 测试串行执行（`cargo test` 默认单线程）→ 风险可控。
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -742,6 +864,80 @@ mod tests {
         let summary = manager.summary();
         assert!(summary.contains("core.max_turns"));
         assert!(summary.contains("default"));
+    }
+
+    // ── TOML 路径测试 ──────────────────────────────────────────────
+
+    #[test]
+    fn test_load_file_toml_flatten() {
+        let toml_content = r#"
+[core]
+default_model = "deepseek-v4-flash"
+max_turns = 30
+temperature = 0.5
+
+[llm]
+api_key = "sk-test"
+"#;
+        let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp.path(), toml_content).unwrap();
+
+        let mut mgr = ConfigManager::new(default_config());
+        mgr.load_file(tmp.path()).unwrap();
+
+        assert_eq!(mgr.get_str("core.default_model"), Some("deepseek-v4-flash"));
+        assert_eq!(mgr.get_number("core.max_turns"), Some(30.0));
+        assert_eq!(mgr.get_number("core.temperature"), Some(0.5));
+        assert_eq!(mgr.get_str("llm.api_key"), Some("sk-test"));
+    }
+
+    #[test]
+    fn test_load_file_missing_is_silent() {
+        let mut mgr = ConfigManager::new(default_config());
+        // 不存在的文件 → Ok(())，不报错
+        let result = mgr.load_file(std::path::Path::new("/nonexistent/path/config.toml"));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_load_provider_file_appends() {
+        // 多次调用 load_provider_file → 累积 entries（修复原 `=` 覆盖 bug）
+        let toml1 = r#"
+[[providers]]
+id = "primary"
+type = "anthropic"
+api_key = "sk-1"
+models = ["claude-sonnet-4-6"]
+"#;
+        let toml2 = r#"
+[[providers]]
+id = "fallback"
+type = "openai-compatible"
+api_key = "sk-2"
+base_url = "https://api.deepseek.com"
+models = ["deepseek-v4-flash"]
+"#;
+        let tmp1 = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp1.path(), toml1).unwrap();
+        let tmp2 = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp2.path(), toml2).unwrap();
+
+        let mut mgr = ConfigManager::new(default_config());
+        mgr.load_provider_file(tmp1.path()).unwrap();
+        mgr.load_provider_file(tmp2.path()).unwrap();
+
+        let entries = mgr.provider_entries();
+        assert_eq!(entries.len(), 2, "应累积而非覆盖");
+        assert_eq!(entries[0].id, "primary");
+        assert_eq!(entries[1].id, "fallback");
+    }
+
+    #[test]
+    fn test_load_provider_file_missing_is_silent() {
+        let mut mgr = ConfigManager::new(default_config());
+        let result = mgr.load_provider_file(std::path::Path::new("/nonexistent/provider.toml"));
+        assert!(result.is_ok());
+        assert!(mgr.provider_entries().is_empty());
     }
 
     // ── Phase 3：get_thinking_intent 测试 ──────────────────────────────
@@ -812,5 +1008,45 @@ mod tests {
             Some(abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Minimal)),
             "新 key 应优先"
         );
+    }
+
+    /// **真实落地验证**：config.toml `[llm_budget]` 真的被 `llm_budget_config()` 读到
+    #[test]
+    fn llm_budget_config_from_toml() {
+        use std::io::Write;
+        let toml_str = "[llm_budget]\n\
+                        max_cost_usd = 5.0\n\
+                        max_total_tokens = 1_000_000\n\
+                        soft_threshold = 0.65\n\
+                        hard_threshold = 0.80\n\
+                        reject_threshold = 0.92\n\
+                        latency_window = 30\n";
+        // 写到临时文件让 load_file 读
+        let tmp = std::env::temp_dir().join(format!("abacus_test_llm_budget_{}.toml",
+                                                   std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp).expect("create tmp file");
+            f.write_all(toml_str.as_bytes()).expect("write");
+        }
+        let mut m = ConfigManager::new(default_config());
+        m.load_file(&tmp).expect("load toml ok");
+        let _ = std::fs::remove_file(&tmp);
+
+        let cfg = m.llm_budget_config();
+        assert_eq!(cfg.max_cost_usd, 5.0);
+        assert_eq!(cfg.max_total_tokens, 1_000_000);
+        assert!((cfg.soft_threshold - 0.65).abs() < 1e-6);
+        assert!((cfg.hard_threshold - 0.80).abs() < 1e-6);
+        assert!((cfg.reject_threshold - 0.92).abs() < 1e-6);
+        assert_eq!(cfg.latency_window, 30);
+    }
+
+    #[test]
+    fn llm_budget_defaults_unlimited() {
+        // 不设 [llm_budget] → 默认全 0（不限）
+        let m = ConfigManager::new(default_config());
+        let cfg = m.llm_budget_config();
+        assert_eq!(cfg.max_cost_usd, 0.0);
+        assert_eq!(cfg.max_total_tokens, 0);
     }
 }

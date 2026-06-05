@@ -609,12 +609,13 @@ impl AbacusServer {
         let mut cfg_mgr = ConfigManager::new(default_config());
         cfg_mgr.load_env("ABACUS_");
 
-        // 配置加载顺序：默认层 < models.yaml < config.yaml < security.yaml < conf.d/*.yaml < 环境变量
+        // 配置加载顺序：默认层 < models.toml < config.toml < security.toml < provider.toml < conf.d/*.toml < 环境变量
         // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
         use abacus_core::paths;
-        let _ = cfg_mgr.load_file(paths::models_yaml());
-        let _ = cfg_mgr.load_file(paths::config_yaml());
-        let _ = cfg_mgr.load_file(paths::security_yaml());
+        let _ = cfg_mgr.load_file(paths::models_toml());
+        let _ = cfg_mgr.load_file(paths::config_toml());
+        let _ = cfg_mgr.load_file(paths::security_toml());
+        let _ = cfg_mgr.load_provider_file(paths::provider_toml());
         cfg_mgr.load_dir(paths::conf_d_dir());
 
         let default_model = cfg_mgr.get_str("core.default_model")
@@ -664,17 +665,17 @@ impl AbacusServer {
             ..Default::default()
         });
 
-        // Phase 3：模型能力 catalog——builtin + ~/.abacus/models.yaml 覆盖
+        // Phase 3：模型能力 catalog——builtin + ~/.abacus/models.toml 覆盖
         let mut catalog = abacus_core::llm::ModelCatalog::builtin();
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .ok();
         if let Some(home) = home {
-            let yaml_path = std::path::PathBuf::from(home).join(".abacus").join("models.yaml");
-            match catalog.merge_yaml(&yaml_path) {
+            let toml_path = std::path::PathBuf::from(home).join(".abacus").join("models.toml");
+            match catalog.merge_toml(&toml_path) {
                 Ok(0) => {}
-                Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
-                Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
+                Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, toml_path.display()),
+                Err(e) => tracing::warn!("Failed to merge {}: {}", toml_path.display(), e),
             }
         }
         let model_catalog = Some(std::sync::Arc::new(catalog));
@@ -898,7 +899,7 @@ impl AbacusServer {
                 core_loop.register_provider("no-api-key", Arc::new(abacus_core::NoApiKeyProvider)).await;
             }
         }
-        // ─── MCIP 权限配置（来自 security.yaml）────────────────────────
+        // ─── MCIP 权限配置（来自 security.toml）────────────────────────
         core_loop.configure_mcip_permissions(
             &cfg_mgr.get_list("mcip.exempt_prefixes").unwrap_or_default(),
             &cfg_mgr.get_list("mcip.allow_tools").unwrap_or_default(),

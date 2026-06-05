@@ -1,6 +1,6 @@
 [package]
 name = "abacus-server"
-version = "1.0.0"
+version = "1.5.0"
 edition = "2021"
 
 [[bin]]
@@ -29,6 +29,7 @@ subtle = "2.6"
 indexmap = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 sha2.workspace = true
+toml = { workspace = true }
 
 [lints]
 workspace = true

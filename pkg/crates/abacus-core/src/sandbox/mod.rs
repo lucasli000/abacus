@@ -417,6 +417,7 @@ User goal: {goal}"#,
                     if path.is_empty() { false } else {
                         let result = tokio::process::Command::new("cargo")
                             .args(["check", "--manifest-path", &format!("{path}/Cargo.toml")])
+                            .kill_on_drop(true)  // task cancel → 自动杀 cargo 子进程
                             .output().await;
                         result.map(|r| r.status.success()).unwrap_or(false)
                     }
@@ -425,6 +426,7 @@ User goal: {goal}"#,
                     let result = tokio::process::Command::new("cargo")
                         .args(["test", "--manifest-path", &format!("{}/Cargo.toml",
                             output.get("work_dir").and_then(|v| v.as_str()).unwrap_or(""))])
+                        .kill_on_drop(true)  // task cancel → 自动杀 cargo 子进程
                         .output().await;
                     result.map(|r| r.status.success()).unwrap_or(false)
                 }

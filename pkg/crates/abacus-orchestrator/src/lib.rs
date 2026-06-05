@@ -231,7 +231,11 @@ mod tests {
         });
 
         let decision = session.route_input("今天天气怎么样");
-        assert!(matches!(decision, RoutingDecision::NoMatch { .. }));
+        // V41 设计意图：NoMatch 降级为 Broadcast——把 input 推给所有已邀请专家，
+        // 让 host 综合判断；只有当 participants 为空时才回 NoMatch。
+        // 此场景已邀请 "coder"，故预期 Escalate（包含该专家）。
+        assert!(matches!(decision, RoutingDecision::Escalate(_)),
+            "V41：无匹配但有参与者时降级为 Escalate，got {:?}", decision);
     }
 }
 

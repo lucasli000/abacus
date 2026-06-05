@@ -855,6 +855,11 @@ impl PipelineHook for GlobalHistoryHook {
 }
 
 #[cfg(test)]
+// 🟡#2 治本：test 代码用 env RAII 模式不可避免（要改 global ABACUS_HOME 测试路径）
+// `std::env::set_var` 在 Rust 1.75+ 标 unsafe 是因与 libc 内部状态竞态。
+// 测试串行执行（`cargo test` 默认单线程）→ 不会与生产代码并发 → 风险可控。
+// 接受 unsafe 用 RAII 模式（set/restore），不要改 env vars 流向生产配置。
+#[allow(unsafe_code)]
 mod tests {
     // ENV_LOCK 跨 .await 持有是测试串行化的核心机制；与 filengine.rs / process_registry.rs 同模式
     #![allow(clippy::await_holding_lock)]

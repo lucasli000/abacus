@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 use tracing;
 
 use crate::tui::i18n::t;
+use crate::tui::util::safe_prefix;
 
 use crate::tui::api::{EngineHandle, send_chat_message, send_team_message, send_meeting_message_streaming, send_plan_and_execute_streaming, list_cwd_files, ai_complete, ApiResult, EngineResponse};
 use crate::tui::event::{handle_chat_scroll_key, handle_global_key, handle_input_key, handle_mouse};
@@ -143,10 +144,18 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     // Phase1-1.2a: 安全降级——打开失败时使用 sink 而非 panic
     // 引用关系：tracing_subscriber writer 消费此 Box
     // 生命周期：进程全局（tracing global subscriber）
+    // 🟡#11：打开失败要给用户看到告警，否则用户 TUI 卡死/异常时无法 forensic
     let file_writer: Box<dyn std::io::Write + Send> = match std::fs::OpenOptions::new()
         .create(true).append(true).open(&log_file_path) {
         Ok(f) => Box::new(f),
-        Err(_) => Box::new(std::io::sink()),
+        Err(e) => {
+            // eprintln 走 stderr——TUI 模式下原始 stderr 仍可见（终端 alt screen 切换前）
+            eprintln!(
+                "⚠ abacus: log file unavailable ({}: {e}), tracing logs will be dropped",
+                log_file_path.display()
+            );
+            Box::new(std::io::sink())
+        }
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -293,7 +302,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             eprintln!("  Please check:");
             eprintln!("    - API key configured (ABACUS_API_KEY or DEEPSEEK_API_KEY)");
             eprintln!("    - Network connectivity");
-            eprintln!("    - Model config in config.yaml\n");
+            eprintln!("    - Model config in config.toml\n");
             return Err(io::Error::other(e));
         }
         Err(_) => {
@@ -452,29 +461,43 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         });
                     }
                 }
-                // ── 热加载：检测 config.yaml 变化，实时更新 context_window ──
+                // ── 热加载：检测 config.toml 变化，实时更新 context_window ──
+                // 🟡#19 治本：
+                // - 用 tokio::time::sleep 实现 500ms 时间 debounce（不是 20-tick 计数，
+                //   tick 频率受 render 帧率影响，时序不稳定）
+                // - metadata + read_to_string 放 spawn_blocking 隔离阻塞 I/O
+                // - 避免 torn JSON：read_to_string 一次读完整文件，toml::from_str 是原子解析
                 config_recheck_ticks = config_recheck_ticks.wrapping_add(1);
                 if config_recheck_ticks >= 20 {
                     config_recheck_ticks = 0;
-                    let config_path = abacus_core::paths::config_yaml();
-                    if let Ok(meta) = std::fs::metadata(&config_path) {
-                        if let Ok(mtime) = meta.modified() {
-                            if state.config_mtime.map_or(true, |t| mtime != t) {
-                                state.config_mtime = Some(mtime);
-                                // 配置变更时重新拉取模型列表（应对新增 API key / provider 变更）
-                                state.pending_model_fetch = true;
-                                if let Ok(content) = std::fs::read_to_string(&config_path) {
-                                    if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
-                                        if let Some(cw) = yaml["core"]["context_window"].as_u64() {
-                                            let new_val = cw as usize;
-                                            if new_val != state.context_window {
-                                                state.context_window = new_val;
-                                                state.add_toast(
-                                                    format!("ctx hot-reload: {}", format_ctx(new_val)),
-                                                    std::time::Duration::from_secs(3),
-                                                );
-                                            }
-                                        }
+                    // 500ms debounce：让 OS 文件系统稳定（编辑器原子保存需要时间）
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let config_path = abacus_core::paths::config_toml();
+                    // spawn_blocking 隔离：metadata + read 都是阻塞 I/O
+                    let check_result = tokio::task::spawn_blocking(move || {
+                        let meta = std::fs::metadata(&config_path).ok()?;
+                        let mtime = meta.modified().ok()?;
+                        let content = std::fs::read_to_string(&config_path).ok()?;
+                        Some((mtime, content))
+                    }).await.ok().flatten();
+                    if let Some((mtime, content)) = check_result {
+                        if state.config_mtime.map_or(true, |t| mtime != t) {
+                            state.config_mtime = Some(mtime);
+                            // 配置变更时重新拉取模型列表（应对新增 API key / provider 变更）
+                            state.pending_model_fetch = true;
+                            // 同步解析（在 spawn_blocking 已经隔离过 I/O，解析是 CPU-bound 可在 async 上下文跑）
+                            if let Ok(toml_val) = toml::from_str::<toml::Value>(&content) {
+                                let cw = toml_val.get("core")
+                                    .and_then(|c| c.get("context_window"))
+                                    .and_then(|v| v.as_integer());
+                                if let Some(cw) = cw {
+                                    let new_val = cw as usize;
+                                    if new_val != state.context_window {
+                                        state.context_window = new_val;
+                                        state.add_toast(
+                                            format!("ctx hot-reload: {}", format_ctx(new_val)),
+                                            std::time::Duration::from_secs(3),
+                                        );
                                     }
                                 }
                             }
@@ -2147,7 +2170,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.is_streaming = true;
                                 // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🔍 Reviewing {}...", kind.label());
+                                state.processing_phase = format!("review/{}", kind.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
                                 state.pending_review_parses = state.pending_review_parses.saturating_add(1);
@@ -2188,7 +2211,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "📋 Planning + executing...".into();
+                                state.processing_phase = "planning".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_plan_and_execute_streaming(&engine, &task, stx, plan_req_ctx).await {
@@ -2220,7 +2243,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = "🤖 Multi-agent executing...".into();
+                                state.processing_phase = "team".into();
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     match send_team_message(&engine, &task, stx).await {
@@ -2252,7 +2275,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.reset_streaming();
                                 state.is_streaming = true;
                                 state.set_busy_state(InputState::Outputting);
-                                state.processing_phase = format!("🤖 {} processing...", role.label());
+                                state.processing_phase = format!("team/{}", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
                                 tokio::spawn(async move {
                                     use crate::tui::api::send_role_message_streaming;
@@ -2323,9 +2346,10 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     // 2026-05-28: bracketed paste — 粘贴内容整块插入输入栏（保留换行）
                     // 不触发 submit，用户粘贴后可编辑再手动 Enter 发送
                     Event::Paste(text) => {
-                        // O(1) 插入代替逐字符 O(N²)
-                        state.input.insert_str(state.cursor_pos, &text);
-                        state.cursor_pos += text.len();
+                        // 规范化粘贴文本：CRLF→LF，strip tabs→spaces
+                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                        state.input.insert_str(state.cursor_pos, &normalized);
+                        state.cursor_pos += normalized.len();
                         state.recalculate_cursor();
                         state.rendered_lines_dirty.set(true);
                         // 2026-05-28: 粘贴 > 5 行时自动打开全屏编辑器
@@ -2414,6 +2438,21 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
                 "📊 Context status\n  Usage: {:.1}% ({}/{} tokens)\n  Compressed: {} messages",
                 status.usage_pct, status.current_tokens, status.max_tokens, status.compressed_count,
             )
+        }
+        SlashCommand::BudgetStatus => {
+            use abacus_core::core::llm_budget::LlmBudgetConfig;
+            let snap = engine.core.llm_budget().snapshot().await;
+            // 区分"未启用"和"已启用但当前为 0"
+            let cfg = LlmBudgetConfig::default();
+            let enabled = snap.max_cost_usd > 0.0 || snap.max_total_tokens > 0;
+            if !enabled {
+                format!(
+                    "💰 LLM budget: **DISABLED**\n  Set [llm_budget] in config.toml:\n    max_cost_usd = {}\n    max_total_tokens = {}\n    (currently unlimited)",
+                    cfg.max_cost_usd, cfg.max_total_tokens
+                )
+            } else {
+                format!("💰 LLM budget: **{snap}**")
+            }
         }
         SlashCommand::ContextCompress => {
             let compressed = engine.core.compress_context(&engine.session).await;
@@ -2651,7 +2690,7 @@ fn format_undo_result(r: &abacus_core::undo::UndoResult) -> String {
     };
     let path_str = r.path.to_string_lossy();
     let header = format!("⏪ undo seq={} session={} ({}): {}",
-        r.seq, &r.session_id[..r.session_id.len().min(8)], action_str, path_str);
+        r.seq, safe_prefix(&r.session_id, 8), action_str, path_str);
 
     if let Some(c) = &r.conflict {
         let detail = match c {
@@ -2676,7 +2715,7 @@ fn format_history(entries: &[abacus_core::undo::HistoryEntry]) -> String {
     let mut out = format!("📜 Undo History ({} entries):\n", entries.len());
     for e in entries {
         let mark = if e.undone { "↺" } else { "✓" };
-        let sid_short = &e.session_id[..e.session_id.len().min(8)];
+        let sid_short = safe_prefix(&e.session_id, 8);
         out.push_str(&format!(
             "  {} #{:<4} {} t{} {}  ({})\n",
             mark, e.seq, e.tool, e.turn,
@@ -2713,7 +2752,7 @@ fn format_timeline(
     let mut current_session: Option<String> = None;
     for e in entries {
         if current_session.as_ref() != Some(&e.session_id) {
-            let sid_short = &e.session_id[..e.session_id.len().min(8)];
+            let sid_short = safe_prefix(&e.session_id, 8);
             let label = if e.session_id == current_session_id {
                 format!("[you]  session {}", sid_short)
             } else {

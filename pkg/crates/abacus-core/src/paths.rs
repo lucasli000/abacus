@@ -20,19 +20,74 @@
 //! 项目层在全局根下，自动跟随覆盖。
 
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
-/// 全局根目录。优先 `ABACUS_HOME` env，否则 `$HOME/.abacus`。
+/// 路径解析错误（治本：替换 `unwrap_or_else(PathBuf::from("/tmp"))` 静默 fallback）
 ///
-/// 副作用：无（仅解析路径）
-pub fn global_dir() -> PathBuf {
+/// ## 为什么是显式错误而不是 silent fallback
+///
+/// 旧代码 `dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))` 有三个真实 bug：
+/// 1. **Windows 错**：`/tmp` 在 Windows 上是相对路径，不是有效的 FS 根
+/// 2. **多用户错**：`/tmp` 全局可写，symlink 攻击可让非特权用户影响 root 用户的 abacus
+/// 3. **真空路径**：如果 `$HOME` 真没设，**应该让用户知道**，而不是装作一切正常
+///
+/// `try_global_dir()` 强制调用方**显式决策**：报错 / 提示 / 用临时目录。
+#[derive(Debug, Error)]
+pub enum PathsError {
+    #[error("cannot resolve home directory: $HOME and $USERPROFILE both unset")]
+    HomeUnavailable,
+    #[error("ABACUS_HOME is set but empty")]
+    AbacusHomeEmpty,
+}
+
+/// 全局根目录（Result 形式，治本路径）
+///
+/// 优先 `ABACUS_HOME` env，否则 `$HOME/.abacus` / `$USERPROFILE/.abacus` (Windows)。
+///
+/// ## 调用方必须显式处理错误
+/// - TUI 启动 → toast 提示用户设 `ABACUS_HOME` 或修 home 目录
+/// - CLI 命令 → 返回 `Err`，用户看到错误退出非 0
+/// - Library 内部调用 → `try_global_dir().unwrap_or_else(|_| temp_dir_fallback())`
+///   这种用法允许，但调用方应记 `tracing::warn!`
+pub fn try_global_dir() -> Result<PathBuf, PathsError> {
+    // 优先 ABACUS_HOME
     if let Ok(v) = std::env::var("ABACUS_HOME") {
         if !v.is_empty() {
-            return PathBuf::from(v);
+            return Ok(PathBuf::from(v));
+        }
+        return Err(PathsError::AbacusHomeEmpty);
+    }
+    // 标准路径：$HOME (Linux/macOS) / $USERPROFILE (Windows)
+    if let Some(home) = dirs::home_dir() {
+        return Ok(home.join(".abacus"));
+    }
+    Err(PathsError::HomeUnavailable)
+}
+
+/// 全局根目录（fallback 形式，向后兼容）
+///
+/// ## 行为
+/// - 正常情况：返回 `try_global_dir()` 的结果
+/// - 错误情况：
+///   - **生产 build (release)**：fallback 到 `<temp_dir>/.abacus`，**记 `tracing::warn!`**
+///   - **debug build**：`debug_assert!` 让开发者立即看到 bug
+///
+/// ## 为什么不 panic
+/// 旧代码会 fallback `/tmp`（bug），新代码用 `<temp_dir>/.abacus`（更安全——
+/// std::env::temp_dir() 在 Windows 上是 `%TEMP%`、macOS 是 `$TMPDIR` per-user）。
+pub fn global_dir() -> PathBuf {
+    match try_global_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            debug_assert!(false, "global_dir fallback triggered: {e}");
+            tracing::warn!(
+                "abacus: cannot resolve home directory ({e}); using temporary path. \
+                 Set $ABACUS_HOME or fix $HOME/$USERPROFILE to silence this warning."
+            );
+            // 治本：temp_dir 替代 /tmp（Windows 兼容 + per-user 隔离）
+            std::env::temp_dir().join(".abacus")
         }
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".abacus")
 }
 
 // ─── 全局共享 SQLite ────────────────────────────────────────────────────
@@ -45,10 +100,21 @@ pub fn task_logs_db() -> PathBuf { global_dir().join("task_logs.db") }
 
 // ─── 全局配置 / 历史 / 全局 memory ──────────────────────────────────────
 
-pub fn config_yaml() -> PathBuf { global_dir().join("config.yaml") }
-pub fn models_yaml() -> PathBuf { global_dir().join("models.yaml") }
-pub fn security_yaml() -> PathBuf { global_dir().join("security.yaml") }
+/// 全局行为配置文件（TOML 格式，替代旧 config.yaml 缩进问题）
+pub fn config_toml() -> PathBuf { global_dir().join("config.toml") }
+/// 供应商配置文件：所有 provider + 模型参数（TOML 格式）
+pub fn provider_toml() -> PathBuf { global_dir().join("provider.toml") }
+/// 模型能力 catalog 覆盖文件（TOML 格式，合并到内置 spec）
+pub fn models_toml() -> PathBuf { global_dir().join("models.toml") }
+/// 安全 / MCIP 权限配置文件（TOML 格式）
+pub fn security_toml() -> PathBuf { global_dir().join("security.toml") }
 pub fn abacusbr_md() -> PathBuf { global_dir().join("abacusbr.md") }
+
+// xe2x94x80xe2x94x80xe2x94x80 v1.4.5 subdir xe5xb8x83xe5xb1x80xefxbcx88xe4xbfx9dxe7x95x99xe4xbbxa5xe5x85xbcxe5xaexb9xe4xbex9dxe8xb5x96xe6xadxa4 layout xe7x9ax84 v1.4.x xe7x94xa8xe6x88xb7xefxbcx89xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80
+pub fn sessions_db() -> PathBuf { global_dir().join("data/sessions.db") }
+pub fn meetings_dir() -> PathBuf { global_dir().join("meetings") }
+pub fn skills_dir() -> PathBuf { global_dir().join("skills") }
+/// conf.d 目录：用户可放入 *.toml / *.yaml 扩展片段（按文件名排序合并）
 pub fn conf_d_dir() -> PathBuf { global_dir().join("conf.d") }
 pub fn history_jsonl() -> PathBuf { global_dir().join("history.jsonl") }
 /// 全局 markdown memory（跨项目复用的通用知识，agent 可加载为基底）
@@ -66,10 +132,37 @@ pub fn project_dir(cwd: &Path) -> PathBuf {
     projects_dir().join(escape_cwd(cwd))
 }
 
-/// 当前 cwd 的项目目录
+/// 当前 cwd 的项目目录（fallback 形式）
+///
+/// ## 行为
+/// - 正常情况：返回 `try_current_project_dir()` 的结果
+/// - 错误情况：cwd 不可读时 fallback 到 **global_dir 根**（而非 `PathBuf::from("/")`——
+///   旧版会 vacuum 整个 FS 根，是严重 bug）
 pub fn current_project_dir() -> PathBuf {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    project_dir(&cwd)
+    match try_current_project_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            debug_assert!(false, "current_project_dir fallback: {e}");
+            tracing::warn!(
+                "abacus: cannot resolve cwd ({e}); using global dir as project root fallback. \
+                 This may cause session data to leak across projects."
+            );
+            // 治本：用 global_dir 根而非 "/" — 防止真空路径 + 防止跨盘 symlink 攻击
+            global_dir()
+        }
+    }
+}
+
+/// 当前 cwd 的项目目录（Result 形式，治本路径）
+#[derive(Debug, Error)]
+pub enum CwdError {
+    #[error("cannot read current working directory: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub fn try_current_project_dir() -> Result<PathBuf, CwdError> {
+    let cwd = std::env::current_dir()?;
+    Ok(project_dir(&cwd))
 }
 
 /// 项目级 sessions 目录
@@ -162,6 +255,8 @@ pub fn ensure_current_project_dirs() -> std::io::Result<()> {
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// 🟡#2 治本：见 config.rs 同注释
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

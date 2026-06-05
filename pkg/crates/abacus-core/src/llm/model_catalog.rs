@@ -1,4 +1,4 @@
-//! Phase 1: 模型能力 catalog（内置已知模型表，Phase 3 增加 YAML 覆盖路径）。
+//! Phase 1: 模型能力 catalog（内置已知模型表，Phase 3 增加 TOML 覆盖路径）。
 //!
 //! ## 职责边界
 //! - **回答**：「model X 的 thinking 能力是什么？context window 多大？」
@@ -6,18 +6,21 @@
 //!
 //! ## 引用关系
 //! - 创建：`engine_init.rs` / `server.rs` 启动时调用 `ModelCatalog::builtin()`，Phase 3 起再
-//!   `.merge_yaml(~/.abacus/models.yaml)`
+//!   `.merge_toml(~/.abacus/models.toml)`
 //! - 注入：`CoreLoop::new()` 接收 `Arc<ModelCatalog>`
 //! - 消费：pipeline 调用 `core.model_catalog.lookup(&effective_model)` 获取
 //!   `Arc<ModelSpec>`，再用 `spec.thinking_capabilities` 决定 resolver 分支
 //!
 //! ## 生命周期
-//! - 创建：CoreLoop 启动时一次（merge YAML 一次性）
+//! - 创建：CoreLoop 启动时一次（merge TOML 一次性）
 //! - 销毁：进程退出（Arc::drop）
 //!
-//! ## 内置 vs YAML
+//! ## 内置 vs TOML
 //! - 内置（本文件 `builtin()`）：维护 Abacus 知道的主流模型。版本升级随 release 滚动。
-//! - YAML 覆盖（Phase 3）：用户自有 endpoint / 第三方代理可覆盖任意模型 spec，无需改源码。
+//! - TOML 覆盖（Phase 3）：用户自有 endpoint / 第三方代理可覆盖任意模型 spec，无需改源码。
+//!
+//! ## YAML 兼容
+//! `merge_yaml()` 仍保留以支持旧测试与外部 YAML 覆盖源；运行时主路径走 TOML。
 
 use abacus_types::{
     EffortLevel, LatencyTier, ModelId, ModelSpec, ModelThinkingConfig, MultiTurnReplay,
@@ -206,7 +209,74 @@ impl ModelCatalog {
         self.specs.insert(id, Arc::new(spec));
     }
 
-    /// Phase 3：从 YAML 文件合并 per-model 覆盖。
+    /// Phase 3：从 TOML 文件合并 per-model 覆盖。
+    ///
+    /// ## TOML schema
+    /// ```toml
+    /// [models."claude-opus-4-7"]
+    /// context_window = 200000          # 可选；缺省走内置
+    /// max_output_tokens = 64000        # 可选
+    /// thinking_capabilities = { supported_modes = ["adaptive_effort"], ... }
+    ///
+    /// [models."custom-local-model"]
+    /// context_window = 32000
+    /// thinking_capabilities = { supported_modes = ["enabled_toggle"], ... }
+    /// ```
+    ///
+    /// ## 合并策略
+    /// - 文件不存在 → Ok(0) 静默（用户没配置）
+    /// - 文件存在但 `[models]` 段缺省 → Ok(0) 静默
+    /// - TOML 解析失败 → Err（不让错误配置静默吃掉）
+    /// - per-model：TOML 中存在 → **整条 ModelSpec 覆盖**（含 thinking_capabilities）
+    /// - per-model：TOML 中字段缺省 → 用内置 spec 的对应字段填充
+    ///
+    /// ## 返回值
+    /// 合并后被覆盖/新增的模型数（用于 startup 日志）
+    pub fn merge_toml(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
+        if !path.exists() {
+            return Ok(0);
+        }
+
+        let raw = std::fs::read_to_string(path)?;
+        let parsed: toml::Value = toml::from_str(&raw)
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TOML parse error in {}: {}", path.display(), e),
+            ))?;
+
+        let Some(models_table) = parsed.get("models").and_then(|v| v.as_table()) else {
+            return Ok(0);
+        };
+
+        let mut count = 0usize;
+        for (name, v) in models_table {
+            let id = ModelId(name.clone());
+            // 起点：内置 spec（若有）或默认空 spec
+            let mut spec = self.lookup(&id)
+                .map(|arc| (*arc).clone())
+                .unwrap_or_default();
+
+            // 合并字段
+            if let Some(cw) = v.get("context_window").and_then(|x| x.as_integer()) {
+                spec.context_window = cw as usize;
+            }
+            if let Some(mt) = v.get("max_output_tokens").and_then(|x| x.as_integer()) {
+                spec.max_output_tokens = mt as u32;
+            }
+            if let Some(caps_v) = v.get("thinking_capabilities") {
+                if let Some(caps) = parse_thinking_capabilities_toml(caps_v) {
+                    spec.thinking_capabilities = caps;
+                }
+            }
+
+            self.specs.insert(id, Arc::new(spec));
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Phase 3：从 YAML 文件合并 per-model 覆盖（保留兼容，运行时主路径走 `merge_toml`）。
     ///
     /// ## YAML schema
     /// ```yaml
@@ -227,16 +297,6 @@ impl ModelCatalog {
     ///       default_mode: "enabled_toggle"
     ///       multi_turn_replay: "reasoning_content"
     /// ```
-    ///
-    /// ## 合并策略
-    /// - 文件不存在 → Ok(()) 静默（用户没配置）
-    /// - 文件存在但 `models` 段缺省 → Ok(()) 静默
-    /// - YAML 解析失败 → Err（不让错误的 YAML 静默吃掉）
-    /// - per-model：YAML 中存在 → **整条 ModelSpec 覆盖**（含 thinking_capabilities）
-    /// - per-model：YAML 中字段缺省 → 用内置 spec 的对应字段填充
-    ///
-    /// ## 返回值
-    /// 合并后被覆盖/新增的模型数（用于 startup 日志）
     pub fn merge_yaml(&mut self, path: &std::path::Path) -> std::io::Result<usize> {
         if !path.exists() {
             return Ok(0);
@@ -339,6 +399,62 @@ impl ModelCatalog {
 
     /// 列出所有已知 ModelId（顺序不保证）
     pub fn ids(&self) -> impl Iterator<Item = &ModelId> { self.specs.keys() }
+}
+
+/// 解析 TOML 中的 `thinking_capabilities` 子节
+///
+/// TOML 子表结构（V29+），例如：
+/// ```toml
+/// thinking_capabilities = { supported_modes = ["enabled_toggle"], default_mode = "enabled_toggle", multi_turn_replay = "reasoning_content" }
+/// ```
+fn parse_thinking_capabilities_toml(v: &toml::Value) -> Option<ThinkingCapabilities> {
+    let table = v.as_table()?;
+
+    let supported_modes: Vec<ThinkingModeKind> = table.get("supported_modes")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|s| s.as_str().and_then(parse_mode_kind))
+            .collect())
+        .unwrap_or_default();
+
+    let default_mode = table.get("default_mode")
+        .and_then(|x| x.as_str())
+        .and_then(parse_mode_kind);
+
+    let effort_levels: Vec<EffortLevel> = table.get("effort_levels")
+        .and_then(|x| x.as_array())
+        .map(|arr| arr.iter()
+            .filter_map(|s| s.as_str().and_then(parse_effort_level))
+            .collect())
+        .unwrap_or_default();
+
+    let budget_range = table.get("budget_range").and_then(|br| {
+        let arr = br.as_array()?;
+        if arr.len() == 2 {
+            let min = arr[0].as_integer()? as u32;
+            let max = arr[1].as_integer()? as u32;
+            Some((min, max))
+        } else {
+            None
+        }
+    });
+
+    let multi_turn_replay = table.get("multi_turn_replay")
+        .and_then(|x| x.as_str())
+        .map(|s| match s {
+            "reasoning_content" => MultiTurnReplay::ReasoningContent,
+            "signature" => MultiTurnReplay::Signature,
+            _ => MultiTurnReplay::None,
+        })
+        .unwrap_or(MultiTurnReplay::None);
+
+    Some(ThinkingCapabilities {
+        supported_modes,
+        default_mode,
+        effort_levels,
+        budget_range,
+        multi_turn_replay,
+    })
 }
 
 /// 解析 YAML 中的 `thinking_capabilities` 子节
@@ -868,5 +984,70 @@ models:
         cat.merge_yaml(tmp.path()).unwrap();
         let spec = cat.lookup(&ModelId("custom-budget-model".into())).unwrap();
         assert_eq!(spec.thinking_capabilities.budget_range, Some((128, 32768)));
+    }
+
+    // ── merge_toml 测试 ────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_toml_missing_file_is_silent() {
+        let mut cat = ModelCatalog::builtin();
+        let n = cat.merge_toml(&std::path::PathBuf::from("/nonexistent/path/x.toml")).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_merge_toml_overrides_context_window() {
+        let toml_content = r#"
+[models."claude-opus-4-7"]
+context_window = 500000
+max_output_tokens = 100000
+"#;
+        let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp.path(), toml_content).unwrap();
+
+        let mut cat = ModelCatalog::builtin();
+        let n = cat.merge_toml(tmp.path()).unwrap();
+        assert_eq!(n, 1);
+
+        let spec = cat.lookup(&ModelId("claude-opus-4-7".into())).unwrap();
+        assert_eq!(spec.context_window, 500_000);
+        assert_eq!(spec.max_output_tokens, 100_000);
+        // thinking_capabilities 未在 TOML 中提供 → 保留内置
+        assert!(spec.thinking_capabilities.supports_adaptive());
+    }
+
+    #[test]
+    fn test_merge_toml_adds_unknown_model() {
+        let toml_content = r#"
+[models."custom-local-llama-3"]
+context_window = 32000
+max_output_tokens = 4096
+thinking_capabilities = { supported_modes = ["enabled_toggle"], default_mode = "enabled_toggle", multi_turn_replay = "reasoning_content" }
+"#;
+        let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp.path(), toml_content).unwrap();
+
+        let mut cat = ModelCatalog::builtin();
+        cat.merge_toml(tmp.path()).unwrap();
+
+        let spec = cat.lookup(&ModelId("custom-local-llama-3".into())).unwrap();
+        assert_eq!(spec.context_window, 32000);
+        assert_eq!(
+            spec.thinking_capabilities.multi_turn_replay,
+            MultiTurnReplay::ReasoningContent
+        );
+        assert!(spec.thinking_capabilities.supported_modes
+            .contains(&ThinkingModeKind::EnabledToggle));
+    }
+
+    #[test]
+    fn test_merge_toml_invalid_syntax_returns_error() {
+        let toml_content = "[models.\"unbalanced\n";  // 缺右引号 + 缺右括号
+        let tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
+        std::fs::write(tmp.path(), toml_content).unwrap();
+
+        let mut cat = ModelCatalog::builtin();
+        let err = cat.merge_toml(tmp.path());
+        assert!(err.is_err(), "坏 TOML 应当报错而非静默");
     }
 }

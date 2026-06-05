@@ -326,6 +326,7 @@ async fn deepseek_complete_401_unauthorized() {
         Some(server.uri()),
         None,
         Some(5),
+        None,  // auth_prefix: use default "Bearer "
     );
     let err = provider
         .complete(req_for("deepseek-v4-flash"))
@@ -356,6 +357,7 @@ async fn deepseek_complete_429_rate_limited() {
         Some(server.uri()),
         None,
         Some(5),
+        None,  // auth_prefix
     );
     let err = provider
         .complete(req_for("deepseek-v4-flash"))
@@ -401,6 +403,7 @@ async fn deepseek_complete_parses_reasoning_content() {
         Some(server.uri()),
         None,
         Some(5),
+        None,  // auth_prefix
     );
     // 显式开 thinking，让 build_request 走 reasoning model 全路径
     let mut r = req_for("deepseek-v4-flash");

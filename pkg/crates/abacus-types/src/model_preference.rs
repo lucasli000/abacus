@@ -148,8 +148,7 @@ impl ModelPreference {
 pub fn preference_file_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".abacus")
-        .join("model_preference.json")
+        .join(".abacus/config/model_preference.json")
 }
 
 /// Load model preferences from a JSON file.

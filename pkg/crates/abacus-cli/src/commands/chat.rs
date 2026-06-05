@@ -136,10 +136,7 @@ pub async fn handle_chat(args: &ChatArgs, formatter: &mut Box<dyn OutputFormatte
         }
     } else {
         // Interactive REPL with rustyline (history + line editing)
-        let history_path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".abacus")
-            .join("history.txt");
+        let history_path = abacus_core::paths::global_dir().join("data/history.txt");
         // 防御性：parent() 在根路径下为 None，回退到当前目录
         if let Some(parent) = history_path.parent() {
             let _ = std::fs::create_dir_all(parent);

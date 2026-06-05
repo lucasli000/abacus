@@ -3,9 +3,7 @@ use crate::OutputFormatter;
 use super::SkillAction;
 
 pub async fn handle_skill(args: &super::SkillArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
-    let skill_dir = dirs::home_dir()
-        .map(|h| h.join(".abacus/skills"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".abacus/skills"));
+    let skill_dir = abacus_core::paths::skills_dir();
 
     match &args.action {
         SkillAction::List => {

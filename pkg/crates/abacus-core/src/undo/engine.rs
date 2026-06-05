@@ -97,6 +97,34 @@ struct RedoFrame {
     saved_post_undo_content: Option<Vec<u8>>,
 }
 
+/// 读取 session 的所有 entries（free fn，治本：可被 spawn_blocking 调用而不持有 &self）
+///
+/// ## 为什么是 free fn
+/// 原 `UndoEngine::read_session_entries(&self, ...)` 是同步方法，被 async 函数
+/// (`undo_last` 等) 调用时直接阻塞 worker thread。治本：把 I/O 部分抽成 free fn，
+/// async 路径用 `tokio::task::spawn_blocking` 隔离阻塞工作。
+pub(crate) fn read_session_entries_at(
+    project_dir: &std::path::Path,
+    session_id: &str,
+) -> std::io::Result<Vec<LogEntry>> {
+    let log_path = super::paths::session_log_path(project_dir, session_id);
+    let content = match std::fs::read_to_string(&log_path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(e) = serde_json::from_str::<LogEntry>(line) {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
 /// 撤销引擎
 pub struct UndoEngine {
     project_dir: PathBuf,
@@ -130,22 +158,7 @@ impl UndoEngine {
 
     /// 列出指定 session 的所有 entries（已撤销的也列出）
     fn read_session_entries(&self, session_id: &str) -> std::io::Result<Vec<LogEntry>> {
-        let log_path = session_log_path(&self.project_dir, session_id);
-        let content = match std::fs::read_to_string(&log_path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut out = Vec::new();
-        for line in content.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(e) = serde_json::from_str::<LogEntry>(line) {
-                out.push(e);
-            }
-        }
-        Ok(out)
+        read_session_entries_at(&self.project_dir, session_id)
     }
 
     /// 列出所有 session（扫 project/undo/<*> 目录，排除 _shared）
@@ -193,7 +206,17 @@ impl UndoEngine {
             Some(s) => s.to_string(),
             None => self.find_latest_active_session().await?,
         };
-        let entries = self.read_session_entries(&target_session)?;
+        // 🟡#8/#14 治本：read_session_entries 含 std::fs::read_to_string + 反序列化，
+        // 阻塞 syscall 不能在 async fn 里直接调（worker thread 阻塞会 stall reactor）。
+        // 治本：spawn_blocking 隔离阻塞工作，让 tokio 继续调度其他 task。
+        let project_dir = self.project_dir.clone();
+        let target_session_clone = target_session.clone();
+        let entries = tokio::task::spawn_blocking(move || {
+            read_session_entries_at(&project_dir, &target_session_clone)
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("spawn_blocking panicked: {e}")))??;
         let target = entries
             .iter().rfind(|e| !e.undone)
             .cloned()
@@ -204,7 +227,15 @@ impl UndoEngine {
     /// 撤销指定 seq
     pub async fn undo_seq(&self, session_id: &str, seq: u64) -> std::io::Result<UndoResult> {
         let _g = self.undo_lock.lock().await;
-        let entries = self.read_session_entries(session_id)?;
+        // 🟡#8/#14 治本：spawn_blocking 隔离阻塞 I/O
+        let project_dir = self.project_dir.clone();
+        let session_id_owned = session_id.to_string();
+        let entries = tokio::task::spawn_blocking(move || {
+            read_session_entries_at(&project_dir, &session_id_owned)
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("spawn_blocking panicked: {e}")))??;
         let target = entries
             .iter()
             .find(|e| e.seq == seq && !e.undone)
@@ -216,7 +247,15 @@ impl UndoEngine {
     /// 撤销整个 turn 的所有 op（按 seq 倒序，最新先撤）
     pub async fn undo_turn(&self, session_id: &str, turn: u32) -> std::io::Result<Vec<UndoResult>> {
         let _g = self.undo_lock.lock().await;
-        let entries = self.read_session_entries(session_id)?;
+        // 🟡#8/#14 治本
+        let project_dir = self.project_dir.clone();
+        let session_id_owned = session_id.to_string();
+        let entries = tokio::task::spawn_blocking(move || {
+            read_session_entries_at(&project_dir, &session_id_owned)
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("spawn_blocking panicked: {e}")))??;
         let targets: Vec<LogEntry> = entries.iter()
             .filter(|e| e.turn == turn && !e.undone)
             .cloned()
@@ -505,39 +544,48 @@ impl UndoEngine {
     /// - 不阻塞：调用方应在 background spawn，非同步等待
     pub async fn cleanup_stale(&self, threshold: chrono::Duration) -> std::io::Result<usize> {
         let cutoff = Utc::now() - threshold;
-        let sessions = self.list_sessions()?;
-        let mut cleaned = 0usize;
+        // 🟡#8/#14 治本：整个 body 含 list_sessions + metadata + remove_dir_all，
+        // 全部阻塞 I/O。spawn_blocking 一并隔离。
+        let project_dir = self.project_dir.clone();
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
+            let engine = UndoEngine::new(project_dir);
+            let sessions = engine.list_sessions()?;
+            let mut cleaned = 0usize;
 
-        for sid in sessions {
-            // 决定 session 的"最后活跃时间"——优先 log.jsonl mtime，缺失用目录 mtime
-            let session_dir = super::paths::session_undo_dir(&self.project_dir, &sid);
-            let log_path = super::paths::session_log_path(&self.project_dir, &sid);
+            for sid in sessions {
+                let session_dir = super::paths::session_undo_dir(&engine.project_dir, &sid);
+                let log_path = super::paths::session_log_path(&engine.project_dir, &sid);
 
-            let mtime = match std::fs::metadata(&log_path) {
-                Ok(m) => m.modified().ok().map(chrono::DateTime::<Utc>::from),
-                Err(_) => match std::fs::metadata(&session_dir) {
+                let mtime = match std::fs::metadata(&log_path) {
                     Ok(m) => m.modified().ok().map(chrono::DateTime::<Utc>::from),
-                    Err(_) => None,
-                },
-            };
+                    Err(_) => match std::fs::metadata(&session_dir) {
+                        Ok(m) => m.modified().ok().map(chrono::DateTime::<Utc>::from),
+                        Err(_) => None,
+                    },
+                };
 
-            let stale = match mtime {
-                Some(t) => t < cutoff,
-                None => false, // 拿不到 mtime → 保守不删
-            };
+                let stale = match mtime {
+                    Some(t) => t < cutoff,
+                    None => false,
+                };
 
-            if stale {
-                if let Err(e) = std::fs::remove_dir_all(&session_dir) {
-                    tracing::warn!(session = %sid, error = %e,
-                        "failed to remove stale session undo dir");
-                } else {
-                    tracing::info!(session = %sid, "cleaned stale undo session dir");
-                    cleaned += 1;
+                if stale {
+                    if let Err(e) = std::fs::remove_dir_all(&session_dir) {
+                        tracing::warn!(session = %sid, error = %e,
+                            "failed to remove stale session undo dir");
+                    } else {
+                        tracing::info!(session = %sid, "cleaned stale undo session dir");
+                        cleaned += 1;
+                    }
                 }
             }
-        }
 
-        Ok(cleaned)
+            Ok(cleaned)
+        })
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
+            format!("spawn_blocking panicked: {e}")))??;
+        Ok(result)
     }
 
     /// 跨 session 时间线（since 时间之后的所有 entries，时间倒序）

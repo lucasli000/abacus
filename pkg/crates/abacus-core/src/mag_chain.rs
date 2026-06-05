@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 use abacus_types::{ToolId, ToolOutput, KernelError};
+use tracing;
 
 /// 中间件 trait
 #[async_trait::async_trait]
@@ -448,7 +449,11 @@ impl Middleware for PersistentAuditLogger {
 
     async fn after_execute(&self, tool_id: &ToolId, output: &mut ToolOutput) -> Result<(), KernelError> {
         let db = self.db.lock().await;
-        db.execute(
+        // 用事务包住 INSERT + DELETE trim：要么两条都成功，要么都回滚，
+        // 避免「insert 成功 + trim 失败」导致 in-memory head 与 DB 不一致。
+        let tx = db.unchecked_transaction()
+            .map_err(|e| KernelError::Other(format!("audit log begin tx failed: {e}")))?;
+        tx.execute(
             "INSERT INTO audit_log (tool_id, success, latency_ms, timestamp) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 tool_id.0,
@@ -458,10 +463,22 @@ impl Middleware for PersistentAuditLogger {
             ],
         ).map_err(|e| KernelError::Other(format!("audit log insert failed: {e}")))?;
         // Trim to max_entries
-        db.execute(
+        match tx.execute(
             "DELETE FROM audit_log WHERE id NOT IN (SELECT id FROM audit_log ORDER BY id DESC LIMIT ?1)",
             [self.max_entries as i64],
-        ).ok();
+        ) {
+            Ok(_) => {
+                tx.commit().map_err(|e| KernelError::Other(format!("audit log commit failed: {e}")))?;
+            }
+            Err(e) => {
+                // 显式回滚 + 警告；audit log 不应阻塞主流程
+                let _ = tx.rollback();
+                tracing::warn!("audit log trim failed (rolled back): {e}");
+                // INSERT 也回滚——这是 trade-off：
+                // 严格一致 vs 主流程可用性。这里选严格一致，调用方可以从
+                // 下次成功 INSERT 重建 trim 状态。
+            }
+        }
         Ok(())
     }
 

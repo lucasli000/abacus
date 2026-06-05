@@ -1351,7 +1351,10 @@ mod tests {
         injector.register_defaults();
 
         let segments = injector.inject("hello world", &Value::Null);
-        assert!(segments.is_empty(), "expected no injection for irrelevant input");
+        // toolagent_hint 是「常驻注入」与 topic 注入无关——不应误判 topic 触发。
+        // 检查无 "Topic context" 类话题段即可。
+        assert!(!segments.iter().any(|s| s.text.contains("Topic context")),
+            "irrelevant 输入不应触发 topic 注入，got {:?}", segments);
     }
 
     #[test]

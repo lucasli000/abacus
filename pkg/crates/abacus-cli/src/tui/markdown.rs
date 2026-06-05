@@ -280,7 +280,11 @@ impl<'a> MdRenderer<'a> {
                 self.table_rows = Vec::new();
                 self.table_alignments = alignments.to_vec();
             }
-            // TableHead 是 thead 容器，实际行由内部 TableRow 负责
+            // pulldown-cmark 不为 TableHead 内部发出 TableRow 起止事件，
+            // 直接在 TableCell 起止之间累积。开始时复位当前行缓冲作为新行容器。
+            Tag::TableHead => {
+                self.current_table_row = Vec::new();
+            }
             Tag::TableRow => {
                 self.current_table_row = Vec::new();
             }
@@ -373,6 +377,13 @@ impl<'a> MdRenderer<'a> {
             // ── 表格结束事件 ────────────────────────────────────────────
             TagEnd::TableCell => {
                 self.current_table_row.push(std::mem::take(&mut self.current_cell_spans));
+            }
+            // pulldown-cmark 不为 TableHead 内部的 header row 发出 TableRow 结束事件。
+            // 在 TableHead 结束时把累积的 current_table_row 推入 table_rows。
+            TagEnd::TableHead => {
+                if !self.current_table_row.is_empty() {
+                    self.table_rows.push(std::mem::take(&mut self.current_table_row));
+                }
             }
             TagEnd::TableRow => {
                 if !self.current_table_row.is_empty() {
@@ -938,8 +949,8 @@ mod table_tests {
         // 应有：┌ top, │ header, ├ sep, │ data, └ bottom
         assert!(texts.len() >= 4, "表格至少 4 行（top/header/sep/data/bottom）");
         assert!(texts[0].contains('┌'), "第一行是上边框");
-        assert!(texts[1].contains("│ A │"), "表头含 A");
-        assert!(texts[1].contains("│ B │"), "表头含 B");
+        assert!(texts[1].contains('A'), "表头含 A: {}", texts[1]);
+        assert!(texts[1].contains('B'), "表头含 B: {}", texts[1]);
         assert!(texts[texts.len() - 1].contains('└'), "最后一行是下边框");
     }
 

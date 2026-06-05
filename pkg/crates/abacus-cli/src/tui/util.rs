@@ -198,3 +198,76 @@ pub fn word_wrap_segments(text: &str, max_width: usize) -> Vec<(usize, usize)> {
     }
     segments
 }
+
+/// 安全取字符串前缀：截到最多 `n` 个字符（不是字节），在 UTF-8 字符边界上截断。
+///
+/// 解决 `&s[..n.min(s.len())]` 在多字节 UTF-8 序列中间切分会 panic 的问题。
+/// 历史上 `session_id`（UUID）触发此 bug——若 session_id 改为非 ASCII 来源（用户输入、
+/// i18n）且长度恰好 8 字节横穿多字节序列，会 panic。
+///
+/// # Examples
+/// ```
+/// use abacus_cli::tui::util::safe_prefix;
+/// assert_eq!(safe_prefix("hello world", 5), "hello");
+/// assert_eq!(safe_prefix("你好世界", 2), "你好");
+/// assert_eq!(safe_prefix("", 8), "");
+/// assert_eq!(safe_prefix("abc", 100), "abc");
+/// ```
+pub fn safe_prefix(s: &str, n: usize) -> &str {
+    if s.is_empty() || n == 0 {
+        return "";
+    }
+    // chars() 迭代器本身就是按字符边界推进的，所以 take(n) 一定在合法边界停下
+    let end_byte = s
+        .char_indices()
+        .nth(n)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    &s[..end_byte]
+}
+
+#[cfg(test)]
+mod safe_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn safe_prefix_ascii() {
+        assert_eq!(safe_prefix("hello world", 5), "hello");
+        assert_eq!(safe_prefix("abc", 100), "abc");
+    }
+
+    #[test]
+    fn safe_prefix_cjk() {
+        // "你好世界" = 4 字符 × 3 字节 = 12 字节
+        // 截 2 字符 → "你好" (6 字节)，不是 panic
+        assert_eq!(safe_prefix("你好世界", 2), "你好");
+        assert_eq!(safe_prefix("你好世界", 3), "你好世");
+    }
+
+    #[test]
+    fn safe_prefix_emoji() {
+        // 4-byte emoji: "🦀" is 1 char / 4 bytes
+        // n=1 → "🦀" (4 bytes)，n=2 → "🦀🦀" (8 bytes)
+        assert_eq!(safe_prefix("🦀🦀x", 2), "🦀🦀");
+        assert_eq!(safe_prefix("🦀🦀x", 3), "🦀🦀x");
+    }
+
+    #[test]
+    fn safe_prefix_edge_cases() {
+        assert_eq!(safe_prefix("", 8), "");
+        assert_eq!(safe_prefix("x", 0), "");
+        assert_eq!(safe_prefix("x", 1), "x");
+    }
+
+    /// 直接演示 `&s[..n.min(s.len())]` 模式在 CJK 字符串上 panic
+    #[test]
+    fn demo_old_pattern_panics_on_cjk() {
+        // 模拟原 buggy 代码：n=1 切在 "好" 中间（3 字节 = 1 字符宽度，但 [..3] 跨字符）
+        let s = "你好世界";
+        // [..3] 切在 "好" 字符中间（"好" 本身 3 字节 [3..6]）
+        // 所以 s[..3] 是 "你" + 0 字节 的"好" → 切在"你"末尾，正好合法边界
+        // 实际会 panic 的：s[..4]（"你" 3 字节 + "好" 第 1 字节）→ 切在"好"中
+        let result = std::panic::catch_unwind(|| &s[..4]);
+        assert!(result.is_err(), "old pattern should panic on CJK mid-codepoint");
+    }
+}

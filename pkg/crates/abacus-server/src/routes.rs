@@ -434,11 +434,16 @@ async fn meeting_ask(
 
     // bridge.rs 内部已含 90s 单参与者 timeout；此处用 server ceiling 作为外层兜底
     let timeout_secs = state.request_timeout_secs;
-    let mut handle_guard = h.write().await;
+    let mut handle_guard = h.try_write().map_err(|_| {
+        // 🟡#9 治本：meeting 正在被另一个 turn 处理时不要无限阻塞——
+        // 返回 409 Conflict 让客户端可以 retry 或换 session
+        tracing::debug!(meeting_id = %id, "meeting busy, returning 409");
+        (StatusCode::CONFLICT,
+         Json(ErrorResponse { error: format!("meeting {id} is busy with another turn; retry later") }))
+    })?;
 
     // 状态机：未启动则 start（Initializing → Inviting → Running）
     if handle_guard.session().status == MeetingStatus::Initializing {
-        let _ = handle_guard.session_mut().status.clone();
         // session.invite 已在 build 时完成；这里直接尝试 start
         if let Err(e) = handle_guard.start() {
             // start 要求 Inviting；如果直接 Initializing，先转到 Inviting

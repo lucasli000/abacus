@@ -252,6 +252,7 @@ impl McpStdioTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)  // parent task drop / panic → 自动杀子进程
             .spawn()?;
 
         let stdin = child.stdin.take()

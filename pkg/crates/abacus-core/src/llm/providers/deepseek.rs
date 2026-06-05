@@ -214,6 +214,8 @@ pub struct DeepSeekProvider {
     /// false = 使用内置默认 URL → 只返回静态列表
     /// 引用关系：with_config 根据 base_url 参数设置；discover_models() 消费
     discover_enabled: bool,
+    /// Authorization 头前缀（默认 "Bearer "，与 openai_compatible 一致）
+    auth_prefix: String,
 }
 
 impl DeepSeekProvider {
@@ -224,6 +226,7 @@ impl DeepSeekProvider {
     const BETA_BASE_URL: &'static str = "https://api.deepseek.com/beta";
     const MODEL_FLASH: &'static str = "deepseek-v4-flash";
     const MODEL_PRO: &'static str = "deepseek-v4-pro";
+    const DEFAULT_AUTH_PREFIX: &'static str = "Bearer ";
 
     /// Create a new DeepSeek provider.
     ///
@@ -232,16 +235,20 @@ impl DeepSeekProvider {
     /// * `model` - Model name (e.g. "deepseek-v4-flash", "deepseek-v4-pro")
     /// * `base_url` - Optional custom base URL (default: `https: //api.deepseek.com`)
     pub fn new(api_key: String, model: impl Into<ModelId>) -> Self {
-        Self::with_config(api_key, model, None, None, None)
+        Self::with_config(api_key, model, None, None, None, None)
     }
 
     /// Create with full configuration.
+    ///
+    /// `auth_prefix`: Authorization 头前缀。默认 `Bearer `。当用户使用自定义网关
+    /// 且该网关要求 `ApiKey xxx` / `Token xxx` 等其他格式时传入。
     pub fn with_config(
         api_key: String,
         model: impl Into<ModelId>,
         base_url: Option<String>,
         reasoning_effort: Option<String>,
         timeout_secs: Option<u64>,
+        auth_prefix: Option<String>,
     ) -> Self {
         // H8: 复用进程级共享 Client（pool/keepalive 配置已在 shared_http_client 中合并）
         let client = crate::llm::shared_http_client().clone();
@@ -282,6 +289,7 @@ impl DeepSeekProvider {
             reasoning_effort,
             default_max_tokens: 64000,
             discover_enabled,
+            auth_prefix: auth_prefix.unwrap_or_else(|| Self::DEFAULT_AUTH_PREFIX.to_string()),
         }
     }
 
@@ -603,11 +611,11 @@ impl LlmProvider for DeepSeekProvider {
             "DeepSeek completions request"
         );
 
-        // V18 wire trace: 把请求 body 写到 /tmp/abacus_wire_last.json，方便 400 时事后 diff
+        // V18 wire trace: 写入 per-pid 路径（避免并发覆盖 + 0600 权限）
         // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
         #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
-            let _ = std::fs::write("/tmp/abacus_wire_last.json", &json);
+            crate::llm::wire_trace::write_wire_trace("deepseek", &self.base_url, &json);
         }
 
         let mut retries: u64 = 0;
@@ -618,7 +626,7 @@ impl LlmProvider for DeepSeekProvider {
                 .client
                 .post(format!("{}/v1/chat/completions", self.base_url))
                 .timeout(self.request_timeout) // H8: per-request timeout
-                .header("Authorization", format!("Bearer {}", self.api_key.as_str()))
+                .header("Authorization", format!("{}{}", self.auth_prefix, self.api_key.as_str()))
                 .header("Content-Type", "application/json")
                 .json(&body)
                 .send()
@@ -685,7 +693,7 @@ impl LlmProvider for DeepSeekProvider {
                 .collect::<Vec<_>>().join("\n");
             let thinking_state = if body.thinking.is_some() { "ON" } else { "OFF" };
             let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+                format!("\n(完整 JSON 见 {})", crate::llm::wire_trace::wire_trace_path("deepseek").display())
             } else {
                 String::new()
             };
@@ -729,11 +737,10 @@ impl LlmProvider for DeepSeekProvider {
         let mut body = self.build_request(&req);
         body.stream = true;
 
-        // V18 wire trace: 把请求 body 写到 /tmp/abacus_wire_last.json
-        // 安全守卫: 仅在 debug build 时写入，防止 release build 泄漏 API key
+        // V18 wire trace: per-pid 路径避免并发覆盖 + 0600 权限
         #[cfg(debug_assertions)]
         if let Ok(json) = serde_json::to_string_pretty(&body) {
-            let _ = std::fs::write("/tmp/abacus_wire_last.json", &json);
+            crate::llm::wire_trace::write_wire_trace("deepseek (streaming)", &self.base_url, &json);
         }
 
         let resp = self
@@ -750,9 +757,11 @@ impl LlmProvider for DeepSeekProvider {
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamEvent::Error(
+            if tx.send(StreamEvent::Error(
                 format!("HTTP {}: {}", status.as_u16(), &body_text[..body_text.len().min(200)])
-            ));
+            )).is_err() {
+                tracing::debug!("stream consumer gone before HTTP error");
+            }
             // V18：把请求摘要也带进错误消息，便于 TUI 立刻看出协议错配
             let summary = body.messages.iter().enumerate()
                 .map(|(i, m)| {
@@ -766,7 +775,7 @@ impl LlmProvider for DeepSeekProvider {
                 .collect::<Vec<_>>().join("\n");
             let thinking_state = if body.thinking.is_some() { "ON" } else { "OFF" };
             let wire_hint = if cfg!(debug_assertions) {
-                format!("\n(完整 JSON 见 /tmp/abacus_wire_last.json)")
+                format!("\n(完整 JSON 见 {})", crate::llm::wire_trace::wire_trace_path("deepseek").display())
             } else {
                 String::new()
             };
@@ -798,22 +807,30 @@ impl LlmProvider for DeepSeekProvider {
         let mut tc_index_started: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
+        // 🟡#7 治本：stream_alive 标志 + per-token send 失败时跳出循环
+        let mut stream_alive = true;
         loop {
             let chunk = match tokio::time::timeout(std::time::Duration::from_secs(45), byte_stream.next()).await {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
                     tracing::warn!("stream idle timeout (45s), treating as complete");
-                    let _ = tx.send(StreamEvent::Error("stream idle timeout (45s)".into()));
+                    if tx.send(StreamEvent::Error("stream idle timeout (45s)".into())).is_err() {
+                        tracing::debug!("stream consumer gone, stopping");
+                        stream_alive = false;
+                    }
                     break;
                 }
             };
+            if !stream_alive { break; }
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
-                    let _ = tx.send(StreamEvent::Error(
+                    if tx.send(StreamEvent::Error(
                         format!("stream interrupted: {e}")
-                    ));
+                    )).is_err() {
+                        tracing::debug!("stream consumer gone during error: {e}");
+                    }
                     return Err(KernelError::Provider(format!("stream read: {e}")));
                 }
             };
@@ -830,7 +847,9 @@ impl LlmProvider for DeepSeekProvider {
 
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data == "[DONE]" {
-                        let _ = tx.send(StreamEvent::Done);
+                        if tx.send(StreamEvent::Done).is_err() {
+                            tracing::debug!("stream consumer gone before Done");
+                        }
                         break;
                     }
 
@@ -844,7 +863,11 @@ impl LlmProvider for DeepSeekProvider {
                                 if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
                                     if !content.is_empty() {
                                         full_text.push_str(content);
-                                        let _ = tx.send(StreamEvent::TextDelta(content.to_string()));
+                                        // 🟡#7 治本：per-token 失败标记死亡
+                                        if tx.send(StreamEvent::TextDelta(content.to_string())).is_err() {
+                                            tracing::debug!("stream consumer gone mid-stream; will stop sending");
+                                            stream_alive = false;
+                                        }
                                     }
                                 }
 
@@ -852,7 +875,9 @@ impl LlmProvider for DeepSeekProvider {
                                 if let Some(reasoning) = delta.get("reasoning_content").and_then(|r| r.as_str()) {
                                     if !reasoning.is_empty() {
                                         full_thinking.push_str(reasoning);
-                                        let _ = tx.send(StreamEvent::ThinkingDelta(reasoning.to_string()));
+                                        if tx.send(StreamEvent::ThinkingDelta(reasoning.to_string())).is_err() {
+                                            stream_alive = false;
+                                        }
                                     }
                                 }
 
@@ -920,10 +945,16 @@ impl LlmProvider for DeepSeekProvider {
                     }
                 }
             }
+            // 🟡#7 治本：parse 完一个 chunk 后若 stream 已死，不再读下一个
+            if !stream_alive { break; }
         }
 
-        let _ = tx.send(StreamEvent::Usage { prompt_tokens, completion_tokens });
-        let _ = tx.send(StreamEvent::Done);
+        if tx.send(StreamEvent::Usage { prompt_tokens, completion_tokens }).is_err() {
+            tracing::debug!("stream consumer gone before Usage");
+        }
+        if tx.send(StreamEvent::Done).is_err() {
+            tracing::debug!("stream consumer gone before final Done");
+        }
 
         // Build aggregated LlmResponse
         // V14：reasoning_content 仅在真实非空时存入；空占位会被 build_messages 跳过传输
@@ -1430,6 +1461,7 @@ mod tests {
             None,
             Some("high".into()), // provider-level default
             None,
+            None,  // auth_prefix: default "Bearer "
         );
         let mut r = basic_req();
         r.model = ModelId("deepseek-v4-pro".into());

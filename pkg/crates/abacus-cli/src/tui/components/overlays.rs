@@ -781,7 +781,7 @@ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rec
         .split(inner);
 
     let fields: [(&str, String, String); 5] = [
-        ("1. API Key", if std::env::var("ABACUS_API_KEY").is_ok() || std::env::var("DEEPSEEK_API_KEY").is_ok() { t("overlay.configured").into() } else { t("overlay.not_configured").into() }, "~/.abacus/config.yaml".into()),
+        ("1. API Key", if std::env::var("ABACUS_API_KEY").is_ok() || std::env::var("DEEPSEEK_API_KEY").is_ok() { t("overlay.configured").into() } else { t("overlay.not_configured").into() }, "~/.abacus/provider.toml".into()),
         ("2. Model", state.model_name.clone(), t("overlay.model_cycle").into()),
         ("3. Thinking", state.thinking_depth.clone(), "off→low→med→high".into()),
         ("4. Theme", state.theme.name.into(), t("overlay.theme_cycle").into()),

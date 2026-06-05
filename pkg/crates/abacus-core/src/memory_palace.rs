@@ -1110,12 +1110,23 @@ pub enum SmartRetrieveResult {
 /// - 都无分隔时整段当 domain（短工具名如 "code"）
 pub(crate) fn extract_tool_domain(tool_id: &str) -> &str {
     if let Some(idx) = tool_id.find('.') {
-        return &tool_id[..idx];
+        return normalize_domain(&tool_id[..idx]);
     }
     if let Some(idx) = tool_id.find('_') {
-        return &tool_id[..idx];
+        return normalize_domain(&tool_id[..idx]);
     }
-    tool_id
+    normalize_domain(tool_id)
+}
+
+/// 短别名 → 规范 domain 名映射
+///
+/// `fs`/`bash` 是历史短前缀（V29.13 之前），统一映射为 `filengine`，
+/// 让 search("filengine") 同时覆盖 dot/underscore 两种命名。
+fn normalize_domain(prefix: &str) -> &str {
+    match prefix {
+        "fs" | "bash" => "filengine",
+        other => other,
+    }
 }
 
 // ─── SQLite 持久化层 ────────────────────────────────────────────────────

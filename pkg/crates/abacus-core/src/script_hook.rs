@@ -10,7 +10,7 @@
 //! | 无前缀 / `sh://` | Shell 命令 | ❌ 系统权限 | spawn 子进程 |
 //! | `py://` | Python 代码 | ❌ 子进程隔离 | spawn 子进程 |
 //!
-//! ## 配置示例 (config.yaml)
+//! ## 配置示例 (config.toml)
 //!
 //! ```yaml
 //! magchain:
@@ -142,6 +142,7 @@ impl PipelineHook for ScriptHook {
                     .envs(envs)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)  // task cancel/panic → 自动杀子进程
                     .spawn()
                     .map_err(|e| KernelError::Other(format!("spawn sh hook: {e}")))?;
                 // 不等待——detach，不阻塞 pipeline
@@ -164,6 +165,7 @@ impl PipelineHook for ScriptHook {
                     .envs(envs)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)  // task cancel/panic → 自动杀子进程
                     .spawn()
                     .map_err(|e| KernelError::Other(format!("spawn py hook: {e}")))?;
                 tokio::spawn(async move {

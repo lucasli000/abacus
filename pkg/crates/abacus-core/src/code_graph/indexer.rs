@@ -273,12 +273,18 @@ impl Indexer {
     }
 
     async fn git_changed_files(&self, workspace: &Path, base_ref: &str) -> Result<Vec<PathBuf>, String> {
-        let output = tokio::process::Command::new("git")
-            .args(["diff", "--name-only", base_ref])
-            .current_dir(workspace)
-            .output()
-            .await
-            .map_err(|e| format!("git diff failed: {e}"))?;
+        // 30s timeout：防止损坏的 .git 目录让 git diff 永久挂起
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::process::Command::new("git")
+                .args(["diff", "--name-only", base_ref])
+                .current_dir(workspace)
+                .kill_on_drop(true)  // 父 task cancel → 自动杀 git 子进程
+                .output(),
+        )
+        .await
+        .map_err(|_| "git diff timed out after 30s (corrupt .git dir?)".to_string())?
+        .map_err(|e| format!("git diff failed: {e}"))?;
 
         if !output.status.success() {
             // 如果 git 失败（非 git 仓库等），回退到全量

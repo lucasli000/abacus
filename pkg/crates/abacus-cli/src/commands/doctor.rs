@@ -20,7 +20,7 @@ pub fn build_doctor_report() -> Vec<String> {
         .unwrap_or_default();
 
     // Config file
-    let config_path = data_dir.join("config.yaml");
+    let config_path = data_dir.join("config.toml");
     lines.push(if config_path.exists() {
         format!("[✓] Config: {}", config_path.display())
     } else {

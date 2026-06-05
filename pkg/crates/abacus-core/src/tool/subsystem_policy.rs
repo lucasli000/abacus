@@ -276,9 +276,13 @@ mod tests {
     #[test]
     fn lazy_subsystem_registers_when_enabled() {
         let mut enabled = HashSet::new();
-        enabled.insert("lsp");
-        assert!(should_register("lsp_", &enabled));
-        assert!(!should_register("mcp_", &enabled), "mcp not in enabled set");
+        // mcp 是当前唯一典型的 Lazy 子系统（lsp 改为 Adaptive）
+        enabled.insert("mcp");
+        assert!(should_register("mcp_", &enabled));
+        assert!(!should_register("plugin_", &enabled), "plugin not in enabled set");
+        // lsp 改 Adaptive 后由 heat 决定，NoopHeat 返 0 → 不注册
+        assert!(!should_register("lsp_", &enabled),
+            "lsp 是 Adaptive，NoopHeat 返 0 → 不注册");
     }
 
     #[test]

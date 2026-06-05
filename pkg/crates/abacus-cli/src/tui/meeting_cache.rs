@@ -51,10 +51,7 @@ use std::path::PathBuf;
 /// 引用关系: 所有读写操作的路径根
 /// 生命周期: 进程内多次调用，每次重新计算（轻量）
 pub fn meetings_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".abacus")
-        .join("meetings")
+    abacus_core::paths::meetings_dir()
 }
 
 /// 确保缓存目录存在（首次调用时创建）
@@ -291,7 +288,7 @@ pub fn extract_action_items_from_text(text: &str) -> Vec<RecordActionItem> {
 
         // Pattern 1: Markdown checkbox — `- [ ] xxx` / `- [x] xxx` / `* [ ] xxx`
         if let Some(rest) = trimmed.strip_prefix("- [") {
-            if let Some(content) = rest.strip_prefix("] ") {
+            if let Some(content) = rest.strip_prefix(" ] ") {
                 items.push(RecordActionItem { text: content.trim().to_string(), done: false });
                 continue;
             }

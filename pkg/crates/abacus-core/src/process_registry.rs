@@ -209,6 +209,8 @@ fn is_pid_alive(_pid: u32) -> bool {
 }
 
 #[cfg(test)]
+// 🟡#2 治本：见 config.rs 同注释
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

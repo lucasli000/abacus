@@ -268,12 +268,12 @@ pub struct McipGateway {
     extra_exempt_prefixes: std::sync::RwLock<Vec<String>>,
     /// 精确允许工具 ID 名单（跳过 MCIP 策略，直接 Allowed）
     ///
-    /// 来源：security.yaml `mcip.allow_tools`
+    /// 来源：security.toml `mcip.allow_tools`
     /// 优先级低于 deny_tools，高于 exempt_prefixes
     allow_tools: std::sync::RwLock<std::collections::HashSet<String>>,
     /// 永久禁止工具 ID 名单（最高优先级，覆盖一切授权）
     ///
-    /// 来源：security.yaml `mcip.deny_tools`
+    /// 来源：security.toml `mcip.deny_tools`
     /// 即使用户已手动授权也不能绕过此项（系统管理员第一道防线）
     deny_tools: std::sync::RwLock<std::collections::HashSet<String>>,
 }
@@ -311,13 +311,13 @@ impl McipGateway {
         }
     }
 
-    /// 从 config 批量设置允许工具名单（security.yaml `mcip.allow_tools`）
+    /// 从 config 批量设置允许工具名单（security.toml `mcip.allow_tools`）
     pub fn apply_allow_tools(&self, tools: &[String]) {
         let mut guard = self.allow_tools.write_or_recover();
         for t in tools { guard.insert(t.clone()); }
     }
 
-    /// 从 config 批量设置禁止工具名单（security.yaml `mcip.deny_tools`）
+    /// 从 config 批量设置禁止工具名单（security.toml `mcip.deny_tools`）
     pub fn apply_deny_tools(&self, tools: &[String]) {
         let mut guard = self.deny_tools.write_or_recover();
         for t in tools { guard.insert(t.clone()); }
@@ -331,7 +331,7 @@ impl McipGateway {
         self.extra_exempt_prefixes.write_or_recover().push(prefix.into());
     }
 
-    /// 批量注册豆免前缀（从 config.yaml 读入的列表）
+    /// 批量注册豆免前缀（从 config.toml 读入的列表）
     pub fn apply_exempt_prefixes(&self, prefixes: &[String]) {
         let mut guard = self.extra_exempt_prefixes.write_or_recover();
         for p in prefixes {
@@ -398,7 +398,7 @@ impl McipGateway {
             let deny = self.deny_tools.read_or_recover();
             if deny.contains(id_str) {
                 return McipDecision::Denied(format!(
-                    "tool '{id_str}' is on the permanent deny list (security.yaml mcip.deny_tools)"
+                    "tool '{id_str}' is on the permanent deny list (security.toml mcip.deny_tools)"
                 ));
             }
         }
@@ -413,7 +413,7 @@ impl McipGateway {
 
         // ③ exempt_prefixes：内置工具和自定义前缀豆免
         // 内置前缀：env_/fs_/db_/kb_/lsp. 等——可信二进制不需 capability policy
-        // 自定义前缀：调用方通过 `add_exempt_prefix()` 或 security.yaml 添加
+                    // 自定义前缀：调用方通过 `add_exempt_prefix()` 或 security.toml 添加
         let extra = self.extra_exempt_prefixes.read_or_recover();
         let is_exempt = BUILTIN_EXEMPT_PREFIXES.iter().any(|p| id_str.starts_with(p))
             || extra.iter().any(|p| id_str.starts_with(p.as_str()));

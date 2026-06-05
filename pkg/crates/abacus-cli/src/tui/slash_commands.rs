@@ -69,6 +69,7 @@ fn registry() -> &'static [Entry] {
         v.push(Entry { names: &["diff"],            handler: cmd_diff,     help: "git diff - /diff [path]" });
         v.push(Entry { names: &["export"],          handler: cmd_export,   help: "导出会话" });
         v.push(Entry { names: &["context", "ctx"],  handler: cmd_context,  help: "上下文状态" });
+        v.push(Entry { names: &["budget", "cost"], handler: cmd_budget, help: "LLM 资源预算 (cost/token/latency)" });
         v.push(Entry { names: &["compress"],        handler: cmd_compress, help: "手动压缩上下文" });
         v.push(Entry { names: &["inject"],          handler: cmd_inject,   help: "注入临时知识 - /inject <text>" });
         v.push(Entry { names: &["rename"],          handler: cmd_rename,   help: "重命名会话 - /rename <alias>" });
@@ -1423,7 +1424,10 @@ fn cmd_debug(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 }
 
 fn cmd_version(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
-    s.add_toast("Abacus v1.0.0", std::time::Duration::from_secs(3));
+    s.add_toast(
+        format!("Abacus v{}", env!("CARGO_PKG_VERSION")),
+        std::time::Duration::from_secs(3),
+    );
     CmdResult::Consumed
 }
 
@@ -1455,6 +1459,9 @@ fn cmd_settings(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 
 fn cmd_context(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     engine_or(s, SlashCommand::ContextStatus)
+}
+fn cmd_budget(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
+    engine_or(s, SlashCommand::BudgetStatus)
 }
 fn cmd_compress(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     engine_or(s, SlashCommand::ContextCompress)
@@ -1558,11 +1565,10 @@ fn cmd_feedback(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
         return CmdResult::Consumed;
     }
     let text = args.join(" ");
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    let dir = format!("{}/.abacus", home);
-    let _ = std::fs::create_dir_all(&dir); // Ensure directory exists
-    let path = format!("{}/feedback.log", dir);
-    let entry = format!("[{}] {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), text);
+    let dir = abacus_core::paths::global_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("data/feedback.log");
+    let entry = format!("[{}] {}\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), text);
     match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut f) => {
             use std::io::Write;

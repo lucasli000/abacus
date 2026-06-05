@@ -480,7 +480,7 @@ pub struct TurnStats {
 
 // ─── Multi-Provider Configuration ──────────────────────────────────────────
 
-/// 供应商配置条目（从 config.yaml `providers` 数组解析）
+/// 供应商配置条目（从 `provider.toml` `[[providers]]` 数组解析）
 ///
 /// ## 引用关系
 /// - 生产者: ConfigManager::parse_providers()
@@ -512,7 +512,7 @@ pub struct ProviderEntry {
 /// 单个模型配置（provider 内的 per-model 参数）
 ///
 /// ## 引用关系
-/// - 生产者: config.yaml providers[].models[] 解析
+/// - 生产者: provider.toml providers[].models[] 解析
 /// - 消费者: engine_init → ModelCatalog.register_override()
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -541,56 +541,37 @@ pub struct ModelEntry {
     pub supports_tools: Option<bool>,
 }
 
-/// 自定义反序列化：支持 models 字段的两种格式
+/// 自定义反序列化：支持 models 字段的两种格式（格式无关：TOML/YAML/JSON 均可）
 /// - 字符串数组: ["model-a", "model-b"] → ModelEntry { name: "model-a", ... }
 /// - 对象数组: [{name: "model-a", max_tokens: 8192}] → 直接解析
+///
+/// 使用 #[serde(untagged)] 替代原 serde_json::Value 中间类型，
+/// 使反序列化器不依赖特定数据格式（原实现硬编码 serde_json::Value，TOML 无法兼容）。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelEntryRaw {
+    Name(String),
+    Full(ModelEntry),
+}
+
 fn deserialize_model_entries<'de, D>(deserializer: D) -> Result<Vec<ModelEntry>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de;
-
-    struct ModelEntriesVisitor;
-
-    impl<'de> de::Visitor<'de> for ModelEntriesVisitor {
-        type Value = Vec<ModelEntry>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a sequence of strings or model entry objects")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: de::SeqAccess<'de>,
-        {
-            let mut entries = Vec::new();
-            while let Some(item) = seq.next_element::<serde_json::Value>()? {
-                match item {
-                    serde_json::Value::String(name) => {
-                        entries.push(ModelEntry {
-                            name,
-                            context_window: None,
-                            max_tokens: None,
-                            temperature: None,
-                            thinking: None,
-                            top_p: None,
-                            supports_images: None,
-                            supports_tools: None,
-                        });
-                    }
-                    serde_json::Value::Object(_) => {
-                        let entry: ModelEntry = serde_json::from_value(item)
-                            .map_err(de::Error::custom)?;
-                        entries.push(entry);
-                    }
-                    _ => return Err(de::Error::custom("model entry must be string or object")),
-                }
-            }
-            Ok(entries)
-        }
-    }
-
-    deserializer.deserialize_seq(ModelEntriesVisitor)
+    let raw: Vec<ModelEntryRaw> = Vec::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(|r| match r {
+        ModelEntryRaw::Name(name) => ModelEntry {
+            name,
+            context_window: None,
+            max_tokens: None,
+            temperature: None,
+            thinking: None,
+            top_p: None,
+            supports_images: None,
+            supports_tools: None,
+        },
+        ModelEntryRaw::Full(entry) => entry,
+    }).collect())
 }
 
 /// 供应商协议类型

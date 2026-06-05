@@ -356,6 +356,15 @@ impl<'a> TurnPipeline<'a> {
             }
         }
 
+        // **资源感知落地**：调 LLM 前先调 pressure_monitor.check_and_shed()
+        // LlmBudget::shed() 在压力超 hard_threshold 时切到 fallback provider
+        // （通过 on_shed 回调，CoreLoop 层面打 warning 标记，让后续 resolve_provider 走 fallback）
+        let shed_actions = self.core.pressure_monitor().check_and_shed().await;
+        for action in &shed_actions {
+            tracing::debug!("pressure shed action: source={} level={:?} items_shed={}",
+                            action.source, action.level, action.items_shed);
+        }
+
         // Resolve provider and call LLM
         let (provider_id, provider) = self.core.resolve_provider().await?;
         // V35-1: messages 改为 mut，便于按需追加 prefix=true assistant message
@@ -439,6 +448,33 @@ impl<'a> TurnPipeline<'a> {
             }
         };
         let final_response = super::extract_text(&response.message);
+
+        // **资源感知落地**：把这次调用的实际 cost/token/latency 记入 LlmBudget。
+        // 后续 turn 开始时 pressure_monitor.check_and_shed() 会自动据此降级。
+        {
+            use std::time::Instant;
+            let model_id = abacus_types::ModelId(
+                self.core.config.default_model.0.clone(),
+            );
+            let cost = self.core.llm_budget()
+                .compute_cost(&model_id, response.usage.prompt_tokens, response.usage.completion_tokens)
+                .await;
+            let usage = crate::core::llm_budget::LlmUsage {
+                cost_usd: cost,
+                prompt_tokens: response.usage.prompt_tokens,
+                completion_tokens: response.usage.completion_tokens,
+                latency: std::time::Duration::from_millis(0),  // latency 由调用方测
+                model: model_id,
+            };
+            self.core.llm_budget().record(usage).await;
+            // level 升级到 elevated/critical 时打 warning（用户能看到）
+            let level = self.core.llm_budget().level().await;
+            if matches!(level, crate::core::pressure::PressureLevel::Critical
+                          | crate::core::pressure::PressureLevel::Overloaded) {
+                let snap = self.core.llm_budget().snapshot().await;
+                tracing::warn!("LLM budget pressure elevated: {snap}");
+            }
+        }
 
         // Store in session
         {

@@ -20,6 +20,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::{HistoryArgs, RedoArgs, UndoArgs};
+use crate::tui::util::safe_prefix;
 
 /// `abacus undo` 入口
 pub async fn handle_undo(args: &UndoArgs) -> Result<(), String> {
@@ -176,7 +177,7 @@ fn format_undo_md(r: &UndoResult) -> String {
     };
     let path_str = r.path.to_string_lossy();
     let header = format!("undo seq={} session={} action={} path={}",
-        r.seq, &r.session_id[..r.session_id.len().min(8)], action_str, path_str);
+        r.seq, safe_prefix(&r.session_id, 8), action_str, path_str);
 
     if let Some(c) = &r.conflict {
         let detail = match c {
@@ -241,7 +242,7 @@ fn print_history_markdown(entries: &[HistoryEntry], project_mode: bool, since_la
     println!("| seq | session  | turn | tool      | op        | path | status |");
     println!("|----:|----------|-----:|-----------|-----------|------|--------|");
     for e in entries {
-        let sid_short = &e.session_id[..e.session_id.len().min(8)];
+        let sid_short = safe_prefix(&e.session_id, 8);
         let status = if e.undone { "↺ undone" } else { "✓ active" };
         let path_short = if e.path.len() > 50 {
             format!("…{}", &e.path[e.path.len() - 47..])

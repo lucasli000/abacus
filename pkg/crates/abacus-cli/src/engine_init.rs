@@ -9,7 +9,7 @@
 //!
 //! ## Config priority
 //! 1. Environment variables (ABACUS_*)
-//! 2. ~/.abacus/config.yaml (TUI setup wizard output)
+//! 2. ~/.abacus/config.toml + provider.toml (TUI setup wizard output)
 //! 3. Built-in defaults
 
 use std::sync::Arc;
@@ -75,16 +75,17 @@ pub async fn create_engine(
     let session_store: Arc<dyn SessionStore> = Arc::new(CliSessionStore);
     let ctx_mgr = Arc::new(ContextManager::new(session_store));
 
-    // ─── ConfigManager: env vars + ~/.abacus/config.yaml ───────────────
+    // ─── ConfigManager: env vars + ~/.abacus/config.toml ───────────────
     let mut cfg_mgr = ConfigManager::new(default_config());
     cfg_mgr.load_env("ABACUS_");
 
-    // 配置加载顺序：默认内置层 < models.yaml < config.yaml < security.yaml < conf.d/*.yaml < 环境变量
+    // 配置加载顺序：默认内置层 < models.toml < config.toml < security.toml < provider.toml < conf.d/*.toml < 环境变量
     // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
     use abacus_core::paths;
-    let _ = cfg_mgr.load_file(paths::models_yaml());      // models.yaml — LLM 凭证 + 模型参数
-    let _ = cfg_mgr.load_file(paths::config_yaml());      // config.yaml — Abacus 行为配置
-    let _ = cfg_mgr.load_file(paths::security_yaml());    // security.yaml — safety / MCIP 安全配置
+    let _ = cfg_mgr.load_file(paths::models_toml());      // models.toml — 模型能力 catalog 覆盖
+    let _ = cfg_mgr.load_file(paths::config_toml());      // config.toml — Abacus 行为配置
+    let _ = cfg_mgr.load_file(paths::security_toml());    // security.toml — safety / MCIP 安全配置
+    let _ = cfg_mgr.load_provider_file(paths::provider_toml()); // provider.toml — 供应商配置（唯一真相源）
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
 
     // Validate config before using — warn on out-of-range values
@@ -171,13 +172,13 @@ pub async fn create_engine(
         ..Default::default()
     });
 
-    // Phase 3：模型能力 catalog——builtin + paths::models_yaml() 覆盖
+    // Phase 3：模型能力 catalog——builtin + paths::models_toml() 覆盖
     let mut catalog = abacus_core::llm::ModelCatalog::builtin();
-    let yaml_path = paths::models_yaml();
-    match catalog.merge_yaml(&yaml_path) {
+    let toml_path = paths::models_toml();
+    match catalog.merge_toml(&toml_path) {
         Ok(0) => {}
-        Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, yaml_path.display()),
-        Err(e) => tracing::warn!("Failed to merge {}: {}", yaml_path.display(), e),
+        Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, toml_path.display()),
+        Err(e) => tracing::warn!("Failed to merge {}: {}", toml_path.display(), e),
     }
     // 2026-05-28: 从 providers[].models[] per-model 参数合并到 catalog
     // 2026-05-30 PR2: 传入 provider_id 写入 qualified_specs（provider-aware 索引）
@@ -248,6 +249,22 @@ pub async fn create_engine(
 
     let mut core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
 
+    // ─── 资源感知（治本：从 config.toml [llm_budget] 真读取并 reconfigure）────────
+    // 用户在 `config.toml` 显式启用 `[llm_budget]` 段后才会有限额；
+    // 默认 0 = 不限（opt-in 语义），保持向后兼容。
+    let budget_cfg = cfg_mgr.llm_budget_config();
+    if budget_cfg.max_cost_usd > 0.0 || budget_cfg.max_total_tokens > 0 {
+        tracing::info!(
+            "llm_budget enabled: max_cost=${:.2} max_tokens={} \
+             soft={:.2} hard={:.2} reject={:.2}",
+            budget_cfg.max_cost_usd, budget_cfg.max_total_tokens,
+            budget_cfg.soft_threshold, budget_cfg.hard_threshold, budget_cfg.reject_threshold
+        );
+    } else {
+        tracing::debug!("llm_budget not enabled (max_cost_usd=0 max_total_tokens=0); resources unlimited");
+    }
+    core.reconfigure_llm_budget(budget_cfg);
+
     // ─── 知识库 + 记忆宫殿 wire-up ───────────────────────────────────────
     // KnowledgeStore 和 DualPalaceMemory 均未集成进 CoreLoop::new()，需在此显式初始化。
     // 两者均持久化到 ~/.abacus/（磁盘失败时静默降级为内存模式，不中断启动）。
@@ -314,7 +331,7 @@ pub async fn create_engine(
     }
 
     // ─── Provider registration ─────────────────────────────────────────
-    // 2026-05-28: 优先使用 config.yaml `providers` 数组（多供应商多模型）
+    // 2026-05-28: 优先使用 provider.toml `[[providers]]` 数组（多供应商多模型）
     // fallback: 无 `providers` 时走旧 llm.* 逻辑（向后兼容）
     use abacus_core::llm::fallback_provider::FallbackProvider;
     use abacus_core::LlmProvider;
@@ -352,7 +369,7 @@ pub async fn create_engine(
                         .unwrap_or_else(|| ModelId(abacus_types::ModelId::AUTO.into()));
                     let p = Arc::new(DeepSeekProvider::with_config(
                         api_key, default_ds_model,
-                        base, None, None,
+                        base, None, None, None,  // auth_prefix: default "Bearer "
                     ));
                     core.register_provider_group(&entry.id, models, p).await;
                 }
@@ -477,7 +494,7 @@ pub async fn create_engine(
             .flatten();
         let p = Arc::new(DeepSeekProvider::with_config(
             api_key, ModelId(resolved_model.to_string()),
-            clean_base, None, None,
+            clean_base, None, None, None,  // auth_prefix: default "Bearer "
         ));
         core.register_provider("deepseek", p.clone()).await;
         if primary.is_none() {
@@ -528,7 +545,7 @@ pub async fn create_engine(
         *core.model_preference().write().await = preference;
     }
 
-    // ─── MCIP 权限配置（来自 security.yaml）───────────────────────
+    // ─── MCIP 权限配置（来自 security.toml）───────────────────────
     // 内置工具前缀（fs_/lsp./kb_ 等）已硬编码豁免，无需配置。
     core.configure_mcip_permissions(
         &cfg_mgr.get_list("mcip.exempt_prefixes").unwrap_or_default(),
@@ -538,7 +555,7 @@ pub async fn create_engine(
 
     // ─── LSP 支持（按需激活）──────────────────────────────────────────
     // 语言服务器是 lazy start：首次调用工具时才实际启动。
-    // 可用 `lsp.enabled = false` 在 ~/.abacus/config.yaml 中禁用。
+    // 可用 `lsp.enabled = false` 在 ~/.abacus/config.toml 中禁用。
     if cfg_mgr.get_bool("lsp.enabled").unwrap_or(true) {
         let workspace = std::env::current_dir()
             .map(|d| d.to_string_lossy().to_string())
@@ -587,7 +604,7 @@ pub async fn create_engine(
     }
 
     // ─── 脚本钩子加载（magchain.hooks）───────────────────────────────
-    // 从 config.yaml 读取 magchain.hooks 列表，注册为 PipelineHook。
+    // 从 config.toml 读取 magchain.hooks 列表，注册为 PipelineHook。
     // 支持 rhai:// / sh:// / py:// 三种运行时。
     if let Some(hook_configs) = cfg_mgr.get_typed::<Vec<abacus_core::script_hook::HookConfig>>("magchain.hooks") {
         for cfg in hook_configs {

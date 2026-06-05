@@ -39,17 +39,17 @@ fn api_key() -> Option<String> {
     if let Ok(k) = std::env::var("DEEPSEEK_API_KEY").or_else(|_| std::env::var("ABACUS_TEST_API_KEY")) {
         return Some(k);
     }
-    // 2. 读 ~/.abacus/config.yaml 中的 llm.api_key
-    let path = std::env::var("HOME").ok()
-        .map(|h| std::path::PathBuf::from(h).join(".abacus").join("config.yaml"));
+    // 2. 读 ~/.abacus/config.toml 中的 llm.api_key
+    let path = dirs::home_dir()
+        .map(|h| std::path::PathBuf::from(h).join(".abacus").join("config.toml"));
     if let Some(p) = path {
         if let Ok(content) = std::fs::read_to_string(&p) {
             for line in content.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("api_key:") {
-                    let val = trimmed.trim_start_matches("api_key:").trim()
+                if trimmed.starts_with("api_key =") {
+                    let val = trimmed.trim_start_matches("api_key").trim_start_matches('=').trim()
                         .trim_matches('"').trim_matches('\'');
-                    if !val.is_empty() && !val.is_empty() {
+                    if !val.is_empty() {
                         return Some(val.to_string());
                     }
                 }

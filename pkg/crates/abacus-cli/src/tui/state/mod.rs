@@ -664,6 +664,8 @@ pub enum SlashCommand {
     ContextStatus,
     ContextCompress,
     ContextInject(String),
+    /// V42: 资源感知状态（cost / token / latency 三维 budget）
+    BudgetStatus,
     ToolList,
     ToolStats,
     SafetyStatus,
@@ -995,7 +997,7 @@ pub struct AppState {
     /// 用途：session 文件命名（{uuid}.json），避免多实例互覆盖。
     pub session_id: String,
     pub model_name: String,
-    /// 当前活跃的 provider ID（来自 config.yaml providers[].id）
+    /// 当前活跃的 provider ID（来自 provider.toml providers[].id）
     /// 来源：StreamChunk::Complete stats.provider_id
     /// 用途：健康仪表盘显示实际 provider，切换同名模型到不同 provider 时可区分
     pub active_provider_id: String,
@@ -1017,7 +1019,7 @@ pub struct AppState {
     pub pending_model_fetch: bool,
     pub thinking_depth: String, // "off" | "low" | "medium" | "high"
     /// 系统设定上下文空间 = model_limit * context_window_ratio（有效窗口）
-    /// 来源：Complete stats.context_max / 热加载 config.yaml
+    /// 来源：Complete stats.context_max / 热加载 config.toml
     pub context_window: usize,
     /// LLM 最大上下文空间（模型物理上限，如 1M）
     /// 来源：model_spec.context_window（引擎初始化时设置）
@@ -3980,15 +3982,15 @@ mod tests {
 
     #[test]
     fn panel_tab_next_cycles_through_quant() {
+        // V35: 两模式统一两 Tab — 现场(Timeline) + 仓库(Quant)
         // Clarify: Timeline → Quant → Timeline (循环)
         let mode = AbacusMode::Clarify;
         assert_eq!(PanelTab::Timeline.next(mode), PanelTab::Quant);
         assert_eq!(PanelTab::Quant.next(mode), PanelTab::Timeline);
 
-        // Meeting: Timeline → Tasks → Quant → Timeline (循环)
+        // Meeting: Timeline → Quant → Timeline (循环) — Tasks 已并入现场 Tab
         let mode = AbacusMode::Meeting;
-        assert_eq!(PanelTab::Timeline.next(mode), PanelTab::Tasks);
-        assert_eq!(PanelTab::Tasks.next(mode), PanelTab::Quant);
+        assert_eq!(PanelTab::Timeline.next(mode), PanelTab::Quant);
         assert_eq!(PanelTab::Quant.next(mode), PanelTab::Timeline);
     }
 
