@@ -88,21 +88,17 @@ pub fn render_card(
         default_color_for_kind(card.kind(), ctx.theme())
     });
 
-    let border_type = match card.streaming() {
-        CardStreaming::Static => BorderType::Rounded,
-        CardStreaming::Active => BorderType::Double,
-        CardStreaming::Aborted => BorderType::Plain,
-    };
-
+    // 边框策略：统一 Rounded（不再切 Double/Plain），border 用弱色
+    // 让消息流视觉连续，避免边框加粗造成割裂感
     let border_color = match card.streaming() {
         CardStreaming::Aborted => ctx.theme().error,
-        _ => color,
+        _ => ctx.theme().border,  // 弱色边框，不抢主色
     };
 
     // 边框 + 标题 + 折叠箭头
     let title_spans = build_title_spans(&header, &color, ctx, shimmer_pos);
     let block = Block::bordered()
-        .border_type(border_type)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
         .title(title_spans);
 

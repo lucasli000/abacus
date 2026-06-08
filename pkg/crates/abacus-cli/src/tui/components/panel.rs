@@ -616,13 +616,12 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn render_section_header(lines: &mut Vec<Line>, label: &str, width: usize, theme: &abacus_ui_kit::Theme) {
-    let dim = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
-    let fill = width.saturating_sub(label.len() + 5).min(14);
+fn render_section_header(lines: &mut Vec<Line>, label: &str, _width: usize, theme: &abacus_ui_kit::Theme) {
+    // 子标题用纯文本前缀 `▸`，去掉 ──── 长横线分隔（视觉杂乱）
+    let _ = _width;
     lines.push(Line::from(vec![
-        Span::styled("  \u{2500} ", dim),
-        Span::styled(label.to_string(), Style::default().fg(theme.muted)),
-        Span::styled(format!(" {}", "\u{2500}".repeat(fill)), dim),
+        Span::styled("  ▸ ", Style::default().fg(theme.muted)),
+        Span::styled(label.to_string(), Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)),
     ]));
 }
 

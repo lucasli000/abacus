@@ -26,7 +26,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, BorderType, Borders, Widget};
+use ratatui::widgets::{Block, Widget};
 
 use abacus_ui_kit::hooks::ShimmerPhase;
 use abacus_ui_kit::prelude::*;
@@ -42,11 +42,8 @@ use crate::tui::state::AppState;
 /// - `area`: 消息区 Rect
 /// - `_focus`: 当前焦点 (V42-B 消息区不参与焦点循环, 保留参数兼容旧调用)
 pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::tui::state::Focus) {
-    // 1. 消息区外框 (圆角边框 + 主题背景)
+    // 1. 消息区背景 (无外框 — 弱化视觉权重，避免消息流被边框割裂)
     let msg_block = Block::default()
-        .border_type(BorderType::Rounded)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(state.theme.border))
         .style(Style::default().bg(state.theme.bg));
     let inner = msg_block.inner(area);
     msg_block.render(area, f.buffer_mut());

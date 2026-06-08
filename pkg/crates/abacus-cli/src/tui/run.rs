@@ -1494,6 +1494,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if !stats.provider_id.is_empty() {
                                 state.active_provider_id = stats.provider_id.clone();
                             }
+                            // 同步当前 model_id（LLM 端 alias 解析后的真实模型名）
+                            // 修复：之前 model_name 只在 setup/discover 阶段更新，chat 完成后没同步
+                            // 导致看板显示 setup 选的模型名，但实际 LLM 调用的是 alias 解析后的名字
+                            if !stats.model_id.is_empty() && stats.model_id != state.model_name {
+                                state.theme.apply_model_brand(&stats.model_id);
+                                state.model_name = stats.model_id.clone();
+                            }
                             // Complete: ctx_live_tokens 优先用 context_tokens（含 system prompt/tools），
                             // fallback 到 prompt+completion（API usage 返回值）
                             state.ctx_live_tokens = stats.context_tokens
