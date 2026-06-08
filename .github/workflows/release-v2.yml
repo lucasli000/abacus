@@ -1,0 +1,186 @@
+name: Release v2.0.0
+
+on:
+  push:
+    tags:
+      - 'v2.0.0'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: abacus
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS arm64 (Apple Silicon)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: abacus-aarch64-apple-darwin
+            asset_name: abacus-aarch64-apple-darwin.tar.gz
+          
+          # Linux x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: abacus-x86_64-unknown-linux-gnu
+            asset_name: abacus-x86_64-linux-gnu.tar.gz
+          
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: abacus-x86_64-pc-windows-msvc
+            asset_name: abacus-x86_64-windows-msvc.zip
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            pkg-config \
+            libssl-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        working-directory: pkg
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_DIR: target
+
+      - name: Strip binary (macOS/Linux)
+        if: matrix.os != 'windows-latest'
+        run: |
+          strip pkg/target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+
+      - name: Create archive (macOS/Linux)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cd pkg/target/${{ matrix.target }}/release
+          tar czf ../../../${{ matrix.asset_name }} ${{ env.BINARY_NAME }}
+          cd ../../..
+
+      - name: Create archive (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cd pkg/target/${{ matrix.target }}/release
+          7z a ../../../${{ matrix.asset_name }} ${{ env.BINARY_NAME }}.exe
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -name "*.tar.gz" -o -name "*.zip" | while read f; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0.0
+          name: "AbacusCode v2.0.0"
+          body: |
+            # AbacusCode v2.0.0
+
+            ## 🚀 Major Features
+
+            ### V42-B Streaming Migration
+            - Deleted 5 V40 fields, migrated to CardStream
+            - 8 new V42-B helper methods
+            - writer.rs: ToolAgentResult handling
+
+            ### Config System Overhaul
+            - 17 config sections with validation
+            - Provider.toml unified (deprecated llm.* keys)
+            - 30+ validation rules
+
+            ### Knowledge Base
+            - 14 seed knowledge entries (Abacus architecture)
+            - 12 behavior patterns + 5 knowledge entries
+            - abacusbr.md with 6 sub-specifications
+
+            ### Setup Wizard
+            - API validation before saving
+            - Latest models (2026-06-08)
+            - URL variants for providers
+            - OpenCodeZen + VolcengineCoding providers
+
+            ## 📦 Downloads
+
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
+            | Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
+            | Windows | x86_64 | `abacus-x86_64-windows-msvc.zip` |
+
+            ## 🔧 Installation
+
+            ```bash
+            # macOS/Linux
+            tar xzf abacus-*.tar.gz
+            sudo mv abacus /usr/local/bin/
+
+            # Windows
+            # Extract zip and add to PATH
+            ```
+
+            ## 📊 Stats
+
+            - 1,490 tests pass
+            - 0 warnings
+            - 0 errors
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

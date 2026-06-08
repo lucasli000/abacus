@@ -1,0 +1,55 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: abacus
+
+jobs:
+  build-windows:
+    name: Build Windows x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/target
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-
+
+      - name: Build release binary
+        working-directory: pkg
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Create archive
+        run: |
+          cd pkg/target/x86_64-pc-windows-msvc/release
+          7z a ../../../abacus-x86_64-windows-msvc.zip ${{ env.BINARY_NAME }}.exe
+
+      - name: Generate checksum
+        run: |
+          cd pkg
+          sha256sum abacus-x86_64-windows-msvc.zip > abacus-x86_64-windows-msvc.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: abacus-x86_64-windows-msvc
+          path: |
+            pkg/abacus-x86_64-windows-msvc.zip
+            pkg/abacus-x86_64-windows-msvc.zip.sha256
