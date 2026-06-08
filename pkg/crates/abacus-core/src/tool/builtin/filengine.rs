@@ -1718,18 +1718,17 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
     // 唯一保留的安全防线：DANGEROUS_COMMANDS 系统级命令由 pipeline 在 MCIP 阶段拦截。
     let _ = session.bash_policy; // consumed by pipeline's classify call
 
-    let child = TokioCmd::new("sh")
-        .arg("-c")
+    let mut cmd = TokioCmd::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(&workdir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        // P1-4: 创建新进程组（便于超时后 kill 整组，包括子进程的子进程）
-        // process_group 在 Windows 上不可用，仅在 Unix 上使用
-        #[cfg(unix)]
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+        .stderr(std::process::Stdio::piped());
+    // P1-4: 创建新进程组（便于超时后 kill 整组，包括子进程的子进程）
+    // process_group 在 Windows 上不可用，仅在 Unix 上使用
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
 
     // P1-4: 保存 pid 用于超时后 kill
     let child_id = child.id();
