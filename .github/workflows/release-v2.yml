@@ -1,9 +1,9 @@
-name: Release v2.0.0
+name: Release
 
 on:
   push:
     tags:
-      - 'v2.0.0'
+      - 'v*'
   workflow_dispatch:
 
 env:
@@ -124,8 +124,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.0
-          name: "AbacusCode v2.0.0"
+          tag_name: ${{ github.ref_name }}
+          name: "AbacusCode ${{ github.ref_name }}"
           body: |
             # AbacusCode v2.0.0
 
