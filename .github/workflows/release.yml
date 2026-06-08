@@ -21,6 +21,8 @@ jobs:
             os: macos-14
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
 
     runs-on: ${{ matrix.os }}
     defaults:
@@ -29,11 +31,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -78,7 +75,8 @@ jobs:
           fi
           ls -lh "$BINARY"
 
-      - name: Package
+      - name: Package (macOS/Linux)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/abacus dist/
@@ -87,11 +85,21 @@ jobs:
           shasum -a 256 abacus-${{ matrix.target }}.tar.gz > abacus-${{ matrix.target }}.tar.gz.sha256
           cat abacus-${{ matrix.target }}.tar.gz.sha256
 
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/abacus.exe dist/
+          cd dist
+          7z a abacus-${{ matrix.target }}.zip abacus.exe
+          certutil -hashfile abacus-${{ matrix.target }}.zip SHA256 > abacus-${{ matrix.target }}.zip.sha256
+          cat abacus-${{ matrix.target }}.zip.sha256
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: abacus-${{ matrix.target }}
-          path: pkg/dist/abacus-${{ matrix.target }}.tar.gz*
+          path: pkg/dist/abacus-${{ matrix.target }}.*
 
   release:
     needs: build
@@ -113,5 +121,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/abacus-*/abacus-*.tar.gz
+            artifacts/abacus-*/abacus-*.zip
             artifacts/abacus-*/abacus-*.sha256
             pkg/scripts/install.sh
