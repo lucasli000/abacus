@@ -666,6 +666,7 @@ fn lint_strict_enabled() -> bool {
 /// 2. **环境变量**：`ABACUS_LINT_PANIC=0` 显式旁路（用于本地紧急修复）
 ///
 /// 引用关系：仅由 handle_issue 内部调用。每次新 register 都重读环境变量。
+#[cfg(debug_assertions)]
 fn panic_bypassed() -> bool {
     // 测试场景下自动旁路——cargo test 会让整个 crate 编译为 test 模式
     // 测试中常用最简 schema（如 {"type": "string"}），不该触发 lint Error panic
