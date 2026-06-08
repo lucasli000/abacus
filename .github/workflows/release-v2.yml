@@ -27,7 +27,7 @@ jobs:
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: abacus-x86_64-unknown-linux-gnu
+            artifact_name: abacus-x86_64-linux-gnu
             asset_name: abacus-x86_64-linux-gnu.tar.gz
           
           # Windows x86_64
