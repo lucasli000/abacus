@@ -40,6 +40,22 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install protoc -y
+          echo "PROTOC=C:\ProgramData\chocolatey\lib\protobuf\tools\bin\protoc.exe" >> $env:GITHUB_ENV
+
+      - name: Install protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
       - name: Cache cargo registry + build
         uses: actions/cache@v4
         with:

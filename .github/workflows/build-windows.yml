@@ -21,6 +21,11 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Install protobuf compiler
+        run: |
+          choco install protoc -y
+          echo "PROTOC=C:\ProgramData\chocolatey\lib\protobuf\tools\bin\protoc.exe" >> $env:GITHUB_ENV
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
