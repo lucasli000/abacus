@@ -240,10 +240,10 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     use ratatui::widgets::block::Padding;
 
     // V32 · 三焦点视觉对称：
-    //   - 输入框边框始终 primary（输入栏永远可接收字符，不变暗）
+    //   - 输入框边框跟随状态变化（Ready=user, Typing=text, Thinking=accent 等）
     //   - Focus::Input 时叠加 thick 上边框（与 Panel/CommandHint 同款锚点）
     //   - 200ms 脉冲叠 BOLD 提示刚切换
-    let bar_color = state.theme.primary;
+    let bar_color = state.input_bar_color();
 
     let input_block = Block::default()
         .border_type(BorderType::Rounded)
@@ -368,7 +368,12 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let cursor_wrapped_idx = {
         let mut idx = wrapped.len().saturating_sub(1);
         for (wi, wl) in wrapped.iter().enumerate() {
-            if state.cursor_pos >= wl.byte_start && state.cursor_pos <= wl.byte_end {
+            // 光标在 [byte_start, byte_end) 范围内，或在行尾（byte_start == byte_end 且光标在该位置）
+            if state.cursor_pos >= wl.byte_start && state.cursor_pos < wl.byte_end {
+                idx = wi;
+                break;
+            } else if wl.byte_start == wl.byte_end && state.cursor_pos == wl.byte_start {
+                // 空行或行尾，光标在该位置
                 idx = wi;
                 break;
             }
@@ -436,8 +441,11 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
             input_lines.push(Line::from(spans));
         }
         // 填充剩余空行
-        for _ in (end - start)..text_area_h {
-            input_lines.push(Line::raw(""));
+        let rendered_lines = end.saturating_sub(start);
+        if rendered_lines < text_area_h {
+            for _ in rendered_lines..text_area_h {
+                input_lines.push(Line::raw(""));
+            }
         }
     }
     // ── 底行：左侧模式标识 + 右侧操作提示 ──
@@ -475,7 +483,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
             let wl = &wrapped[cursor_wrapped_idx];
             // 指针差值得到段在逻辑行内的字节偏移
             let line_ptr = logical_lines[wl.logical_line].as_ptr() as usize;
-            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr - input_ptr);
+            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr.saturating_sub(input_ptr));
             // 逐字符累加 display width，不超过 seg 的字节边界
             let mut bw = 0usize;
             let mut dw = 0usize;

@@ -89,8 +89,37 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
 
         // scroll: 跳过 scroll_offset 行
         if skipped < scroll_offset {
-            skipped = skipped.saturating_add(h);
-            continue;
+            let remaining = scroll_offset - skipped;
+            if remaining >= h {
+                // 整个卡片被跳过
+                skipped = skipped.saturating_add(h);
+                continue;
+            } else {
+                // 部分卡片可见（顶部被裁剪）
+                let clip_top = remaining;
+                let visible_h = h - clip_top;
+                if y >= inner.y + inner.height {
+                    break; // 超出可见区
+                }
+                let available_h = inner.y + inner.height - y;
+                let actual_h = visible_h.min(available_h);
+                if actual_h == 0 {
+                    break;
+                }
+                // 创建裁剪后的 Rect（顶部被裁剪）
+                let rect = Rect::new(inner.x, y, inner.width, actual_h);
+                // 计算 shimmer 位置 (仅 active 卡)
+                let shimmer_pos = if state.cards.active_id() == Some(id) {
+                    let tick = state.anim_tick.get();
+                    ShimmerPhase::compute(tick, 50, 3500, 8, inner.width as u16)
+                } else {
+                    -999 // sentinel: 关闭 shimmer
+                };
+                render_card(f, card.as_ref(), &ctx, rect, collapse, shimmer_pos);
+                y = y.saturating_add(actual_h);
+                skipped = skipped.saturating_add(h);
+                continue;
+            }
         }
 
         if y >= inner.y + inner.height {

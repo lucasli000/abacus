@@ -1,0 +1,266 @@
+diff --git a/pkg/crates/abacus-cli/src/tui/cards/expert.rs b/pkg/crates/abacus-cli/src/tui/cards/expert.rs
+index e510044..cd66df9 100644
+--- a/pkg/crates/abacus-cli/src/tui/cards/expert.rs
++++ b/pkg/crates/abacus-cli/src/tui/cards/expert.rs
+@@ -122,19 +122,17 @@ impl MessageCard for ExpertCard {
+                     lines.push(Line::raw(""));
+                 }
+                 // V42-B 升级: reply 加 1 字符前导 padding, 避免贴左边框
+-                for line in self.reply_text.lines() {
+-                    let mut spans = vec![Span::raw(" ")];
+-                    spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));
+-                    lines.push(Line::from(spans));
+-                }
+-                if lines.is_empty() {
++                if self.reply_text.is_empty() {
+                     lines.push(Line::from(Span::styled(
+-                        " (replying…)",
++                        "(replying…)",
+                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
+                     )));
+-                }
+-                if lines.is_empty() {
+-                    lines.push(Line::from(Span::styled("(replying…)", Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM))));
++                } else {
++                    for line in self.reply_text.lines() {
++                        let mut spans = vec![Span::raw(" ")];
++                        spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));
++                        lines.push(Line::from(spans));
++                    }
+                 }
+                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+                 f.render_widget(p, inner);
+diff --git a/pkg/crates/abacus-cli/src/tui/cards/llm.rs b/pkg/crates/abacus-cli/src/tui/cards/llm.rs
+index 357f12a..e09ffc1 100644
+--- a/pkg/crates/abacus-cli/src/tui/cards/llm.rs
++++ b/pkg/crates/abacus-cli/src/tui/cards/llm.rs
+@@ -169,9 +169,9 @@ impl MessageCard for LlmCard {
+                     }
+                     h = h.saturating_add(1); // 空行分隔
+                 }
+-                // reply 部分 — 估算行数 (cannot call all_styled on &self)
+-                let estimated_reply = ((self.reply_text.lines().count() as f64) * 1.5).ceil() as u16;
+-                h = h.saturating_add(estimated_reply.max(1));
++                // reply 部分 — 实际行数
++                let reply_lines = self.reply_text.lines().count().max(1) as u16;
++                h = h.saturating_add(reply_lines);
+                 if h == 0 { 1 } else { h }
+             }
+         }
+@@ -228,20 +228,19 @@ impl MessageCard for LlmCard {
+                     )));
+                     lines.push(Line::raw(""));
+                 }
+-                // reply 部分 — 估计行数 (cannot call all_styled on &self)
+-                // 简单估算: reply_text 换行数 + markdown 扩展系数 1.5x
+-                let reply_text = self.reply_text.clone();
+-                let estimated = (reply_text.lines().count() as f64 * 1.5).ceil() as usize;
+-                let h = estimated.max(1);
+-                // V42-B 升级: reply 占位行加 1 字符前导 padding, 避免贴左边框
+-                for _ in 0..h {
+-                    lines.push(Line::from(Span::raw(" ")));
+-                }
+-                if lines.is_empty() {
++                // reply 部分 — 渲染实际内容
++                if self.reply_text.is_empty() {
+                     lines.push(Line::from(Span::styled(
+                         "(replying…)",
+                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
+                     )));
++                } else {
++                    for line in self.reply_text.lines() {
++                        lines.push(Line::from(Span::styled(
++                            format!(" {}", line),
++                            Style::default().fg(ctx.theme().text),
++                        )));
++                    }
+                 }
+                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+                 f.render_widget(p, inner);
+diff --git a/pkg/crates/abacus-cli/src/tui/cards/render.rs b/pkg/crates/abacus-cli/src/tui/cards/render.rs
+index dafe7b3..ab7712e 100644
+--- a/pkg/crates/abacus-cli/src/tui/cards/render.rs
++++ b/pkg/crates/abacus-cli/src/tui/cards/render.rs
+@@ -89,8 +89,37 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
+ 
+         // scroll: 跳过 scroll_offset 行
+         if skipped < scroll_offset {
+-            skipped = skipped.saturating_add(h);
+-            continue;
++            let remaining = scroll_offset - skipped;
++            if remaining >= h {
++                // 整个卡片被跳过
++                skipped = skipped.saturating_add(h);
++                continue;
++            } else {
++                // 部分卡片可见（顶部被裁剪）
++                let clip_top = remaining;
++                let visible_h = h - clip_top;
++                if y >= inner.y + inner.height {
++                    break; // 超出可见区
++                }
++                let available_h = inner.y + inner.height - y;
++                let actual_h = visible_h.min(available_h);
++                if actual_h == 0 {
++                    break;
++                }
++                // 创建裁剪后的 Rect（顶部被裁剪）
++                let rect = Rect::new(inner.x, y, inner.width, actual_h);
++                // 计算 shimmer 位置 (仅 active 卡)
++                let shimmer_pos = if state.cards.active_id() == Some(id) {
++                    let tick = state.anim_tick.get();
++                    ShimmerPhase::compute(tick, 50, 3500, 8, inner.width as u16)
++                } else {
++                    -999 // sentinel: 关闭 shimmer
++                };
++                render_card(f, card.as_ref(), &ctx, rect, collapse, shimmer_pos);
++                y = y.saturating_add(actual_h);
++                skipped = skipped.saturating_add(h);
++                continue;
++            }
+         }
+ 
+         if y >= inner.y + inner.height {
+diff --git a/pkg/crates/abacus-cli/src/tui/components/bars.rs b/pkg/crates/abacus-cli/src/tui/components/bars.rs
+index d2c96b0..a77bdec 100644
+--- a/pkg/crates/abacus-cli/src/tui/components/bars.rs
++++ b/pkg/crates/abacus-cli/src/tui/components/bars.rs
+@@ -240,10 +240,10 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area:
+     use ratatui::widgets::block::Padding;
+ 
+     // V32 · 三焦点视觉对称：
+-    //   - 输入框边框始终 primary（输入栏永远可接收字符，不变暗）
++    //   - 输入框边框跟随状态变化（Ready=user, Typing=text, Thinking=accent 等）
+     //   - Focus::Input 时叠加 thick 上边框（与 Panel/CommandHint 同款锚点）
+     //   - 200ms 脉冲叠 BOLD 提示刚切换
+-    let bar_color = state.theme.primary;
++    let bar_color = state.input_bar_color();
+ 
+     let input_block = Block::default()
+         .border_type(BorderType::Rounded)
+@@ -368,7 +368,12 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area:
+     let cursor_wrapped_idx = {
+         let mut idx = wrapped.len().saturating_sub(1);
+         for (wi, wl) in wrapped.iter().enumerate() {
+-            if state.cursor_pos >= wl.byte_start && state.cursor_pos <= wl.byte_end {
++            // 光标在 [byte_start, byte_end) 范围内，或在行尾（byte_start == byte_end 且光标在该位置）
++            if state.cursor_pos >= wl.byte_start && state.cursor_pos < wl.byte_end {
++                idx = wi;
++                break;
++            } else if wl.byte_start == wl.byte_end && state.cursor_pos == wl.byte_start {
++                // 空行或行尾，光标在该位置
+                 idx = wi;
+                 break;
+             }
+@@ -436,8 +441,11 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area:
+             input_lines.push(Line::from(spans));
+         }
+         // 填充剩余空行
+-        for _ in (end - start)..text_area_h {
+-            input_lines.push(Line::raw(""));
++        let rendered_lines = end.saturating_sub(start);
++        if rendered_lines < text_area_h {
++            for _ in rendered_lines..text_area_h {
++                input_lines.push(Line::raw(""));
++            }
+         }
+     }
+     // ── 底行：左侧模式标识 + 右侧操作提示 ──
+@@ -475,7 +483,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area:
+             let wl = &wrapped[cursor_wrapped_idx];
+             // 指针差值得到段在逻辑行内的字节偏移
+             let line_ptr = logical_lines[wl.logical_line].as_ptr() as usize;
+-            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr - input_ptr);
++            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr.saturating_sub(input_ptr));
+             // 逐字符累加 display width，不超过 seg 的字节边界
+             let mut bw = 0usize;
+             let mut dw = 0usize;
+diff --git a/pkg/crates/abacus-cli/src/tui/components/overlays.rs b/pkg/crates/abacus-cli/src/tui/components/overlays.rs
+index e94a7a1..bcff7b3 100644
+--- a/pkg/crates/abacus-cli/src/tui/components/overlays.rs
++++ b/pkg/crates/abacus-cli/src/tui/components/overlays.rs
+@@ -747,9 +747,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
+ 
+ /// 渲染设置模态框
+ pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
+-    // B6：背景遮罩用主题 bg + DIM，避免亮色主题下纯黑突兀（与暗色主题保持一致体感）
++    // B6：背景遮罩用 elevated 颜色，避免亮色主题下纯黑突兀（与暗色主题保持一致体感）
+     let block = Block::default()
+-        .style(Style::default().bg(state.theme.bg).add_modifier(Modifier::DIM));
++        .style(Style::default().bg(state.theme.elevated));
+     f.render_widget(block, area);
+ 
+     // 设置卡片
+@@ -933,9 +933,9 @@ fn render_fullscreen_editor(f: &mut ratatui::Frame, state: &AppState) {
+     // 光标定位
+     let visual_line = state.cursor_line.saturating_sub(scroll_top);
+     if visual_line < visible_h {
+-        let cursor_x = inner.x + line_num_width + state.cursor_col as u16;
+-        let cursor_y = inner.y + visual_line as u16;
+-        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
++        let cursor_x = inner.x.saturating_add(line_num_width).saturating_add(state.cursor_col as u16);
++        let cursor_y = inner.y.saturating_add(visual_line as u16);
++        if cursor_x < inner.x.saturating_add(inner.width) && cursor_y < inner.y.saturating_add(inner.height) {
+             f.set_cursor_position((cursor_x, cursor_y));
+         }
+     }
+diff --git a/pkg/crates/abacus-cli/src/tui/event/mod.rs b/pkg/crates/abacus-cli/src/tui/event/mod.rs
+index bffb231..4f0982c 100644
+--- a/pkg/crates/abacus-cli/src/tui/event/mod.rs
++++ b/pkg/crates/abacus-cli/src/tui/event/mod.rs
+@@ -1605,7 +1605,12 @@ pub fn handle_chat_scroll_key(state: &mut AppState, code: KeyCode) {
+ // 将来真死代码可被 rustc 立刻提示
+ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16, terminal_rows: u16) {
+     // E11：输入框高度跟随终端自适应，与渲染层一致
+-    let input_h = crate::tui::layout::chat_input_height(terminal_rows);
++    let input_lines = if state.input_state == crate::tui::state::InputState::Editor {
++        2
++    } else {
++        state.input.matches('\n').count() + 1
++    };
++    let input_h = crate::tui::layout::chat_input_height_adaptive(terminal_rows, input_lines);
+     match event.kind {
+         MouseEventKind::ScrollUp => {
+                 // V29.7: 滚动优先级 — 消息区 > 看板 timeline > (输入框命令面板用键盘 ↑↓)
+diff --git a/pkg/crates/abacus-ui-kit/src/theme.rs b/pkg/crates/abacus-ui-kit/src/theme.rs
+index d371482..2ef5412 100644
+--- a/pkg/crates/abacus-ui-kit/src/theme.rs
++++ b/pkg/crates/abacus-ui-kit/src/theme.rs
+@@ -599,15 +599,37 @@ impl ColorCapability {
+         if std::env::var_os("NO_COLOR").is_some() {
+             return Self::NoColor;
+         }
++        // 优先检查 COLORTERM（最可靠的信号）
+         if let Ok(term) = std::env::var("COLORTERM") {
+             if term == "truecolor" || term == "24bit" {
+                 return Self::TrueColor;
+             }
+         }
++        // 检查 TERM
+         if let Ok(term) = std::env::var("TERM") {
+             if term.contains("256color") {
+                 return Self::Ansi256;
+             }
++            // 现代终端默认支持 TrueColor
++            if term.contains("xterm") || term.contains("screen") || term.contains("tmux") {
++                return Self::TrueColor;
++            }
++        }
++        // 检查 TERM_PROGRAM（macOS 终端.app / iTerm2 / WezTerm 等）
++        if let Ok(program) = std::env::var("TERM_PROGRAM") {
++            match program.as_str() {
++                "iTerm.app" | "WezTerm" | "Alacritty" | "kitty" | "ghostty" | "Hyper" => {
++                    return Self::TrueColor;
++                }
++                "Apple_Terminal" => {
++                    return Self::Ansi256; // Terminal.app 支持 256 色
++                }
++                _ => {}
++            }
++        }
++        // 检查 Windows Terminal
++        if std::env::var_os("WT_SESSION").is_some() {
++            return Self::TrueColor;
+         }
+         Self::Ansi16
+     }

@@ -122,19 +122,17 @@ impl MessageCard for ExpertCard {
                     lines.push(Line::raw(""));
                 }
                 // V42-B 升级: reply 加 1 字符前导 padding, 避免贴左边框
-                for line in self.reply_text.lines() {
-                    let mut spans = vec![Span::raw(" ")];
-                    spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));
-                    lines.push(Line::from(spans));
-                }
-                if lines.is_empty() {
+                if self.reply_text.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        " (replying…)",
+                        "(replying…)",
                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
                     )));
-                }
-                if lines.is_empty() {
-                    lines.push(Line::from(Span::styled("(replying…)", Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM))));
+                } else {
+                    for line in self.reply_text.lines() {
+                        let mut spans = vec![Span::raw(" ")];
+                        spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));
+                        lines.push(Line::from(spans));
+                    }
                 }
                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });
                 f.render_widget(p, inner);

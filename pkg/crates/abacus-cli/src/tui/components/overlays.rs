@@ -747,9 +747,9 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
 
 /// 渲染设置模态框
 pub fn render_settings_modal(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
-    // B6：背景遮罩用主题 bg + DIM，避免亮色主题下纯黑突兀（与暗色主题保持一致体感）
+    // B6：背景遮罩用 elevated 颜色，避免亮色主题下纯黑突兀（与暗色主题保持一致体感）
     let block = Block::default()
-        .style(Style::default().bg(state.theme.bg).add_modifier(Modifier::DIM));
+        .style(Style::default().bg(state.theme.elevated));
     f.render_widget(block, area);
 
     // 设置卡片
@@ -933,9 +933,9 @@ fn render_fullscreen_editor(f: &mut ratatui::Frame, state: &AppState) {
     // 光标定位
     let visual_line = state.cursor_line.saturating_sub(scroll_top);
     if visual_line < visible_h {
-        let cursor_x = inner.x + line_num_width + state.cursor_col as u16;
-        let cursor_y = inner.y + visual_line as u16;
-        if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+        let cursor_x = inner.x.saturating_add(line_num_width).saturating_add(state.cursor_col as u16);
+        let cursor_y = inner.y.saturating_add(visual_line as u16);
+        if cursor_x < inner.x.saturating_add(inner.width) && cursor_y < inner.y.saturating_add(inner.height) {
             f.set_cursor_position((cursor_x, cursor_y));
         }
     }

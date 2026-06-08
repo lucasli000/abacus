@@ -1605,7 +1605,12 @@ pub fn handle_chat_scroll_key(state: &mut AppState, code: KeyCode) {
 // 将来真死代码可被 rustc 立刻提示
 pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16, terminal_rows: u16) {
     // E11：输入框高度跟随终端自适应，与渲染层一致
-    let input_h = crate::tui::layout::chat_input_height(terminal_rows);
+    let input_lines = if state.input_state == crate::tui::state::InputState::Editor {
+        2
+    } else {
+        state.input.matches('\n').count() + 1
+    };
+    let input_h = crate::tui::layout::chat_input_height_adaptive(terminal_rows, input_lines);
     match event.kind {
         MouseEventKind::ScrollUp => {
                 // V29.7: 滚动优先级 — 消息区 > 看板 timeline > (输入框命令面板用键盘 ↑↓)

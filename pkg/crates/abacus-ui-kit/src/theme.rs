@@ -599,15 +599,37 @@ impl ColorCapability {
         if std::env::var_os("NO_COLOR").is_some() {
             return Self::NoColor;
         }
+        // 优先检查 COLORTERM（最可靠的信号）
         if let Ok(term) = std::env::var("COLORTERM") {
             if term == "truecolor" || term == "24bit" {
                 return Self::TrueColor;
             }
         }
+        // 检查 TERM
         if let Ok(term) = std::env::var("TERM") {
             if term.contains("256color") {
                 return Self::Ansi256;
             }
+            // 现代终端默认支持 TrueColor
+            if term.contains("xterm") || term.contains("screen") || term.contains("tmux") {
+                return Self::TrueColor;
+            }
+        }
+        // 检查 TERM_PROGRAM（macOS 终端.app / iTerm2 / WezTerm 等）
+        if let Ok(program) = std::env::var("TERM_PROGRAM") {
+            match program.as_str() {
+                "iTerm.app" | "WezTerm" | "Alacritty" | "kitty" | "ghostty" | "Hyper" => {
+                    return Self::TrueColor;
+                }
+                "Apple_Terminal" => {
+                    return Self::Ansi256; // Terminal.app 支持 256 色
+                }
+                _ => {}
+            }
+        }
+        // 检查 Windows Terminal
+        if std::env::var_os("WT_SESSION").is_some() {
+            return Self::TrueColor;
         }
         Self::Ansi16
     }

@@ -169,9 +169,9 @@ impl MessageCard for LlmCard {
                     }
                     h = h.saturating_add(1); // 空行分隔
                 }
-                // reply 部分 — 估算行数 (cannot call all_styled on &self)
-                let estimated_reply = ((self.reply_text.lines().count() as f64) * 1.5).ceil() as u16;
-                h = h.saturating_add(estimated_reply.max(1));
+                // reply 部分 — 实际行数
+                let reply_lines = self.reply_text.lines().count().max(1) as u16;
+                h = h.saturating_add(reply_lines);
                 if h == 0 { 1 } else { h }
             }
         }
@@ -228,20 +228,19 @@ impl MessageCard for LlmCard {
                     )));
                     lines.push(Line::raw(""));
                 }
-                // reply 部分 — 估计行数 (cannot call all_styled on &self)
-                // 简单估算: reply_text 换行数 + markdown 扩展系数 1.5x
-                let reply_text = self.reply_text.clone();
-                let estimated = (reply_text.lines().count() as f64 * 1.5).ceil() as usize;
-                let h = estimated.max(1);
-                // V42-B 升级: reply 占位行加 1 字符前导 padding, 避免贴左边框
-                for _ in 0..h {
-                    lines.push(Line::from(Span::raw(" ")));
-                }
-                if lines.is_empty() {
+                // reply 部分 — 渲染实际内容
+                if self.reply_text.is_empty() {
                     lines.push(Line::from(Span::styled(
                         "(replying…)",
                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
                     )));
+                } else {
+                    for line in self.reply_text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!(" {}", line),
+                            Style::default().fg(ctx.theme().text),
+                        )));
+                    }
                 }
                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });
                 f.render_widget(p, inner);
