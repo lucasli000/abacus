@@ -90,17 +90,9 @@ pub fn global_dir() -> PathBuf {
     }
 }
 
-// ─── 全局共享 SQLite ────────────────────────────────────────────────────
+// ─── 全局配置 ─────────────────────────────────────────────────────────────
 
-pub fn knowledge_db() -> PathBuf { global_dir().join("knowledge.db") }
-pub fn palace_db() -> PathBuf { global_dir().join("palace.db") }
-pub fn memory_db() -> PathBuf { global_dir().join("memory.db") }
-pub fn deduction_metrics_db() -> PathBuf { global_dir().join("deduction_metrics.db") }
-pub fn task_logs_db() -> PathBuf { global_dir().join("task_logs.db") }
-
-// ─── 全局配置 / 历史 / 全局 memory ──────────────────────────────────────
-
-/// 全局行为配置文件（TOML 格式，替代旧 config.yaml 缩进问题）
+/// 全局行为配置文件（TOML 格式）
 pub fn config_toml() -> PathBuf { global_dir().join("config.toml") }
 /// 供应商配置文件：所有 provider + 模型参数（TOML 格式）
 pub fn provider_toml() -> PathBuf { global_dir().join("provider.toml") }
@@ -108,22 +100,42 @@ pub fn provider_toml() -> PathBuf { global_dir().join("provider.toml") }
 pub fn models_toml() -> PathBuf { global_dir().join("models.toml") }
 /// 安全 / MCIP 权限配置文件（TOML 格式）
 pub fn security_toml() -> PathBuf { global_dir().join("security.toml") }
+/// 行为规范文件（Markdown 格式，Layer 230 注入 system prompt）
 pub fn abacusbr_md() -> PathBuf { global_dir().join("abacusbr.md") }
-
-// xe2x94x80xe2x94x80xe2x94x80 v1.4.5 subdir xe5xb8x83xe5xb1x80xefxbcx88xe4xbfx9dxe7x95x99xe4xbbxa5xe5x85xbcxe5xaexb9xe4xbex9dxe8xb5x96xe6xadxa4 layout xe7x9ax84 v1.4.x xe7x94xa8xe6x88xb7xefxbcx89xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80xe2x94x80
-pub fn sessions_db() -> PathBuf { global_dir().join("data/sessions.db") }
-pub fn meetings_dir() -> PathBuf { global_dir().join("meetings") }
-pub fn skills_dir() -> PathBuf { global_dir().join("skills") }
 /// conf.d 目录：用户可放入 *.toml / *.yaml 扩展片段（按文件名排序合并）
 pub fn conf_d_dir() -> PathBuf { global_dir().join("conf.d") }
-pub fn history_jsonl() -> PathBuf { global_dir().join("history.jsonl") }
-/// 全局 markdown memory（跨项目复用的通用知识，agent 可加载为基底）
+
+// ─── 全局数据 ─────────────────────────────────────────────────────────────
+
+/// 全局数据目录（数据库文件统一存放）
+pub fn data_dir() -> PathBuf { global_dir().join("data") }
+/// 知识库数据库（FTS5 全文检索 + 语义搜索）
+pub fn knowledge_db() -> PathBuf { data_dir().join("knowledge.db") }
+/// 记忆宫殿数据库（行为宫 + 知识宫 + 记忆桥）
+pub fn palace_db() -> PathBuf { data_dir().join("palace.db") }
+/// 通用记忆数据库
+pub fn memory_db() -> PathBuf { data_dir().join("memory.db") }
+/// 推演指标数据库
+pub fn deduction_metrics_db() -> PathBuf { data_dir().join("deduction_metrics.db") }
+/// 任务日志数据库
+pub fn task_logs_db() -> PathBuf { data_dir().join("task_logs.db") }
+/// 会话数据库
+pub fn sessions_db() -> PathBuf { data_dir().join("sessions.db") }
+/// 历史记录（JSONL 格式）
+pub fn history_jsonl() -> PathBuf { data_dir().join("history.jsonl") }
+
+// ─── 全局资源 ─────────────────────────────────────────────────────────────
+
+/// 全局记忆目录（Markdown 文件，用户可手动添加）
 pub fn global_memory_dir() -> PathBuf { global_dir().join("memory") }
+/// 用户技能目录（YAML 文件）
+pub fn skills_dir() -> PathBuf { global_dir().join("skills") }
+/// 会议记录目录
+pub fn meetings_dir() -> PathBuf { global_dir().join("meetings") }
+/// 项目目录（所有项目都在此下）
+pub fn projects_dir() -> PathBuf { global_dir().join("projects") }
 
 // ─── 项目层 ─────────────────────────────────────────────────────────────
-
-/// projects 容器目录（所有项目都在此下）
-pub fn projects_dir() -> PathBuf { global_dir().join("projects") }
 
 /// 指定 cwd 的项目目录。转义规则：路径分隔符替换为 `-`
 ///
@@ -230,10 +242,40 @@ pub fn escape_cwd(path: &Path) -> String {
 // ─── 副作用：确保目录存在 ────────────────────────────────────────────────
 
 /// 确保全局目录存在。在 abacus 启动早期调用。
+/// 确保全局目录结构存在
+///
+/// 目录结构：
+/// ```
+/// ~/.abacus/
+/// ├── config.toml        # 核心配置
+/// ├── provider.toml      # 供应商配置
+/// ├── models.toml        # 模型能力覆盖
+/// ├── security.toml      # 安全配置
+/// ├── abacusbr.md        # 行为规范
+/// ├── conf.d/            # 扩展配置
+/// ├── data/              # 数据库文件
+/// │   ├── knowledge.db
+/// │   ├── palace.db
+/// │   ├── memory.db
+/// │   ├── sessions.db
+/// │   └── ...
+/// ├── memory/            # 全局记忆
+/// ├── skills/            # 用户技能
+/// ├── meetings/          # 会议记录
+/// └── projects/          # 项目目录
+/// ```
 pub fn ensure_global_dirs() -> std::io::Result<()> {
+    // 根目录
     std::fs::create_dir_all(global_dir())?;
-    std::fs::create_dir_all(projects_dir())?;
+    // 配置相关
+    std::fs::create_dir_all(conf_d_dir())?;
+    // 数据目录（数据库统一存放）
+    std::fs::create_dir_all(data_dir())?;
+    // 资源目录
     std::fs::create_dir_all(global_memory_dir())?;
+    std::fs::create_dir_all(skills_dir())?;
+    std::fs::create_dir_all(meetings_dir())?;
+    std::fs::create_dir_all(projects_dir())?;
     Ok(())
 }
 

@@ -299,6 +299,7 @@ impl AbacusMetrics {
         use std::sync::atomic::Ordering::{Relaxed, AcqRel, Acquire, Release};
         self.write_epoch.fetch_add(1, AcqRel);
         std::sync::atomic::fence(Acquire);
+        self.stream_requests_total.fetch_add(1, Relaxed);
         self.requests_total.fetch_add(1, Relaxed);
         if success { self.requests_success.fetch_add(1, Relaxed); }
         else       { self.requests_error.fetch_add(1, Relaxed); }
@@ -617,6 +618,9 @@ impl AbacusServer {
         let _ = cfg_mgr.load_file(paths::security_toml());
         let _ = cfg_mgr.load_provider_file(paths::provider_toml());
         cfg_mgr.load_dir(paths::conf_d_dir());
+
+        // 检测废弃的 llm.* 配置键
+        cfg_mgr.detect_deprecated_keys();
 
         let default_model = cfg_mgr.get_str("core.default_model")
             .unwrap_or(abacus_types::ModelId::AUTO);
@@ -1140,4 +1144,155 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("Shutdown signal received");
+}
+
+#[cfg(test)]
+mod server_tests {
+    //! Tests for pure/internal functions in server.rs.
+    //!
+    //! Coverage:
+    //! - `adaptive_timeout_secs` — model-specific timeout calculation
+    //! - `ServerSessionManager` — session lifecycle, LRU eviction
+    //! - `AbacusMetrics` — record/render_prometheus round-trip
+    //!
+    //! Full HTTP handler tests require a real `AppState` (which depends on
+    //! `CoreLoop`, `TeamManager`, `ConfigManager`). Those are integration
+    //! tests and require a test harness with mock providers — out of scope.
+
+    use super::*;
+
+    // ─── adaptive_timeout_secs ─────────────────────────────────────────
+
+    #[test]
+    fn adaptive_timeout_flash_model_uses_lower_base() {
+        // flash 模型 600s base，低于普通 900s
+        let flash = adaptive_timeout_secs("deepseek-v4-flash", false, 1000, 1, 3600);
+        let normal = adaptive_timeout_secs("claude-sonnet", false, 1000, 1, 3600);
+        assert!(flash < normal);
+    }
+
+    #[test]
+    fn adaptive_timeout_thinking_adds_bonus() {
+        let without = adaptive_timeout_secs("claude", false, 1000, 1, 3600);
+        let with = adaptive_timeout_secs("claude", true, 1000, 1, 3600);
+        assert!(with > without, "thinking must add bonus, got with={with} without={without}");
+    }
+
+    #[test]
+    fn adaptive_timeout_scales_with_max_tokens() {
+        let small = adaptive_timeout_secs("claude", false, 1000, 1, 3600);
+        let large = adaptive_timeout_secs("claude", false, 32000, 1, 3600);
+        assert!(large > small, "larger max_tokens must yield larger timeout");
+    }
+
+    #[test]
+    fn adaptive_timeout_respects_ceiling() {
+        // ceiling 远低于 computed，clamp 后应等于 effective_ceiling (= 300 floor)
+        let t = adaptive_timeout_secs("claude", true, 32000, 100, 100);
+        assert_eq!(t, 300, "ceiling=100 < FLOOR_SECS=300, must fall back to floor");
+    }
+
+    #[test]
+    fn adaptive_timeout_session_depth_saturates_at_600s() {
+        // 1000 轮 / 5 * 30 = 6000s，should saturate at 600s contribution
+        let shallow = adaptive_timeout_secs("claude", false, 1000, 5, 3600);
+        let deep = adaptive_timeout_secs("claude", false, 1000, 1000, 3600);
+        let diff = deep - shallow;
+        assert!(diff <= 600, "session depth contribution must cap at 600s, got {diff}");
+    }
+
+    // ─── ServerSessionManager ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_manager_get_or_create_is_idempotent() {
+        let mgr = ServerSessionManager::new();
+        let (s1, is_new1) = mgr.get_or_create("alice").await;
+        let (s2, is_new2) = mgr.get_or_create("alice").await;
+        assert!(is_new1);
+        assert!(!is_new2);
+        assert!(Arc::ptr_eq(&s1, &s2), "second call must return same session Arc");
+    }
+
+    #[tokio::test]
+    async fn session_manager_list_returns_all_sessions() {
+        let mgr = ServerSessionManager::new();
+        mgr.get_or_create("a").await;
+        mgr.get_or_create("b").await;
+        mgr.get_or_create("c").await;
+        let ids: Vec<String> = mgr.list().await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&"a".to_string()));
+        assert!(ids.contains(&"b".to_string()));
+        assert!(ids.contains(&"c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn session_manager_remove_evicts() {
+        let mgr = ServerSessionManager::new();
+        mgr.get_or_create("ephemeral").await;
+        assert_eq!(mgr.list().await.len(), 1);
+        assert!(mgr.remove("ephemeral").await);
+        assert_eq!(mgr.list().await.len(), 0);
+        assert!(!mgr.remove("ephemeral").await, "double-remove returns false");
+    }
+
+    #[tokio::test]
+    async fn session_manager_lru_eviction() {
+        // 容量 2，插入 3 个，最旧的应被驱逐
+        let mut mgr = ServerSessionManager::new();
+        mgr.set_max_sessions(2);
+        mgr.get_or_create("oldest").await;
+        // 短延迟确保 last_access 时间差
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        mgr.get_or_create("middle").await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        mgr.get_or_create("newest").await;
+        let ids: Vec<String> = mgr.list().await.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&"oldest".to_string()), "oldest must be evicted");
+        assert!(ids.contains(&"middle".to_string()));
+        assert!(ids.contains(&"newest".to_string()));
+    }
+
+    // ─── AbacusMetrics ─────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_record_request_increments_counters() {
+        let m = AbacusMetrics::new();
+        m.record_request(100, true, false, 10, 20, 5, 0);
+        m.record_request(200, false, false, 10, 20, 5, 0);
+        m.record_request(300, false, true, 10, 20, 5, 0); // timeout
+        let out = m.render_prometheus(0, 0);
+        assert!(out.contains("abacus_requests_total 3"), "total counter must be 3");
+        assert!(out.contains("abacus_requests_success_total 1"), "success counter must be 1");
+        assert!(out.contains("abacus_requests_error_total 1"), "error counter must be 1");
+        assert!(out.contains("abacus_requests_timeout_total 1"), "timeout counter must be 1");
+    }
+
+    #[test]
+    fn metrics_render_prometheus_includes_all_required_lines() {
+        let m = AbacusMetrics::new();
+        let out = m.render_prometheus(5, 2);
+        // 所有 prometheus 输出必须包含这些 metric name
+        for line in [
+            "abacus_requests_total",
+            "abacus_request_latency_ms",
+            "abacus_tokens_total",
+            "abacus_tool_calls_total",
+            "abacus_stream_requests_total",
+            "abacus_active_sessions 5",
+            "abacus_active_teams 2",
+        ] {
+            assert!(out.contains(line), "metrics output missing {line}\nfull output:\n{out}");
+        }
+    }
+
+    #[test]
+    fn metrics_stream_complete_increments() {
+        let m = AbacusMetrics::new();
+        m.record_stream_complete(true, 10, 20, 5, 0);
+        m.record_stream_complete(false, 10, 20, 5, 0);
+        let out = m.render_prometheus(0, 0);
+        assert!(out.contains("abacus_stream_requests_total 2"));
+    }
 }

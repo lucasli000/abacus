@@ -2,6 +2,7 @@
 /target/
 /pkg/target/
 **/*.rs.bk
+**/*.bak
 # Local builds (unsigned macOS binaries fail Gatekeeper; let GitHub Actions build)
 /pkg/dist/
 

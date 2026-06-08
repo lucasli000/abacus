@@ -28,7 +28,7 @@ static THEME_SET: Lazy<ThemeSet> = Lazy::new(ThemeSet::load_defaults);
 ///
 /// `lang`: 语言名（如 "rust", "python", "go"）。空字符串 = 纯文本。
 /// 返回: 带颜色的 Span 列表，每个 token 一个 Span。
-pub fn highlight_line(line: &str, lang: &str, user_theme: &crate::tui::theme::Theme) -> Vec<Span<'static>> {
+pub fn highlight_line(line: &str, lang: &str, user_theme: &abacus_ui_kit::Theme) -> Vec<Span<'static>> {
     let syntax = if lang.is_empty() {
         SYNTAX_SET.find_syntax_plain_text()
     } else {
@@ -55,7 +55,7 @@ pub fn highlight_line(line: &str, lang: &str, user_theme: &crate::tui::theme::Th
 }
 
 /// 高亮整段代码（多行），返回每行的 Span 列表
-pub fn highlight_code(code: &str, lang: &str, user_theme: &crate::tui::theme::Theme) -> Vec<Vec<Span<'static>>> {
+pub fn highlight_code(code: &str, lang: &str, user_theme: &abacus_ui_kit::Theme) -> Vec<Vec<Span<'static>>> {
     let syntax = if lang.is_empty() {
         SYNTAX_SET.find_syntax_plain_text()
     } else {
@@ -102,7 +102,7 @@ fn syntect_to_ratatui_color(c: highlighting::Color) -> Color {
 ///
 /// — 浅色 bg → base16-ocean.light（若存在）
 /// — 深色 / Reset / 名称色 → base16-ocean.dark
-fn pick_syntect_theme(user_theme: &crate::tui::theme::Theme) -> &'static str {
+fn pick_syntect_theme(user_theme: &abacus_ui_kit::Theme) -> &'static str {
     if let Color::Rgb(r, g, b) = user_theme.bg {
         let luminance = (r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000;
         if luminance > 128 && THEME_SET.themes.contains_key("base16-ocean.light") {

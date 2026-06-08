@@ -200,7 +200,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
         AbacusMode::Meeting
     };
 
-    let mut state = AppState::new(mode);
+    // 从 config.toml 读取 [tui.panel] sections 覆盖
+    let panel_sections = load_panel_sections_from_config();
+    let mut state = AppState::new_with_sections(mode, panel_sections);
 
     // V29.11: 系统级 always_allow 加载（优先于 session，全局共享）
     state.always_allow = load_always_allow();
@@ -241,7 +243,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             Line::raw(""),
             Line::from(Span::styled(
                 "  Checking API key...",
-                state.theme.text_style(crate::tui::theme::TextRole::Caption),
+                state.theme.text_style(abacus_ui_kit::TextRole::Caption),
             )),
         ]).alignment(Alignment::Center);
         f.render_widget(loading, inner);
@@ -392,7 +394,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         state.resize_debounce_frames -= 1;
                         if state.resize_debounce_frames == 0 {
                             // debounce 结束，触发缓存失效
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                         }
                     }
                 }
@@ -516,10 +518,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         // 顺序: take → 创建 Thinking trace → 检查 tool 兜底(非流式)→ reset_streaming
                         let mut trace_ids = std::mem::take(&mut state.streaming_trace_ids);
 
-                        // 1. Thinking trace — 优先用 streaming_thinking 累积内容(流式),
+                        // 1. Thinking trace — V42-B 优先用 LlmCard.thinking（流式累积）,
                         //    fallback 到 response.thinking(非流式 / 一次性返回路径)
-                        let thinking_text = if !state.streaming_thinking.is_empty() {
-                            state.streaming_thinking.clone()
+                        let from_card = state.last_llm_thinking();
+                        let thinking_text = if !from_card.is_empty() {
+                            from_card
                         } else {
                             response.thinking.clone().unwrap_or_default()
                         };
@@ -574,7 +577,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         let mut parts: Vec<MsgContent> = Vec::new();
 
                         // thinking 提升为内联 Block：用户不需要展开 trace 即可看到推理过程
-                        // 引用关系：thinking_text 来自 streaming_thinking 或 response.thinking
+                        // V42-B: thinking_text 来自 LlmCard.thinking 或 response.thinking
                         // 生命周期：随 Message 持久化，collapsed=true 默认折叠，Space 展开
                         if !thinking_text.is_empty() {
                             let line_count = thinking_text.lines().count();
@@ -648,11 +651,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.last_review_strict = strict;
                         }
 
-                        // V28: 落档完成,现在清流式累积字段(streaming_text/thinking/tools/trace_ids)
-                        // 手动落档后提前清空 streaming_text，避免 reset_streaming 内部
-                        // 的自动落档守卫(streaming_complete && !streaming_text.is_empty())
-                        // 二次 add_message 导致消息重复渲染。
-                        state.streaming_text.clear();
+                        // V42-B: 落档完成，reset CardStream
                         state.reset_streaming();
 
                         let response_tool_count = response.tool_records.len();
@@ -1015,14 +1014,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 while let Ok(chunk) = stream_rx.try_recv() {
                     use abacus_core::llm::stream::StreamChunk;
                     let ts = chrono::Local::now().format("%H:%M").to_string();
+                    let chunk_for_cards = chunk.clone();
                     match chunk {
                         StreamChunk::IterationStart { iteration } => {
-                            // V38: 迭代边界——清空累积的 thinking，准备新一轮内容
-                            // 保留 streaming_text（回复内容跨迭代累积是正确的）
-                            // 保留 streaming_tools（工具历史保留供参考）
-                            state.streaming_thinking.clear();
-                            state.streaming_thinking_started = false;
-                            state.streaming_text_started = false;
+                            // V42-B: 迭代边界——CardStream handle_chunk 已在前面处理 clear_thinking
+                            // V42-B: streaming_text_started / streaming_thinking_started 已删除
                             if iteration > 0 {
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = format!("· iteration {}", iteration + 1);
@@ -1043,7 +1039,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 .map(|t| now.duration_since(t).as_millis() >= 100)
                                 .unwrap_or(true);
                             if should_refresh {
-                                let gen_est = (state.streaming_text.len() / 3) as u64;
+                                let gen_est = (state.active_llm_text_len() / 3) as u64;
                                 // clamp 到 context_window：估算不可能超过物理上限
                                 let raw = state.session_tokens.latest_prompt_tokens
                                     .saturating_add(gen_est);
@@ -1051,8 +1047,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.ctx_live_tokens = if cap > 0 { raw.min(cap) } else { raw };
                                 state.ctx_estimate_at = Some(now);
                             }
-                            if !t.is_empty() && !state.streaming_text_started {
-                                state.streaming_text_started = true;
+                            // V42-B: 首次 TextDelta 检测（替代 streaming_text_started 标志）
+                            // handle_chunk 在 match 之后才执行，此时 LlmCard 尚未收到文本
+                            if !t.is_empty() && state.active_llm_text_len() == 0 {
                                 // V38: 切换状态指示到 Outputting
                                 state.set_busy_state(InputState::Outputting);
                                 state.processing_phase.clear();
@@ -1063,18 +1060,15 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             if !added.is_empty() {
                                 state.flash_state.mark_new_lines(&added);
                             }
-                            // V40: timeline Text entry — 记录 byte range
-                            let text_start = state.streaming_text.len();
-                            state.streaming_text.push_str(&t);
-                            let text_end = state.streaming_text.len();
-                            // 合并连续 Text entries（避免每个 delta 一个 entry）
+                            // V42-B: timeline Text entry — 从 active LlmCard 取累计长度（零拷贝）
+                            let card_len = state.active_llm_text_len();
                             if let Some(crate::tui::state::TimelineEntry::Text { end, .. }) =
                                 state.streaming_timeline.last_mut()
                             {
-                                *end = text_end;
+                                *end = card_len;
                             } else {
                                 state.streaming_timeline.push(
-                                    crate::tui::state::TimelineEntry::Text { start: text_start, end: text_end }
+                                    crate::tui::state::TimelineEntry::Text { start: card_len.saturating_sub(t.len()), end: card_len }
                                 );
                             }
                             // 增量送入 streaming md 引擎（mdstream committed/pending 分割）
@@ -1090,9 +1084,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             had_streaming_update = true;
                         }
                         StreamChunk::Thinking(t) => {
-                            // V29.5: 同 TextDelta, 用 streaming_thinking_started 判首次
-                            if !t.is_empty() && !state.streaming_thinking_started {
-                                state.streaming_thinking_started = true;
+                            // V42-B: 首次 Thinking 检测（替代 streaming_thinking_started 标志）
+                            if !t.is_empty() && state.active_llm_thinking_len() == 0 {
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase.clear();
                                 state.add_event(&ts, "llm", crate::tui::i18n::t("event.thinking"), crate::tui::state::EventLevel::Info);
@@ -1112,28 +1105,27 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     crate::tui::state::TimelineEntry::Thinking { summary }
                                 );
                             } else if !t.is_empty() {
-                                // 后续 thinking chunk: 更新摘要为最新一行（实时感）
+                                // V42-B: 后续 thinking chunk: 更新 timeline 摘要
+                                let thinking_preview = state.active_llm_thinking();
+                                let last2: Vec<String> = thinking_preview
+                                    .lines()
+                                    .filter(|l| !l.trim().is_empty())
+                                    .collect::<Vec<_>>()
+                                    .into_iter().rev().take(2).rev()
+                                    .map(|l| if l.chars().count() > 50 {
+                                        format!("{}…", l.chars().take(47).collect::<String>())
+                                    } else { l.to_string() })
+                                    .collect();
                                 if let Some(crate::tui::state::TimelineEntry::Thinking { summary }) =
                                     state.streaming_timeline.iter_mut().rev()
                                         .find(|e| matches!(e, crate::tui::state::TimelineEntry::Thinking { .. }))
                                 {
-                                    // 取 thinking 全文最近 2 行非空行作为 live preview（\n 分隔）
-                                    let full = &state.streaming_thinking;
-                                    let combined = format!("{}{}", full, t);
-                                    let last2: Vec<String> = combined.lines()
-                                        .filter(|l| !l.trim().is_empty())
-                                        .collect::<Vec<_>>()
-                                        .into_iter().rev().take(2).rev()
-                                        .map(|l| if l.chars().count() > 50 {
-                                            format!("{}…", l.chars().take(47).collect::<String>())
-                                        } else { l.to_string() })
-                                        .collect();
                                     if !last2.is_empty() {
                                         *summary = last2.join("\n");
                                     }
                                 }
                             }
-                            state.streaming_thinking.push_str(&t);
+                            // V42-B: thinking 已累积到 CardStream（handle_chunk 处理）
                             had_streaming_update = true;
                         }
                         StreamChunk::ToolStart { name } => {
@@ -1432,7 +1424,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.pending_mcip_confirmations = vec![req.clone()];
                                 state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.wait_auth_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Warning);
                             }
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                         }
                         StreamChunk::CompressStart => {
                             // 显式状态切换：压缩是可见操作阶段
@@ -1440,7 +1432,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             state.set_busy_state(InputState::Executing);
                             state.processing_phase = crate::tui::i18n::t("compress.phase").to_string();
                             state.add_toast(crate::tui::i18n::t("compress.toast_start"), Duration::from_secs(3));
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                             state.frame_dirty.set(true);
                         }
                         StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
@@ -1474,7 +1466,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // pending_compress_input 保留：
                             //   Execution 阶段 → CompressAutoResume 来了会消费它
                             //   Communication 阶段 → interval tick 检测到非 busy 时消费（见下方）
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                             state.frame_dirty.set(true);
                         }
                         StreamChunk::CompressAutoResume => {
@@ -1485,7 +1477,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 压缩完成 toast 已由 CompressEnd 发出，AutoResume 不再重复
                             state.input = msg;
                             crate::tui::event::submit_message(&mut state);
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                             state.frame_dirty.set(true);
                         }
                         StreamChunk::ToolHealth(entries) => {
@@ -1537,7 +1529,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
                             state.set_busy_state(InputState::Executing);
                             state.processing_phase = "· wrapping up...".into();
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                             // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
                             // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
                         }
@@ -1554,15 +1546,15 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 Duration::from_secs(4)
                             };
                             state.add_toast(msg, dur);
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                         }
                         StreamChunk::Error(e) => {
                             let is_net = e.starts_with("NETWORK_ERROR:");
                             let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
 
                             // 2026-05-28: 保留已流式的部分内容（fatal 时不丢弃）
-                            let partial_text = if is_fatal_net && !state.streaming_text.is_empty() {
-                                Some(std::mem::take(&mut state.streaming_text))
+                            let partial_text = if is_fatal_net && !state.last_llm_text().is_empty() {
+                                Some(state.take_last_llm_text())
                             } else {
                                 None
                             };
@@ -1573,7 +1565,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                             state.op_started_at = None;
                             state.accumulated_elapsed = Duration::ZERO;
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
 
                             if is_net {
                                 // 网络错误：标记状态 + 专属提示
@@ -1615,11 +1607,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         // 2026-05-28: 流中断后重试——清除已渲染的部分内容，等待重新生成
                         StreamChunk::StreamRetryReset { partial_text } => {
-                            // 清除当前 iteration 的流式输出（TextDelta + Thinking）
-                            // 保留 ToolStart/ToolEnd（已执行的工具不会重做）
-                            state.streaming_text.clear();
-                            state.streaming_thinking.clear();
+                            // V42-B: CardStream handle_chunk 已清除 current LlmCard 内容
                             // P2: 重置 markdown 增量解析引擎——text 清空后 md 内部偏移不一致
+                            *state.streaming_md.borrow_mut() = None;
                             *state.streaming_md.borrow_mut() = None;
                             // 在 timeline 中标注中断点
                             if !partial_text.is_empty() {
@@ -1705,13 +1695,8 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                         // V41: ToolAgent 批量执行结果 — 替代多条 ToolStart/ToolEnd 刷屏
                         StreamChunk::ToolAgentResult { agent_id: _, icon, name, call_count, summary, details } => {
-                            // 在消息流中追加折叠块（展示汇总，详情可展开）
-                            let display = format!("{} {} · {} calls", icon, name, call_count);
-                            state.streaming_text.push_str(&format!("\n{}\n", display));
-                            if !summary.is_empty() {
-                                state.streaming_text.push_str(&format!("  → {}\n", summary));
-                            }
-                            // 记录到 timeline
+                            // V42-B: LlmCard 写入已由 writer::handle_chunk 处理
+                            // 这里仅记录 timeline（V40 字段，暂无 CardStream 等价物）
                             state.streaming_timeline.push(
                                 crate::tui::state::TimelineEntry::ToolAgent {
                                     icon: icon.clone(),
@@ -1724,12 +1709,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             had_streaming_update = true;
                         }
                     }
+                    // V42-B: forward to CardStream writer (clone consumed by match above)
+                    crate::tui::cards::writer::handle_chunk(&mut state, &chunk_for_cards);
                 }
                 // V40: 全量 drain 后统一设一次 dirty（替代每 chunk 重复设置）
                 // had_streaming_update 同时作为分区渲染信号：true = 仅 streaming 尾部需重建
                 if had_streaming_update {
                     state.streaming_content_dirty.set(true);
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 }
 
                 // V29.11 (B): drain sandbox 实时事件 → push_trace(Generic)
@@ -1750,7 +1737,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         if count >= 20 { break; }
                     }
                     if count > 0 {
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                     }
                 }
 
@@ -1758,16 +1745,16 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // 生命周期：Runner 每 tick 可能推送新快照；大字符不益(只取最新一条)
                 while let Ok(health) = auto_health_rx.try_recv() {
                     state.auto_health = health;
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 }
 
                 // P1 优化：条件渲染
                 // - streaming 期间：每帧渲染（内容持续变化 + 光标动画）
                 // - 非 streaming：仅在有状态变化时渲染（事件/响应/resize/toast）
                 // ratatui 双缓冲 diff 保证即使每帧调也只写变化区域到终端
-                let needs_draw = state.is_streaming
+                let needs_draw = state.is_streaming_active()
                     || !matches!(state.input_state, InputState::Ready) // spinner 动画需要持续渲染
-                    || state.rendered_lines_dirty.get()
+                    || state.is_render_dirty()
                     || state.resize_debounce_frames > 0
                     || !state.toasts.is_empty()
                     || state.confirm_dialog.is_some()
@@ -1861,7 +1848,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // 如需恢复打字机效果，还原此处为 stream_cursor += N 逻辑
                 if state.stream_cursor > 0 {
                     state.stream_cursor = 0;
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 }
 
                 // info panel 自动打开（/help /status 等触发）
@@ -1997,12 +1984,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 AbacusMode::Meeting => {
                                     let stx = stream_tx.clone();
                                     // 修复：Meeting 模式切换前保存未落档内容
-                                    if !state.streaming_text.is_empty() && !state.streaming_complete {
+                                    if !state.last_llm_text().is_empty() && !state.streaming_complete {
                                         let ts = chrono::Local::now().format("%H:%M").to_string();
                                         let mut parts: Vec<crate::tui::state::MsgContent> = Vec::new();
-                                        if !state.streaming_thinking.is_empty() {
-                                            let line_count = state.streaming_thinking.lines().count();
-                                            let first_line = state.streaming_thinking.lines()
+                                        let thinking = state.last_llm_thinking();
+                                        if !thinking.is_empty() {
+                                            let line_count = thinking.lines().count();
+                                            let first_line = thinking.lines()
                                                 .find(|l| !l.trim().is_empty()).unwrap_or("").trim();
                                             let preview: String = first_line.chars().take(40).collect();
                                             let summary = if preview.is_empty() {
@@ -2014,20 +2002,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 kind: crate::tui::state::BlockKind::Think,
                                                 summary,
                                                 collapsed: true,
-                                                detail: state.streaming_thinking.clone(),
+                                                detail: thinking,
                                             });
                                         }
-                                        if !state.streaming_text.is_empty() {
-                                            parts.push(crate::tui::state::MsgContent::Stream(
-                                                std::mem::take(&mut state.streaming_text)
-                                            ));
+                                        let text = state.take_last_llm_text();
+                                        if !text.is_empty() {
+                                            parts.push(crate::tui::state::MsgContent::Stream(text));
                                         }
                                         if !parts.is_empty() {
                                             state.add_message(crate::tui::state::Message::new_session(parts, &ts));
                                         }
                                     }
                                     state.reset_streaming();
-                                    state.is_streaming = true;
+                                    state.begin_streaming_session();
                                     tokio::spawn(async move {
                                         match send_meeting_message_streaming(&engine, &text, stx).await {
                                             ApiResult::Ok(resp) => { let _ = tx.send(resp); }
@@ -2055,13 +2042,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         let stx = stream_tx.clone();
                                         // 启动新流式：先保存未落档的流式内容，再清旧累积
                                         // 修复：用户在中途发消息时，上一轮 streaming 内容可能未落档
-                                        if !state.streaming_text.is_empty() && !state.streaming_complete {
+                                        if !state.last_llm_text().is_empty() && !state.streaming_complete {
                                             // streaming 未完成但有内容 → 用户主动打断，保存为临时消息
                                             let ts = chrono::Local::now().format("%H:%M").to_string();
                                             let mut parts: Vec<crate::tui::state::MsgContent> = Vec::new();
-                                            if !state.streaming_thinking.is_empty() {
-                                                let line_count = state.streaming_thinking.lines().count();
-                                                let first_line = state.streaming_thinking.lines()
+                                            let thinking = state.last_llm_thinking();
+                                            if !thinking.is_empty() {
+                                                let line_count = thinking.lines().count();
+                                                let first_line = thinking.lines()
                                                     .find(|l| !l.trim().is_empty()).unwrap_or("").trim();
                                                 let preview: String = first_line.chars().take(40).collect();
                                                 let summary = if preview.is_empty() {
@@ -2073,20 +2061,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                     kind: crate::tui::state::BlockKind::Think,
                                                     summary,
                                                     collapsed: true,
-                                                    detail: state.streaming_thinking.clone(),
+                                                    detail: thinking,
                                                 });
                                             }
-                                            if !state.streaming_text.is_empty() {
-                                                parts.push(crate::tui::state::MsgContent::Stream(
-                                                    std::mem::take(&mut state.streaming_text)
-                                                ));
+                                            let text = state.take_last_llm_text();
+                                            if !text.is_empty() {
+                                                parts.push(crate::tui::state::MsgContent::Stream(text));
                                             }
                                             if !parts.is_empty() {
                                                 state.add_message(crate::tui::state::Message::new_session(parts, &ts));
                                             }
                                         }
                                         state.reset_streaming();
-                                        state.is_streaming = true;
+                                        state.begin_streaming_session();
                                         tokio::spawn(async move {
                                             use crate::tui::api::send_chat_message_streaming;
                                             match send_chat_message_streaming(&engine, &text, stx, chat_req_ctx).await {
@@ -2167,7 +2154,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let tx = res_tx.clone();
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
-                                state.is_streaming = true;
+                                state.begin_streaming_session();
                                 // 防并发：ReviewRole 调 LLM，设 Outputting 让输入框显示对应状态
                                 state.set_busy_state(InputState::Outputting);
                                 state.processing_phase = format!("review/{}", kind.label());
@@ -2209,7 +2196,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     ..Default::default()
                                 };
                                 state.reset_streaming();
-                                state.is_streaming = true;
+                                state.begin_streaming_session();
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "planning".into();
                                 state.op_started_at = Some(std::time::Instant::now());
@@ -2241,7 +2228,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let tx = res_tx.clone();
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
-                                state.is_streaming = true;
+                                state.begin_streaming_session();
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "team".into();
                                 state.op_started_at = Some(std::time::Instant::now());
@@ -2273,7 +2260,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 let tx = res_tx.clone();
                                 let stx = stream_tx.clone();
                                 state.reset_streaming();
-                                state.is_streaming = true;
+                                state.begin_streaming_session();
                                 state.set_busy_state(InputState::Outputting);
                                 state.processing_phase = format!("team/{}", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
@@ -2351,7 +2338,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         state.input.insert_str(state.cursor_pos, &normalized);
                         state.cursor_pos += normalized.len();
                         state.recalculate_cursor();
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                         // 2026-05-28: 粘贴 > 5 行时自动打开全屏编辑器
                         let line_count = state.input.matches('\n').count() + 1;
                         if line_count > 5 && state.input_state != crate::tui::state::InputState::Editor {
@@ -2366,7 +2353,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
     shutdown.store(true, Ordering::Relaxed);
     // R7：save_session 失败需可见（之前 .ok() 静默吞错，磁盘满/权限错时用户不知）
-    let save_err = save_session(&state).err();
+    let save_err = crate::tui::state::session_export::save_session(&state).err();
     // V28.7: Phase 3 后单实例 flock 已移除（多开靠 UUID 命名 + WAL 隔离），
     // 历史 lockfile 清理逻辑已废止，无需 remove_file（清掉对悬挂 lock_path 的引用）
     guard.deactivate()?;
@@ -2883,401 +2870,7 @@ pub(crate) fn save_always_allow(set: &std::collections::HashSet<String>) -> std:
     Ok(())
 }
 
-/// - 文件命名用 state.session_id (UUID)，多实例不互覆盖
-/// - 额外写 last_session_uuid 文本 pointer（项目内）以支持 "恢复上次"语义
-///
-/// V28 (T9): SessionExport 升级到 v2 — 把 events: Vec<EventEntry> 替换为
-/// trace_events: Vec<TraceEvent> + next_trace_id: u64(SSOT 直接持久化)。
-/// 旧 v1 文件由 load_last_session 自动 migration 到 v2 形态(events → Generic kind)。
-pub(crate) fn save_session(state: &AppState) -> std::io::Result<()> {
-    use serde::Serialize;
-    #[derive(Serialize)]
-    struct SessionExport {
-        version: u32,
-        session_id: String,
-        model_name: String,
-        thinking_depth: String,
-        turn_count: u32,
-        session_summary: String,
-        messages: Vec<crate::tui::state::Message>,
-        // V28: trace_events 是 SSOT,events 字段不再写出
-        trace_events: Vec<crate::tui::state::TraceEvent>,
-        next_trace_id: u64,
-        // V29.11: always_allow 已迁移到系统级 ~/.abacus/always_allow.json
-        // 此字段不再写入 session; 旧 session 的 "always_allow" JSON key 在 load 时
-        // 由 apply_session_export 手动处理(一次性迁移到系统文件), struct 不需要该字段
-        #[serde(skip_serializing)]
-        _always_allow_legacy: Vec<String>,
-        // V29.9: 会话可读别名(/rename) + turnkey 全托管目标(/turnkey)
-        // 引用关系: AppState.session_alias / session_goal → 持久化 → load 时回填
-        // 生命周期: 写入: save_session(每条消息后/手动 /save) | 销毁: 用户 /new 或显式 clear
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_alias: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_goal: Option<String>,
-        // V34-4: 模式 + 跨阶段 artifact 持久化（DAG 状态恢复）
-        // 引用关系: AppState.mode / mode_artifact → 持久化 → load 时回填
-        // 生命周期:
-        //   mode → 写入 set_mode 调用后；恢复后用户从原阶段继续（避免重启回到 Clarify 起点）
-        //   mode_artifact → 写入 try_switch_mode（Plan→Team 解析后）；恢复后由 switch_mode take() 消费
-        // 兼容性: skip_serializing_if = Option::is_none 保证旧 session 文件不报字段缺失
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mode: Option<abacus_types::AbacusMode>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mode_artifact: Option<abacus_types::ModeArtifact>,
-        // V37-2: token 统计持久化（含 V36-3 per_model 分布）
-        //   引用关系: AppState.session_tokens → 持久化 → load 时回填
-        //   生命周期: 累加于每轮 EngineResponse.stats；跨重启保留（用户想看跨会话累计开销）
-        //   兼容性: 旧 session 文件无此字段 → load 时 serde 不报错（apply_session_export 用 get-or-default）
-        #[serde(skip_serializing_if = "session_tokens_is_empty")]
-        session_tokens: Option<crate::tui::state::SessionTokenStats>,
-        // V40-1: 持久化最近一次 review 结果 + strict 阻断标志
-        //   引用关系: AppState.last_review / last_review_strict
-        //   设计意图: 防止用户重启后丢失 strict 阻断 → 已被 fail 的 plan 被错误放进 Team
-        //   兼容性: skip_serializing_if = Option::is_none 旧文件无字段不报错
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        last_review: Option<crate::tui::api::ReviewReport>,
-        #[serde(default, skip_serializing_if = "bool_is_false")]
-        last_review_strict: bool,
-        // V41-1: 持久化 /auto-review 配置（用户意图持久，关机不丢）
-        //   引用关系: AppState.auto_review_plan ← cmd_auto_review 切换
-        //   设计意图: 用户显式开启的 toggle 不应静默关闭 — 跨重启遵守用户意图
-        //   兼容性: 默认 false 时跳过序列化（旧 session 无字段 → 默认关闭）
-        #[serde(default, skip_serializing_if = "bool_is_false")]
-        auto_review_plan: bool,
-        // V41-补持久化: review_history（V41-4 规定的"完整轨迹"应跨重启保留）
-        //   引用关系: AppState.review_history ← run.rs:397 review 抵达后 push_back
-        //   设计意图: 字段文档承诺"完整轨迹"，仅 in-memory 不持久化等于宣称"完整"实则每次重启清零
-        //   兼容性: 旧 session 无字段 → 反序列化得空 VecDeque（默认行为不变）
-        //   上限保护: load 后 push 时 > 20 仍会 pop_front 兜底，capacity 不准也无副作用
-        #[serde(default, skip_serializing_if = "review_history_is_empty")]
-        review_history: std::collections::VecDeque<crate::tui::api::ReviewReport>,
-        // V41-补持久化: review_required 强约束开关（V41-2）
-        //   引用关系: AppState.review_required ← cmd_review_required 切换
-        //   设计意图: 与 auto_review_plan 同性质 — 用户显式开启的 toggle 不应静默关闭
-        //   兼容性: 默认 false 时跳过序列化（旧 session 无字段 → 默认关闭）
-        #[serde(default, skip_serializing_if = "bool_is_false")]
-        review_required: bool,
-        // V41-补持久化: review fresh-age 阈值（V41-2）
-        //   引用关系: AppState.review_max_age_secs ← cmd_review_required 解析 [<秒>]
-        //   设计意图: 用户自定义阈值跨重启保留；总是序列化避免默认值漂移导致静默语义改变
-        //   兼容性: 旧 session 无字段 → serde default = 600（与 AppState::new 默认一致）
-        #[serde(default = "default_review_max_age_secs")]
-        review_max_age_secs: u64,
-        saved_at: String,
-    }
 
-    /// V40-1: bool false 判定 — 用于 last_review_strict skip
-    fn bool_is_false(v: &bool) -> bool { !*v }
-
-    /// V37-2: SessionTokenStats 全零判定 — 全 0 时跳过序列化节省字节
-    fn session_tokens_is_empty(opt: &Option<crate::tui::state::SessionTokenStats>) -> bool {
-        match opt {
-            None => true,
-            Some(s) => s.total_tokens == 0 && s.cost_cny == 0.0 && s.per_model.is_empty(),
-        }
-    }
-    /// V41-补: review_history 空判定 — 用于 skip_serializing_if
-    /// 引用关系: SessionExport.review_history 字段; 空时跳过序列化保持旧 session 文件兼容
-    fn review_history_is_empty(v: &std::collections::VecDeque<crate::tui::api::ReviewReport>) -> bool {
-        v.is_empty()
-    }
-    /// V41-补: review_max_age_secs 缺字段时的兜底默认 — 与 AppState::new 默认值（600）保持一致
-    /// 引用关系: SessionExport.review_max_age_secs 字段 serde default; 旧 session 无字段时回退此值
-    fn default_review_max_age_secs() -> u64 { 600 }
-    let export = SessionExport {
-        version: 2,
-        session_id: state.session_id.clone(),
-        model_name: state.model_name.clone(),
-        thinking_depth: state.thinking_depth.clone(),
-        turn_count: state.turn_count,
-        session_summary: state.session_summary.clone(),
-        messages: state.messages.iter().cloned().collect(),
-        trace_events: state.trace_events.clone(),
-        next_trace_id: state.next_trace_id,
-        _always_allow_legacy: Vec::new(), // 不再写入 session
-        session_alias: state.session_alias.clone(),
-        session_goal: state.session_goal.clone(),
-        // V34-4: 持久化当前模式（Clarify 默认无需写出，节省字节）+ 待消费 artifact
-        mode: (state.mode != abacus_types::AbacusMode::Clarify).then_some(state.mode),
-        mode_artifact: state.mode_artifact.clone(),
-        // V37-2: 持久化 token 统计（含 per_model 分布）；全 0 时 None 跳过序列化
-        session_tokens: if state.session_tokens.total_tokens == 0
-            && state.session_tokens.cost_cny == 0.0
-            && state.session_tokens.per_model.is_empty()
-        {
-            None
-        } else {
-            Some(state.session_tokens.clone())
-        },
-        // V40-1: 持久化 review 状态
-        last_review: state.last_review.clone(),
-        last_review_strict: state.last_review_strict,
-        // V41-1: 持久化 /auto-review 配置
-        auto_review_plan: state.auto_review_plan,
-        // V41-补持久化: review_history / review_required / review_max_age_secs
-        //   设计闭环: 字段文档承诺"完整轨迹" + V41-1 立的"用户意图持久"原则同时落实
-        review_history: state.review_history.clone(),
-        review_required: state.review_required,
-        review_max_age_secs: state.review_max_age_secs,
-        saved_at: chrono::Utc::now().to_rfc3339(),
-    };
-    // Phase 3: paths::current_sessions_dir() 为项目层路径
-    // 形如：~/.abacus/projects/<escaped-cwd>/sessions/
-    let dir = abacus_core::paths::current_sessions_dir();
-    std::fs::create_dir_all(&dir)?;
-
-    // 用 session_id (UUID) 命名，多实例不会撞同名
-    let filename = format!("{}.json", state.session_id);
-    let path = dir.join(&filename);
-    let json = serde_json::to_string_pretty(&export)?;
-
-    // 原子写入：先写 .tmp 再 rename，避免部分写入损坏
-    let tmp_path = dir.join(format!(".{}.json.tmp", state.session_id));
-    std::fs::write(&tmp_path, &json)?;
-    std::fs::rename(&tmp_path, &path)?;
-
-    // 项目层 last_session_uuid 文本 pointer — 仅本项目多实例会互覆（last-writer-wins，可接受）
-    // 跨项目不冲突，符合"项目隔离"语义。
-    let pointer = dir.join("last_session_uuid");
-    let _ = std::fs::write(&pointer, &state.session_id);
-
-    // R3 修复 (保留)：项目内保留最近 SESSION_KEEP 个 *.json (按 mtime)。
-    // 包含跨多实例产生的 session——UUID 命名让文件名不都含时间戳，改走 mtime。
-    const SESSION_KEEP: usize = 50;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        let mut snapshots: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let p = e.path();
-                let is_session = p.extension().and_then(|x| x.to_str()) == Some("json")
-                    && !p.file_name().and_then(|x| x.to_str()).map(|n| n.starts_with('.')).unwrap_or(false);
-                if !is_session { return None; }
-                e.metadata().ok().and_then(|m| m.modified().ok()).map(|mt| (p, mt))
-            })
-            .collect();
-        snapshots.sort_by_key(|s| s.1); // 升序：最旧在前，便于裁剪头部
-        if snapshots.len() > SESSION_KEEP {
-            for (old, _) in &snapshots[..snapshots.len() - SESSION_KEEP] {
-                let _ = std::fs::remove_file(old);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 从 ~/.abacus/sessions/latest.json 恢复上次会话
-///
-/// V28 (T9): v1 → v2 migration:
-///   - v2: 直接反序列化 trace_events + next_trace_id(SSOT 真相源)
-///   - v1 / 缺 version: 老 events: Vec<EventEntry> 转成 TraceEvent::Generic, 顺序分配 id 0..N
-///   - 旧 messages 中遗留的 Block(Think/ToolCall) 原样保留(渲染层兼容,T5 不删 Block 路径)
-pub fn load_last_session(state: &mut AppState) -> std::io::Result<bool> {
-    let path = session_path();
-    if !path.exists() { return Ok(false); }
-    load_session_from_path(state, &path)
-}
-
-/// V29.9 (C2): 按 uuid 加载特定 session — /resume 命令用
-///
-/// 引用关系:
-///   - 调用: slash_commands::cmd_resume
-///   - 使用: paths::current_sessions_dir() 推导 {dir}/{uuid}.json
-/// 生命周期: 一次性调用，加载成功后由调用方决定是否同步 last_session_uuid pointer
-/// 返回: Ok(true) 加载并应用, Ok(false) 文件不存在, Err(io) IO 错误
-pub fn load_session_by_uuid(state: &mut AppState, uuid: &str) -> std::io::Result<bool> {
-    let dir = abacus_core::paths::current_sessions_dir();
-    let path = dir.join(format!("{}.json", uuid));
-    if !path.exists() { return Ok(false); }
-    load_session_from_path(state, &path)
-}
-
-/// 内部 helper — 给定路径加载 session JSON 到 state
-/// 引用关系: load_last_session + load_session_by_uuid 共用
-fn load_session_from_path(state: &mut AppState, path: &std::path::Path) -> std::io::Result<bool> {
-    let json = std::fs::read_to_string(path)?;
-    let export: serde_json::Value = serde_json::from_str(&json)?;
-    apply_session_export(state, &export);
-    Ok(true)
-}
-
-/// 把 SessionExport JSON 应用到 state(纯函数,便于单元测试)
-///
-/// V28: 显式区分 v1 vs v2 路径,v1 把 events 数组转成 TraceEvent::Generic 列表
-fn apply_session_export(state: &mut AppState, export: &serde_json::Value) {
-    use crate::tui::state::{TraceEvent, TraceKind};
-
-    // Phase 3：恢复 session_id (UUID)；旧文件无此字段 → 保留 state 现有 UUID（启动生成的）
-    if let Some(sid) = export.get("session_id").and_then(|v| v.as_str()) {
-        if !sid.is_empty() {
-            state.session_id = sid.to_string();
-        }
-    }
-    if let Some(name) = export.get("model_name").and_then(|v| v.as_str()) {
-        state.model_name = name.to_string();
-    }
-    if let Some(tc) = export.get("turn_count").and_then(|v| v.as_u64()) {
-        state.turn_count = tc as u32;
-    }
-    if let Some(s) = export.get("session_summary").and_then(|v| v.as_str()) {
-        state.session_summary = s.to_string();
-    }
-    // Phase 3 (3.6): 恢复 thinking_depth——保存时序列化了此字段，但原先缺少反序列化回填。
-    // 引用关系：save_session 写入 thinking_depth；本处恢复到 AppState.thinking_depth
-    // 兼容性：旧文件无此字段 → 保留 state 现值（启动默认 "medium"）
-    if let Some(td) = export.get("thinking_depth").and_then(|v| v.as_str()) {
-        if !td.is_empty() {
-            state.thinking_depth = td.to_string();
-        }
-    }
-    if let Some(msgs) = export.get("messages") {
-        if let Ok(msgs) = serde_json::from_value::<Vec<crate::tui::state::Message>>(msgs.clone()) {
-            state.messages = msgs.into();
-        }
-    }
-
-    // V28 version 判定: 缺字段或 version<2 走 v1 migration 路径
-    let version = export.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
-    if version >= 2 {
-        // v2: 直接反序列化 trace_events + next_trace_id
-        if let Some(te) = export.get("trace_events") {
-            if let Ok(te) = serde_json::from_value::<Vec<TraceEvent>>(te.clone()) {
-                state.trace_events = te;
-            }
-        }
-        if let Some(nti) = export.get("next_trace_id").and_then(|v| v.as_u64()) {
-            state.next_trace_id = nti;
-        } else {
-            // 兜底: 从 trace_events 末尾推算
-            state.next_trace_id = state.trace_events.last().map(|e| e.id + 1).unwrap_or(0);
-        }
-    } else {
-        // v1 migration: events: Vec<EventEntry> → trace_events: Vec<TraceEvent::Generic>
-        if let Some(evts) = export.get("events") {
-            if let Ok(evts) = serde_json::from_value::<Vec<crate::tui::state::EventEntry>>(evts.clone()) {
-                state.trace_events = evts.into_iter().enumerate().map(|(i, e)| TraceEvent {
-                    id: i as u64,
-                    time: e.time,
-                    category: e.category,
-                    level: e.level,
-                    kind: TraceKind::Generic { content: e.content },
-                    duration_ms: None,
-                }).collect();
-                state.next_trace_id = state.trace_events.len() as u64;
-            }
-        }
-    }
-
-    // V29.11: always_allow 已迁移到系统级 ~/.abacus/always_allow.json
-    //   旧 session 文件含此字段时做一次性迁移：合并到系统文件（不覆盖，追加 diff）
-    //   迁移后不再读取 session-level always_allow
-    if let Some(aa) = export.get("always_allow") {
-        if let Ok(list) = serde_json::from_value::<Vec<String>>(aa.clone()) {
-            if !list.is_empty() {
-                // 一次性迁移: session → system (追加不重复)
-                for tool in list {
-                    state.always_allow.insert(tool);
-                }
-                // 迁移后立即保存到系统文件
-                let _ = save_always_allow(&state.always_allow);
-            }
-        }
-    }
-
-    // V29.9: 恢复 session_alias / session_goal —— /rename 与 /turnkey 跨重启保留
-    //   缺字段 → None(默认行为不变);存在但非 string → 静默跳过
-    if let Some(s) = export.get("session_alias").and_then(|v| v.as_str()) {
-        state.session_alias = (!s.is_empty()).then(|| s.to_string());
-    }
-    if let Some(s) = export.get("session_goal").and_then(|v| v.as_str()) {
-        state.session_goal = (!s.is_empty()).then(|| s.to_string());
-    }
-
-    // V34-4: 恢复 mode / mode_artifact
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState
-    //   兼容性: 缺字段 → 保留 state 现值（默认 Clarify / None）
-    //   设计意图: 重启后用户回到上次的阶段，避免每次都从 Clarify 起点重做
-    if let Some(m) = export.get("mode") {
-        if let Ok(mode) = serde_json::from_value::<abacus_types::AbacusMode>(m.clone()) {
-            state.set_mode(mode);
-        }
-    }
-    if let Some(art) = export.get("mode_artifact") {
-        if let Ok(artifact) = serde_json::from_value::<abacus_types::ModeArtifact>(art.clone()) {
-            state.mode_artifact = Some(artifact);
-        }
-    }
-
-    // V37-2: 恢复 session_tokens（含 per_model 分布）
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.session_tokens
-    //   兼容性: 旧文件无 session_tokens / per_model 字段 → serde default 兜底（全 0 / 空 HashMap）
-    //   设计意图: 让用户在新 session 启动后立即看到上次会话的累计开销，避免归零误导
-    if let Some(st) = export.get("session_tokens") {
-        if let Ok(tokens) = serde_json::from_value::<crate::tui::state::SessionTokenStats>(st.clone()) {
-            state.session_tokens = tokens;
-        }
-    }
-
-    // V40-1: 恢复 review 状态（last_review + strict 阻断）
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.last_review / last_review_strict
-    //   设计意图: 防止用户重启后 strict 阻断丢失 → 已被 fail 的 plan 被错误放进 Team
-    //   兼容性: 旧文件无字段 → 保持默认 None / false
-    if let Some(r) = export.get("last_review") {
-        if let Ok(report) = serde_json::from_value::<crate::tui::api::ReviewReport>(r.clone()) {
-            state.last_review = Some(report);
-        }
-    }
-    if let Some(v) = export.get("last_review_strict").and_then(|x| x.as_bool()) {
-        state.last_review_strict = v;
-    }
-
-    // V41-1: 恢复 /auto-review 配置
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.auto_review_plan
-    //   设计意图: 跨重启遵守用户意图 — 上次 /auto-review on 后重启仍应是 on
-    //   兼容性: 旧文件无字段 → 保持默认 false
-    if let Some(v) = export.get("auto_review_plan").and_then(|x| x.as_bool()) {
-        state.auto_review_plan = v;
-    }
-
-    // V41-补: 恢复 review_history（V41-4 完整轨迹）
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.review_history
-    //   设计意图: 字段文档承诺"完整轨迹"；只有跨重启保留才名实相符
-    //   兼容性: 旧文件无字段或反序列化失败 → 保留 state 现值（new 时已 with_capacity(20)）
-    //   FIFO 保护: 即便载入超 20 条（极端历史文件），下次 push_back 后会 pop_front 兜底
-    if let Some(rh) = export.get("review_history") {
-        if let Ok(history) = serde_json::from_value::<std::collections::VecDeque<crate::tui::api::ReviewReport>>(rh.clone()) {
-            state.review_history = history;
-        }
-    }
-
-    // V41-补: 恢复 review_required（V41-2 强约束 toggle）
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.review_required
-    //   设计意图: 与 auto_review_plan 同性质 — 用户显式开启的 toggle 不应静默关闭
-    //   兼容性: 旧文件无字段 → 保持默认 false
-    if let Some(v) = export.get("review_required").and_then(|x| x.as_bool()) {
-        state.review_required = v;
-    }
-
-    // V41-补: 恢复 review_max_age_secs（V41-2 fresh-age 阈值）
-    //   引用关系: save_session 写入；这里反序列化回填到 AppState.review_max_age_secs
-    //   设计意图: 用户自定义阈值跨重启保留；旧文件无字段 → 保持默认 600
-    if let Some(v) = export.get("review_max_age_secs").and_then(|x| x.as_u64()) {
-        state.review_max_age_secs = v;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// V28.4 已知遗留 (PR10 收尾时记录)
-//
-//   `cargo test -p abacus-cli` 被 abacus-core 并发编辑阻塞:
-//     abacus-core/src/core/context.rs:1106 调用 `flush_pending(...)`
-//     传 3 参,但 line 983-986 闭包签名要求 4 参(缺 archive 出参)。
-//     该错误在 abacus-core 主 lib 代码,非测试代码,亦非 V28 范围。
-//
-//   影响: V28.4 的下面 4+4 单元测试无法在并发会话期间随手验证。
-//   缓解: `cargo check -p abacus-cli` 已通过,V28.4 自身无新错误;
-//         abacus-core 收敛后回归即可,无需 V28 侧改动。
-// ─────────────────────────────────────────────────────────────────────
 
 // ─── Phase 6: timeline 渲染单测 ─────────────────────────────────
 #[cfg(test)]
@@ -3347,7 +2940,6 @@ mod undo_timeline_render_tests {
 
     #[test]
     fn timeline_groups_consecutive_same_session() {
-        // 同 session 连续 3 条只画一次 header
         let entries = vec![
             entry("sess-A", 3, 300, "fs_write", "/x", false),
             entry("sess-A", 2, 200, "fs_write", "/y", false),
@@ -3366,208 +2958,30 @@ mod undo_timeline_render_tests {
         assert!(out.contains("…"), "long path should be truncated with ellipsis");
         assert!(!out.contains(&long), "raw long path should not appear");
     }
-}
-
-#[cfg(test)]
-mod session_migration_tests {
-    //! V28 T9 SessionExport v1 → v2 migration 回归
-    //!
-    //! 不变量:
-    //! - v1 events 列表全部映射到 TraceKind::Generic,顺序保持,id 从 0 单调
-    //! - v2 文件直接反序列化,trace_events / next_trace_id 等价于写出时
-    //! - messages 中遗留的 Block(Think/ToolCall) 不被 migration 触碰(T5 渲染层兼容)
-    use super::*;
-    use crate::tui::state::{AppState, AbacusMode, TraceKind};
-
-    #[test]
-    fn v1_events_migrate_to_generic_trace_events() {
-        let v1_json = serde_json::json!({
-            "version": 1,
-            "model_name": "gpt-4",
-            "turn_count": 3,
-            "session_summary": "test",
-            "messages": [],
-            "events": [
-                { "time": "12:00", "category": "llm", "content": "开始", "level": "Info" },
-                { "time": "12:01", "category": "tool", "content": "fs.read 完成", "level": "Notice" },
-                { "time": "12:02", "category": "session", "content": "用户提交", "level": "Info" },
-            ],
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &v1_json);
-
-        assert_eq!(state.model_name, "gpt-4");
-        assert_eq!(state.turn_count, 3);
-        assert_eq!(state.trace_events.len(), 3);
-        assert_eq!(state.next_trace_id, 3);
-        // 顺序保持 + id 单调
-        for (i, ev) in state.trace_events.iter().enumerate() {
-            assert_eq!(ev.id, i as u64);
-            // 全部是 Generic kind
-            assert!(matches!(ev.kind, TraceKind::Generic { .. }), "v1 migration 必须全为 Generic");
-        }
-        // category 字段保留
-        assert_eq!(state.trace_events[0].category, "llm");
-        assert_eq!(state.trace_events[1].category, "tool");
-        assert_eq!(state.trace_events[2].category, "session");
     }
 
-    #[test]
-    fn v1_missing_version_treated_as_v1() {
-        // 缺 version 字段(更老的格式)也应当走 v1 migration 路径
-        let json = serde_json::json!({
-            "model_name": "x",
-            "messages": [],
-            "events": [
-                { "time": "12:00", "category": "llm", "content": "hi", "level": "Info" },
-            ],
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &json);
-        assert_eq!(state.trace_events.len(), 1);
-        assert!(matches!(state.trace_events[0].kind, TraceKind::Generic { .. }));
-    }
 
-    #[test]
-    fn v2_round_trip_preserves_trace_events() {
-        // v2: 模拟"先写一份带 trace_events 的 export,再读回来,内容应等价"
-        let v2_json = serde_json::json!({
-            "version": 2,
-            "model_name": "claude",
-            "turn_count": 1,
-            "session_summary": "v2",
-            "messages": [],
-            "trace_events": [
-                {
-                    "id": 5, "time": "10:00", "category": "llm", "level": "Info",
-                    "duration_ms": null,
-                    "kind": { "type": "Thinking", "text": "推理过程", "lines": 3 }
-                },
-                {
-                    "id": 6, "time": "10:01", "category": "tool", "level": "Notice",
-                    "duration_ms": 150,
-                    "kind": {
-                        "type": "ToolCall", "name": "filengine.fs.read", "args": "{}",
-                        "output": "ok", "status": "Success"
-                    }
-                },
-            ],
-            "next_trace_id": 7,
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &v2_json);
-
-        assert_eq!(state.trace_events.len(), 2);
-        assert_eq!(state.next_trace_id, 7);
-        // id 不被重置 — v2 直接采用文件中的 id(关键: 不与历史 message 引用冲突)
-        assert_eq!(state.trace_events[0].id, 5);
-        assert_eq!(state.trace_events[1].id, 6);
-        match &state.trace_events[0].kind {
-            TraceKind::Thinking { text, lines } => {
-                assert_eq!(text, "推理过程");
-                assert_eq!(*lines, 3);
-            }
-            _ => panic!("expected Thinking kind"),
-        }
-        match &state.trace_events[1].kind {
-            TraceKind::ToolCall { name, status, .. } => {
-                assert_eq!(name, "filengine.fs.read");
-                assert!(matches!(status, crate::tui::state::ToolStatus::Success));
-            }
-            _ => panic!("expected ToolCall kind"),
-        }
-    }
-
-    #[test]
-    fn v2_missing_next_trace_id_falls_back_to_last_id_plus_1() {
-        let json = serde_json::json!({
-            "version": 2,
-            "messages": [],
-            "trace_events": [
-                {
-                    "id": 42, "time": "10:00", "category": "llm", "level": "Info",
-                    "duration_ms": null,
-                    "kind": { "type": "Generic", "content": "x" }
-                },
-            ],
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &json);
-        assert_eq!(state.next_trace_id, 43, "缺 next_trace_id 时从末尾 id+1 推算");
-    }
-
-    // ─── V29.9 字段持久化回归 (alias / goal) ──────────────────
-    //
-    // 不变量:
-    // - v2 文件含 session_alias/session_goal 字段 → apply 后 state 字段同值
-    // - 缺字段 → state 保持 None(默认), 不 panic
-    // - 空字符串 → 视为 None(避免后续 UI 显示空白)
-
-    #[test]
-    fn v2_loads_session_alias_and_goal() {
-        let json = serde_json::json!({
-            "version": 2,
-            "messages": [],
-            "trace_events": [],
-            "next_trace_id": 0,
-            "session_alias": "feature-x",
-            "session_goal": "把 turnkey 接通 sandbox",
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &json);
-        assert_eq!(state.session_alias.as_deref(), Some("feature-x"));
-        assert_eq!(state.session_goal.as_deref(), Some("把 turnkey 接通 sandbox"));
-    }
-
-    #[test]
-    fn v2_missing_alias_and_goal_default_to_none() {
-        let json = serde_json::json!({
-            "version": 2,
-            "messages": [],
-            "trace_events": [],
-            "next_trace_id": 0,
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &json);
-        assert!(state.session_alias.is_none(), "缺字段应保持 None");
-        assert!(state.session_goal.is_none(), "缺字段应保持 None");
-    }
-
-    #[test]
-    fn v2_empty_alias_string_treated_as_none() {
-        let json = serde_json::json!({
-            "version": 2,
-            "messages": [],
-            "trace_events": [],
-            "next_trace_id": 0,
-            "session_alias": "",
-            "session_goal": "",
-        });
-        let mut state = AppState::new(AbacusMode::Clarify);
-        apply_session_export(&mut state, &json);
-        assert!(state.session_alias.is_none(), "空字符串应视为 None");
-        assert!(state.session_goal.is_none(), "空字符串应视为 None");
-    }
-}
-
-/// 项目层 "上次 session" 路径。
+/// 从 config.toml 读取 [tui.panel] sections 配置。
 ///
-/// Phase 3 重构：从 sessions/latest.json 改为读 last_session_uuid pointer 推导
-/// 到 sessions/{uuid}.json。pointer 不存在 / 读不到 → 返回不存在路径（调用方
-/// 以 .exists() 处理"干净启动"语义）。
-///
-/// 返回 PathBuf 而非 Option 以保留与原签名的向后兼容。
-fn session_path() -> std::path::PathBuf {
-    let dir = abacus_core::paths::current_sessions_dir();
-    let pointer = dir.join("last_session_uuid");
-    if let Ok(uuid) = std::fs::read_to_string(&pointer) {
-        let uuid = uuid.trim();
-        if !uuid.is_empty() {
-            return dir.join(format!("{uuid}.json"));
+/// 用户可在 `~/.abacus/config.toml` 中写入：
+/// ```toml
+/// [tui.panel]
+/// sections = ["llm", "tools", "local", "palace", "timeline", "focus"]
+/// ```
+/// 未配置时返回 `None`（使用默认布局）。
+fn load_panel_sections_from_config() -> Option<Vec<String>> {
+    let path = abacus_core::paths::config_toml();
+    let content = std::fs::read_to_string(&path).ok()?;
+    let toml_val: toml::Value = toml::from_str(&content).ok()?;
+    let sections = toml_val.get("tui")?.get("panel")?.get("sections")?;
+    match sections {
+        toml::Value::Array(arr) => {
+            let ids: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            if ids.is_empty() { None } else { Some(ids) }
         }
+        _ => None,
     }
-    // Fallback：返回预期不存在的路径（调用方以 .exists() 检查）
-    dir.join(".no-last-session")
 }
+
 
 

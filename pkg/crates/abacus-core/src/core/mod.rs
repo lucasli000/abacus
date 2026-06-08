@@ -2950,7 +2950,8 @@ impl CoreLoop {
         base_dir: impl Into<String>,
         require_signing: bool,
     ) -> Result<usize, KernelError> {
-        let loader = Arc::new(crate::mcp::PluginLoader::new(base_dir));
+        let loader = Arc::new(crate::mcp::PluginLoader::new(base_dir)
+            .map_err(|e| KernelError::Other(format!("PluginLoader init: {e}")))?);
         let raw_manifests = loader.discover().await?;
         // 签名预过滤
         let mut manifests = Vec::with_capacity(raw_manifests.len());
@@ -3384,6 +3385,11 @@ impl CoreLoop {
 
     /// 获取沙箱引擎引用（CLI turnkey 命令使用）
     pub fn sandbox_engine(&self) -> &Arc<SandboxOrchestrator> { &self.sandbox_engine }
+
+    /// 获取 ProviderRegistry（供模型路由和验证使用）
+    pub fn provider_registry(&self) -> &Arc<crate::llm::provider_registry::ProviderRegistry> {
+        &self.provider_registry
+    }
 
     /// 获取 HealthRegistry（供外部注册探针）
     pub fn health_registry(&self) -> &Arc<health::HealthRegistry> { &self.health_registry }
@@ -4786,7 +4792,12 @@ Output JSON:
             return Ok((id.clone(), provider.clone()));
         }
 
-        Err(KernelError::Other("no LLM provider available — set DEEPSEEK_API_KEY or ABACUS_API_KEY".into()))
+        Err(KernelError::Other(
+            "没有可用的 LLM Provider。请配置 API Key：\n\
+             1. 运行 `abacus config set llm.api_key <your-key>`\n\
+             2. 或设置环境变量 DEEPSEEK_API_KEY / ANTHROPIC_API_KEY\n\
+             3. 或在 ~/.abacus/provider.toml 中配置 providers".into()
+        ))
     }
 
     /// build_tool_definitions 默认入口（无 task_kind 过滤、无 turn 修剪）。仅测试场景使用。
@@ -4832,7 +4843,7 @@ Output JSON:
             match &t.schema.applicable_task_kinds {
                 None => true,
                 Some(list) => {
-                    let label = task_kind_label.unwrap();
+                    let label = task_kind_label.expect("routing_active=true implies task_kind_label is Some");
                     list.iter().any(|k| k == label)
                 }
             }
@@ -4853,7 +4864,9 @@ Output JSON:
         // - 依赖：scene_active_prefixes() 自由函数、self.tool_last_invoked、self.config.scene_tool_loading_enabled
         // - 消费方：下游 Phase γ-I 和段 K3 接收过滤后的 tools Vec
         let tools: Vec<_> = if self.config.scene_tool_loading_enabled && task_kind_label.is_some() {
-            let prefixes = scene_active_prefixes(task_kind_label.unwrap());
+            let prefixes = scene_active_prefixes(
+                task_kind_label.expect("guard above ensures is_some()")
+            );
             // 修复：未列举的任务类型（general_chat 等）前缀为空列表→过滤掉所有工具→tools=0
             // 修复：前缀为空时跳过过滤，全部工具透传
             if prefixes.is_empty() {
@@ -4874,7 +4887,7 @@ Output JSON:
                 }
                 // Rule 3: explicitly marked for this task_kind (already passed β-D filter above)
                 if let Some(ref kinds) = t.schema.applicable_task_kinds {
-                    if kinds.iter().any(|k| k == task_kind_label.unwrap()) {
+                    if kinds.iter().any(|k| k == task_kind_label.expect("guard above ensures is_some()")) {
                         return true;
                     }
                 }
@@ -4893,8 +4906,8 @@ Output JSON:
         let pruning_active = current_turn.is_some()
             && self.config.tool_frequency_pruning_turns.is_some();
         let tools: Vec<_> = if pruning_active {
-            let turn = current_turn.unwrap();
-            let n = self.config.tool_frequency_pruning_turns.unwrap();
+            let turn = current_turn.expect("pruning_active guard implies is_some()");
+            let n = self.config.tool_frequency_pruning_turns.expect("pruning_active guard implies is_some()");
             let last = self.tool_last_invoked.read().await;
             tools.into_iter().filter(|t| {
                 match last.get(&t.id) {

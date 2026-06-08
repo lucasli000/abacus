@@ -74,7 +74,8 @@ pub fn sha256_hex(content: &[u8]) -> String {
     let mut s = String::with_capacity(64);
     for b in digest.iter() {
         use std::fmt::Write;
-        write!(&mut s, "{b:02x}").unwrap();
+        // Writing to a String can never fail; the use_import_braces lint flags unused Result.
+        write!(&mut s, "{b:02x}").expect("writing to String is infallible");
     }
     s
 }

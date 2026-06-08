@@ -888,3 +888,140 @@ impl<'a> TurnPipeline<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod post_process_tests {
+    //! Tests for pure functions in post.rs (no async/IO needed).
+    //!
+    //! Coverage:
+    //! - `extract_completion_summary` — finds `✓ summary` after `\n---\n` separator
+    //! - `parse_checkpoint_json` — extracts SessionCheckpoint from JSON
+    //!
+    //! Heavy async tests (post_process, detect_inertia, generate_session_checkpoint
+    //! with real LLM) require full TurnPipeline + provider mocks; out of scope here.
+
+    use super::TurnPipeline;
+
+    // ─── extract_completion_summary ─────────────────────────────────────
+
+    #[test]
+    fn extract_summary_finds_checkmark_after_separator() {
+        let text = "Some long response text.\n\n---\n✓ Implemented session persistence";
+        assert_eq!(
+            TurnPipeline::extract_completion_summary(text),
+            Some("Implemented session persistence".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_summary_trims_leading_dashes_and_newlines() {
+        let text = "Body\n\n---\n\n\n✓ Fixed the P0 bug";
+        assert_eq!(
+            TurnPipeline::extract_completion_summary(text),
+            Some("Fixed the P0 bug".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_summary_picks_first_checkmark_line() {
+        // First matching line wins; subsequent are ignored
+        let text = "Body\n---\n✓ First done\n✓ Second done";
+        assert_eq!(
+            TurnPipeline::extract_completion_summary(text),
+            Some("First done".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_summary_rejects_over_200_chars() {
+        let long = "a".repeat(201);
+        let text = format!("Body\n---\n✓ {long}");
+        assert_eq!(TurnPipeline::extract_completion_summary(&text), None);
+    }
+
+    #[test]
+    fn extract_summary_rejects_empty_checkmark() {
+        let text = "Body\n---\n✓    ";
+        assert_eq!(TurnPipeline::extract_completion_summary(text), None);
+    }
+
+    #[test]
+    fn extract_summary_returns_none_without_separator() {
+        assert_eq!(TurnPipeline::extract_completion_summary("just text"), None);
+        assert_eq!(TurnPipeline::extract_completion_summary("✓ no separator"), None);
+    }
+
+    #[test]
+    fn extract_summary_returns_none_without_checkmark() {
+        let text = "Body\n---\nJust a regular line";
+        assert_eq!(TurnPipeline::extract_completion_summary(text), None);
+    }
+
+    // ─── parse_checkpoint_json ──────────────────────────────────────────
+
+    #[test]
+    fn parse_checkpoint_full_valid_json() {
+        let json = r#"{
+            "accomplished": ["task A", "task B"],
+            "current_topic": "refactoring storage",
+            "pending": [
+                {"task": "review PR", "phase": "communication"},
+                {"task": "merge to main", "phase": "execution"}
+            ],
+            "overall_phase": "execution"
+        }"#;
+        let cp = TurnPipeline::parse_checkpoint_json(json, 5).unwrap();
+        assert_eq!(cp.turn_count, 5);
+        assert_eq!(cp.accomplished, vec!["task A", "task B"]);
+        assert_eq!(cp.current_topic, "refactoring storage");
+        assert_eq!(cp.pending.len(), 2);
+        assert!(matches!(cp.pending[0].phase, crate::core::context::SessionPhase::Communication));
+        assert!(matches!(cp.pending[1].phase, crate::core::context::SessionPhase::Execution));
+        assert!(matches!(cp.overall_phase, crate::core::context::SessionPhase::Execution));
+    }
+
+    #[test]
+    fn parse_checkpoint_strips_markdown_fence() {
+        let text = "```json\n{\"accomplished\": [\"a\"], \"current_topic\": \"t\"}\n```";
+        let cp = TurnPipeline::parse_checkpoint_json(text, 1).unwrap();
+        assert_eq!(cp.accomplished, vec!["a"]);
+        assert_eq!(cp.current_topic, "t");
+    }
+
+    #[test]
+    fn parse_checkpoint_missing_accomplished_defaults_empty() {
+        let json = r#"{"current_topic": "t"}"#;
+        let cp = TurnPipeline::parse_checkpoint_json(json, 1).unwrap();
+        assert!(cp.accomplished.is_empty());
+        assert_eq!(cp.current_topic, "t");
+    }
+
+    #[test]
+    fn parse_checkpoint_invalid_phase_falls_back_to_communication() {
+        let json = r#"{
+            "accomplished": [],
+            "current_topic": "t",
+            "pending": [{"task": "x", "phase": "weird_unknown_value"}],
+            "overall_phase": "garbage"
+        }"#;
+        let cp = TurnPipeline::parse_checkpoint_json(json, 1).unwrap();
+        assert!(matches!(cp.overall_phase, crate::core::context::SessionPhase::Communication));
+        assert!(matches!(cp.pending[0].phase, crate::core::context::SessionPhase::Communication));
+    }
+
+    #[test]
+    fn parse_checkpoint_invalid_json_returns_none() {
+        assert_eq!(TurnPipeline::parse_checkpoint_json("not json at all", 1), None);
+        assert_eq!(TurnPipeline::parse_checkpoint_json("{malformed", 1), None);
+    }
+
+    #[test]
+    fn parse_checkpoint_caps_accomplished_at_5() {
+        let json = r#"{
+            "accomplished": ["a", "b", "c", "d", "e", "f", "g"],
+            "current_topic": "t"
+        }"#;
+        let cp = TurnPipeline::parse_checkpoint_json(json, 1).unwrap();
+        assert_eq!(cp.accomplished.len(), 5, "should cap at 5 per the spec");
+    }
+}

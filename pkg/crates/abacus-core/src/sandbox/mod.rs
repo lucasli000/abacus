@@ -66,7 +66,9 @@ impl SandboxOrchestrator {
         config: SandboxConfig,
         providers: HashMap<String, Arc<dyn LlmProvider>>,
     ) -> Self {
-        let task_log = TaskLogStore::new(None).unwrap_or_else(|_| TaskLogStore::in_memory().unwrap());
+        let task_log = TaskLogStore::new(None)
+            .unwrap_or_else(|_| TaskLogStore::in_memory()
+                .expect("TaskLogStore::in_memory must succeed; in-memory backend is infallible"));
         Self {
             config,
             active_sessions: RwLock::new(HashMap::new()),

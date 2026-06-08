@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
 use crate::tui::i18n::t;
 use crate::tui::state::AppState;
-use crate::tui::theme::{SemanticIntent, Strength, TextRole};
+use abacus_ui_kit::{SemanticIntent, Strength, TextRole};
 
 // ════════════════════════════════════════════════════════════════
 // Toast — 左上角浮动通知
@@ -607,7 +607,7 @@ pub fn render_picker_popup(f: &mut ratatui::Frame, state: &AppState, input_area:
         spans.push(Span::styled(format!(" {} ", marker), row_style));
         spans.push(Span::styled(label.clone(), row_style));
         if matches!(p.kind, PickerKind::Theme) {
-            let t = crate::tui::theme::from_name(id);
+            let t = abacus_ui_kit::from_name(id);
             spans.push(Span::raw(" "));
             spans.push(Span::styled("██", Style::default().fg(t.primary)));
             spans.push(Span::styled("██", Style::default().fg(t.accent)));

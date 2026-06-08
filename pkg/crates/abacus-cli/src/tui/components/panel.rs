@@ -12,16 +12,16 @@
 //! - 面板可见时每帧渲染；不持有状态
 
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::tui::i18n::t;
 use crate::tui::state::{AppState, Focus};
-use crate::tui::theme::TextRole;
+use abacus_ui_kit::TextRole;
 
-/// render_card_bar lives in super (mod.rs); re-used here for panel content areas.
-use super::render_card_bar;
+/// render_card_bar lives in super::card; re-used here for panel content areas.
+use super::card::render_card_bar;
 
 // ════════════════════════════════════════════════════════════════
 // Panel public entry point
@@ -47,7 +47,7 @@ fn label_with_count(base: &str, count: usize) -> String {
 /// 样式: active = "▸ {名}" accent BOLD | inactive = " {名}" muted | sep = " │ " border DIM
 /// 引用关系: 被 render_panel 的 Team/Meeting 分支调用
 /// 生命周期: 每帧渲染时按 panel_tab 状态构造
-fn build_tab_spans<'a>(labels: &'a [String], active: usize, theme: &crate::tui::theme::Theme) -> Vec<Span<'a>> {
+fn build_tab_spans<'a>(labels: &'a [String], active: usize, theme: &abacus_ui_kit::Theme) -> Vec<Span<'a>> {
     let mut spans: Vec<Span<'a>> = Vec::with_capacity(labels.len() * 2);
     for (i, label) in labels.iter().enumerate() {
         if i > 0 {
@@ -163,123 +163,6 @@ fn render_panel_header(
     render_card_bar(f, &state.theme, layout[2])
 }
 
-/// 自定义 Tab 通用渲染器 — 根据 TabTemplate 分派渲染
-///
-/// 支持模板：KeyValue / Table / ProgressBars / Sparkline / FreeText / Mixed
-/// 引用关系：被 render_panel 的 PanelTab::Custom(idx) 分支调用
-fn render_custom_tab(f: &mut ratatui::Frame, state: &AppState, area: Rect, idx: usize) {
-    use crate::tui::state::{TabTemplate, TabRowKind};
-
-    let tab = match state.custom_tabs.get(idx) {
-        Some(t) => t,
-        None => {
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(" (Tab not found)", Style::default().fg(state.theme.muted)))),
-                area,
-            );
-            return;
-        }
-    };
-
-    let mut lines: Vec<Line> = Vec::new();
-
-    if tab.content.is_empty() {
-        lines.push(Line::from(Span::styled(t("panel.no_data"), Style::default().fg(state.theme.muted))));
-        f.render_widget(Paragraph::new(lines), area);
-        return;
-    }
-
-    match &tab.template {
-        TabTemplate::KeyValue => {
-            for row in &tab.content {
-                let color = resolve_color_hint(&row.color_hint, state);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {} ", row.label), Style::default().fg(state.theme.muted)),
-                    Span::styled(&row.value, Style::default().fg(color)),
-                ]));
-            }
-        }
-        TabTemplate::ProgressBars => {
-            for row in &tab.content {
-                let pct = match &row.kind {
-                    TabRowKind::Progress { percent } => *percent,
-                    _ => row.numeric.map(|n| n as u8).unwrap_or(0),
-                };
-                let bar_len = 12;
-                let filled = (pct as usize * bar_len / 100).min(bar_len);
-                let empty = bar_len - filled;
-                let color = resolve_color_hint(&row.color_hint, state);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("  {} ", row.label), Style::default().fg(state.theme.text)),
-                    Span::styled("█".repeat(filled), Style::default().fg(color)),
-                    Span::styled("░".repeat(empty), Style::default().fg(state.theme.border)),
-                    Span::styled(format!(" {}%", pct), Style::default().fg(state.theme.muted)),
-                ]));
-            }
-        }
-        TabTemplate::Sparkline { width } => {
-            for row in &tab.content {
-                if let TabRowKind::Sparkline { values } = &row.kind {
-                    let spark_chars = "▁▂▃▄▅▆▇█";
-                    let max_val = values.iter().cloned().fold(f64::MIN, f64::max).max(1.0);
-                    let min_val = values.iter().cloned().fold(f64::MAX, f64::min);
-                    let range = (max_val - min_val).max(0.01);
-                    let spark: String = values.iter().rev().take(*width).rev().map(|v| {
-                        let idx = ((v - min_val) / range * 7.0) as usize;
-                        spark_chars.chars().nth(idx.min(7)).unwrap_or('▁')
-                    }).collect();
-                    let color = resolve_color_hint(&row.color_hint, state);
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {} ", row.label), Style::default().fg(state.theme.muted)),
-                        Span::styled(spark, Style::default().fg(color)),
-                        Span::styled(format!(" {:.1}", values.last().unwrap_or(&0.0)), Style::default().fg(state.theme.text)),
-                    ]));
-                }
-            }
-        }
-        TabTemplate::FreeText => {
-            for row in &tab.content {
-                let color = resolve_color_hint(&row.color_hint, state);
-                lines.push(Line::from(Span::styled(format!("  {}", row.value), Style::default().fg(color))));
-            }
-        }
-        TabTemplate::Table { columns } => {
-            let header_spans: Vec<Span> = columns.iter().map(|col| {
-                Span::styled(format!(" {:>8} ", col), Style::default().fg(state.theme.muted).add_modifier(Modifier::BOLD))
-            }).collect();
-            lines.push(Line::from(header_spans));
-            for row in &tab.content {
-                let cols: Vec<&str> = row.value.split('|').collect();
-                let row_spans: Vec<Span> = cols.iter().map(|col| {
-                    Span::styled(format!(" {:>8} ", col.trim()), Style::default().fg(state.theme.text))
-                }).collect();
-                lines.push(Line::from(row_spans));
-            }
-        }
-        _ => {
-            // Mixed 和其他：FreeText 降级
-            for row in &tab.content {
-                let color = resolve_color_hint(&row.color_hint, state);
-                lines.push(Line::from(Span::styled(format!("  {}", row.value), Style::default().fg(color))));
-            }
-        }
-    }
-
-    f.render_widget(Paragraph::new(lines), area);
-}
-
-/// 解析颜色提示字符串 → 实际 Color
-fn resolve_color_hint(hint: &Option<String>, state: &AppState) -> Color {
-    match hint.as_deref() {
-        Some("success") => state.theme.success,
-        Some("error") => state.theme.error,
-        Some("gold") | Some("warning") => state.theme.gold,
-        Some("accent") | Some("primary") => state.theme.accent,
-        Some("muted") => state.theme.muted,
-        _ => state.theme.text,
-    }
-}
-
 
 /// Timeline tab — 简洁事件流（Go 版风格）
 ///
@@ -317,18 +200,18 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         .filter(|e| matches!(e.kind, TraceKind::ToolCall { .. }))
         .collect();
 
-    if tool_events.is_empty() && state.streaming_thinking.is_empty() && !state.is_streaming {
+    if tool_events.is_empty() && state.active_llm_thinking().is_empty() && !state.is_streaming_active() {
         lines.push(Line::styled(" —", Style::default().fg(state.theme.muted)));
     } else {
         // Thinking 进度
         let think_events: Vec<&crate::tui::state::TraceEvent> = state.trace_events.iter()
             .filter(|e| matches!(e.kind, TraceKind::Thinking { .. }))
             .collect();
-        if !think_events.is_empty() || !state.streaming_thinking.is_empty() {
+        if !think_events.is_empty() || !state.active_llm_thinking().is_empty() {
             let think_lines: usize = think_events.iter().map(|e| {
                 if let TraceKind::Thinking { lines, .. } = &e.kind { *lines } else { 0 }
             }).sum();
-            let total_lines = think_lines + state.streaming_thinking.lines().count();
+            let total_lines = think_lines + state.active_llm_thinking().lines().count();
             lines.push(Line::from(vec![
                 Span::styled(" ✓ ", Style::default().fg(state.theme.success)),
                 Span::styled(format!("{} {}行", t("timeline.thinking"), total_lines), Style::default().fg(state.theme.text)),
@@ -381,7 +264,7 @@ fn render_tab_timeline(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         }
 
         // 当前正在执行的工具（streaming 期间）
-        if state.is_streaming {
+        if state.is_streaming_active() {
             for (name, status, _, _) in state.streaming_tools.iter() {
                 if matches!(status, crate::tui::state::StreamingToolStatus::Running) {
                     lines.push(Line::from(vec![
@@ -544,7 +427,7 @@ fn compute_timeline_groups(state: &AppState) -> Vec<crate::tui::state::TimelineG
         }
     }
     if groups.len() > 30 { let d = groups.len() - 30; groups.drain(0..d); }
-    if !state.processing_phase.is_empty() && state.is_streaming {
+    if !state.processing_phase.is_empty() && state.is_streaming_active() {
         if let Some(last) = groups.last_mut() { last.is_active = true; }
     }
     groups
@@ -565,7 +448,7 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
 
     // 判断 Focus 是否需要显示
-    let focus_active = state.is_streaming
+    let focus_active = state.is_streaming_active()
         || !state.processing_phase.is_empty()
         || state.mode == crate::tui::state::AbacusMode::Meeting
         || state.turn_count > 0;
@@ -733,7 +616,7 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 }
 
-fn render_section_header(lines: &mut Vec<Line>, label: &str, width: usize, theme: &crate::tui::theme::Theme) {
+fn render_section_header(lines: &mut Vec<Line>, label: &str, width: usize, theme: &abacus_ui_kit::Theme) {
     let dim = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
     let fill = width.saturating_sub(label.len() + 5).min(14);
     lines.push(Line::from(vec![
@@ -914,8 +797,9 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     }
 
     // A+E 融合：会话快照 + 流式 thinking 预览
-    if state.is_streaming && !state.streaming_thinking.is_empty() {
-        let think_lines: Vec<&str> = state.streaming_thinking.lines().filter(|l| !l.trim().is_empty()).collect();
+    let active_thinking = state.active_llm_thinking();
+    if state.is_streaming_active() && !active_thinking.is_empty() {
+        let think_lines: Vec<&str> = active_thinking.lines().filter(|l| !l.trim().is_empty()).collect();
         let total = think_lines.len();
         let visible = if total > 3 { &think_lines[total - 3..] } else { &think_lines[..] };
         for l in visible {
@@ -930,7 +814,7 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled("─".repeat(w.saturating_sub(4)), dim)]));
     }
 
-    let title = if state.is_streaming { format!("Focus · {}", t("focus.processing")) } else { format!("Focus \u{00b7} {} {}", t("panel.round"), state.turn_count) };
+    let title = if state.is_streaming_active() { format!("Focus · {}", t("focus.processing")) } else { format!("Focus \u{00b7} {} {}", t("panel.round"), state.turn_count) };
     render_header(&title, &mut lines, w);
 
     if let Some(ref goal) = state.session_goal {

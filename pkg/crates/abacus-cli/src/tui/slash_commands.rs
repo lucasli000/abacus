@@ -346,7 +346,7 @@ fn cmd_new(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 
 fn cmd_save(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     if s.engine_handle.is_some() {
-        match crate::tui::run::save_session(s) {
+        match crate::tui::state::session_export::save_session(s) {
             Ok(()) => {
                 let ts = chrono::Local::now().format("%H:%M").to_string();
                 s.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
@@ -488,9 +488,29 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     // Priority: preference alias > hardcoded shortcut > raw input
     let input_str = args[0];
     let name = match lower.as_str() {
-        "pro" | "deepseek-v4-pro" => "deepseek-v4-pro",
-        "flash" | "deepseek-v4-flash" => "deepseek-v4-flash",
-        "qwen" | "qwen-plus" => "qwen-plus",
+        // DeepSeek
+        "pro" | "v4-pro" => "deepseek-v4-pro",
+        "flash" | "v4-flash" => "deepseek-v4-flash",
+        // 通义千问
+        "qwen" | "qwen-max" => "qwen3.7-max",
+        "qwen-plus" => "qwen3.7-plus",
+        "qwen-flash" => "qwen3.6-flash",
+        // 智谱
+        "glm" | "glm-5" => "glm-5.1",
+        "glm-4" => "glm-4.7",
+        // Kimi
+        "kimi" | "k2" => "kimi-k2.6",
+        "k2.5" => "kimi-k2.5",
+        // MiniMax
+        "minimax" | "m3" => "MiniMax-M3",
+        "m2.7" => "MiniMax-M2.7",
+        // OpenAI
+        "gpt4o" | "4o" => "gpt-4o",
+        // Anthropic
+        "claude" | "sonnet" => "claude-sonnet-4-20250514",
+        "opus" => "claude-opus-4-20250514",
+        "haiku" => "claude-haiku-4-20250514",
+        // 特殊命令
         "list" | "ls" => {
             // PR4: `/model list` → delegate to engine for ProviderRegistry listing
             return engine_or(s, SlashCommand::ModelList);
@@ -508,9 +528,11 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     // - core.model_preference() → read alias → resolve QualifiedModelId
     // - core.set_model_override() → write effective model
     // - save_model_preference() → persist to ~/.abacus/model_preference.json
-    if let Some(ref engine) = s.engine_handle {
-        let core = engine.core.clone();
+    // 先克隆 engine core 引用，避免 borrow 冲突
+    let engine_core = s.engine_handle.as_ref().map(|e| e.core.clone());
+    if let Some(core) = engine_core {
         let model_input = name.to_string();
+        let mut validation_result: Result<(), String> = Ok(());
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 // Resolve alias through preference
@@ -518,21 +540,71 @@ fn cmd_model(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
                     let preference = core.model_preference().read().await;
                     preference.resolve_alias(&model_input)
                 };
-                // Set override using the resolved model name
-                core.set_model_override(qid.model_name()).await;
-                // Persist selection
-                {
-                    let mut pref = core.model_preference().write().await;
-                    pref.set_last_selected(qid.clone());
+                // 验证模型是否在 ProviderRegistry 中可用
+                let registry = core.provider_registry();
+                let resolve_result = registry.resolve(&qid).await;
+                match resolve_result {
+                    Some((_provider_id, _provider)) => {
+                        // 模型可用，继续切换
+                        core.set_model_override(qid.model_name()).await;
+                        // Persist selection
+                        {
+                            let mut pref = core.model_preference().write().await;
+                            pref.set_last_selected(qid.clone());
+                        }
+                        // Fire-and-forget save to disk
+                        let pref_snapshot = core.model_preference().read().await.clone();
+                        let pref_path = abacus_types::preference_file_path();
+                        let _ = abacus_types::save_model_preference(&pref_snapshot, &pref_path);
+                    }
+                    None => {
+                        // 模型不在任何已注册 Provider 中
+                        // 检查是否有 provider 可以处理这个模型（可能是自定义模型）
+                        let resolve_unqualified = registry.resolve_unqualified(&qid.model.0).await;
+                        match resolve_unqualified {
+                            Ok(resolved_qid) => {
+                                // 找到了 provider，使用解析后的 QualifiedModelId
+                                core.set_model_override(resolved_qid.model_name()).await;
+                                let mut pref = core.model_preference().write().await;
+                                pref.set_last_selected(resolved_qid);
+                                let pref_snapshot = core.model_preference().read().await.clone();
+                                let pref_path = abacus_types::preference_file_path();
+                                let _ = abacus_types::save_model_preference(&pref_snapshot, &pref_path);
+                            }
+                            Err(e) => {
+                                // 模型完全不可用
+                                validation_result = Err(e);
+                            }
+                        }
+                    }
                 }
-                // Fire-and-forget save to disk
-                let pref_snapshot = core.model_preference().read().await.clone();
-                let pref_path = abacus_types::preference_file_path();
-                let _ = abacus_types::save_model_preference(&pref_snapshot, &pref_path);
             });
         });
+        match validation_result {
+            Ok(()) => {
+                s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
+            }
+            Err(e) => {
+                s.add_toast(
+                    format!("⚠ 模型切换失败: {}（已设置，但可能不可用）", e),
+                    std::time::Duration::from_secs(4),
+                );
+                // 仍然设置 override，让用户可以在下次请求时看到具体错误
+                let model_input2 = name.to_string();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let qid = {
+                            let preference = core.model_preference().read().await;
+                            preference.resolve_alias(&model_input2)
+                        };
+                        core.set_model_override(qid.model_name()).await;
+                    });
+                });
+            }
+        }
+    } else {
+        s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
     }
-    s.add_toast(format!("模型 → {}（已生效）", name), std::time::Duration::from_secs(2));
     CmdResult::Consumed
 }
 
@@ -1355,8 +1427,8 @@ fn cmd_tokens(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 fn cmd_debug(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
     // V14 增强：从 UI/会话状态拼诊断信息（thinking 协议 / endpoint 联通 / 工具调用）
     let engine_state = if s.engine_handle.is_some() { "已连接" } else { "未连接" };
-    let last_thinking_len = s.streaming_thinking.chars().count();
-    let last_thinking_status = if s.is_streaming {
+    let last_thinking_len = s.active_llm_thinking().chars().count();
+    let last_thinking_status = if s.is_streaming_active() {
         if last_thinking_len > 0 {
             format!("流式中（已收 {} 字符）", last_thinking_len)
         } else {
@@ -1414,7 +1486,7 @@ fn cmd_debug(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
         scroll = s.scroll,
         input = s.input_state,
         paused = s.paused,
-        streaming = s.is_streaming,
+        streaming = s.is_streaming_active(),
         msg_total = s.messages.len(),
         msg_user = s.messages.iter().filter(|m| matches!(m.role, crate::tui::state::MsgRole::User)).count(),
         evt_total = s.trace_events.len(),
@@ -1956,7 +2028,7 @@ fn cmd_diff(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
 //   - 不强制要求 alias —— 无 alias 时新 session 显示截短 uuid。
 fn cmd_branch(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     // 1) 在原 session_id 下保存当前快照（避免分叉点丢失）
-    if let Err(e) = crate::tui::run::save_session(s) {
+    if let Err(e) = crate::tui::state::session_export::save_session(s) {
         s.add_toast(
             format!("分叉前保存失败: {}", e),
             std::time::Duration::from_secs(3),
@@ -1990,7 +2062,7 @@ fn cmd_branch(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     );
 
     // 4) 立即把新 session 落盘（建立独立文件 + 推 last_session_uuid 指针）
-    if let Err(e) = crate::tui::run::save_session(s) {
+    if let Err(e) = crate::tui::state::session_export::save_session(s) {
         s.add_toast(
             format!("新分支保存失败: {}", e),
             std::time::Duration::from_secs(3),
@@ -2113,7 +2185,7 @@ fn cmd_resume(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
     }
 
     // 切换前先保住当前进度
-    if let Err(e) = crate::tui::run::save_session(s) {
+    if let Err(e) = crate::tui::state::session_export::save_session(s) {
         s.add_toast(
             format!("切换前保存失败: {} (取消切换)", e),
             std::time::Duration::from_secs(3),
@@ -2121,7 +2193,7 @@ fn cmd_resume(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
         return CmdResult::Consumed;
     }
 
-    match crate::tui::run::load_session_by_uuid(s, &uuid) {
+    match crate::tui::state::session_export::load_session_by_uuid(s, &uuid) {
         Ok(true) => {
             s.add_toast(
                 format!("已恢复 session: {}", &uuid[..8.min(uuid.len())]),

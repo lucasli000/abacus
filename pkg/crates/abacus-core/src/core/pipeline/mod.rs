@@ -452,7 +452,6 @@ impl<'a> TurnPipeline<'a> {
         // **资源感知落地**：把这次调用的实际 cost/token/latency 记入 LlmBudget。
         // 后续 turn 开始时 pressure_monitor.check_and_shed() 会自动据此降级。
         {
-            use std::time::Instant;
             let model_id = abacus_types::ModelId(
                 self.core.config.default_model.0.clone(),
             );
@@ -1406,7 +1405,8 @@ impl<'a> TurnPipeline<'a> {
 
             // 执行 LLM 请求（streaming 或 blocking），400 错误时尝试自动修复并重试一次
             let provider_result: Result<crate::llm::LlmResponse, KernelError> = if use_streaming {
-                let stream_tx = self.stream_tx.as_ref().unwrap();
+                let stream_tx = self.stream_tx.as_ref()
+                    .expect("use_streaming=true implies stream_tx is Some (checked at line 1404)");
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
                 let provider = ctx.provider.clone();
                 let req_clone = req.clone();

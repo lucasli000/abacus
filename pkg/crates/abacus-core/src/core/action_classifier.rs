@@ -471,6 +471,7 @@ allow: ["git status"]
         #[derive(Deserialize)]
         struct TestRules {
             #[serde(default)]
+            #[allow(dead_code)]
             hard_deny: Vec<String>,
         }
         // hard_deny 是 list，给 string 应该是 Err

@@ -91,12 +91,19 @@ fn main() {
 
     // ─── 压测 3: streaming 模式（每帧追加文本）───
     state.scroll = 0;
-    state.is_streaming = true;
-    state.streaming_thinking = "正在分析...\n检查依赖...\n规划方案...".into();
-    state.streaming_text = String::new();
+    state.begin_streaming_session();
+    if let Some(llm) = state.cards.card_downcast_mut::<abacus_cli::tui::cards::LlmCard>(
+        state.cards.active_id().unwrap()
+    ) {
+        llm.append_thinking("正在分析...\n检查依赖...\n规划方案...");
+    }
     let start = Instant::now();
     for i in 0..frames {
-        state.streaming_text.push_str(&format!("第{}帧的流式文本输出。包含中英文混合 content for word-wrap testing. ", i));
+        if let Some(llm) = state.cards.card_downcast_mut::<abacus_cli::tui::cards::LlmCard>(
+            state.cards.active_id().unwrap()
+        ) {
+            llm.append_reply(&format!("第{}帧的流式文本输出。包含中英文混合 content for word-wrap testing. ", i));
+        }
         state.mark_dirty();
         terminal.draw(|f| {
             abacus_cli::tui::modes::render(f, &state, rows);

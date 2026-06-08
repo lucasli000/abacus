@@ -458,7 +458,8 @@ impl McpClient {
                     .map_err(|e| KernelError::Other(format!("spawn MCP server: {e}")))?,
             );
         }
-        let transport = transport_guard.as_mut().unwrap();
+        let transport = transport_guard.as_mut()
+            .expect("transport_guard is Some: just inserted above if was None");
 
         // 构建请求
         let request = serde_json::json!({
@@ -630,15 +631,17 @@ struct PluginInstance {
 
 impl PluginLoader {
     /// Create a new plugin loader that scans the given directory.
-    pub fn new(base_dir: impl Into<String>) -> Self {
+    pub fn new(base_dir: impl Into<String>) -> Result<Self, KernelError> {
         let config = Config::new();
-        let engine = Engine::new(&config).unwrap();
-        Self {
+        let engine = Engine::new(&config).map_err(|e| {
+            KernelError::Other(format!("failed to create wasmtime engine: {e}"))
+        })?;
+        Ok(Self {
             plugins: Arc::new(RwLock::new(HashMap::new())),
             base_dir: PathBuf::from(base_dir.into()),
             engine,
             name_map: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     /// Task #79：暴露 base_dir 给签名验证路径读取 wasm 字节
@@ -972,7 +975,9 @@ impl McpWatcher {
 
 
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use abacus_types::ServerId;
 
     #[tokio::test]
@@ -1010,7 +1015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_plugin_loader() {
-        let loader = PluginLoader::new("/tmp/.abacus/plugins");
+        let loader = PluginLoader::new("/tmp/.abacus/plugins").unwrap();
         let plugins = loader.discover().await.unwrap();
         assert!(plugins.is_empty());
     }
@@ -1048,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_executor_rejects_malformed_id() {
         use crate::tool::{ExecutionContext, ToolExecutor};
-        let loader = Arc::new(PluginLoader::new("/tmp/.abacus/nonexistent_test"));
+        let loader = Arc::new(PluginLoader::new("/tmp/.abacus/nonexistent_test").unwrap());
         let executor = PluginToolExecutor::new(loader);
         let ctx = ExecutionContext::noop("test");
 
@@ -1075,7 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn plugin_executor_rejects_unknown_plugin() {
         use crate::tool::{ExecutionContext, ToolExecutor};
-        let loader = Arc::new(PluginLoader::new("/tmp/.abacus/nonexistent_test"));
+        let loader = Arc::new(PluginLoader::new("/tmp/.abacus/nonexistent_test").unwrap());
         let executor = PluginToolExecutor::new(loader);
         let ctx = ExecutionContext::noop("test");
 

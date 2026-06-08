@@ -129,7 +129,7 @@ fn majority_vote(answers: &[String]) -> (String, f64) {
     let total = answers.len();
     let (_, (count, original)) = counts.into_iter()
         .max_by_key(|(_, (c, _))| *c)
-        .unwrap();
+        .expect("early return above ensures answers is non-empty, so counts has at least one entry");
 
     let confidence = count as f64 / total as f64;
     (original, confidence)

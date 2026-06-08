@@ -136,13 +136,13 @@ impl PipelineHook for ScriptHook {
             ScriptRuntime::Shell(cmd) => {
                 let envs = build_event_env(event);
                 // 保留 PATH 等基础环境变量，仅覆盖 ABACUS_* 事件变量
-                let mut child = Command::new("sh")
+                let child = Command::new("sh")
                     .arg("-c")
                     .arg(cmd)
                     .envs(envs)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true)  // task cancel/panic → 自动杀子进程
+                    .kill_on_drop(true)
                     .spawn()
                     .map_err(|e| KernelError::Other(format!("spawn sh hook: {e}")))?;
                 // 不等待——detach，不阻塞 pipeline
@@ -159,7 +159,7 @@ impl PipelineHook for ScriptHook {
             }
             ScriptRuntime::Python(code) => {
                 let envs = build_event_env(event);
-                let mut child = Command::new("python3")
+                let child = Command::new("python3")
                     .arg("-c")
                     .arg(code)
                     .envs(envs)

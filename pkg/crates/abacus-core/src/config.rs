@@ -349,6 +349,62 @@ impl ConfigManager {
         warnings
     }
 
+    /// 检测已废弃的 `llm.*` 配置键，返回迁移提示
+    ///
+    /// ## 废弃键列表
+    /// - `llm.api_key` → `provider.toml` `[[providers]]` 的 `api_key`
+    /// - `llm.base_url` → `provider.toml` `[[providers]]` 的 `base_url`
+    /// - `llm.openai_api_key` → `provider.toml` `[[providers]]` 的 `api_key`
+    /// - `llm.openai_base_url` → `provider.toml` `[[providers]]` 的 `base_url`
+    /// - `llm.anthropic_api_key` → `provider.toml` `[[providers]]` 的 `api_key`
+    /// - `llm.anthropic_base_url` → `provider.toml` `[[providers]]` 的 `base_url`
+    ///
+    /// ## 行为
+    /// - 检测到废弃键被显式设置（非空）时，返回迁移提示
+    /// - 使用 `OnceLock` 保证每进程仅警告一次
+    pub fn detect_deprecated_keys(&self) -> Vec<String> {
+        use std::sync::OnceLock;
+        static WARNED: OnceLock<()> = OnceLock::new();
+
+        let deprecated_keys = [
+            ("llm.api_key", "api_key", "deepseek"),
+            ("llm.base_url", "base_url", "deepseek"),
+            ("llm.openai_api_key", "api_key", "openai"),
+            ("llm.openai_base_url", "base_url", "openai"),
+            ("llm.anthropic_api_key", "api_key", "anthropic"),
+            ("llm.anthropic_base_url", "base_url", "anthropic"),
+        ];
+
+        let mut warnings = Vec::new();
+        for &(key, field, provider_id) in &deprecated_keys {
+            if let Some(val) = self.get_str(key) {
+                if !val.is_empty() {
+                    warnings.push(format!(
+                        "DEPRECATED: '{}' 已废弃，请迁移到 provider.toml:\n  \
+                         [[providers]]\n  id = \"{}\"\n  {} = \"{}\"",
+                        key, provider_id, field, val
+                    ));
+                }
+            }
+        }
+
+        if !warnings.is_empty() && WARNED.set(()).is_ok() {
+            for w in &warnings {
+                tracing::warn!("{}", w);
+            }
+            tracing::info!(
+                "迁移指南: 将 llm.* 配置迁移到 ~/.abacus/provider.toml，详见 config.example.toml"
+            );
+        }
+
+        warnings
+    }
+
+    /// 检查 provider.toml 是否已有配置（用于判断是否需要 fallback 到旧键）
+    pub fn has_provider_entries(&self) -> bool {
+        !self.provider_entries.is_empty()
+    }
+
     /// 获取配置值
     pub fn get(&self, key: &str) -> Option<&TaggedValue> {
         self.merged.get(key)
@@ -686,43 +742,81 @@ fn parse_env_value(s: &str) -> ConfigValue {
 }
 
 /// 创建默认配置
+///
+/// ## 配置分节
+///
+/// 配置项按 section 分组，对应 config.toml 的 `[section]` 块：
+/// - `[core]` — 核心 LLM 参数
+/// - `[thinking]` — 思考配置
+/// - `[budget]` — 资源预算
+/// - `[safety]` — 安全限制
+/// - `[progressive]` — 渐进输出协议
+/// - `[subagent]` / `[specialist]` / `[inertia]` — 编排器
+/// - `[sandbox]` — 沙箱
+/// - `[mcip]` — 工具权限
+/// - `[server]` — 服务器
+/// - `[pipeline]` — 管道
+/// - `[deduction]` — 推演引擎
+/// - `[palace]` — 记忆宫殿
+/// - `[lsp]` / `[code_graph]` / `[plugins]` — 扩展
+/// - `[dedup]` — 去重
+/// - `[llm]` — 旧版配置 (deprecated，迁移到 provider.toml)
 pub fn default_config() -> HashMap<String, ConfigValue> {
     let mut defaults = HashMap::new();
-    // V29.13: max_turns 默认 5 → 25
-    //   原 5 是 V0 时代值, 工具生态扩展后多文件 refactor / 调研类任务 5 轮极易撞线
-    //   兜底文案 "(max turns reached)" 会覆盖 LLM 实际输出, 用户感知差
-    //   25 在多数任务下足够收敛, 同时不至于让 runaway loop 烧太多 token
-    //   范围参考: 简单问答 5-10, 工具任务 15-25, 复杂调研 40+
-    //   引用: validation.rs NumericRange max=200 上限不变; engine_init.rs unwrap_or(20) 兜底不变
-    defaults.insert("core.max_turns".into(), ConfigValue::Number(25.0));
-    defaults.insert("core.max_tool_calls".into(), ConfigValue::Number(8.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [core] — 核心 LLM 参数
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("core.default_model".into(), ConfigValue::String("auto".into()));
     defaults.insert("core.temperature".into(), ConfigValue::Number(0.6));
     defaults.insert("core.max_tokens".into(), ConfigValue::Number(64000.0));
-    // ─── 资源感知（[llm_budget] 段）────────────────────────────────────
-    // 用户在 config.toml 显式启用后才生效；默认 0 = 不限（opt-in）
-    // 真实落地：CoreLoop 启动时调 LlmBudget::reconfigure() 应用这些值
+    defaults.insert("core.max_turns".into(), ConfigValue::Number(25.0));
+    defaults.insert("core.max_tool_calls".into(), ConfigValue::Number(8.0));
+    defaults.insert("core.max_escalations".into(), ConfigValue::Number(10.0));
+    defaults.insert("core.context_window".into(), ConfigValue::Number(128000.0));
+    defaults.insert("core.context_window_ratio".into(), ConfigValue::Number(1.0));
+    defaults.insert("core.system_prompt".into(), ConfigValue::String("".into()));
+    defaults.insert("core.silent_router_enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("core.task_kind_routing".into(), ConfigValue::Bool(true));
+    defaults.insert("core.scene_tool_loading".into(), ConfigValue::Bool(true));
+    defaults.insert("core.tool_frequency_pruning_turns".into(), ConfigValue::Number(20.0));
+    defaults.insert("core.adaptive_d_tier_hide".into(), ConfigValue::Bool(true));
+    defaults.insert("core.event_sink_enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("core.skill_workflow_enabled".into(), ConfigValue::Bool(false));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [thinking] — 思考配置
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // PRIMARY: 单字段表达 thinking 意图
+    //   off | adaptive | minimal | low | medium | high | max | xhigh | <整数 budget>
+    defaults.insert("core.thinking".into(), ConfigValue::String("off".into()));
+    //   summarized | omitted（仅 Anthropic adaptive 路径生效）
+    defaults.insert("core.thinking_display".into(), ConfigValue::String("summarized".into()));
+    // [DEPRECATED] 旧版 key，保留默认值供兼容层使用
+    defaults.insert("core.thinking_enabled".into(), ConfigValue::Bool(false));
+    defaults.insert("core.thinking_effort".into(), ConfigValue::String("medium".into()));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [dedup] — 工具结果去重
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("core.dedup.enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("core.dedup.ttl_secs".into(), ConfigValue::Number(60.0));
+    defaults.insert("core.dedup.capacity_kb".into(), ConfigValue::Number(2048.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [budget] — LLM 资源预算
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // 用户显式启用后才生效；默认 0 = 不限（opt-in）
     defaults.insert("llm_budget.max_cost_usd".into(),       ConfigValue::Number(0.0));
     defaults.insert("llm_budget.max_total_tokens".into(),   ConfigValue::Number(0.0));
     defaults.insert("llm_budget.soft_threshold".into(),     ConfigValue::Number(0.70));
     defaults.insert("llm_budget.hard_threshold".into(),     ConfigValue::Number(0.85));
     defaults.insert("llm_budget.reject_threshold".into(),   ConfigValue::Number(0.95));
     defaults.insert("llm_budget.latency_window".into(),     ConfigValue::Number(20.0));
-    // [DEPRECATED] 旧版思考配置 key，保留默认值供兼容层 get_bool/get_str 调用使用。
-    // 迁移路径：用户若在配置文件中显式设置这两个 key，get_thinking_intent() 会自动
-    // 转译为新 key 语义并打 warning 提示迁移到 core.thinking。
-    // 当确认不再有用户使用旧 key 时可安全删除这两行及 get_thinking_intent() 中的兼容分支。
-    defaults.insert("core.thinking_enabled".into(), ConfigValue::Bool(false));
-    defaults.insert("core.thinking_effort".into(), ConfigValue::String("medium".into()));
-    // Phase 3 新 key（PRIMARY）：单字段表达 thinking 意图
-    //   off | adaptive | minimal | low | medium | high | max | xhigh | <整数 budget>
-    defaults.insert("core.thinking".into(), ConfigValue::String("off".into()));
-    //   summarized | omitted（仅 Anthropic adaptive 路径生效）
-    defaults.insert("core.thinking_display".into(), ConfigValue::String("summarized".into()));
-    defaults.insert("core.context_window".into(), ConfigValue::Number(128000.0));
-    // 默认 1.0 = 全用模型最大上下文（setup 向导空填写语义）
-    // 旧配置文件若显式写了 0.5，engine_init 读到后仍沿用 0.5（不被此默认覆盖）
-    defaults.insert("core.context_window_ratio".into(), ConfigValue::Number(1.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [safety] — 安全限制
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("safety.max_input_length".into(), ConfigValue::Number(100000.0));
     defaults.insert("safety.max_tool_calls".into(), ConfigValue::Number(500.0));
     let home = std::env::var("HOME")
@@ -731,17 +825,17 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("safety.allowed_roots".into(), ConfigValue::List(vec![
         ConfigValue::String(home),
     ]));
-    defaults.insert("llm.base_url".into(), ConfigValue::String("https://api.deepseek.com".into()));
-    defaults.insert("llm.api_key".into(), ConfigValue::String("".into()));
-    defaults.insert("llm.openai_base_url".into(), ConfigValue::String("".into()));
-    defaults.insert("llm.openai_api_key".into(), ConfigValue::String("".into()));
-    defaults.insert("llm.openai_auth_header".into(), ConfigValue::String("Authorization".into()));
-    defaults.insert("llm.openai_auth_prefix".into(), ConfigValue::String("Bearer ".into()));
-    defaults.insert("llm.anthropic_base_url".into(), ConfigValue::String("".into()));
-    defaults.insert("llm.anthropic_api_key".into(), ConfigValue::String("".into()));
-    defaults.insert("log.level".into(), ConfigValue::String("info".into()));
 
-    // Progressive Output Protocol
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [mcip] — 工具访问权限（security.toml 配置）
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("mcip.exempt_prefixes".into(), ConfigValue::List(vec![]));
+    defaults.insert("mcip.allow_tools".into(), ConfigValue::List(vec![]));
+    defaults.insert("mcip.deny_tools".into(), ConfigValue::List(vec![]));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [progressive] — 渐进输出协议
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("progressive.enabled".into(), ConfigValue::Bool(true));
     defaults.insert("progressive.autonomy_level".into(), ConfigValue::String("medium".into()));
     defaults.insert("progressive.threshold_passthrough".into(), ConfigValue::Number(0.30));
@@ -760,43 +854,101 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     defaults.insert("progressive.calibrator_drift_limit".into(), ConfigValue::Number(0.10));
     defaults.insert("progressive.calibrator_min_gap".into(), ConfigValue::Number(0.15));
 
-    // SubAgent limits
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [subagent] — 子代理限制
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("subagent.max_steps".into(), ConfigValue::Number(20.0));
     defaults.insert("subagent.max_tokens".into(), ConfigValue::Number(8192.0));
     defaults.insert("subagent.max_duration_secs".into(), ConfigValue::Number(120.0));
 
-    // Specialist engagement limits
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [specialist] — 专家参与限制
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("specialist.max_speeches".into(), ConfigValue::Number(3.0));
     defaults.insert("specialist.max_think_tokens".into(), ConfigValue::Number(4096.0));
     defaults.insert("specialist.max_tool_calls_per_think".into(), ConfigValue::Number(5.0));
     defaults.insert("specialist.min_confidence".into(), ConfigValue::Number(0.30));
     defaults.insert("specialist.timeout_secs".into(), ConfigValue::Number(120.0));
 
-    // Inertia detection
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [inertia] — 惯性检测
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("inertia.max_retries".into(), ConfigValue::Number(2.0));
     defaults.insert("inertia.trigger_threshold".into(), ConfigValue::Number(0.60));
 
-    // Sandbox
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [sandbox] — 沙箱执行
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("sandbox.max_retries_per_step".into(), ConfigValue::Number(2.0));
     defaults.insert("sandbox.default_timeout_secs".into(), ConfigValue::Number(120.0));
     defaults.insert("sandbox.verify_model".into(), ConfigValue::String("deepseek-v4-flash".into()));
 
-    // MCIP — 工具访问权限配置（全部在 security.toml `mcip:` 节配置）
-    // mcip.exempt_prefixes: 前缀豆免列表（空 = 仅内置豆免生效）
-    defaults.insert("mcip.exempt_prefixes".into(), ConfigValue::List(vec![]));
-    // mcip.allow_tools: 精确允许名单（空 = 仅靠豆免前缀和策略）
-    defaults.insert("mcip.allow_tools".into(), ConfigValue::List(vec![]));
-    // mcip.deny_tools: 永久禁止名单（空 = 不禁用任何工具）
-    defaults.insert("mcip.deny_tools".into(), ConfigValue::List(vec![]));
-
-    // Server limits
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [server] — HTTP 服务器
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("server.max_sessions".into(), ConfigValue::Number(1000.0));
     defaults.insert("server.rate_limit_per_sec".into(), ConfigValue::Number(60.0));
     defaults.insert("server.silent_router_enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("server.timeout_ceiling_secs".into(), ConfigValue::Number(1800.0));
 
-    // Pipeline limits
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [pipeline] — 管道限制
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("pipeline.max_total_tool_calls".into(), ConfigValue::Number(40.0));
     defaults.insert("pipeline.escalation_target_model".into(), ConfigValue::String("deepseek-v4-pro".into()));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [deduction] — 推演引擎
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("deduction.observer_contamination".into(), ConfigValue::Bool(true));
+    defaults.insert("deduction.cross_session".into(), ConfigValue::Bool(true));
+    defaults.insert("deduction.context_degradation".into(), ConfigValue::Bool(true));
+    defaults.insert("deduction.prompt_impact".into(), ConfigValue::Bool(true));
+    defaults.insert("epistemic.threshold".into(), ConfigValue::Number(3.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [palace] — 记忆宫殿
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("palace.enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("palace.sync_interval_turns".into(), ConfigValue::Number(5.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [lsp] — LSP 语言服务
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("lsp.enabled".into(), ConfigValue::Bool(true));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [code_graph] — 代码图谱
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("code_graph.enabled".into(), ConfigValue::Bool(true));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [plugins] — WASM 插件
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("core.plugins.base_dir".into(), ConfigValue::String("".into()));
+    defaults.insert("core.plugins.signing_required".into(), ConfigValue::Bool(true));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [auto] — AutoEngine 持久化
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("auto.persist_path".into(), ConfigValue::String("".into()));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [llm] — 旧版 LLM 配置 (DEPRECATED，迁移到 provider.toml)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("llm.base_url".into(), ConfigValue::String("https://api.deepseek.com".into()));
+    defaults.insert("llm.api_key".into(), ConfigValue::String("".into()));
+    defaults.insert("llm.openai_base_url".into(), ConfigValue::String("".into()));
+    defaults.insert("llm.openai_api_key".into(), ConfigValue::String("".into()));
+    defaults.insert("llm.openai_auth_header".into(), ConfigValue::String("Authorization".into()));
+    defaults.insert("llm.openai_auth_prefix".into(), ConfigValue::String("Bearer ".into()));
+    defaults.insert("llm.anthropic_base_url".into(), ConfigValue::String("".into()));
+    defaults.insert("llm.anthropic_api_key".into(), ConfigValue::String("".into()));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [log] — 日志
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("log.level".into(), ConfigValue::String("info".into()));
 
     defaults
 }

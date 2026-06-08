@@ -1,0 +1,393 @@
+# ============================================================
+# AbacusCode 配置参考
+# ============================================================
+#
+# 文件位置: ~/.abacus/config.toml
+# 加载优先级 (从低到高):
+#   1. 内置默认值
+#   2. ~/.abacus/models.toml (模型能力覆盖)
+#   3. ~/.abacus/config.toml (本文件)
+#   4. ~/.abacus/security.toml (安全配置)
+#   5. ~/.abacus/provider.toml (供应商配置)
+#   6. ~/.abacus/conf.d/*.toml (扩展配置，按文件名字母序)
+#   7. 环境变量 ABACUS_*
+#   8. CLI 参数 --key value
+#
+# 环境变量命名规则:
+#   config key 中的 `.` 替换为 `__`，全部大写，加 ABACUS_ 前缀
+#   例: core.max_turns → ABACUS_CORE__MAX_TURNS
+#
+# ============================================================
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Provider 配置 (独立文件)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 供应商配置存放在 ~/.abacus/provider.toml，格式如下:
+#
+# [[providers]]
+# id = "deepseek"
+# type = "deepseek"                    # anthropic | openai-compatible | deepseek | gemini
+# api_key = "env:DEEPSEEK_API_KEY"     # 支持 env: 前缀引用环境变量
+# base_url = "https://api.deepseek.com"
+#
+# [[providers]]
+# id = "openai"
+# type = "openai-compatible"
+# api_key = "env:OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+#
+# [[providers]]
+# id = "anthropic"
+# type = "anthropic"
+# api_key = "env:ANTHROPIC_API_KEY"
+#
+# 旧版 llm.* 配置键已废弃，请迁移到 provider.toml
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [core] — 核心 LLM 参数
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[core]
+# 默认模型 (auto | provider:model)
+# auto = 使用 provider.toml 中第一个 provider 的第一个 model
+# default_model = "auto"
+
+# 温度 [0.0, 2.0]
+# temperature = 0.6
+
+# 单次最大输出 token [100, 1000000]
+# max_tokens = 64000
+
+# 单会话最大轮次 [1, 200]
+# 简单问答 5-10, 工具任务 15-25, 复杂调研 40+
+# max_turns = 25
+
+# 单轮最大工具调用次数 [1, 1000]
+# max_tool_calls = 8
+
+# 模型升级预算 [1, 100]
+# max_escalations = 10
+
+# 上下文窗口大小 (token)
+# context_window = 128000
+
+# 上下文使用比例 [0.1, 1.0]
+# 1.0 = 全用模型最大上下文
+# context_window_ratio = 1.0
+
+# 自定义系统提示词 (空 = 使用内置默认)
+# system_prompt = ""
+
+# 静默路由器 (自动选择模型)
+# silent_router_enabled = true
+
+# 按任务类型路由工具
+# task_kind_routing = true
+
+# 按场景加载工具 schema
+# scene_tool_loading = true
+
+# 工具频率裁剪轮次
+# tool_frequency_pruning_turns = 20
+
+# 自适应 D-tier 隐藏
+# adaptive_d_tier_hide = true
+
+# 事件流 (JSONL)
+# event_sink_enabled = true
+
+# 技能工作流 (实验性)
+# skill_workflow_enabled = false
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [thinking] — 思考配置
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[thinking]
+# 思考深度
+# off | adaptive | minimal | low | medium | high | max | xhigh | <整数 budget>
+# level = "off"
+
+# Anthropic adaptive 显示模式
+# summarized | omitted
+# display = "summarized"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [dedup] — 工具结果去重
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[dedup]
+# 启用去重
+# enabled = true
+
+# 去重缓存 TTL (秒)
+# ttl_secs = 60
+
+# 去重缓存容量 (KB)
+# capacity_kb = 2048
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [budget] — LLM 资源预算
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[budget]
+# 最大 USD/会话 (0 = 不限)
+# max_cost_usd = 0.0
+
+# 最大 token/会话 (0 = 不限)
+# max_total_tokens = 0
+
+# 软阈值比例
+# soft_threshold = 0.70
+
+# 硬阈值比例
+# hard_threshold = 0.85
+
+# 拒绝阈值比例
+# reject_threshold = 0.95
+
+# 延迟平滑窗口
+# latency_window = 20
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [safety] — 安全限制
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[safety]
+# 最大输入长度 (字符)
+# max_input_length = 100000
+
+# 最大工具调用次数
+# max_tool_calls = 500
+
+# 允许的文件系统根目录
+# allowed_roots = ["$HOME"]
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [mcip] — 工具访问权限 (security.toml 配置)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[mcip]
+# 前缀豁免列表 (空 = 仅内置豁免生效)
+# exempt_prefixes = []
+
+# 精确允许名单 (空 = 仅靠豁免前缀和策略)
+# allow_tools = []
+
+# 永久禁止名单 (空 = 不禁用任何工具)
+# deny_tools = []
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [progressive] — 渐进输出协议
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[progressive]
+# 启用渐进输出
+# enabled = true
+
+# 自治级别 (low | medium | high)
+# autonomy_level = "medium"
+
+# 直通阈值
+# threshold_passthrough = 0.30
+
+# 门控阈值
+# threshold_gated = 0.70
+
+# 清单超时 (秒)
+# checklist_timeout_secs = 300
+
+# 最大清单项数
+# max_checklist_items = 7
+
+# 强制门控类型
+# forced_gated_types = ["prd", "sop", "architecture_design", "financial_report", "compliance_doc"]
+
+# 团队执行豁免
+# team_exempt_in_execution = true
+
+# 校准器参数
+# calibrator_alpha = 0.10
+# calibrator_drift_limit = 0.10
+# calibrator_min_gap = 0.15
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [subagent] — 子代理限制
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[subagent]
+# max_steps = 20
+# max_tokens = 8192
+# max_duration_secs = 120
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [specialist] — 专家参与限制
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[specialist]
+# max_speeches = 3
+# max_think_tokens = 4096
+# max_tool_calls_per_think = 5
+# min_confidence = 0.30
+# timeout_secs = 120
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [inertia] — 惯性检测
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[inertia]
+# max_retries = 2
+# trigger_threshold = 0.60
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [sandbox] — 沙箱执行
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[sandbox]
+# max_retries_per_step = 2
+# default_timeout_secs = 120
+# verify_model = "deepseek-v4-flash"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [server] — HTTP 服务器
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[server]
+# 最大活跃会话数 [1, 100000]
+# max_sessions = 1000
+
+# 速率限制 (请求/秒) [1, 10000]
+# rate_limit_per_sec = 60
+
+# 静默路由器
+# silent_router_enabled = true
+
+# 超时上限 (秒) [60, 86400]
+# timeout_ceiling_secs = 1800
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [pipeline] — 管道限制
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[pipeline]
+# 最大总工具调用次数
+# max_total_tool_calls = 40
+
+# 升级目标模型
+# escalation_target_model = "deepseek-v4-pro"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [deduction] — 推演引擎
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[deduction]
+# observer_contamination = true
+# cross_session = true
+# context_degradation = true
+# prompt_impact = true
+
+# 认知阈值
+# epistemic.threshold = 3
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [palace] — 记忆宫殿
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[palace]
+# enabled = true
+# sync_interval_turns = 5
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [lsp] — LSP 语言服务
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[lsp]
+# enabled = true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [code_graph] — 代码图谱
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[code_graph]
+# enabled = true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [plugins] — WASM 插件
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[plugins]
+# base_dir = ""
+# signing_required = true
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [auto] — AutoEngine 持久化
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[auto]
+# persist_path = ""
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# [log] — 日志
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[log]
+# level = "info"
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 环境变量参考
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# ABACUS_HOME          配置根目录 (默认 ~/.abacus)
+# ABACUS_API_KEY       DeepSeek API Key (deprecated)
+# DEEPSEEK_API_KEY     DeepSeek API Key
+# ANTHROPIC_API_KEY    Anthropic API Key
+# ABACUS_OPENAI_API_KEY    OpenAI-compatible API Key
+# ABACUS_OPENAI_BASE_URL   OpenAI-compatible Base URL
+# ABACUS_SERVER_TOKEN  HTTP Bearer Token
+# ABACUS_SERVER_ADDR   绑定地址 (默认 0.0.0.0:8080)
+# ABACUS_CORS_ORIGINS  CORS 来源 (逗号分隔)
+# ABACUS_ENV           环境模式 (production = 严格 CORS)
+# ABACUS_THEME         TUI 主题 (默认 light)
+# ABACUS_LANG          语言 (zh / en)
+# RUST_LOG             Tracing 日志过滤器
+# EDITOR               config edit 使用的编辑器
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CLI 命令参考
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# abacus chat --model <name> --thinking <level>    对话模式
+# abacus run --task <desc> --model <name>          任务执行
+# abacus config show                               显示当前配置
+# abacus config set <key> <value>                  设置配置值
+# abacus config validate                           验证配置
+# abacus config edit                               编辑配置文件
+# abacus model list                                列出可用模型
+# abacus model ping                                测试模型连通性
+# abacus tui --chat --team --meeting               TUI 模式
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TUI 斜杠命令参考
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# /model [name]                    切换模型
+# /model thinking [level]          设置思考深度
+# /set <key> <value>               调整运行时参数
+# /preset [name]                   应用场景预设
+# /theme [name]                    切换主题
+# /lang [zh|en]                    切换语言
+# /streaming                       切换流式输出
+# /budget                          显示资源预算
+# /context                         显示上下文状态
+# /doctor                          系统健康检查
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 场景预设
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# quick     温度 0.3, 2048 token, thinking off, 10 工具
+# code      温度 0.6, 64000 token, thinking high, 50 工具
+# creative  温度 0.9, 16384 token, thinking off, 5 工具
+# lean      温度 0.5, 4096 token, thinking low, 20 工具
+# marathon  温度 0.5, 32000 token, thinking medium, 50 工具
+# debug     温度 0.3, 8192 token, thinking high, 50 工具

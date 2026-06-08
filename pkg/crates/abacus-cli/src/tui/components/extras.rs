@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::tui::i18n::t;
 use crate::tui::state::{AppState, ExpertStatus, TaskStatus};
-use crate::tui::theme::TextRole;
+use abacus_ui_kit::TextRole;
 
 // ════════════════════════════════════════════════════════════════
 // ExpertList — 专家列表

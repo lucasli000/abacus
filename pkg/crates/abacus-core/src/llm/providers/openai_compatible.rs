@@ -761,7 +761,6 @@ impl LlmProvider for OpenAICompatibleProvider {
                     tracing::warn!("stream idle timeout (45s), treating as complete");
                     if tx.send(StreamEvent::Error("stream idle timeout (45s)".into())).is_err() {
                         tracing::debug!("stream consumer gone, stopping");
-                        stream_alive = false;  // 标记死亡，下面 Usage/Done 不再尝试 send
                     }
                     break;
                 }

@@ -82,7 +82,7 @@ pub fn apply_picker_selection(state: &mut AppState) {
             state.cursor_line = 0;
             state.cursor_col = state.input.len();
             state.input_state = crate::tui::state::InputState::Ready;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
             submit_message(state);
             return;
         }
@@ -95,7 +95,7 @@ pub fn apply_picker_selection(state: &mut AppState) {
     state.cursor_line = 0;
     state.cursor_col = 0;
     state.input_state = crate::tui::state::InputState::Ready;
-    state.rendered_lines_dirty.set(true);
+    state.mark_render_dirty();
 }
 
 /// 解析并执行斜杠命令。返回 true 表示命令已消费（不发给引擎）。
@@ -144,7 +144,7 @@ fn reset_session_state(state: &mut AppState, toast: &str) {
 
 fn handle_save_session(state: &mut AppState) {
     if state.engine_handle.is_some() {
-        match crate::tui::run::save_session(state) {
+        match crate::tui::state::session_export::save_session(state) {
             Ok(()) => {
                 let ts = chrono::Local::now().format("%H:%M").to_string();
                 state.add_event(&ts, "session", "手动保存", crate::tui::state::EventLevel::Info);
@@ -233,7 +233,7 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
     match action {
         EscAction::CloseSettings => {
             state.show_settings = false;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         EscAction::ClosePicker => {
             state.picker = None;
@@ -244,18 +244,18 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
         }
         EscAction::CloseThemePreview => {
             state.theme_preview_open = false;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         EscAction::ExitCompletion => {
             cancel_completion(state);
         }
         EscAction::CancelOperation => {
-            // V42: 保留已有 streaming 内容为部分回复（用户打断不丢数据）
-            // 条件：streaming_text 或 streaming_trace_ids 非空 = 已收到内容
-            if !state.streaming_text.is_empty() || !state.streaming_trace_ids.is_empty() {
+            // V42-B: 保留已有 streaming 内容为部分回复（用户打断不丢数据）
+            // 条件：last_llm_text 或 streaming_trace_ids 非空 = 已收到内容
+            if !state.last_llm_text().is_empty() || !state.streaming_trace_ids.is_empty() {
                 let ts = chrono::Local::now().format("%H:%M").to_string();
-                let text = std::mem::take(&mut state.streaming_text);
-                let thinking = std::mem::take(&mut state.streaming_thinking);
+                let text = state.take_last_llm_text();
+                let thinking = state.take_last_llm_thinking();
                 let trace_ids = std::mem::take(&mut state.streaming_trace_ids);
 
                 let mut parts = Vec::new();
@@ -299,13 +299,13 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
             state.accumulated_elapsed = Duration::ZERO;
             // TT18: 走 SSoT helper（reset_streaming 是唯一 streaming 状态清理入口）
             state.reset_streaming();
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
             state.add_toast("Cancelled", Duration::from_secs(2));
         }
         EscAction::CancelSelection => {
             // V30 复制修复：丢弃选中区间、不复制。
             state.text_selection = None;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
             state.add_toast("已取消选中", Duration::from_millis(800));
         }
         EscAction::ReturnToInput => {
@@ -433,7 +433,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
         state.show_streaming_trace = !state.show_streaming_trace;
         let mode = if state.show_streaming_trace { "显示" } else { "隐藏" };
         state.add_toast(format!("Thinking/Tools 流式展示已{}", mode), Duration::from_secs(2));
-        state.rendered_lines_dirty.set(true);
+        state.mark_render_dirty();
         return true;
     }
 
@@ -591,7 +591,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                     3 => {
                         // B2+B5 修复：用 theme.name 字段循环遍历全部 12 个主题，
                         // 替代之前对 mode_color magic number 的错误判断
-                        let next = crate::tui::theme::Theme::cycle_next(state.theme.name);
+                        let next = abacus_ui_kit::Theme::cycle_next(state.theme.name);
                         if state.theme.switch_theme(next) {
                             state.add_toast(format!("主题 → {}", next), Duration::from_secs(2));
                         }
@@ -645,7 +645,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                         state.knowledge_scroll_offset += 1;
                     }
                 }
-                state.rendered_lines_dirty.set(true); // 触发完整重绘
+                state.mark_render_dirty(); // 触发完整重绘
                 return true;
             }
             KeyCode::Down => {
@@ -657,7 +657,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                         state.knowledge_scroll_offset = state.knowledge_scroll_offset.saturating_sub(1);
                     }
                 }
-                state.rendered_lines_dirty.set(true); // 触发完整重绘
+                state.mark_render_dirty(); // 触发完整重绘
                 return true;
             }
             _ => {}
@@ -678,7 +678,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                         state.cmd_scroll = state.cmd_selected / 2;
                     }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return true;
             }
             KeyCode::Down => {
@@ -690,7 +690,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                         state.cmd_scroll = row.saturating_sub(4);
                     }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return true;
             }
             KeyCode::Enter => {
@@ -713,7 +713,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                     state.focus = crate::tui::state::Focus::Panel;
                     state.input_state = crate::tui::state::InputState::Typing;
                     state.add_toast(format!("已填充: {}", prefix), Duration::from_millis(800));
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 }
                 return true;
             }
@@ -771,7 +771,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
             if state.compact { "Compact 模式" } else { "Comfortable 模式" },
             Duration::from_secs(2),
         );
-        state.rendered_lines_dirty.set(true);
+        state.mark_render_dirty();
         return true;
     }
 
@@ -784,7 +784,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
             if state.code_blocks_expanded { "代码块已展开" } else { "代码块已折叠（超 20 行）" },
             Duration::from_secs(2),
         );
-        state.rendered_lines_dirty.set(true);
+        state.mark_render_dirty();
         return true;
     }
 
@@ -844,21 +844,8 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
         }
     }
 
-    // [ / ]: 看板 Tab 切换（含自定义 Tab，看板可见时生效）
-    if state.panel_visible {
-        let custom_count = state.custom_tabs.len();
-        match code {
-            KeyCode::Char('[') => {
-                state.panel_tab = state.panel_tab.prev_with_custom(state.mode, custom_count);
-                return true;
-            }
-            KeyCode::Char(']') => {
-                state.panel_tab = state.panel_tab.next_with_custom(state.mode, custom_count);
-                return true;
-            }
-            _ => {}
-        }
-    }
+    // V42-B: 看板 [ / ] Tab 切换已删除 (panel_sections 替代, custom_tabs 是 V40 dead)
+
 
     false
 }
@@ -992,14 +979,14 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 if let Some(p) = state.picker.as_mut() {
                     if p.selected > 0 { p.selected -= 1; }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return;
             }
             KeyCode::Down => {
                 if let Some(p) = state.picker.as_mut() {
                     if p.selected + 1 < p.items.len() { p.selected += 1; }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return;
             }
             // V29.8: ←→ 调 thinking 深度 (仅 show_thinking_slider 时拦截)
@@ -1015,7 +1002,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                         }
                     }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return;
             }
             KeyCode::Right => {
@@ -1029,7 +1016,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                         }
                     }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return;
             }
             KeyCode::Char(' ') => {
@@ -1037,7 +1024,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 if let Some(p) = state.picker.as_mut() {
                     if matches!(p.kind, crate::tui::state::PickerKind::Review) {
                         p.review_strict = !p.review_strict;
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                     }
                 }
                 return;
@@ -1057,7 +1044,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 if let Some(p) = state.picker.as_mut() {
                     p.selected = (p.selected + 1) % p.items.len().max(1);
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
                 return;
             }
             // 其它键：吞掉，让用户专注 picker（Esc 由全局 dispatch_esc 处理）
@@ -1451,7 +1438,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         if state.input.is_empty() {
             state.input_state = InputState::Ready;
         }
-        state.rendered_lines_dirty.set(true);
+        state.mark_render_dirty();
         return;
     }
 
@@ -1488,7 +1475,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             state.cursor_pos = state.input.len();
             state.recalculate_cursor();
             state.inline_candidates.clear();
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         return;
     }
@@ -1578,7 +1565,7 @@ pub fn handle_chat_scroll_key(state: &mut AppState, code: KeyCode) {
                 let should_anchor = state.scroll > 0;
                 let before_rows = if should_anchor {
                     state.messages.get(msg_idx)
-                        .map(|m| crate::tui::components::estimate_msg_rows(m, content_w))
+                        .map(|m| crate::tui::components::estimate_msg_rows(m, content_w as usize))
                         .unwrap_or(0)
                 } else { 0 };
 
@@ -1596,11 +1583,11 @@ pub fn handle_chat_scroll_key(state: &mut AppState, code: KeyCode) {
                     if should_anchor {
                         // V29.11: 切换后估算 + 调整 scroll, 保持上方 anchor 不动
                         // V29.16: 经 SSOT set_scroll(AnchorAdjust) — 内部判方向 + 标 dirty
-                        let after_rows = crate::tui::components::estimate_msg_rows(msg, content_w);
+                        let after_rows = crate::tui::components::estimate_msg_rows(msg, content_w as usize);
                         state.set_scroll(ScrollAction::AnchorAdjust { after_rows, before_rows });
                     } else {
                         // 不锚定时仅折叠状态变了, 仍需重渲染
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                     }
                 }
             }
@@ -1642,7 +1629,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                         }
                         PanelSection::Knowledge => state.knowledge_scroll_offset += 2,
                     }
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 } else {
                     // 默认消息区(含输入区上方区域): 向上浏览历史
                     // V29.5 (B1): 与键盘路径同 clamp 策略, 避免越过顶部
@@ -1662,7 +1649,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                         PanelSection::Timeline => state.timeline_scroll_offset = state.timeline_scroll_offset.saturating_sub(2),
                         PanelSection::Knowledge => state.knowledge_scroll_offset = state.knowledge_scroll_offset.saturating_sub(2),
                     }
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 } else {
                     // V29.16: 走 SSOT — clamp/dirty 内部统一
                     state.set_scroll(ScrollAction::Down(3));
@@ -1688,7 +1675,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                         end_msg_idx: msg_idx,
                         end_char_idx: char_idx,
                     });
-                    state.rendered_lines_dirty.set(true);
+                    state.mark_render_dirty();
                 }
                 return;
             }
@@ -1742,7 +1729,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                                 format!("已填充: {}", prefix),
                                 Duration::from_millis(800),
                             );
-                            state.rendered_lines_dirty.set(true);
+                            state.mark_render_dirty();
                             return;
                         }
                     }
@@ -1787,7 +1774,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                                 Duration::from_secs(2),
                             );
                         }
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                     }
                 }
             } else if in_input_row {
@@ -1868,7 +1855,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                             sel.end_msg_idx = msg_idx;
                             sel.end_char_idx = char_idx;
                         }
-                        state.rendered_lines_dirty.set(true);
+                        state.mark_render_dirty();
                     }
                 }
             }
@@ -1899,7 +1886,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                         }
                     }
                 }
-                state.rendered_lines_dirty.set(true);
+                state.mark_render_dirty();
             }
         }
         _ => {}
@@ -1913,9 +1900,9 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
 /// 这样 target_idx 的最后一行落到屏幕底部(用户滚轮可微调)。
 ///
 /// 引用关系: 被 timeline 点击 hit-test 调用(event 所属 msg → 跳转)
-/// 副作用: 设 state.scroll + mark_dirty;is_streaming 时不动(自动跟随底部)
+/// 副作用: 设 state.scroll + mark_dirty;is_streaming_active 时不动(自动跟随底部)
 pub fn scroll_to_message(state: &mut AppState, target_idx: usize, content_width: usize) {
-    if state.is_streaming || target_idx >= state.messages.len() { return; }
+    if state.is_streaming_active() || target_idx >= state.messages.len() { return; }
     let last_idx = state.messages.len().saturating_sub(1);
     if target_idx >= last_idx {
         // 目标已在最底,scroll = 0(自动跟随)
@@ -2053,7 +2040,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
             state.cursor_pos += 1;
             state.recalculate_cursor();
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         // Tab → 插入 4 空格
         KeyCode::Tab => {
@@ -2062,7 +2049,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.cursor_pos += 1;
             }
             state.cursor_col += 4;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         // 光标移动
         KeyCode::Up => {
@@ -2086,7 +2073,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.recalculate_cursor();
             }
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::Down => {
             let after = &state.input[state.cursor_pos..];
@@ -2108,7 +2095,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.recalculate_cursor();
             }
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::Left => {
             if state.cursor_pos > 0 {
@@ -2117,7 +2104,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.cursor_pos = prev_char_start;
                 state.recalculate_cursor();
             }
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::Right => {
             if state.cursor_pos < state.input.len() {
@@ -2126,14 +2113,14 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.cursor_pos += next;
                 state.recalculate_cursor();
             }
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::Home => {
             let before = &state.input[..state.cursor_pos];
             let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
             state.cursor_pos = line_start;
             state.recalculate_cursor();
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::End => {
             let after = &state.input[state.cursor_pos..];
@@ -2142,14 +2129,14 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 .unwrap_or(state.input.len());
             state.cursor_pos = line_end;
             state.recalculate_cursor();
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         // 字符插入
         KeyCode::Char(c) => {
             state.input.insert(state.cursor_pos, c);
             state.cursor_pos += c.len_utf8();
             state.recalculate_cursor();
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         // 删除
         KeyCode::Backspace => {
@@ -2161,13 +2148,13 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 }
             }
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::Delete => {
             if state.cursor_pos < state.input.len() {
                 state.input.remove(state.cursor_pos);
             }
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         // PgUp/PgDn — 滚动 ±(visible_h - 2) 并移动光标
         KeyCode::PageUp => {
@@ -2196,7 +2183,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 state.recalculate_cursor();
             }
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         KeyCode::PageDown => {
             let page = state.editor_state.as_ref()
@@ -2226,7 +2213,7 @@ fn handle_editor_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
                 }
             }
             editor_ensure_visible(state);
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
         }
         _ => {}
     }
@@ -2306,7 +2293,7 @@ pub fn submit_message(state: &mut AppState) {
             state.cursor_pos = 0;
             state.cursor_line = 0;
             state.cursor_col = 0;
-            state.rendered_lines_dirty.set(true);
+            state.mark_render_dirty();
             return;
         }
         // 如果输入不匹配任何意图词，忽略（保留弹窗）
@@ -2528,7 +2515,7 @@ pub fn switch_mode(state: &mut AppState, mode: AbacusMode) {
     // ST7 修复：流式中切 mode 不清累积，会在新 mode 下显示旧 mode 的 chunks（视觉混乱）。
     // 后台请求虽未 cancel（cancel token 未持久化到 state），但显示层先清，
     // 残留 chunks 抵达后会被 reset_streaming 后的判定丢弃显示
-    if state.is_streaming || !state.streaming_text.is_empty() {
+    if state.is_streaming_active() || !state.last_llm_text().is_empty() {
         state.reset_streaming();
         state.input_state = InputState::Ready;
     }
@@ -2710,9 +2697,9 @@ mod scroll_to_message_tests {
         s.add_message(build_msg("a"));
         s.add_message(build_msg("b"));
         s.set_scroll(ScrollAction::Absolute(7));
-        s.is_streaming = true;
+        s.begin_streaming_session();
         scroll_to_message(&mut s, 0, 80);
-        assert_eq!(s.scroll, 7, "is_streaming 时不动 scroll(自动跟随优先)");
+        assert_eq!(s.scroll, 7, "streaming 时不动 scroll(自动跟随优先)");
     }
 }
 

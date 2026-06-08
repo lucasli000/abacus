@@ -180,9 +180,25 @@ impl ProviderRegistry {
     pub async fn resolve_unqualified(&self, model: &str) -> Result<QualifiedModelId, String> {
         let index = self.model_index.read().await;
         match index.get(model) {
-            None => Err(format!(
-                "model '{}' not found in any registered provider", model
-            )),
+            None => {
+                // 提供更友好的错误信息
+                let available_providers: Vec<&str> = index.values()
+                    .flat_map(|candidates| candidates.iter().map(|(id, _)| id.0.as_str()))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                if available_providers.is_empty() {
+                    Err(format!(
+                        "没有可用的 LLM Provider。请先配置 API Key：运行 `abacus config set llm.api_key <your-key>` 或设置环境变量 DEEPSEEK_API_KEY"
+                    ))
+                } else {
+                    Err(format!(
+                        "模型 '{}' 不可用。已注册的 Provider: [{}]。请检查模型名称是否正确，或使用 'provider:model' 格式指定",
+                        model,
+                        available_providers.join(", ")
+                    ))
+                }
+            }
             Some(candidates) if candidates.len() == 1 => {
                 Ok(QualifiedModelId {
                     provider: Some(candidates[0].0.clone()),
@@ -199,10 +215,11 @@ impl ProviderRegistry {
                         .map(|(id, _)| id.0.as_str())
                         .collect();
                     Err(format!(
-                        "model '{}' is ambiguous — found in providers [{}] at same priority. \
-                         Use 'provider:model' to specify.",
+                        "模型 '{}' 在多个 Provider 中可用: [{}]。请使用 'provider:model' 格式指定，如 '{}:{}'",
                         model,
-                        tied_names.join(", ")
+                        tied_names.join(", "),
+                        tied_names[0],
+                        model
                     ))
                 } else {
                     // Clear winner by priority
@@ -346,7 +363,7 @@ mod tests {
         let result = reg.resolve_unqualified("shared-model").await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.contains("ambiguous"), "error should mention ambiguity: {}", err);
+        assert!(err.contains("多个 Provider") || err.contains("ambiguous"), "error should mention ambiguity: {}", err);
         assert!(err.contains("provider-a"));
         assert!(err.contains("provider-b"));
     }

@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::effects;
 use crate::tui::syntax;
-use crate::tui::theme::{TextRole, Theme};
+use abacus_ui_kit::{TextRole, Theme};
 
 /// 将 Markdown 文本渲染为 ratatui Line 序列
 ///
@@ -1016,4 +1016,11 @@ mod table_tests {
         let table_count = lines.iter().filter(|l| l.line_type == LineType::Table).count();
         assert_eq!(table_count, 0, "空文本不产生表格行");
     }
+}
+
+/// Plural wrapper: 转换 Vec<StyledLine> → Vec<Line<'static>>
+/// 用于 cards/user.rs 等需要从 markdown 渲染结果转 ratatui Line 的场景
+pub fn styled_lines_to_lines(styled: &[StyledLine]) -> Vec<Line<'static>> {
+    let empty_bar = Span::raw("");
+    styled.iter().map(|s| styled_line_to_ratatui(s, &empty_bar, &Theme::brand())).collect()
 }

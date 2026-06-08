@@ -116,14 +116,14 @@ pub enum SessionPhase {
 }
 
 /// 待办事项（含阶段标记）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingItem {
     pub task: String,
     pub phase: SessionPhase,
 }
 
 /// 结构化 checkpoint——压缩前由 LLM 生成
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCheckpoint {
     /// 触发时 context 使用率（如 70.0 表示 70%）
     pub context_pct: f64,

@@ -1,0 +1,747 @@
+# tools.toml — Tool Manifest v1
+# Single source of truth for all built-in tool metadata.
+# Consumers (ClusterRegistry / SilentRouter / scene_active_prefixes /
+# cost_suffix / short_description / tool_catalog) ALL derive from this file.
+# Edit here → all 6 sources stay in sync automatically.
+#
+# Convention:
+# - Every tool that appears in schemas() must appear here, even if partial fields.
+# - External/MCP/Plugin/Skill tools are NOT in this file (they register dynamically).
+manifest_version = "1.0"
+
+# ─── Cluster purposes ────────────────────────────────────────────────
+# Used by ClusterRegistry::builtin() to set each cluster's purpose string.
+[cluster]
+session_history = "Access content/state from past or current sessions"
+interaction_checkpoint = "Navigate the current session's interaction map (checkpoints/path)"
+session_meta = "Session-level meta operations (focus/permission/introspect)"
+knowledge_base = "Retrieve from the knowledge base (KB chunks + memory palace)"
+fs_read_discover = "Read files or discover filesystem entries"
+fs_write_mutate = "Modify files (DESTRUCTIVE — verify intent before calling)"
+db_read = "Read from SQLite databases (no side effects)"
+web_io = "Fetch from the live web"
+
+# ─── Scene→prefix mappings ──────────────────────────────────────────
+# Controls which tools get full mode definitions in build_tool_definitions_for.
+# Mirrors the old scene_active_prefixes() match function.
+# NOTE: `_default` is the catch-all for unknown task_kinds.
+[scene]
+code_writing   = ["fs_", "bash", "code", "cargo"]
+code_reading   = ["fs_", "bash", "code", "cargo"]
+debugging      = ["fs_", "bash", "code", "cargo", "test"]
+web_search     = ["web", "fetch", "search", "browse"]
+file_edit      = ["fs_", "bash"]
+data_analysis  = ["fs_", "bash", "code", "db", "data"]
+mathematics    = ["code", "math", "bash"]
+architecture   = ["fs_", "bash", "code"]
+review         = ["fs_", "bash", "code", "lint", "test"]
+knowledge_query = ["kb", "search", "web", "fetch"]
+_default       = ["fs_read", "fs_write", "fs_edit", "bash", "web"]
+
+# ─── Tool entries ────────────────────────────────────────────────────
+# Fields:
+#   name             — tool_id (must match dispatch match arm)
+#   description      — full description sent to LLM
+#   short_description— ≤50 chars, used when >12 tools active (short-mode)
+#   cluster          — cluster ID for ClusterRegistry grouping (omit = singleton)
+#   differentiator   — sibling disambiguation hint (omit = no cluster entry)
+#   tokens           — estimated token cost for LLM suffix display
+#   latency          — human-readable latency string
+#   risk             — "low" / "medium" / "high"
+#   confirm          — whether MCIP confirm dialog is required
+#   idempotent       — true for reads, false for writes/mutations
+#   domains          — SilentRouter domain IDs (omit = empty)
+#   actions          — SilentRouter action tags (omit = empty)
+#   scenes           — applicable task_kinds (omit = all scenes)
+
+[[tool]]
+name = "fs_read"
+description = "读取文件完整内容（支持单 path 字符串或 paths 数组批量）"
+short_description = "Read file content (single or batch)"
+cluster = "fs_read_discover"
+differentiator = "读取完整文件内容（文本）"
+tokens = 64
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6, 0]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "fs_write"
+description = "创建或覆盖文件"
+short_description = "Write/create file"
+cluster = "fs_write_mutate"
+differentiator = "创建或覆盖文件（完整内容）"
+tokens = 64
+latency = "10ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6, 0]
+actions = ["Create", "Update"]
+
+[[tool]]
+name = "fs_edit"
+description = "精确替换文件中的文本段——推荐使用 fs_edit_single 或 fs_edit_line"
+short_description = "Replace text segment in file"
+cluster = "fs_write_mutate"
+differentiator = "precise text replacement (preferred for existing files)"
+tokens = 96
+latency = "15ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6, 0]
+actions = ["Update"]
+
+[[tool]]
+name = "fs_edit_single"
+description = "精确替换文件中第 N 次出现的 old_string（避免 replace_all 误替换）"
+short_description = "Replace Nth occurrence of text"
+cluster = "fs_write_mutate"
+differentiator = "replace Nth occurrence (safe when text repeats)"
+tokens = 96
+latency = "15ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6, 0]
+actions = ["Update"]
+
+[[tool]]
+name = "fs_edit_line"
+description = "按行号范围替换文件内容（不依赖旧字符串，适合已知行号场景）"
+short_description = "Replace lines by line numbers"
+cluster = "fs_write_mutate"
+differentiator = "replace by line numbers (no old_string needed)"
+tokens = 96
+latency = "15ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6, 0]
+actions = ["Update"]
+
+[[tool]]
+name = "fs_move"
+description = "移动或重命名文件/目录"
+short_description = "Move or rename file/directory"
+cluster = "fs_write_mutate"
+differentiator = "rename or relocate; fails if dest exists"
+tokens = 48
+latency = "10ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6]
+actions = ["Update"]
+
+[[tool]]
+name = "fs_mkdir"
+description = "递归创建目录（含所有父目录）"
+short_description = "Create directory recursively"
+cluster = "fs_write_mutate"
+differentiator = "create directories (incl nested); not file content"
+tokens = 32
+latency = "5ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [6]
+actions = ["Create"]
+
+[[tool]]
+name = "fs_info"
+description = "获取文件或目录元数据（大小/权限/修改时间）"
+short_description = "Get file/dir metadata"
+cluster = "fs_read_discover"
+differentiator = "仅元数据——无内容"
+tokens = 32
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "fs_search"
+description = "按 Glob 模式搜索文件名（如 **/*.rs）"
+short_description = "Glob pattern file search"
+cluster = "fs_read_discover"
+differentiator = "通过 Glob 模式查找文件（仅路径）"
+tokens = 48
+latency = "50ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Search"]
+
+[[tool]]
+name = "fs_ls"
+description = "列出目录内容（recursive=true 时递归 5 层树）"
+short_description = "List directory contents"
+cluster = "fs_read_discover"
+differentiator = "列出单个目录的直接子项（单层）"
+tokens = 32
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Read"]
+
+[[tool]]
+name = "fs_tree"
+description = "以树形结构递归显示目录内容"
+short_description = "Tree view of directory"
+cluster = "fs_read_discover"
+differentiator = "目录的递归树视图"
+tokens = 48
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Read"]
+
+[[tool]]
+name = "fs_grep"
+description = "搜索文件内容（正则匹配，返回匹配行+文件路径+行号）"
+short_description = "Regex content search in files"
+cluster = "fs_read_discover"
+differentiator = "通过正则表达式在文件内查找内容"
+tokens = 96
+latency = "500ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6, 0]
+actions = ["Read", "Search"]
+
+[[tool]]
+name = "bash_exec"
+description = "执行 shell 命令并返回输出"
+short_description = "Execute shell command"
+tokens = 96
+latency = "1s"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [1]
+actions = ["Execute"]
+
+[[tool]]
+name = "http_request"
+description = "全 HTTP 客户端（GET/POST/PUT/DELETE/PATCH/HEAD，支持自定义 headers 和 body）"
+short_description = "Full HTTP client (GET/POST/PUT/DELETE)"
+tokens = 128
+latency = "1s"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [5]
+actions = ["Execute"]
+
+[[tool]]
+name = "web_fetch"
+description = "HTTP GET 请求获取网页内容"
+short_description = "HTTP GET web content"
+cluster = "web_io"
+differentiator = "fetch a specific URL by exact address"
+tokens = 128
+latency = "1s"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [5]
+actions = ["Read", "Search"]
+
+[[tool]]
+name = "web_search"
+description = "搜索引擎搜索并返回结果标题/摘要/链接"
+short_description = "Search engine query"
+cluster = "web_io"
+differentiator = "search engine query when URL is unknown"
+tokens = 128
+latency = "2s"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [5]
+actions = ["Search"]
+
+[[tool]]
+name = "json_process"
+description = "JSON 查询/转换/验证（jq-like 语法）"
+short_description = "JSON query/transform/validate"
+tokens = 64
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [2]
+actions = ["Analyze"]
+
+[[tool]]
+name = "diff"
+description = "文件/文本差异比较"
+short_description = "File/text diff comparison"
+tokens = 64
+latency = "50ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Analyze"]
+
+[[tool]]
+name = "fs_cwd"
+description = "返回当前工作目录路径"
+tokens = 8
+latency = "1ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Read"]
+
+[[tool]]
+name = "fs_status"
+description = "返回当前文件系统会话摘要（已追踪的写入/移动/目录创建操作）"
+tokens = 16
+latency = "1ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [6]
+actions = ["Read"]
+
+[[tool]]
+name = "code_edit_search_replace"
+description = "跨多文件搜索正则模式并替换为新的内容（搜索+替换原子操作）"
+short_description = "Multi-file search & replace"
+cluster = "fs_write_mutate"
+differentiator = "跨文件的正则搜索+替换（一次性完成多个文件）"
+tokens = 256
+latency = "500ms"
+risk = "medium"
+confirm = true
+idempotent = false
+domains = [6, 0]
+actions = ["Update"]
+
+[[tool]]
+name = "lint_fix"
+description = "对指定语言或文件运行 linter 并应用自动修复（如 cargo clippy --fix）"
+short_description = "Run linter with auto-fix"
+tokens = 256
+latency = "5s"
+risk = "medium"
+confirm = true
+idempotent = false
+domains = [0]
+actions = ["Execute"]
+
+[[tool]]
+name = "batch_fetch"
+description = "并发获取多个 URL 的网页内容（一次性返回所有结果）"
+short_description = "Concurrent multi-URL fetch"
+cluster = "web_io"
+differentiator = "一次性并发获取多个 URL 的完整内容"
+tokens = 256
+latency = "2s"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [5]
+actions = ["Read", "Search"]
+
+[[tool]]
+name = "semantic_search"
+description = "对代码库进行语义搜索（理解意图而非关键词匹配），返回相关代码段"
+short_description = "Semantic code search"
+tokens = 128
+latency = "500ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Search"]
+
+# ─── Builtins from other modules (to be expanded) ─────────────────────
+
+[[tool]]
+name = "db_info"
+description = "获取 SQLite 数据库元数据（表/列/行数/大小）"
+short_description = "Database metadata"
+cluster = "db_read"
+differentiator = "数据库级元数据"
+tokens = 32
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [2]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "db_list_tables"
+description = "列出数据库中的所有用户表名"
+short_description = "List all table names"
+cluster = "db_read"
+differentiator = "列出用户表名"
+tokens = 16
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [2]
+actions = ["Read"]
+
+[[tool]]
+name = "db_table_schema"
+description = "获取一个表的列模式（类型/非空/默认值/主键）"
+short_description = "Table column schema"
+cluster = "db_read"
+differentiator = "一个表的列模式"
+tokens = 32
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [2]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "db_query"
+description = "执行原始参数化 SQL 查询（SELECT 只读；INSERT/UPDATE/DELETE 自动事务）"
+short_description = "Raw parameterized SQL"
+cluster = "db_read"
+differentiator = "原始参数化 SQL（最大灵活性）"
+tokens = 64
+latency = "20ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [2]
+actions = ["Read", "Search", "Analyze"]
+
+[[tool]]
+name = "db_read_records"
+description = "结构化等值过滤行读取（无需写 SQL）"
+short_description = "Filtered row read (no SQL)"
+cluster = "db_read"
+differentiator = "结构化等值过滤行读取"
+tokens = 48
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [2]
+actions = ["Read", "Search"]
+
+[[tool]]
+name = "code_execute"
+description = "在 Rhai 沙箱中执行代码表达式（仅纯计算，无 I/O）"
+short_description = "Execute code in Rhai sandbox"
+tokens = 96
+latency = "50ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [0, 1]
+actions = ["Execute"]
+
+[[tool]]
+name = "kb_search"
+description = "搜索知识库块和记忆殿堂（语义搜索）"
+short_description = "Semantic search across KB + palace"
+cluster = "knowledge_base"
+differentiator = "multi-source: KB chunks + memory palace (broadest scope)"
+tokens = 128
+latency = "200ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [3, 2]
+actions = ["Search"]
+
+[[tool]]
+name = "kb_query"
+description = "从知识库块中精确检索（按路径/ID）"
+short_description = "Exact KB retrieval by path/ID"
+cluster = "knowledge_base"
+differentiator = "KB chunks ONLY (BM25 + trigram); narrowest scope"
+tokens = 32
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [3]
+actions = ["Read"]
+
+[[tool]]
+name = "kb_ingest"
+description = "将文件/内容索引到知识库"
+short_description = "Index file/content into KB"
+cluster = "knowledge_base"
+differentiator = "WRITE — index a file into KB; precondition for kb_query/kb_search"
+tokens = 256
+latency = "500ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [3]
+actions = ["Create", "Update"]
+
+[[tool]]
+name = "git_status"
+description = "获取 Git 仓库状态（变更/暂存/未跟踪文件）"
+short_description = "Git repository status"
+tokens = 48
+latency = "50ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Read"]
+
+[[tool]]
+name = "git_diff"
+description = "显示 Git 差异（支持工作区/暂存区/分支间对比）"
+short_description = "Git diff display"
+tokens = 96
+latency = "100ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "git_log"
+description = "显示 Git 提交历史"
+short_description = "Git commit history"
+tokens = 64
+latency = "100ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Read"]
+
+[[tool]]
+name = "git_commit"
+description = "创建 Git 提交（含自动暂存 + 提交信息）"
+short_description = "Create git commit"
+tokens = 64
+latency = "100ms"
+risk = "high"
+confirm = true
+idempotent = false
+domains = [0]
+actions = ["Create"]
+
+[[tool]]
+name = "cg_symbol_search"
+description = "搜索代码符号（函数/结构体/变量等）"
+short_description = "Search code symbols"
+tokens = 64
+latency = "100ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Search"]
+
+[[tool]]
+name = "cg_call_graph"
+description = "获取函数调用图（调用者/被调用者）"
+short_description = "Function call graph"
+tokens = 96
+latency = "200ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [0]
+actions = ["Read", "Analyze"]
+
+[[tool]]
+name = "session_set_focus"
+description = "锚定当前 session 的目标/阶段/约束，防止注意力漂移"
+short_description = "Anchor session goal/phase"
+cluster = "session_meta"
+differentiator = "锚定目标/阶段/约束，防止注意力漂移"
+tokens = 32
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = false
+domains = [7]
+actions = ["Create", "Update"]
+
+[[tool]]
+name = "cross_session_query"
+description = "跨所有过去 session 的语义内容检索（记忆殿堂）"
+short_description = "Semantic cross-session search"
+cluster = "session_history"
+differentiator = "semantic content retrieval (knowledge palace) across all past sessions"
+tokens = 256
+latency = "500ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Search"]
+
+[[tool]]
+name = "session_resume_query"
+description = "查询先前会话的元数据统计（轮次/工具计数、延迟、压缩）"
+short_description = "Prior session metadata stats"
+cluster = "session_history"
+differentiator = "metadata stats (turn/tool counts, latency, compression) of prior sessions"
+tokens = 64
+latency = "50ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "messages_recover"
+description = "通过 recover_id 逐字回忆已压缩的消息"
+short_description = "Recover compressed messages"
+cluster = "session_history"
+differentiator = "verbatim recall of compressed messages by recover_id"
+tokens = 64
+latency = "20ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "session_request_permission"
+description = "请求用户授权某个权限门控的工具"
+short_description = "Request permission for tool"
+cluster = "session_meta"
+differentiator = "request user authz for a permission-gated tool"
+tokens = 16
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = false
+domains = [7]
+actions = ["Create"]
+
+[[tool]]
+name = "magchain_status"
+description = "查询 MagChain hooks + epistemic + decay tier 状态"
+short_description = "MagChain status introspection"
+cluster = "session_meta"
+differentiator = "introspect MagChain hooks + epistemic + decay tier state"
+tokens = 32
+latency = "10ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "interaction_status"
+description = "查看当前在交互图中的位置"
+short_description = "Current position in interaction map"
+cluster = "interaction_checkpoint"
+differentiator = "current position only (lightest read)"
+tokens = 16
+latency = "2ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "interaction_path"
+description = "查看完整交互图路径（已完成+当前+剩余）"
+short_description = "Full interaction path"
+cluster = "interaction_checkpoint"
+differentiator = "full path: completed + current + remaining"
+tokens = 24
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "interaction_recall"
+description = "按 ID 深入查看一个历史检查点的详细信息"
+short_description = "Recall checkpoint details"
+cluster = "interaction_checkpoint"
+differentiator = "deep details of one specific past checkpoint by id"
+tokens = 32
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [7]
+actions = ["Read"]
+
+[[tool]]
+name = "interaction_mark"
+description = "手动创建新的交互检查点"
+short_description = "Create a checkpoint"
+cluster = "interaction_checkpoint"
+differentiator = "WRITE — manually create a new checkpoint"
+tokens = 16
+latency = "5ms"
+risk = "low"
+confirm = false
+idempotent = false
+domains = [7]
+actions = ["Create"]
+
+[[tool]]
+name = "config_get"
+description = "读取当前配置项的值"
+short_description = "Read config value"
+tokens = 16
+latency = "2ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [4]
+actions = ["Read"]
+
+[[tool]]
+name = "config_set"
+description = "设置配置项的值（仅当前 session 有效）"
+short_description = "Set config value"
+tokens = 16
+latency = "5ms"
+risk = "medium"
+confirm = false
+idempotent = false
+domains = [4]
+actions = ["Update"]
+
+[[tool]]
+name = "deduction_analyze"
+description = "对给定文本执行推理分析（上下文相关）"
+short_description = "Deduction/reasoning analysis"
+tokens = 128
+latency = "300ms"
+risk = "low"
+confirm = false
+idempotent = true
+domains = [3]
+actions = ["Analyze"]

@@ -817,7 +817,6 @@ impl LlmProvider for DeepSeekProvider {
                     tracing::warn!("stream idle timeout (45s), treating as complete");
                     if tx.send(StreamEvent::Error("stream idle timeout (45s)".into())).is_err() {
                         tracing::debug!("stream consumer gone, stopping");
-                        stream_alive = false;
                     }
                     break;
                 }

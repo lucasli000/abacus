@@ -15,15 +15,19 @@
 //! 不含任何 `.await` 表达式。如需跨越 await 边界，改用 `Mutex<T>` 或在 await
 //! 前 `drop(refmut_guard)` 显式释放。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::time::{Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+pub mod session_export;
+/// V42-B Phase 13: session v3 → v4 透明升级
+pub mod session_migrate;
+
 use crate::tui::api::EngineHandle;
-use crate::tui::theme::Theme;
+use abacus_ui_kit::{CardStream, Theme};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Enums
@@ -1052,7 +1056,18 @@ pub struct AppState {
     ///   - 销毁: /turnkey execute(执行后清) | /turnkey clear | /new
     /// 持久化: 不进 SessionExport(plan 是会话期间的临时审阅状态, 重启清空)
     pub pending_turnkey_plan: Option<abacus_types::sandbox::TaskSpec>,
-    pub messages: VecDeque<Message>,
+    /// V40 Vec<Message> 数据结构
+    ///
+    /// V42-B 升级:
+    /// - V40 字段用于 V40 render_messages_in_card 的 build_message_lines
+    /// - V42-B `render_cards` 不读 messages, 改读 `state.cards: CardStream`
+    /// - 字段保留 (V40 兼容, slash_commands 仍用), 但 V42-B 新代码应迁移到 cards
+    /// - 旧代码应迁移到 `state.message_count()` / `state.clear_messages()` helper
+     pub messages: VecDeque<Message>,
+    /// V40 屏幕行数缓存 — `screen_pos_to_msg_char` (mouse hit-test) 热路径使用
+    /// 缓存有效性: `cached_msg_rows.len() == messages.len()` 时直接用, 否则回退 `estimate_msg_rows`
+    /// V42-B: 保留 (RefCell 让 hit-test 路径在 streaming 期间动态更新)
+    pub cached_msg_rows: RefCell<Vec<usize>>,
     pub scroll: usize,
     /// Phase 2: 用户是否主动离开底部浏览历史（streaming 期间不强制拉回）
     /// - set_scroll(Up/Down) → true
@@ -1078,7 +1093,6 @@ pub struct AppState {
     /// 引用关系: render_messages_in_card 写入 inner.width.saturating_sub(5)；
     ///           handle_chat_scroll_key Space 分支调 estimate_msg_rows 时读取
     /// 生命周期: 启动时 0（锚定逻辑见 0 时退化为 80, 安全 fallback）
-    pub(crate) last_content_width: std::cell::Cell<usize>,
 
     /// B11: 每条消息的实际渲染行数缓存（由 render_messages_in_card 每次 L2 重建时写入）
     /// 用于 screen_row_to_msg_idx / screen_pos_to_msg_char 的热路径，避免每帧/每次点击
@@ -1086,7 +1100,6 @@ pub struct AppState {
     /// 
     /// 缓存有效性: cached_msg_rows.len() == messages.len() 时有效，否则回退 estimate_msg_rows。
     /// 生命周期: 启动时空 Vec；每次 L2 渲染后刷新；messages 数量变化时自动失效。
-    pub(crate) cached_msg_rows: std::cell::RefCell<Vec<usize>>,
 
     pub input: String,
     pub input_state: InputState,
@@ -1140,6 +1153,13 @@ pub struct AppState {
     /// V28 SSOT: 所有 trace 事件(thinking / tool_call / generic / reply)的真相源
     /// 引用关系: 被 Message::Trace.event_ids + streaming_trace_ids 引用; 被 render_tab_timeline 读取
     /// 生命周期: push_trace 追加; MAX=500 FIFO 裁剪; v2 SessionExport 显式拷入
+    /// V40 trace events 列表
+    ///
+    /// V42-B 升级:
+    /// - V40 字段存储 V40 render 的 trace event 列表
+    /// - V42-B `AbacusCard.events` 内置 (每张 AbacusCard 自带)
+    /// - 字段保留 (V40 panel_sections/timeline/focus 仍用), 但 V42-B 新代码应迁移
+    /// - 旧代码应迁移到 `state.trace_event_count()` / `state.collect_trace_events()` helper
     pub trace_events: Vec<TraceEvent>,
     /// trace event id → index 映射（O(1) 查找替代 O(n) 线性扫描）
     /// 引用关系：push_trace_full 写入时同步更新；FIFO drain 时批量重建
@@ -1152,7 +1172,7 @@ pub struct AppState {
     pub tool_freq_dirty: std::cell::Cell<bool>,
     /// V28: 单调自增 trace id 分配器,SessionExport v2 持久化(防止重启后与历史 message 引用冲突)
     pub next_trace_id: u64,
-    /// V28: 流式期间临时聚集 trace ids,落档时 mem::take 转移到 Message::Trace.event_ids
+    /// 流式期间临时聚集 trace ids,落档时 mem::take 转移到 Message::Trace.event_ids
     /// 不持久化(异常退出后这些 ids 视为孤儿,trace_events 仍保留但不归任何消息)
     pub streaming_trace_ids: Vec<u64>,
     /// V28.1: timeline 上被点击展开的 event id 集合 — 渲染时显示 inline 详情(限 3-5 行)
@@ -1200,7 +1220,6 @@ pub struct AppState {
     /// - 销毁：reset_streaming() 清除（每 turn 结束后）
     /// - 设计意图：消除流式阶段每帧重复 similar::TextDiff::from_lines() 的 CPU 浪费
     /// RefCell 允许在 &AppState 渲染路径中写入缓存（render_messages_in_card 接收 &AppState）
-    pub streaming_diff_cache: RefCell<std::collections::HashMap<u64, Vec<ratatui::text::Line<'static>>>>,
     pub thinking_text: String,
 
     pub experts: Vec<Expert>,
@@ -1211,6 +1230,29 @@ pub struct AppState {
     pub tasks: Vec<TaskCard>,
 
     pub toasts: Vec<Toast>,
+
+    /// V42-B: 消息流卡片集合 (替代 V40 的 Vec<Message> + 6 个 streaming_* 字段 + 3 级缓存)
+    /// 初始化后即存在, 全生命周期持有; cards 内部有 alloc_id / active / collapse_overrides
+    /// 当前 Phase 9 仅作"并存写入", 旧字段保留; Phase 14 清理旧字段后, 此字段成为唯一数据源
+    pub cards: CardStream,
+
+    /// V42-B: 消息流垂直滚动偏移 (像素单位, 0 = 顶部)
+    /// V40 时期有更复杂的 ScrollableStack + cached_msg_rows 状态机; V42-B 简化为单一字段
+    /// 滚动边界由 `render_cards` 在每帧重建时 clamp
+    pub message_scroll_y: u16,
+
+    /// V42-B: 消息区 Rect 缓存 (render_cards 每帧写入, hit_test 读取)
+    /// 替代 V40 的 message_trace_row_map
+    /// 4 字段记录 inner Rect (border 内), hit_test 用 (x, y) 反查 Card id
+    /// 用 `RefCell` 包装: render 路径 (`&AppState`) 也需要写, 普通字段无法
+    /// 在 immutable 借用下写入; 借用范围仅 4 行赋值, 无并发风险
+    pub last_msg_area_x: RefCell<u16>,
+    pub last_msg_area_y: RefCell<u16>,
+    pub last_msg_area_width: RefCell<u16>,
+    pub last_msg_area_height: RefCell<u16>,
+    /// V40 字段 — 消息区最近一次的内容宽度, 供 hit-test (event/mod.rs) 使用
+    /// Cell 让 immutable render 路径可写
+    pub last_content_width: Cell<u16>,
 
     pub running: bool,
     pub paused: bool,
@@ -1292,19 +1334,24 @@ pub struct AppState {
     /// 总处理阶段数
     pub processing_total_steps: u32,
     /// 消息渲染缓存（dirty 标记避免每帧重建全部行）
+    ///
+    /// V42-B 升级:
+    /// - V40 字段用于 V40 render_messages_in_card 的 L0/L1/L2 三级缓存
+    /// - V42-B `render_cards` 每帧重建, **不需要** dirty 标记
+    /// - 字段保留 (V40 路径兼容), 但 V42-B 渲染路径不读不写
+    /// - 旧代码应迁移到 `state.mark_render_dirty()` / `state.is_render_dirty()` helper
     pub(crate) rendered_lines_dirty: std::cell::Cell<bool>,
     /// P1 优化：帧级 dirty 标记 — 任何事件/交互导致状态变化时设 true
     /// 引用关系：event handler / run.rs 响应处理 设置 → run.rs 条件渲染判定消费
     /// 生命周期：每帧 draw 前检查，draw 后 reset
     pub(crate) frame_dirty: std::cell::Cell<bool>,
-    /// V40: streaming-only dirty — 仅 streaming 尾部内容变化，base 消息未改变
+    /// streaming-only dirty — 仅 streaming 尾部内容变化，base 消息未改变
     /// 引用关系：run.rs chunk drain 设置 → components/mod.rs 分区渲染路径消费
     /// 生命周期：每帧渲染后 reset
     pub(crate) streaming_content_dirty: std::cell::Cell<bool>,
-    /// V40: 分区渲染缓存 — 缓存 build_message_lines 的结果（streaming 期间不重建）
+    /// 分区渲染缓存 — 缓存 build_message_lines 的结果（streaming 期间不重建）
     /// 引用关系：components/mod.rs 写入/读取
     /// 生命周期：新消息加入 messages 时失效（reset_streaming / add_message 清空）
-    pub(crate) cached_base_lines: std::cell::RefCell<Vec<ratatui::text::Line<'static>>>,
     /// V40: 上次缓存 base lines 时的 messages.len()（用于判断 base 是否需要重建）
     pub(crate) cached_base_msg_count: std::cell::Cell<usize>,
     /// info panel 内容 — 长信息走面板不走 toast
@@ -1325,53 +1372,44 @@ pub struct AppState {
     /// 生命周期：单次切换可见 / Esc 或再次 /theme 切走时清零
     pub theme_preview_open: bool,
     /// 消息渲染缓存（避免每帧重建）
-    pub(crate) cached_lines: RefCell<Vec<ratatui::text::Line<'static>>>,
     /// 缓存对应的渲染宽度
     pub(crate) cached_width: RefCell<u16>,
 
-    // ─── V0.2 Streaming State ───────────────────────────────────────
+    // ─── Streaming State ──────────────────────────────────────────
     /// 是否启用流式输出（用户可通过 /streaming toggle）
     pub streaming_enabled: bool,
-    /// 当前是否正在接收流式输出
-    pub is_streaming: bool,
-    /// 流式输出累积的正文文本
-    pub streaming_text: String,
-    /// 流式输出累积的思考文本
-    pub streaming_thinking: String,
-    /// V37: 是否展示 thinking/tools 流式内容（Ctrl+O 切换，默认隐藏，与 Claude Code 一致）
+    // V42-B: is_streaming 字段已删除，改用 `is_streaming_active()` (CardStream)
+    // V42-B: streaming_text / streaming_thinking 已拆分到 LlmCard，字段已删除
+    // V42-B: streaming_text_started / streaming_thinking_started 已删除，改用 active_llm_text_len() == 0
+    /// 是否展示 thinking/tools 流式内容（Ctrl+O 切换，默认隐藏，与 Claude Code 一致）
     pub show_streaming_trace: bool,
-    /// V29.5: 本轮 streaming 是否已收到首条非空 TextDelta（用于触发"开始输出"事件）
-    /// 替代 `streaming_text.is_empty()` 判定 — provider 推空 delta 心跳时不再误识别
-    /// 生命周期: reset_streaming 时清 false; 首条非空 TextDelta 抵达时置 true
-    pub streaming_text_started: bool,
-    /// V29.5: 本轮 streaming 是否已收到首条非空 Thinking（同上, 用于触发"开始推理"事件）
-    pub streaming_thinking_started: bool,
-    /// P1: 标记当前 LLM 调用已 Complete，但尚未收到 EngineResponse
+    /// 标记当前 LLM 调用已 Complete，但尚未收到 EngineResponse
     /// 引用关系：run.rs StreamChunk::Complete 置 true；reset_streaming 重置 false
     /// 生命周期：Complete 到达时 true → EngineResponse 到达 reset_streaming 时 false
     pub streaming_complete: bool,
     /// 流式输出中的工具执行状态
-    /// V11: 三元组承载 ToolEnd 已有的 success + duration_ms（之前用 `..` 丢失）
-    /// V28 (T3): 元组扩成 4 元 — 末位 trace_id 让 ToolEnd 能按 id 直接定位 trace_events
+    /// 三元组承载 ToolEnd 已有的 success + duration_ms（之前用 `..` 丢失）
+    /// 元组扩成 4 元 — 末位 trace_id 让 ToolEnd 能按 id 直接定位 trace_events
     /// 中对应条目(避免在并行 tool call 场景下按 name 顺序匹配错位)。
     /// 字段:name / status / duration_ms (None=进行中) / trace_id (SSOT 引用,不参与显示)
     /// 引用关系:run.rs ToolStart 创建 trace 同时 push 元组;ToolEnd 按 trace_id 回查;
-    ///          components::render 读 name/status/dur 显示流式列表
-    /// 生命周期:streaming 开始空 → 工具流期间增改 → streaming 结束/异常清空
+    ///
+    /// V42-B: 拆分到 `AbacusCard.events` 内部，字段保留供 timeline 使用
     pub streaming_tools: Vec<(String, StreamingToolStatus, Option<u64>, u64)>,
-    /// V40: 统一时序流 — 所有 streaming 事件按到达顺序排列
+    /// 统一时序流 — 所有 streaming 事件按到达顺序排列
     /// 引用关系：run.rs push → components/mod.rs 遍历渲染
     /// 生命周期：首次 chunk 到达时 push → reset_streaming 清空
     pub streaming_timeline: Vec<TimelineEntry>,
     // Phase 3+4: blocks 每帧从 timeline 局部构建（O(timeline_len) 聚合），不持久化
     // Phase 4: 用户手动展开的 block id 集合（优先级高于 auto_collapse）
     pub expanded_block_ids: std::cell::RefCell<std::collections::HashSet<u64>>,
-    // V40: streaming_parsed_lines / streaming_parsed_len 已移除
+    // streaming_parsed_lines / streaming_parsed_len 已移除
     // 旧的增量解析缓存被 timeline + mdstream committed/pending 模型完全替代
     /// 流式 Markdown 增量渲染状态（mdstream committed/pending 模型）
     /// 引用关系：run.rs TextDelta → append；components 渲染 → committed_styled/pending_styled
     /// 生命周期：首次 TextDelta 时 lazy 创建，reset_streaming 时 drop
     /// 使用 RefCell：渲染函数持有 &self 但 committed_styled 需 &mut self
+    /// V42-B: 拆分到 `LlmCard.reply_md` 内部，字段保留供兼容路径使用
     pub streaming_md: std::cell::RefCell<Option<crate::tui::md_stream::StreamingMd>>,
 
     // ─── V0.3 IDE Effects ──────────────────────────────────────────
@@ -1392,9 +1430,27 @@ pub struct AppState {
     /// LSP 警告诊断数
     pub lsp_diag_warnings: u32,
 
-    // ─── V0.4 Custom Tabs (用户扩展看板) ──────────────────────────────
-    /// 用户自定义 Tab 列表（通过 /tab 命令或配置文件注册）
-    pub custom_tabs: Vec<CustomTab>,
+    // ─── V42 Section / Dashboard Registry (可扩展 UI 框架) ───────────────
+    /// 看板 Section 注册仓库 —— 启动时由 [`crate::tui::extensions::register_builtin_sections`] 注入 6 内置
+    ///
+    /// Agent 应用可通过 `state.section_registry.register(Box::new(MySection))` 注入自定义看板区块。
+    ///
+    /// ## 引用关系
+    /// - 写入: AppState::new 时调 extensions::register_builtin_sections; 外部 Agent 可后续 register
+    /// - 读取: panel.rs::render_tab_scene 调 build_stack(&panel_layout).render(...)
+    ///
+    /// ## 不持久化
+    /// trait object 不可 serde, 重启时按 builtin 重新注册（外部 Agent 自己负责 re-register）
+    pub section_registry: abacus_ui_kit::SectionRegistry,
+
+    /// 仪表盘 DashboardTab 注册仓库 —— 启动时注入 Health + Auto 两个内置 tab
+    ///
+    /// Agent 应用可通过 `state.dashboard_registry.register(Box::new(MyTab))` 注入自定义仪表盘 tab。
+    pub dashboard_registry: abacus_ui_kit::DashboardRegistry,
+
+    /// 看板 Section 启用列表 + 渲染顺序 —— 用户通过 config.toml 覆盖, 默认见
+    /// [`crate::tui::extensions::default_panel_layout`]
+    pub panel_layout: Vec<String>,
 
     // ─── V0.5 Confirmation Dialog ────────────────────────────────────
     /// 权限确认弹窗状态（None = 无弹窗，Some = 等待用户确认）
@@ -1465,116 +1521,6 @@ pub const MAGNET_SUPPRESS_MS: u128 = 2000;
 /// 5000ms：与典型一次 agent 回复时长相近，让用户在一次完整对话只看到 1 次提示。
 pub const MAGNET_TOAST_THROTTLE_MS: u128 = 5000;
 
-/// 用户自定义 Tab — 可扩展看板内容
-///
-/// 设计目标：预留用户扩展看板能力的接口
-/// - 注册方式：/tab add <name> <template> 或配置文件 ~/.abacus/tabs.yaml
-/// - 数据驱动：content 由 DataSource 实时更新
-/// - Session 联动：可订阅事件（消息/tool/模式切换）自动刷新
-///
-/// 引用关系：由 AppState.custom_tabs 持有，render_panel 遍历渲染
-/// 生命周期：注册 → session 期间持续更新 → session 结束清除（除非 persistent=true）
-#[derive(Debug, Clone)]
-pub struct CustomTab {
-    /// Tab 显示名称（如 "📊 仪表板"、"🔥 热点"）
-    pub name: String,
-    /// 渲染模板类型
-    pub template: TabTemplate,
-    /// 内容数据行（由 DataSource 驱动更新）
-    pub content: Vec<TabContentRow>,
-    /// 数据源类型（决定何时、如何更新 content）
-    pub data_source: TabDataSource,
-    /// 是否跨 session 持久化
-    pub persistent: bool,
-}
-
-/// Tab 渲染模板 — 决定内容区如何布局
-#[derive(Debug, Clone, PartialEq)]
-pub enum TabTemplate {
-    /// KV 列表（label: value 对齐排列）
-    KeyValue,
-    /// 表格（固定列宽 + header）
-    Table { columns: Vec<String> },
-    /// 进度条列表（name + bar + percentage）
-    ProgressBars,
-    /// Sparkline 折线图（ASCII art）
-    Sparkline { width: usize },
-    /// 自由文本（逐行渲染，支持 ANSI 色彩标记）
-    FreeText,
-    /// 混合（多个 section，每个 section 用不同模板）
-    Mixed { sections: Vec<(String, TabTemplate)> },
-}
-
-/// Tab 内容行数据
-#[derive(Debug, Clone)]
-pub struct TabContentRow {
-    /// 行类型标识（用于模板渲染分派）
-    pub kind: TabRowKind,
-    /// 键/标签
-    pub label: String,
-    /// 值/内容
-    pub value: String,
-    /// 可选数值（用于 Sparkline/ProgressBar）
-    pub numeric: Option<f64>,
-    /// 可选颜色提示（"success"/"error"/"gold"/"muted"/"accent"）
-    pub color_hint: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum TabRowKind {
-    Text,
-    KeyValue,
-    Progress { percent: u8 },
-    Separator,
-    Header,
-    Sparkline { values: Vec<f64> },
-}
-
-/// 数据源类型 — 决定 Tab 内容的更新时机和来源
-#[derive(Debug, Clone, PartialEq)]
-pub enum TabDataSource {
-    /// 静态内容（注册时提供，不自动更新）
-    Static,
-    /// Session 事件驱动（每次 add_event 时检查是否需要更新）
-    SessionEvents { filter_category: Option<String> },
-    /// 定时轮询（外部命令/API 结果）
-    Poll { command: String, interval_secs: u64 },
-    /// 消息统计（自动从 messages 计算）
-    MessageStats,
-    /// Tool 调用统计
-    ToolStats,
-    /// 自定义回调标识（由后端/插件推送更新）
-    External { channel_id: String },
-}
-
-impl CustomTab {
-    /// 创建一个简单的 KV 仪表板 Tab
-    pub fn dashboard(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            template: TabTemplate::KeyValue,
-            content: Vec::new(),
-            data_source: TabDataSource::SessionEvents { filter_category: None },
-            persistent: false,
-        }
-    }
-
-    /// 创建一个 Sparkline 监控 Tab
-    pub fn monitor(name: &str, command: &str, interval: u64) -> Self {
-        Self {
-            name: name.to_string(),
-            template: TabTemplate::Sparkline { width: 20 },
-            content: Vec::new(),
-            data_source: TabDataSource::Poll { command: command.to_string(), interval_secs: interval },
-            persistent: true,
-        }
-    }
-
-    /// 更新内容（由数据源驱动调用）
-    pub fn update_content(&mut self, rows: Vec<TabContentRow>) {
-        self.content = rows;
-    }
-}
 
 /// 权限确认弹窗数据 — 通用授权框架
 ///
@@ -2172,7 +2118,6 @@ mod per_mode_query_tests {
 
     #[test]
     fn mode_stats_returns_none_when_absent() {
-        let s = make_stats();
         // Clarify 已插入，Meeting 已插入；测试空 stats
         let s2 = SessionTokenStats::default();
         assert!(s2.mode_stats(AbacusMode::Clarify).is_none());
@@ -2403,7 +2348,12 @@ impl SessionTokenStats {
     }
 }
 
-/// 文本选择区域
+/// 文本选择区域（V40 鼠标拖拽选区）
+///
+/// V42-B: 字段保留, V40 drag selection 复制功能**保留**（升级而非删除）
+/// 升级路径:
+/// - 旧 V40: (msg_idx, char_idx) 精确定位 Vec<Message> + Vec<TraceEvent>
+/// - 新 V42-B: 仍用 V40 路径 (本字段有效), Phase 14.1+ 可基于 CardStream 重写
 #[derive(Debug, Clone)]
 pub struct TextSelection {
     pub start_msg_idx: usize,
@@ -2418,9 +2368,288 @@ const MAX_MESSAGES: usize = 200;
 const MAX_EVENTS: usize = 300;
 
 impl AppState {
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // V42-B is_streaming 升级路径
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// V42-B: 判断是否正在流式（替代 V40 `is_streaming` 字段读）
+    ///
+    /// V40: `state.is_streaming` 字段
+    /// V42-B: `state.cards.active_id().is_some()`（CardStream active 状态）
+    ///
+    /// 升级路径: 旧代码 `if s.is_streaming {}` 改为 `if s.is_streaming_active() {}`
+    pub fn is_streaming_active(&self) -> bool {
+        self.cards.active_id().is_some()
+    }
+
+    /// V42-B: 开始一个流式 session（替代 `state.is_streaming = true`）
+    ///
+    /// V40 行为: 仅设置 bool 标志
+    /// V42-B 行为: alloc_id + 创建 LlmCard + push_active (CardStream 真正进入流式)
+    ///
+    /// 升级路径: 旧代码 `state.is_streaming = true;` 改为 `state.begin_streaming_session();`
+    pub fn begin_streaming_session(&mut self) {
+        // 防御: 如果已有 active, 先 finish
+        if self.cards.active_id().is_some() {
+            self.cards.finish_active();
+        }
+        // 创建新的 LlmCard 作为 active
+        let id = self.cards.alloc_id();
+        let model = if self.model_name.is_empty() { "llm".into() } else { self.model_name.clone() };
+        let card = crate::tui::cards::LlmCard::new(id, model, "default");
+        self.cards.push_active(Box::new(card));
+    }
+
+    /// V42-B: 结束流式 session（替代 `state.is_streaming = false`）
+    ///
+    /// V40: 重置 bool 标志
+    /// V42-B 行为: 调 `cards.finish_active()` 标记当前 active Card 为 Static
+    pub fn end_streaming_session(&mut self) {
+        self.cards.finish_active();
+    }
+
+    /// V42-B: 同 `end_streaming_session`，但保持 bool 字段同步
+    /// （给 `self.is_streaming = false` 旧 setter 路径用, 让 V40 字段和 V42-B 状态机保持一致）
+    pub fn is_streaming_active_set_false(&mut self) {
+        self.cards.finish_active();
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // V42-B streaming text/thinking 升级路径
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// V42-B: 取当前 active LlmCard 的累积 reply 文本（替代 `state.streaming_text` 读）
+    ///
+    /// `state.streaming_text` (String 字段)
+    /// V42-B: `state.cards.active_id()` → downcast → `LlmCard.reply_text`
+    ///
+    /// 返回空字符串如果没有 active LlmCard。
+    /// 升级路径: 旧代码 `state.streaming_text` 改为 `state.active_llm_text()`
+    pub fn active_llm_text(&self) -> String {
+        if let Some(id) = self.cards.active_id() {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                return llm.reply_text_for_copy();
+            }
+        }
+        String::new()
+    }
+
+    /// V42-B: active LlmCard 的 reply 文本长度（零拷贝，避免 clone）
+    pub fn active_llm_text_len(&self) -> usize {
+        if let Some(id) = self.cards.active_id() {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                return llm.reply_text_len();
+            }
+        }
+        0
+    }
+
+    /// V42-B: 取当前 active LlmCard 的累积 thinking 文本（替代 `state.streaming_thinking` 读）
+    ///
+    /// `state.streaming_thinking` (String 字段)
+    /// V42-B: `state.cards.active_id()` → downcast → `LlmCard.thinking`
+    ///
+    /// 返回空字符串如果没有 active LlmCard 或没有 thinking。
+    /// 升级路径: 旧代码 `state.streaming_thinking` 改为 `state.active_llm_thinking()`
+    pub fn active_llm_thinking(&self) -> String {
+        if let Some(id) = self.cards.active_id() {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                if let Some(t) = llm.thinking_text() {
+                    return t;
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// V42-B: active LlmCard 的 thinking 文本长度（零拷贝）
+    pub fn active_llm_thinking_len(&self) -> usize {
+        if let Some(id) = self.cards.active_id() {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                return llm.thinking_text_len();
+            }
+        }
+        0
+    }
+
+    /// V42-B: 取最近一张 LlmCard (不论 active 状态) 的累积 reply 文本
+    ///
+    /// 用于 finalize 阶段（handle_chunk(Complete) 已把 active 标记为 Static 后）。
+    /// 对应: `state.streaming_text` 在 reset 前的快照。
+    ///
+    /// 升级路径: 旧代码 `state.streaming_text.clone()` 改为 `state.last_llm_text()`
+    pub fn last_llm_text(&self) -> String {
+        // 顺序遍历, 记下最后一张 LlmCard
+        let mut last_id: Option<u64> = None;
+        for card in self.cards.iter() {
+            if card.kind() == abacus_ui_kit::kinds::LLM {
+                last_id = Some(card.id());
+            }
+        }
+        if let Some(id) = last_id {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                return llm.reply_text_for_copy();
+            }
+        }
+        String::new()
+    }
+
+    /// V42-B: 取最近一张 LlmCard 的 reply 文本并清空其 reply 字段
+    ///
+    /// 用于 fatal network 错误时保留已流式内容（V40 take 模式）。
+    /// LlmCard 仍保留在 CardStream 中（user 切换 mode 后还能看到），
+    /// 但 reply_text 被清空，渲染时该卡变成"empty"状态。
+    pub fn take_last_llm_text(&mut self) -> String {
+        let mut last_id: Option<u64> = None;
+        for card in self.cards.iter() {
+            if card.kind() == abacus_ui_kit::kinds::LLM {
+                last_id = Some(card.id());
+            }
+        }
+        if let Some(id) = last_id {
+            if let Some(llm) = self.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(id) {
+                return std::mem::take(&mut llm.reply_text_field());
+            }
+        }
+        String::new()
+    }
+
+    /// V42-B: 取最近一张 LlmCard 的 thinking 文本并清空
+    ///
+    /// 用于 fatal/cancel 时保留后置处理（V40 take 模式）。
+    pub fn take_last_llm_thinking(&mut self) -> String {
+        let mut last_id: Option<u64> = None;
+        for card in self.cards.iter() {
+            if card.kind() == abacus_ui_kit::kinds::LLM {
+                last_id = Some(card.id());
+            }
+        }
+        if let Some(id) = last_id {
+            if let Some(llm) = self.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(id) {
+                if let Some(t) = llm.take_thinking() {
+                    return t;
+                }
+            }
+        }
+        String::new()
+    }
+
+    /// V42-B: 取最近一张 LlmCard 的累积 thinking 文本
+    ///
+    /// 对应: `state.streaming_thinking` 在 reset 前的快照。
+    pub fn last_llm_thinking(&self) -> String {
+        let mut last_id: Option<u64> = None;
+        for card in self.cards.iter() {
+            if card.kind() == abacus_ui_kit::kinds::LLM {
+                last_id = Some(card.id());
+            }
+        }
+        if let Some(id) = last_id {
+            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                if let Some(t) = llm.thinking_text() {
+                    return t;
+                }
+            }
+        }
+        String::new()
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // V42-B rendered_lines_dirty 升级路径
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// V42-B: 标记渲染脏（替代 V40 `state.rendered_lines_dirty.set(true)`）
+    ///
+    /// V40 行为: 设置 bool 标记, render_messages_in_card 据此决定是否全量重建
+    /// V42-B 行为: 设置 V40 字段 (兼容), V42-B `render_cards` 每帧重建无需此标记
+    pub fn mark_render_dirty(&self) {
+        self.rendered_lines_dirty.set(true);
+    }
+
+    pub fn is_render_dirty(&self) -> bool {
+        self.rendered_lines_dirty.get()
+    }
+
+    pub fn clear_render_dirty(&self) {
+        self.rendered_lines_dirty.set(false);
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // V42-B messages 升级路径
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// V42-B: 消息总数（替代 V40 `state.messages.len()`）
+    pub fn message_count(&self) -> usize {
+        self.cards.len()
+    }
+
+    /// V42-B: 清空所有消息（替代 V40 `state.messages.clear()`）
+    pub fn clear_messages(&mut self) {
+        self.cards.clear();
+    }
+
+    /// V42-B: 检查消息是否为空（替代 V40 `state.messages.is_empty()`）
+    pub fn messages_is_empty(&self) -> bool {
+        self.cards.is_empty()
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // V42-B trace_events 升级路径
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    pub fn trace_event_count(&self) -> usize {
+        use crate::tui::cards::AbacusCard;
+        let mut total = 0;
+        for card in self.cards.iter() {
+            if let Some(ac) = self.cards.card_downcast_ref::<AbacusCard>(card.id()) {
+                total += ac.events_ref().len();
+            }
+        }
+        total + self.trace_events.len() // 合并 V40 遗留数据
+    }
+
+    pub fn collect_trace_events(&self) -> Vec<crate::tui::state::TraceEvent> {
+        use crate::tui::cards::AbacusCard;
+        let mut all = Vec::new();
+        for card in self.cards.iter() {
+            if let Some(ac) = self.cards.card_downcast_ref::<AbacusCard>(card.id()) {
+                all.extend(ac.events_ref().iter().cloned());
+            }
+        }
+        all.extend(self.trace_events.iter().cloned());
+        all
+    }
+
+    /// Create app state.
+    ///
+    /// `panel_sections` — if `Some`, override the default panel layout from config.
+    /// Each element should be a registered section ID (e.g. "llm", "tools").
+    /// Invalid IDs are silently filtered with a warning.
     pub fn new(mode: AbacusMode) -> Self {
+        Self::new_with_sections(mode, None)
+    }
+
+    pub fn new_with_sections(mode: AbacusMode, panel_sections: Option<Vec<String>>) -> Self {
         let mut theme = Theme::init();
         theme.set_mode_color(mode.label());
+
+        // 读取 config.toml [tui.panel] sections 覆盖默认布局
+        let panel_layout: Vec<String> = if let Some(sections) = panel_sections {
+            let reg = crate::tui::extensions::new_section_registry();
+            sections.into_iter().filter(|id| {
+                if reg.contains(id) {
+                    true
+                } else {
+                    tracing::warn!("unknown panel section `{id}` in config [tui.panel] sections, ignoring");
+                    false
+                }
+            }).collect()
+        } else {
+            crate::tui::extensions::default_panel_layout()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
 
         Self {
             theme,
@@ -2476,9 +2705,7 @@ impl AppState {
             last_total_lines: std::cell::Cell::new(0),
             last_timeline_visible: std::cell::Cell::new(0),
             // V29.11: 启动时未渲染, 错赋 0; Space 锁定逻辑看到 0 时退化为 80
-            last_content_width: std::cell::Cell::new(0),
             // B11: 启动时空缓存，第一次 L2 渲染后填充
-            cached_msg_rows: std::cell::RefCell::new(Vec::new()),
             input: String::new(),
             input_state: InputState::Ready,
             pre_compress_input_state: None,
@@ -2514,12 +2741,18 @@ impl AppState {
             focused_event_id: None,
             tool_records: Vec::new(),
             tool_health: std::collections::HashMap::new(),
-            streaming_diff_cache: RefCell::new(std::collections::HashMap::new()),
             thinking_text: String::new(),
             experts: Vec::new(),
             expert_names_cache: HashSet::new(),
             tasks: Vec::new(),
             toasts: Vec::new(),
+            cards: CardStream::new(),
+            message_scroll_y: 0,
+            last_msg_area_x: RefCell::new(0),
+            last_msg_area_y: RefCell::new(0),
+            last_msg_area_width: RefCell::new(0),
+            last_msg_area_height: RefCell::new(0),
+            last_content_width: Cell::new(80),
             running: true,
             paused: false,
             compact: false,
@@ -2558,24 +2791,19 @@ impl AppState {
             rendered_lines_dirty: std::cell::Cell::new(true),
             frame_dirty: std::cell::Cell::new(true),
             streaming_content_dirty: std::cell::Cell::new(false),
-            cached_base_lines: std::cell::RefCell::new(Vec::new()),
             cached_base_msg_count: std::cell::Cell::new(0),
             info_panel_text: String::new(),
             info_panel_auto_open: false,
             picker: None,
             editor_state: None,
             theme_preview_open: false,
-            cached_lines: RefCell::new(Vec::new()),
+            cached_msg_rows: RefCell::new(Vec::new()),
             cached_width: RefCell::new(0),
-            // V0.2 Streaming
+            // Streaming 状态
             streaming_enabled: true, // 默认启用流式输出
-            is_streaming: false,
-            streaming_text: String::new(),
-            streaming_thinking: String::new(),
+            // V42-B: is_streaming 字段已删除，改用 is_streaming_active()
             show_streaming_trace: true, // V38: 默认显示 thinking/tools 内容流 + 状态指示并存
-            // V29.5: 首次 chunk 触发标志（替代 is_empty 判定, 防空 delta 心跳误判）
-            streaming_text_started: false,
-            streaming_thinking_started: false,
+            // V42-B: streaming_text_started / streaming_thinking_started 已删除
             streaming_complete: false,
             streaming_tools: Vec::new(),
             streaming_timeline: Vec::new(),
@@ -2586,7 +2814,9 @@ impl AppState {
             code_blocks_expanded: false,
             lsp_diag_errors: 0,
             lsp_diag_warnings: 0,
-            custom_tabs: Vec::new(),
+            section_registry: crate::tui::extensions::new_section_registry(),
+            dashboard_registry: crate::tui::extensions::new_dashboard_registry(),
+            panel_layout,
             confirm_dialog: None,
             pending_confirmation_response: None,
             always_allow: std::collections::HashSet::new(),
@@ -2811,7 +3041,7 @@ impl AppState {
             ScrollAction::Restore(n) => n,
         };
         self.scroll = new;
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     pub fn toggle_panel(&mut self) {
@@ -2853,7 +3083,7 @@ impl AppState {
     /// 保护：streaming 中延迟为 toast，避免打断流式渲染
     pub fn show_info(&mut self, text: impl Into<String>) {
         let s = text.into();
-        if self.is_streaming {
+        if self.is_streaming_active() {
             self.add_toast("命令已收到，请等流式结束后查看", std::time::Duration::from_secs(2));
             self.info_panel_text = s;
             self.info_panel_auto_open = true;
@@ -2864,7 +3094,7 @@ impl AppState {
             vec![MsgContent::Stream(s)],
             &ts,
         ));
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// thinking 深度循环：off → low → medium → high → max → off
@@ -3063,12 +3293,12 @@ impl AppState {
             review_strict: false,
         });
         // picker 打开后立即触发重绘，避免 input_state=Ready 时 needs_draw=false 导致首帧不显示
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开主题 picker — 列出 Theme::all_names，selected 设为当前主题位置
     pub fn open_picker_theme(&mut self) {
-        let names = crate::tui::theme::Theme::all_names();
+        let names = abacus_ui_kit::Theme::all_names();
         let items: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let labels = items.clone();
         let current = items.iter().position(|n| n == self.theme.name);
@@ -3083,7 +3313,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开思考深度 picker — off/low/medium/high/max
@@ -3111,7 +3341,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开模式切换 picker（Clarify / Meeting）
@@ -3139,7 +3369,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开审查类型 picker（plan / diff / security）
@@ -3168,7 +3398,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false, // Space 键切换
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// V35: 打开 Meeting 操作 picker
@@ -3200,7 +3430,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开历史 session 恢复 picker
@@ -3272,7 +3502,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 打开输入历史 picker（最近 20 条，选中重发）
@@ -3306,7 +3536,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 通用 picker 打开方法 — 供不需要特殊初始化逻辑的 picker 使用
@@ -3325,7 +3555,7 @@ impl AppState {
             opened_at: std::time::Instant::now(),
             review_strict: false,
         });
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 2026-05-28: 打开全屏编辑器
@@ -3341,7 +3571,7 @@ impl AppState {
             selection_anchor: None,
         });
         self.input_state = InputState::Editor;
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 2026-05-28: 关闭全屏编辑器
@@ -3349,7 +3579,7 @@ impl AppState {
     pub fn close_editor(&mut self) {
         self.editor_state = None;
         self.input_state = InputState::Ready;
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 2026-05-28: 安全设置 busy 态（Editor 态不覆盖——用户正在编辑时后台 streaming 不抢夺输入焦点）
@@ -3387,7 +3617,7 @@ impl AppState {
         self.focused_event_id = None;
         self.tool_records.clear();
         self.tool_health.clear();
-        self.streaming_diff_cache.borrow_mut().clear();
+        // V42-B: streaming_diff_cache 已删除 (无引用)
         self.thinking_text.clear();
         self.turn_count = 0;
         self.set_scroll(ScrollAction::ToBottom);
@@ -3410,7 +3640,7 @@ impl AppState {
 
     /// 标记渲染缓存失效（外部触发重绘）
     pub fn mark_dirty(&self) {
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
     }
 
     /// 清空所有流式输出累积状态（is_streaming + streaming_* 字段 + 增量解析缓存）
@@ -3418,62 +3648,20 @@ impl AppState {
     /// 引用关系：被 res_rx 收到 EngineResponse / StreamChunk::Complete /
     ///           StreamChunk::Error / 启动新流式（先清后填）调用——4 处共用真相源
     /// 生命周期：操作幂等，可无条件调用
-    /// 设计意图：之前各处独立写 6 行清理逻辑，跨 tick 时存在
-    ///   "is_streaming=false 但 streaming_text 残留" 的双显示窗口（ST1）。
-    ///   抽 helper 后 res_rx 与 chunk Complete/Error 三路径状态完全一致
+    ///
+    /// V42（Bug B 修复）：删除"自动落档守卫"逻辑
+    /// 旧实现内部判定 `streaming_complete && !streaming_text.is_empty()` 时
+    /// 自动构造 Message 落档。这是双责任设计 — `run.rs:618` 已经在 EngineResponse
+    /// 抵达时手动落档了, 两条独立路径在 race 条件下双触发造成消息重复。
+    /// 旧 workaround（`run.rs:655` `streaming_text.clear()` 抢在 reset 之前清空）脆弱。
+    ///
+    /// 新设计：reset_streaming 只清状态, 不写消息。
+    /// 需要"落档未消费内容"的调用方显式调用 [`flush_streaming_to_message`].
     pub fn reset_streaming(&mut self) {
-        // 如果有未落档的 streaming 内容且 streaming_complete=true，先自动落档再清空
-        if self.streaming_complete && !self.streaming_text.is_empty() {
-            let ts = chrono::Local::now().format("%H:%M").to_string();
-            let text = std::mem::take(&mut self.streaming_text);
-            let thinking = std::mem::take(&mut self.streaming_thinking);
-            let tools = std::mem::take(&mut self.streaming_tools);
-            let _timeline = std::mem::take(&mut self.streaming_timeline);
-            let trace_ids = std::mem::take(&mut self.streaming_trace_ids);
-
-            let mut parts: Vec<MsgContent> = Vec::new();
-            if !thinking.is_empty() {
-                let line_count = thinking.lines().count();
-                let preview: String = thinking.lines()
-                    .find(|l| !l.trim().is_empty()).unwrap_or("")
-                    .chars().take(40).collect();
-                let summary = if preview.is_empty() {
-                    format!("💭 {} lines", line_count)
-                } else {
-                    format!("💭 {} lines · {}", line_count, preview)
-                };
-                parts.push(MsgContent::Block {
-                    kind: BlockKind::Think,
-                    summary,
-                    collapsed: true,
-                    detail: thinking,
-                });
-            }
-            if !tools.is_empty() {
-                let tool_ids: Vec<u64> = trace_ids.iter().copied()
-                    .filter(|id| self.trace_events.iter().any(|e|
-                        e.id == *id && matches!(e.kind, TraceKind::ToolCall { .. })
-                    ))
-                    .collect();
-                if !tool_ids.is_empty() {
-                    parts.push(MsgContent::Trace {
-                        event_ids: tool_ids,
-                        collapsed: true,
-                        expanded_event_ids: std::collections::HashSet::new(),
-                    });
-                }
-            }
-            parts.push(MsgContent::Stream(text));
-            self.add_message(Message::new_session(parts, &ts));
-        }
-
-        self.is_streaming = false;
+        self.is_streaming_active_set_false();
         self.streaming_complete = false;
-        self.streaming_text.clear();
-        self.streaming_thinking.clear();
-        // V29.5: 重置首次触发标志, 下一轮 streaming 重新激活"开始输出"/"开始推理"事件
-        self.streaming_text_started = false;
-        self.streaming_thinking_started = false;
+        // V42-B: streaming_text / streaming_thinking 已由 CardStream 管理
+        // V42-B: streaming_text_started / streaming_thinking_started 已删除，无需重置
         self.streaming_tools.clear();
         self.streaming_timeline.clear();
         self.expanded_block_ids.borrow_mut().clear();
@@ -3482,18 +3670,101 @@ impl AppState {
         self.streaming_trace_ids.clear();
         // 流式 Markdown 增量引擎：drop 释放 mdstream 状态
         *self.streaming_md.borrow_mut() = None;
-        // V40: 失效分区渲染缓存（streaming 结束后 messages 即将变化）
-        self.cached_base_lines.borrow_mut().clear();
-        self.cached_base_msg_count.set(0);
+        // V42-B: cached_base_lines + cached_base_msg_count 已删除
         self.streaming_content_dirty.set(false);
         // Phase 2: 流式结束后恢复自动跟随
         self.user_scrolled_away.set(false);
+    }
+
+    /// V42-B：显式 helper — 把当前累积的 streaming 内容落档为一条 session message
+    ///
+    /// ## 适用场景
+    /// - 模式切换前用户主动打断（统一替代 `run.rs:2026/2085` 的内联手动构造逻辑）
+    /// - `switch_mode` 前保护未消费内容
+    /// - 任何"streaming 已有内容但 EngineResponse 不会再来"的兜底
+    ///
+    /// ## 不变量
+    /// - 不主动调 `reset_streaming` — 调用方负责后续清理（单一职责）
+    /// - 用 `take_last_llm` 转移内容到新 Message, CardStream 字段被清空
+    /// - 仅处理 LlmCard.text / LlmCard.thinking / streaming_trace_ids
+    ///   （streaming_tools 和 streaming_timeline 只是 UI 渲染辅助, 不进 Message）
+    ///
+    /// ## 返回值
+    /// - `true`: 有内容被落档为新消息
+    /// - `false`: streaming 内容为空, 无操作
+    pub fn flush_streaming_to_message(&mut self) -> bool {
+        let text = self.take_last_llm_text();
+        let thinking = self.take_last_llm_thinking();
+        if text.is_empty() && thinking.is_empty() && self.streaming_trace_ids.is_empty() {
+            return false;
+        }
+        let ts = chrono::Local::now().format("%H:%M").to_string();
+        let trace_ids = std::mem::take(&mut self.streaming_trace_ids);
+        // streaming_tools/streaming_timeline 在 reset_streaming 内清, 这里不动
+        // (避免 UI 状态被部分清理导致下一帧渲染状态不一致)
+
+        let mut parts: Vec<MsgContent> = Vec::new();
+        if !thinking.is_empty() {
+            let line_count = thinking.lines().count();
+            let preview: String = thinking.lines()
+                .find(|l| !l.trim().is_empty()).unwrap_or("")
+                .chars().take(40).collect();
+            let summary = if preview.is_empty() {
+                format!("💭 {} lines", line_count)
+            } else {
+                format!("💭 {} lines · {}", line_count, preview)
+            };
+            parts.push(MsgContent::Block {
+                kind: BlockKind::Think,
+                summary,
+                collapsed: true,
+                detail: thinking,
+            });
+        }
+        // 仅保留 ToolCall 类型的 trace ids（与旧 reset_streaming 守卫语义一致）
+        let tool_ids: Vec<u64> = trace_ids.iter().copied()
+            .filter(|id| self.trace_events.iter().any(|e|
+                e.id == *id && matches!(e.kind, TraceKind::ToolCall { .. })
+            ))
+            .collect();
+        if !tool_ids.is_empty() {
+            parts.push(MsgContent::Trace {
+                event_ids: tool_ids,
+                collapsed: true,
+                expanded_event_ids: std::collections::HashSet::new(),
+            });
+        }
+        if !text.is_empty() {
+            parts.push(MsgContent::Stream(text));
+        }
+        if parts.is_empty() {
+            return false;
+        }
+        self.add_message(Message::new_session(parts, &ts));
+        true
     }
 
     pub fn add_message(&mut self, msg: Message) {
         // User 消息递增 turn_count（用于统计对话轮次）
         if msg.role == MsgRole::User {
             self.turn_count += 1;
+        }
+
+        // V42-B C-1 修复：写入 state.cards 桥接
+        //   渲染层（render_cards）只读 state.cards，不读 state.messages
+        //   原 add_message 仅写 state.messages → 用户键入消息在 V42-B 不可见
+        //   桥接策略：保留 state.messages 写入（向后兼容 31 个 deprecation 调用方），
+        //   同时把 User 消息的纯文本提取后写入 state.cards，触发 UserCard 渲染
+        //   文本提取：User 消息的 parts[0] 通常为 MsgContent::Stream(text)（见 Message::new_user）
+        if msg.role == MsgRole::User {
+            let text = msg.parts.iter()
+                .find_map(|p| match p {
+                    MsgContent::Stream(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("")
+                .to_string();
+            crate::tui::cards::writer::push_user_message(self, &text, &msg.time);
         }
         // Phase2 性能优化: Expert 消息缓存去重名
         if let MsgRole::Expert(ref name) = msg.role {
@@ -3540,15 +3811,12 @@ impl AppState {
         // 内部有 2s 抑制窗保护连续输入场景，不会真正打断用户。
         let from_agent = !matches!(msg.role, MsgRole::User);
         self.messages.push_back(msg);
-        // V40 修复：新消息加入时必须失效 base 渲染缓存
-        // 引用关系：components/mod.rs V40 分区渲染路径依赖 cached_base_msg_count 判断缓存新鲜度
-        // 漏清导致非 streaming 消息（slash command / system note）被"吞"——渲染层用旧缓存不包含新行
-        self.cached_base_lines.borrow_mut().clear();
-        self.cached_base_msg_count.set(0);
+        // V42-B: cached_base_lines + cached_base_msg_count 已删除
+        // 旧 V40 失效逻辑: V42-B 无 base 渲染缓存 (render_cards 每帧重建, 无 L0/L1/L2 三级缓存)
         if from_agent {
             self.try_magnet_focus(Focus::Panel, PanelSection::Timeline);
         }
-        self.rendered_lines_dirty.set(true);
+        self.mark_render_dirty();
         self.stream_cursor = 0; // 新消息触发打字机重置
         // V29.15 (B2/B12 续修): scroll 不再被主动重置——尊重用户当前浏览位置
         //   原代码: streaming 期间 scroll=0 强制跟底部 → 与 V29.5 渲染层"streaming 不强制 0"
@@ -3738,7 +4006,7 @@ impl AppState {
             InputState::Thinking | InputState::Executing | InputState::Outputting => {
                 self.theme.accent
             }
-            InputState::Paused => self.theme.semantic_fg(crate::tui::theme::SemanticIntent::Warning),
+            InputState::Paused => self.theme.semantic_fg(abacus_ui_kit::SemanticIntent::Warning),
             InputState::Editor => self.theme.accent,
         }
     }
@@ -4102,15 +4370,22 @@ mod tests {
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.push_trace("llm", EventLevel::Info, TraceKind::Thinking { text: "x".into(), lines: 1 });
         state.streaming_trace_ids.push(id);
-        state.streaming_text = "partial".into();
-        state.streaming_thinking = "thinking".into();
+        // V42-B: 用 CardStream 管道设置内容，而非直接写 V40 字段
+        state.begin_streaming_session();
+        if let Some(llm) = state.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(
+            state.cards.active_id().unwrap()
+        ) {
+            llm.append_reply("partial");
+            llm.append_thinking("thinking");
+        }
 
         state.reset_streaming();
 
         assert_eq!(state.trace_events.len(), 1, "trace_events 必须保留(SSOT)");
         assert_eq!(state.next_trace_id, 1, "next_trace_id 不应回退");
-        assert!(state.streaming_text.is_empty());
-        assert!(state.streaming_thinking.is_empty());
+        // V42-B: CardStream 被 reset 清空，但 V40 字段不再由生产代码写入
+        assert!(state.active_llm_text().is_empty(), "active_llm_text 应被 reset 清空");
+        assert!(state.active_llm_thinking().is_empty(), "active_llm_thinking 应被 reset 清空");
         assert!(state.streaming_trace_ids.is_empty(), "streaming_trace_ids 兜底清空");
     }
 
@@ -4305,9 +4580,14 @@ mod tests {
     fn reset_streaming_clears_all_fields() {
         let mut state = AppState::new(AbacusMode::Clarify);
         // 模拟流式累积状态
-        state.is_streaming = true;
-        state.streaming_text = "partial output".into();
-        state.streaming_thinking = "partial reasoning".into();
+        state.begin_streaming_session();
+        // V42-B: 通过 CardStream 设置内容
+        if let Some(llm) = state.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(
+            state.cards.active_id().unwrap()
+        ) {
+            llm.append_reply("partial output");
+            llm.append_thinking("partial reasoning");
+        }
         state.streaming_tools.push(("read_file".into(), StreamingToolStatus::Running, None, 0));
         state.streaming_timeline.push(TimelineEntry::Tool {
             name: "read_file".into(), context: String::new(),
@@ -4317,9 +4597,10 @@ mod tests {
 
         state.reset_streaming();
 
-        assert!(!state.is_streaming, "is_streaming 应被清空");
-        assert!(state.streaming_text.is_empty(), "streaming_text 应被清空");
-        assert!(state.streaming_thinking.is_empty(), "streaming_thinking 应被清空");
+        assert!(!state.is_streaming_active(), "is_streaming 应被清空");
+        // V42-B: CardStream 内容被 reset 清空
+        assert!(state.active_llm_text().is_empty(), "active_llm_text 应被清空");
+        assert!(state.active_llm_thinking().is_empty(), "active_llm_thinking 应被清空");
         assert!(state.streaming_tools.is_empty(), "streaming_tools 应被清空");
         assert!(state.streaming_timeline.is_empty(), "streaming_timeline 应被清空");
     }
@@ -4332,7 +4613,155 @@ mod tests {
         state.reset_streaming();
         state.reset_streaming();
         // 默认状态已是 reset 状态，多次调用仍应保持
-        assert!(!state.is_streaming);
-        assert!(state.streaming_text.is_empty());
+        assert!(!state.is_streaming_active());
+        assert!(state.active_llm_text().is_empty());
+    }
+
+    // ─── V42-B streaming text/thinking helpers ──────────────────────
+
+    #[test]
+    fn active_llm_text_empty_when_no_active() {
+        let state = AppState::new(AbacusMode::Clarify);
+        assert_eq!(state.active_llm_text(), "");
+        assert_eq!(state.active_llm_thinking(), "");
+    }
+
+    #[test]
+    fn active_llm_text_returns_card_reply_text() {
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test-model", "high");
+        card.append_reply("hello ");
+        card.append_reply("world");
+        state.cards.push_active(Box::new(card));
+        assert_eq!(state.active_llm_text(), "hello world");
+    }
+
+    #[test]
+    fn active_llm_thinking_returns_card_thinking() {
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test-model", "high");
+        card.append_thinking("step 1: ");
+        card.append_thinking("analyze");
+        state.cards.push_active(Box::new(card));
+        assert_eq!(state.active_llm_thinking(), "step 1: analyze");
+    }
+
+    #[test]
+    fn active_llm_thinking_empty_when_card_has_none() {
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        let card = LlmCard::new(id, "test-model", "high");
+        // No append_thinking → thinking is None
+        state.cards.push_active(Box::new(card));
+        assert_eq!(state.active_llm_thinking(), "");
+        // reply_text is empty by default
+        assert_eq!(state.active_llm_text(), "");
+    }
+
+    #[test]
+    fn active_llm_text_empty_when_active_is_not_llm() {
+        use crate::tui::cards::AbacusCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        // Push a non-LlmCard (AbacusCard) as active
+        state.cards.push_active(Box::new(AbacusCard::new(id, "tool")));
+        // active_llm_text should return empty since it's not an LlmCard
+        assert_eq!(state.active_llm_text(), "");
+        assert_eq!(state.active_llm_thinking(), "");
+    }
+
+    // ─── V42-B last_llm_text/thinking (for finalize path) ─────────
+
+    #[test]
+    fn last_llm_text_empty_when_no_llm_card() {
+        let state = AppState::new(AbacusMode::Clarify);
+        assert_eq!(state.last_llm_text(), "");
+        assert_eq!(state.last_llm_thinking(), "");
+    }
+
+    #[test]
+    fn last_llm_text_finds_after_finish() {
+        // 模拟 finalize 场景：LlmCard 已被 finish_active() 标记为 Static
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test-model", "high");
+        card.append_reply("first response");
+        card.append_thinking("first reasoning");
+        state.cards.push_active(Box::new(card));
+        // Simulate the writer's Complete/ToolEnd behavior
+        state.cards.finish_active();
+        // Now active_id is None, but the LlmCard is still in the stream
+        assert!(state.cards.active_id().is_none());
+        // last_llm_* should still find the card and return its text
+        assert_eq!(state.last_llm_text(), "first response");
+        assert_eq!(state.last_llm_thinking(), "first reasoning");
+    }
+
+    #[test]
+    fn last_llm_text_picks_most_recent() {
+        // 多次 LlmCard（多轮）：应返回最后一张
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        // Turn 1
+        let id1 = state.cards.alloc_id();
+        let mut card1 = LlmCard::new(id1, "model", "high");
+        card1.append_reply("first turn");
+        state.cards.push_active(Box::new(card1));
+        state.cards.finish_active();
+        // Turn 2
+        let id2 = state.cards.alloc_id();
+        let mut card2 = LlmCard::new(id2, "model", "high");
+        card2.append_reply("second turn");
+        state.cards.push_active(Box::new(card2));
+        state.cards.finish_active();
+        assert_eq!(state.last_llm_text(), "second turn");
+    }
+
+    #[test]
+    fn last_llm_text_skips_non_llm_cards() {
+        use crate::tui::cards::{AbacusCard, LlmCard};
+        let mut state = AppState::new(AbacusMode::Clarify);
+        // LlmCard first
+        let id1 = state.cards.alloc_id();
+        let mut card1 = LlmCard::new(id1, "m", "h");
+        card1.append_reply("llm text");
+        state.cards.push_active(Box::new(card1));
+        state.cards.finish_active();
+        // Then AbacusCard (tool result) — should be skipped
+        let id2 = state.cards.alloc_id();
+        state.cards.push_active(Box::new(AbacusCard::new(id2, "tool")));
+        state.cards.finish_active();
+        // last_llm_text should still return the LlmCard text, not nothing
+        assert_eq!(state.last_llm_text(), "llm text");
+    }
+
+    #[test]
+    fn take_last_llm_text_clears_card() {
+        // 用于 fatal network 错误时 take-and-store
+        use crate::tui::cards::LlmCard;
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let id = state.cards.alloc_id();
+        let mut card = LlmCard::new(id, "m", "h");
+        card.append_reply("partial text");
+        state.cards.push_active(Box::new(card));
+        state.cards.finish_active();
+
+        let taken = state.take_last_llm_text();
+        assert_eq!(taken, "partial text");
+        // After take, the card is still in stream but its reply_text is empty
+        assert_eq!(state.last_llm_text(), "");
+    }
+
+    #[test]
+    fn take_last_llm_text_empty_when_no_llm_card() {
+        let mut state = AppState::new(AbacusMode::Clarify);
+        let taken = state.take_last_llm_text();
+        assert_eq!(taken, "");
     }
 }

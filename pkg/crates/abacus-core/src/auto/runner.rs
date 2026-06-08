@@ -329,7 +329,7 @@ async fn build_health(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto::pipeline::{Pipeline, Step, StepKind};
+    use crate::auto::pipeline::Pipeline;
 
     #[tokio::test]
     async fn test_runner_spawn_and_shutdown() {

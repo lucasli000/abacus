@@ -1,0 +1,83 @@
+# ============================================================
+# AbacusCode 供应商配置
+# ============================================================
+#
+# 文件位置: ~/.abacus/provider.toml
+# 这是 LLM 供应商的唯一配置入口
+#
+# 旧版 llm.* 配置键已废弃，请迁移到本文件
+#
+# ============================================================
+
+# DeepSeek
+[[providers]]
+id = "deepseek"
+type = "deepseek"
+api_key = "env:DEEPSEEK_API_KEY"     # 从环境变量读取
+base_url = "https://api.deepseek.com"
+
+# OpenAI
+# [[providers]]
+# id = "openai"
+# type = "openai-compatible"
+# api_key = "env:OPENAI_API_KEY"
+# base_url = "https://api.openai.com/v1"
+
+# Anthropic
+# [[providers]]
+# id = "anthropic"
+# type = "anthropic"
+# api_key = "env:ANTHROPIC_API_KEY"
+
+# 本地 Ollama
+# [[providers]]
+# id = "ollama"
+# type = "openai-compatible"
+# base_url = "http://localhost:11434/v1"
+# api_key = ""
+
+# 自定义 OpenAI-compatible
+# [[providers]]
+# id = "custom"
+# type = "openai-compatible"
+# api_key = "env:CUSTOM_API_KEY"
+# base_url = "https://api.custom.com/v1"
+
+# ============================================================
+# 模型配置 (可选)
+# ============================================================
+#
+# 每个 provider 可以配置多个 model:
+#
+# [[providers]]
+# id = "deepseek"
+# type = "deepseek"
+# api_key = "env:DEEPSEEK_API_KEY"
+#
+# [[providers.models]]
+# name = "deepseek-v4-flash"
+# context_window = 1000000
+# max_tokens = 384000
+# temperature = 0.6
+#
+# [[providers.models]]
+# name = "deepseek-v4-pro"
+# context_window = 1000000
+# max_tokens = 384000
+# temperature = 0.6
+
+# ============================================================
+# api_key 语法
+# ============================================================
+#
+# 直接值:
+#   api_key = "sk-abc123..."
+#
+# 环境变量引用:
+#   api_key = "env:MY_API_KEY"
+#
+# 空值 (如 local ollama):
+#   api_key = ""
+#
+# 无 key (某些 local provider):
+#   省略 api_key 字段

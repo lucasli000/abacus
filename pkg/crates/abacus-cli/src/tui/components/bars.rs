@@ -12,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
 use crate::tui::i18n::t;
 use crate::tui::state::{AppState, Focus, InputState};
-use crate::tui::theme::{SemanticIntent, Strength, TextRole};
+use abacus_ui_kit::{SemanticIntent, Strength, TextRole};
 use crate::tui::util::display_width;
 
 use super::format_duration_ms;

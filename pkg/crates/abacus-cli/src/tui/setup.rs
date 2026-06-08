@@ -33,43 +33,120 @@ enum ProviderKind {
     DeepSeek,
     OpenAI,
     Anthropic,
-    Dashscope,    // 阿里云通义千问
-    Moonshot,     // 月之暗面 Kimi
-    Zhipu,        // 智谱 GLM
-    SiliconFlow,  // 硅基流动
-    Groq,         // Groq 快速推理
-    Volcengine,   // 火山引擎方舟（豆包）
-    Tencent,      // 腾讯云混元
-    MiniMax,      // MiniMax
-    Yi,           // 零一万物
-    Baichuan,     // 百川
-    Ollama,       // 本地 Ollama
-    Generic,      // 其他 OpenAI 兼容
+    Dashscope,        // 阿里云百炼（兼容模式）
+    Moonshot,         // 月之暗面 Kimi
+    Zhipu,            // 智谱 GLM（通用 API）
+    ZhipuCoding,      // 智谱 GLM（Coding Plan）
+    SiliconFlow,      // 硅基流动
+    Groq,             // Groq 快速推理
+    Volcengine,       // 火山引擎方舟（通用 API）
+    VolcengineCoding, // 火山引擎方舟（Coding Plan）
+    Tencent,          // 腾讯云混元
+    MiniMax,          // MiniMax
+    Yi,               // 零一万物
+    Baichuan,         // 百川
+    Ollama,           // 本地 Ollama
+    OpenCodeZen,      // OpenCode Zen（模型网关）
+    Custom,           // 自定义 OpenAI 兼容
 }
 
 impl ProviderKind {
+    /// 从 URL 自动检测 Provider（基于域名特征，避免过度硬编码）
     fn detect(base_url: &str) -> Self {
         let lower = base_url.to_lowercase();
-        // 优先级：精确域名特征 > 路径特征 > 通用兜底
-        if lower.contains("deepseek")                                       { return ProviderKind::DeepSeek; }
-        if lower.contains("anthropic") || lower.contains("claude")         { return ProviderKind::Anthropic; }
-        if lower.contains("dashscope") || lower.contains("aliyun") || lower.contains("bailian") { return ProviderKind::Dashscope; }
-        if lower.contains("moonshot")  || lower.contains("kimi")           { return ProviderKind::Moonshot; }
-        if lower.contains("bigmodel")  || lower.contains("zhipu")          { return ProviderKind::Zhipu; }
-        if lower.contains("siliconflow")                                    { return ProviderKind::SiliconFlow; }
-        if lower.contains("groq")                                           { return ProviderKind::Groq; }
-        // 火山引擎方舟：ark.cn-* / volces.com / volcengine
-        if lower.contains("volces") || lower.contains("volcengine") || lower.contains("ark.cn") {
+        // 提取 host 部分用于精确匹配（避免路径中的误匹配）
+        let host = lower.split("://").nth(1).unwrap_or(&lower).split('/').next().unwrap_or("");
+        let host_no_port = host.split(':').next().unwrap_or(host);
+
+        // 精确域名后缀匹配（按优先级排序）
+        if host_no_port.ends_with("deepseek.com")              { return ProviderKind::DeepSeek; }
+        if host_no_port.ends_with("anthropic.com") || host_no_port.ends_with("claude.com") { return ProviderKind::Anthropic; }
+        if host_no_port.ends_with("moonshot.cn")                { return ProviderKind::Moonshot; }
+        if host_no_port.ends_with("bigmodel.cn") {
+            // 区分通用 API 和 Coding Plan
+            if lower.contains("/coding/") { return ProviderKind::ZhipuCoding; }
+            return ProviderKind::Zhipu;
+        }
+        if host_no_port.ends_with("dashscope.aliyuncs.com")     { return ProviderKind::Dashscope; }
+        if host_no_port.ends_with("siliconflow.cn")             { return ProviderKind::SiliconFlow; }
+        if host_no_port.ends_with("groq.com")                   { return ProviderKind::Groq; }
+        if host_no_port.ends_with("volces.com") || host_no_port.ends_with("volcengine.com") {
+            // 区分通用 API 和 Coding Plan
+            if lower.contains("/coding/") { return ProviderKind::VolcengineCoding; }
             return ProviderKind::Volcengine;
         }
-        if lower.contains("hunyuan") || lower.contains("tencent")          { return ProviderKind::Tencent; }
-        if lower.contains("minimax")                                        { return ProviderKind::MiniMax; }
-        if lower.contains("lingyiwanwu") || lower.contains("01.ai")        { return ProviderKind::Yi; }
-        if lower.contains("baichuan")                                       { return ProviderKind::Baichuan; }
-        // Ollama 本地：localhost:11434 或含 "ollama"
-        if lower.contains("localhost:11434") || lower.contains("ollama")   { return ProviderKind::Ollama; }
-        if lower.contains("openai")                                         { return ProviderKind::OpenAI; }
-        ProviderKind::Generic
+        if host_no_port.ends_with("hunyuan.cloud.tencent.com") || host_no_port.ends_with("tencent.com") {
+            return ProviderKind::Tencent;
+        }
+        if host_no_port.ends_with("minimax.chat")               { return ProviderKind::MiniMax; }
+        if host_no_port.ends_with("lingyiwanwu.com") || host_no_port.ends_with("01.ai") {
+            return ProviderKind::Yi;
+        }
+        if host_no_port.ends_with("baichuan-ai.com")            { return ProviderKind::Baichuan; }
+        // OpenCode Zen
+        if host_no_port.ends_with("opencode.ai")                { return ProviderKind::OpenCodeZen; }
+        // Ollama 本地
+        if host_no_port.starts_with("localhost:") || host_no_port.contains("ollama") {
+            return ProviderKind::Ollama;
+        }
+        if host_no_port.ends_with("openai.com")                 { return ProviderKind::OpenAI; }
+        // 兜底：路径包含关键词（兼容代理/镜像站）
+        if lower.contains("dashscope")                          { return ProviderKind::Dashscope; }
+        if lower.contains("minimax")                            { return ProviderKind::MiniMax; }
+        ProviderKind::Custom
+    }
+
+    /// 各 Provider 官方 API Base URL（默认推荐）
+    fn default_base_url(&self) -> &'static str {
+        match self {
+            ProviderKind::DeepSeek    => "https://api.deepseek.com",
+            ProviderKind::OpenAI      => "https://api.openai.com/v1",
+            ProviderKind::Anthropic   => "https://api.anthropic.com",
+            ProviderKind::Dashscope   => "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ProviderKind::Moonshot    => "https://api.moonshot.cn/v1",
+            ProviderKind::Zhipu       => "https://open.bigmodel.cn/api/paas/v4",
+            ProviderKind::ZhipuCoding => "https://open.bigmodel.cn/api/coding/paas/v4",
+            ProviderKind::SiliconFlow => "https://api.siliconflow.cn/v1",
+            ProviderKind::Groq        => "https://api.groq.com/openai/v1",
+            ProviderKind::Volcengine  => "https://ark.cn-beijing.volces.com/api/v3",
+            ProviderKind::VolcengineCoding => "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ProviderKind::Tencent     => "https://api.hunyuan.cloud.tencent.com/v1",
+            ProviderKind::MiniMax     => "https://api.minimax.chat/v1",
+            ProviderKind::Yi          => "https://api.lingyiwanwu.com/v1",
+            ProviderKind::Baichuan    => "https://api.baichuan-ai.com/v1",
+            ProviderKind::Ollama      => "http://localhost:11434/v1",
+            ProviderKind::OpenCodeZen => "https://opencode.ai/zen/v1",
+            ProviderKind::Custom      => "",
+        }
+    }
+
+    /// Provider 已知 URL 变体（coding plan / token plan / 通用 API 等）
+    ///
+    /// 用于 setup 向导展示可选端点，用户可按需选择
+    fn url_variants(&self) -> &[(&str, &str)] {
+        match self {
+            ProviderKind::Zhipu | ProviderKind::ZhipuCoding => &[
+                ("通用 API", "https://open.bigmodel.cn/api/paas/v4"),
+                ("Coding Plan", "https://open.bigmodel.cn/api/coding/paas/v4"),
+            ],
+            ProviderKind::Dashscope => &[
+                ("兼容模式", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                ("百炼 API", "https://dashscope.aliyuncs.com/api/v1"),
+            ],
+            ProviderKind::Volcengine | ProviderKind::VolcengineCoding => &[
+                ("通用 API", "https://ark.cn-beijing.volces.com/api/v3"),
+                ("Coding Plan (OpenAI)", "https://ark.cn-beijing.volces.com/api/coding/v3"),
+                ("Coding Plan (Anthropic)", "https://ark.cn-beijing.volces.com/api/coding"),
+            ],
+            ProviderKind::Ollama => &[
+                ("本地", "http://localhost:11434/v1"),
+                ("局域网", "http://0.0.0.0:11434/v1"),
+            ],
+            ProviderKind::OpenCodeZen => &[
+                ("Zen API", "https://opencode.ai/zen/v1"),
+            ],
+            _ => &[],
+        }
     }
 
     fn label(&self) -> &'static str {
@@ -79,16 +156,19 @@ impl ProviderKind {
             ProviderKind::Anthropic   => "Anthropic API",
             ProviderKind::Dashscope   => "阿里云百炼",
             ProviderKind::Moonshot    => "Moonshot (Kimi)",
-            ProviderKind::Zhipu       => "智谱 (GLM)",
+            ProviderKind::Zhipu       => "智谱 GLM (通用)",
+            ProviderKind::ZhipuCoding => "智谱 GLM (Coding Plan)",
             ProviderKind::SiliconFlow => "SiliconFlow",
             ProviderKind::Groq        => "Groq",
-            ProviderKind::Volcengine  => "火山引擎方舟",
+            ProviderKind::Volcengine  => "火山引擎方舟 (通用)",
+            ProviderKind::VolcengineCoding => "火山引擎方舟 (Coding Plan)",
             ProviderKind::Tencent     => "腾讯云混元",
             ProviderKind::MiniMax     => "MiniMax",
             ProviderKind::Yi          => "零一万物",
             ProviderKind::Baichuan    => "百川",
             ProviderKind::Ollama      => "Ollama (本地)",
-            ProviderKind::Generic     => "OpenAI Compatible",
+            ProviderKind::OpenCodeZen => "OpenCode Zen",
+            ProviderKind::Custom      => "自定义 (OpenAI Compatible)",
         }
     }
 
@@ -100,66 +180,77 @@ impl ProviderKind {
             ProviderKind::Dashscope   => "dashscope",
             ProviderKind::Moonshot    => "moonshot",
             ProviderKind::Zhipu       => "zhipu",
+            ProviderKind::ZhipuCoding => "zhipu",
             ProviderKind::SiliconFlow => "siliconflow",
             ProviderKind::Groq        => "groq",
             ProviderKind::Volcengine  => "volcengine",
+            ProviderKind::VolcengineCoding => "volcengine",
             ProviderKind::Tencent     => "tencent",
             ProviderKind::MiniMax     => "minimax",
             ProviderKind::Yi          => "yi",
             ProviderKind::Baichuan    => "baichuan",
-            ProviderKind::Ollama      | ProviderKind::Generic => "openai",
+            ProviderKind::Ollama      | ProviderKind::Custom => "openai",
+            ProviderKind::OpenCodeZen => "openai",
         }
     }
 
     fn default_model(&self) -> &str {
+        // 仅作 API 未返回模型时的兜底，setup 向导会自动从 /models 接口获取最新模型
+        // 最后更新：2026-06-08
         match self {
-            ProviderKind::DeepSeek    => "deepseek-v4-flash",
+            ProviderKind::DeepSeek    => "deepseek-v4-pro",
             ProviderKind::OpenAI      => "gpt-4o",
-            ProviderKind::Anthropic   => "claude-sonnet-4-5",
-            ProviderKind::Dashscope   => "qwen-max",
-            ProviderKind::Moonshot    => "moonshot-v1-128k",
-            ProviderKind::Zhipu       => "glm-4-flash",
-            ProviderKind::SiliconFlow => "deepseek-v4-flash",
+            ProviderKind::Anthropic   => "claude-sonnet-4-20250514",
+            ProviderKind::Dashscope   => "qwen3.7-max",
+            ProviderKind::Moonshot    => "kimi-k2.6",
+            ProviderKind::Zhipu       => "glm-5.1",
+            ProviderKind::ZhipuCoding => "glm-5.1",
+            ProviderKind::SiliconFlow => "deepseek-v4-pro",
             ProviderKind::Groq        => "llama-3.3-70b-versatile",
-            ProviderKind::Volcengine  => "doubao-1-5-pro-32k",
+            ProviderKind::Volcengine  => "deepseek-v4-pro",
+            ProviderKind::VolcengineCoding => "deepseek-v4-pro",
             ProviderKind::Tencent     => "hunyuan-turbo",
-            ProviderKind::MiniMax     => "abab6.5s-chat",
+            ProviderKind::MiniMax     => "MiniMax-M3",
             ProviderKind::Yi          => "yi-lightning",
-            ProviderKind::Baichuan    => "Baichuan4-Air",
-            ProviderKind::Ollama      => "llama3.2",
-            ProviderKind::Generic     => "",
+            ProviderKind::Baichuan    => "Baichuan4",
+            ProviderKind::Ollama      => "llama3.3",
+            ProviderKind::OpenCodeZen => "opencode/deepseek-v4-flash",
+            ProviderKind::Custom      => "",
         }
     }
 
     fn is_openai_compatible(&self) -> bool {
-        // Anthropic 使用独有协议写入配置；其余（含 Ollama、各云厂商）均用 OpenAI 兼容格式
         !matches!(self, ProviderKind::Anthropic)
     }
 
-    /// provider 层级的上下文提示（API 未返回 context_window 时的兜底）
     fn typical_max_context(&self) -> &'static str {
+        // 最后更新：2026-06-08
         match self {
             ProviderKind::DeepSeek    => "最大 1M（V4 系列）",
             ProviderKind::OpenAI      => "最大 128k（GPT-4o）",
-            ProviderKind::Anthropic   => "最大 200k（Claude 3.x）",
-            ProviderKind::Dashscope   => "最大 1M（Qwen-Long）",
-            ProviderKind::Moonshot    => "最大 128k",
-            ProviderKind::Zhipu       => "最大 128k（GLM-4）",
+            ProviderKind::Anthropic   => "最大 200k（Claude Sonnet 4）",
+            ProviderKind::Dashscope   => "最大 1M（Qwen3.7）",
+            ProviderKind::Moonshot    => "最大 256k（Kimi K2.6）",
+            ProviderKind::Zhipu       => "最大 200k（GLM-5.1）",
+            ProviderKind::ZhipuCoding => "最大 200k（GLM-5.1 Coding Plan）",
             ProviderKind::SiliconFlow => "按代理模型规格",
             ProviderKind::Groq        => "最大 128k",
-            ProviderKind::Volcengine  => "最大 128k（豆包系列）",
+            ProviderKind::Volcengine  => "最大 1M（deepseek-v4-pro）",
+            ProviderKind::VolcengineCoding => "最大 1M（deepseek-v4-pro Coding Plan）",
             ProviderKind::Tencent     => "最大 256k（混元）",
-            ProviderKind::MiniMax     => "最大 1M（MiniMax-01）",
+            ProviderKind::MiniMax     => "最大 1M（MiniMax-M3）",
             ProviderKind::Yi          => "最大 200k",
             ProviderKind::Baichuan    => "最大 128k",
-            ProviderKind::Ollama      => "按加载模型规格",
-            ProviderKind::Generic     => "按模型规格",
+            ProviderKind::Ollama      => "取决于本地模型",
+            ProviderKind::OpenCodeZen => "取决于模型（Zen 网关）",
+            ProviderKind::Custom      => "取决于模型",
         }
     }
 }
 
-/// 建议的 API URL
+/// 建议的 API URL（默认 DeepSeek，检测到其他 Provider 时动态切换）
 const SUGGESTED_URL: &str = "https://api.deepseek.com";
+const SUGGESTED_LABEL: &str = "DeepSeek";
 
 struct SetupState {
     focus: FocusField,
@@ -190,6 +281,18 @@ struct SetupState {
     feature_toggles: [bool; 4],
     /// 可选功能列表中当前选中的 index
     feature_focus: usize,
+    /// API 验证状态
+    api_validation: ApiValidation,
+    /// 验证失败信息
+    validation_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ApiValidation {
+    Idle,         // 未验证
+    Validating,   // 验证中...
+    Passed,       // 验证通过
+    Failed,       // 验证失败
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -233,6 +336,8 @@ impl SetupState {
             features_page: false,
             feature_toggles: [false, false, false, false],
             feature_focus: 0,
+            api_validation: ApiValidation::Idle,
+            validation_error: None,
         }
     }
     fn provider(&self) -> ProviderKind {
@@ -478,6 +583,8 @@ fn ensure_default_configs() -> Result<(), String> {
     use abacus_core::paths;
     let dir = config_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建配置目录失败: {e}"))?;
+    // 确保数据目录存在（数据库文件统一存放）
+    std::fs::create_dir_all(paths::data_dir()).map_err(|e| format!("创建数据目录失败: {e}"))?;
 
     // security.toml — 安全 / MCIP 权限 / 沙箱
     let security_path = paths::security_toml();
@@ -544,6 +651,182 @@ fn ensure_default_configs() -> Result<(), String> {
 "#;
         std::fs::write(&mcp_path, template)
             .map_err(|e| format!("写入 mcp_servers.toml 失败: {e}"))?;
+    }
+
+    // abacusbr.md — 行为规范（coding 子规范内联）
+    let abacusbr_path = dir.join("abacusbr.md");
+    if !abacusbr_path.exists() {
+        let template = r#"# Abacus 行为规范 (abacusbr.md)
+#
+# 本文件定义 Abacus 的核心行为规则和 coding 子规范。
+# 加载优先级：~/.abacus/abacusbr.md > <cwd>/abacusbr.md > <cwd>/abacusbr.local.md
+# 子场景按 TaskKind 自动筛选（## core 始终加载，## coding / ## debug 等按需加载）
+
+## core
+
+### 基本原则
+- **安全第一**: 修改文件前先备份，删除前先确认
+- **最小权限**: 只访问任务需要的文件和目录
+- **渐进式修改**: 小步快跑，每步可验证可回滚
+- **用户确认**: 破坏性操作前必须获得用户确认
+
+### 交互风格
+- **结论先行**: 直接给出答案/执行，不要开场铺垫、确认前言
+- **语言一致**: 默认中文；技术术语、代码、路径、专有名词保留英文
+- **禁止静默推断**: 不确定时标注 [待确认]，不假装知道
+- **实时反馈**: 进度必须实时反映当前真实状态，不允许静默挂起或展示过期状态
+- **模糊量词先量化**: "大概"、"可能"、"一般" → 先落到明确阈值再执行
+
+### 沟通规范
+- 回答简洁，避免冗余解释
+- 错误信息要具体，包含文件路径和行号
+- 代码变更后说明影响范围
+- 不确定时主动询问，不猜测
+
+### 工具使用
+- 优先使用专用工具（grep > bash grep, glob > bash find）
+- 批量操作前先小范围验证
+- 长命令加 timeout，避免阻塞
+- 禁止在代码中硬编码 API Key / Token
+
+### 记忆可信度评估
+加载或引用记忆/KB 时，多维权衡（非纯时间序）：
+- **时效性**: 超过 decay 周期未验证 → 降信任
+- **来源可信度**: 用户确认 > 工具验证 > 模型推断
+- **上下文相关性**: 跨域引用需显式标注来源
+- **结构依赖**: 高被引用节点修改前评估影响范围
+冲突解决：来源可信度 > 时效性 > 相关性；当前观察与记忆矛盾 → 信当前观察
+
+### 压缩规则
+- 禁止压缩：关键错误行号、API 状态码、推理转折点
+- 禁止压缩：用户指令、强验证记录、未解决问题
+- 压缩时必须声明："上下文已压缩——核心决策链已保留。"
+
+## coding
+
+### 代码风格
+- 遵循项目现有代码风格（看 neighboring files）
+- 不添加无意义注释（代码自解释优先）
+- 函数长度 ≤ 50 行，圈复杂度 ≤ 10
+- 变量命名清晰，避免缩写（除行业惯例如 URL, API, ID）
+
+### 变更规范
+- 修改前先理解上下文（读 imports, 看调用链）
+- 一次只改一件事（单一职责）
+- 新增 public API 必须有文档注释
+- 删除代码前确认无其他引用
+
+### 代码修改声明
+修改代码前必须声明：
+1. **修改内容**: 具体改什么
+2. **影响范围**: 哪些模块/功能受影响
+3. **验证方式**: 如何验证修改正确
+禁止：未声明就改代码；改完后遗漏交付清单
+
+### 复用 vs 重建决策
+禁止未经评估就复用或重建：
+1. **语义同构检查**: 现有实现的核心逻辑是否与当前需求同构
+2. **总成本评估**: 适配成本 + 耦合约束 + 未来分叉概率 vs 重建成本
+3. **结论**: 同构且总成本低 → 复用；表面相似但语义分叉 → 独立实现
+
+### Git 提交
+- 提交信息格式: `<type>(<scope>): <subject>`
+- type: feat / fix / refactor / docs / test / chore
+- scope: 模块名或功能域
+- subject: 祈使句，≤ 72 字符
+- body: 说明 why，不是 what
+
+### 测试规范
+- 新增功能必须有对应测试
+- 修复 bug 必须有回归测试
+- 测试命名: `test_<功能>_<场景>_<预期>`
+- 测试应独立，不依赖执行顺序
+
+### 错误处理
+- 不使用 `unwrap()` / `expect()` 在生产代码（测试除外）
+- 错误类型要具体，避免泛化 `Box<dyn Error>`
+- 错误信息包含上下文（路径、参数、状态）
+- 可恢复错误用 Result，不可恢复用 panic（仅限致命状态）
+
+### 性能意识
+- 热路径避免不必要的 clone / allocation
+- 大数据结构用引用而非值传递
+- 异步操作避免阻塞线程
+- 注意内存泄漏（循环引用、未释放资源）
+
+## debug
+
+### 调试流程
+1. 复现问题（最小输入）
+2. 定位根因（二分法、日志、断点）
+3. 修复验证（测试通过）
+4. 回归防护（新增测试用例）
+
+### 日志规范
+- 错误日志包含完整上下文
+- 警告日志用于可恢复异常
+- 信息日志用于关键状态变更
+- 调试日志用于开发调试（生产环境关闭）
+
+## refactor
+
+### 重构原则
+- 重构前确保测试通过
+- 小步重构，每步可编译可测试
+- 不改变外部行为（纯内部优化）
+- 重构后运行完整测试套件
+
+### 代码清理
+- 删除死代码（未使用的函数、变量、导入）
+- 合并重复逻辑（DRY）
+- 简化复杂条件（提取函数、early return）
+- 更新过时注释
+
+## security
+
+### 安全红线
+- 不在代码中硬编码密钥 / Token / 密码
+- 不在日志中输出敏感信息
+- 不在错误信息中暴露内部路径
+- 不绕过权限检查
+
+### 强验证场景
+以下场景必须独立验证，验证前禁止执行：
+1. 破坏性操作（删除文件、清空数据库、重置配置）
+2. 凭据相关（API Key、Token、密码）
+3. 规则变更（配置文件、权限、策略）
+4. 生产环境操作（部署、迁移、回滚）
+
+### D-HIL（人在回路）
+涉及以下领域时，执行前必须输出确认提示并等待用户确认：
+- **financial**: 支付、资金、订单、交易
+- **infra**: CI/CD、部署、防火墙、服务器
+- **auth**: 认证、凭据、token、权限
+格式：`[D-HIL: domain:<name>] 操作：<说明>，请确认继续。`
+禁止：以方案已确认跳过；子任务同等适用
+
+### 输入验证
+- 外部输入必须验证（用户输入、API 响应、文件内容）
+- 路径遍历防护（检查 `..` 和绝对路径）
+- 长度限制（防止 DoS）
+- 类型检查（防止注入）
+
+## performance
+
+### 性能优化
+- 先测量，后优化（避免过早优化）
+- 关注热路径（80/20 法则）
+- 基准测试验证改进效果
+- 文档化性能关键决策
+
+### 资源管理
+- 及时释放资源（RAII 模式）
+- 避免不必要的内存分配
+- 使用流式处理大数据
+- 设置超时防止无限等待
+"#;
+        std::fs::write(&abacusbr_path, template)
+            .map_err(|e| format!("写入 abacusbr.md 失败: {e}"))?;
     }
 
     Ok(())
@@ -624,7 +907,7 @@ fn save_provider_toml(
 /// 引用关系：被 render_setup 调用，传入 setup_theme()
 /// 设计意图：不同主题（light/dark/apple…）下视觉一致；不再"配置屏永远品牌深蓝色调，与最终主题脱节"
 fn disclaimer_lines(theme: &Theme) -> Vec<Line<'static>> {
-    use crate::tui::theme::{SemanticIntent, Strength};
+    use abacus_ui_kit::{SemanticIntent, Strength};
     let danger = theme.semantic_style(SemanticIntent::Danger, Strength::Strong);
     let warning = theme.semantic_style(SemanticIntent::Warning, Strength::Strong);
     let info = theme.semantic_style(SemanticIntent::Info, Strength::Strong);
@@ -653,7 +936,7 @@ fn disclaimer_lines(theme: &Theme) -> Vec<Line<'static>> {
     ]
 }
 
-use crate::tui::theme::Theme;
+use abacus_ui_kit::Theme;
 
 fn setup_theme() -> Theme {
     let mut t = Theme::init();
@@ -757,7 +1040,12 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
     let url_inner = url_block.inner(parts[4]);
     url_block.render(parts[4], f.buffer_mut());
 
-    let placeholder = "例如: https://api.openai.com/v1";
+    let placeholder = if state.base_url.is_empty() {
+        // 根据当前焦点显示上下文相关的占位提示
+        "输入 API URL（如 https://api.deepseek.com）"
+    } else {
+        "例如: https://api.openai.com/v1"
+    };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             if state.base_url.is_empty() { placeholder } else { &state.base_url },
@@ -832,9 +1120,18 @@ fn render_setup(f: &mut Frame, state: &SetupState) {
     };
     let model_title = format!("{}默认模型 (Tab 循环选择，可随时更改){}{}", model_focus, model_count, model_status);
     let model_display = if state.model_name.is_empty() {
-        let provider = state.provider();
-        let def = provider.default_model();
-        format!("默认: {}", def)
+        match state.model_fetch_status {
+            ModelFetchStatus::Fetching => "正在从 API 获取模型列表...".to_string(),
+            ModelFetchStatus::Done if !state.fetched_models.is_empty() => {
+                format!("已从 API 获取 {} 个模型，Tab 选择", state.fetched_models.len())
+            }
+            _ => {
+                let provider = state.provider();
+                let def = provider.default_model();
+                if def.is_empty() { "请输入模型名称".to_string() }
+                else { format!("兜底: {} (API 未返回)", def) }
+            }
+        }
     } else {
         state.model_name.clone()
     };
@@ -994,9 +1291,10 @@ fn sync_default_model(state: &mut SetupState) {
     const ALL_PROVIDERS: &[ProviderKind] = &[
         ProviderKind::DeepSeek, ProviderKind::OpenAI, ProviderKind::Anthropic,
         ProviderKind::Dashscope, ProviderKind::Moonshot, ProviderKind::Zhipu,
-        ProviderKind::SiliconFlow, ProviderKind::Groq, ProviderKind::Volcengine,
-        ProviderKind::Tencent, ProviderKind::MiniMax, ProviderKind::Yi,
-        ProviderKind::Baichuan, ProviderKind::Ollama, ProviderKind::Generic,
+        ProviderKind::ZhipuCoding, ProviderKind::SiliconFlow, ProviderKind::Groq,
+        ProviderKind::Volcengine, ProviderKind::VolcengineCoding, ProviderKind::Tencent,
+        ProviderKind::MiniMax, ProviderKind::Yi, ProviderKind::Baichuan,
+        ProviderKind::Ollama, ProviderKind::OpenCodeZen, ProviderKind::Custom,
     ];
     let is_still_default = state.model_name.is_empty()
         || ALL_PROVIDERS.iter().any(|p| state.model_name == p.default_model());
@@ -1144,6 +1442,80 @@ fn parse_models_response(json: &str) -> Vec<(String, Option<u64>)> {
     models
 }
 
+/// 验证 API 连接是否可用
+///
+/// ## 验证逻辑
+/// 1. 测试 base_url 是否可达
+/// 2. 测试 API Key 是否有效（通过 /models 接口）
+/// 3. 如果指定了模型，检查模型是否在列表中
+///
+/// ## 返回
+/// - Ok(())：验证通过
+/// - Err(String)：验证失败，返回错误信息
+fn validate_api_connection(base_url: &str, api_key: &str, model_name: &str) -> Result<(), String> {
+    if base_url.is_empty() {
+        return Err("API URL 不能为空".to_string());
+    }
+    if api_key.is_empty() {
+        return Err("API Key 不能为空".to_string());
+    }
+
+    // 测试连接：尝试获取模型列表
+    let models = fetch_model_list_sync(base_url, api_key);
+
+    if models.is_empty() {
+        // 可能是 URL 错误或 Key 无效
+        // 尝试直接访问 base_url 看是否可达
+        let test_url = format!("{}/models", base_url.trim_end_matches('/'));
+        match ureq::get(&test_url)
+            .set("Authorization", &format!("Bearer {}", api_key))
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == 401 || status == 403 {
+                    return Err("API Key 无效，请检查后重试".to_string());
+                } else if status >= 400 {
+                    return Err(format!("API 返回错误 {}: 请检查 URL 和 Key", status));
+                } else {
+                    // 连接成功但没有模型（可能是自定义 Provider）
+                    // 这种情况下允许继续
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("Connection refused") || err_str.contains("connect") {
+                    return Err(format!("无法连接到 {}，请检查 URL 是否正确", base_url));
+                } else if err_str.contains("timeout") || err_str.contains("Timeout") {
+                    return Err("连接超时，请检查网络或稍后重试".to_string());
+                } else if err_str.contains("dns") || err_str.contains("DNS") || err_str.contains("resolve") {
+                    return Err(format!("无法解析域名 {}，请检查 URL", base_url));
+                } else {
+                    return Err(format!("连接失败: {}", err_str));
+                }
+            }
+        }
+    }
+
+    // 如果指定了模型，检查模型是否可用
+    if !model_name.is_empty() {
+        let model_exists = models.iter().any(|(id, _)| id == model_name);
+        if !model_exists && !models.is_empty() {
+            // 模型不在列表中，但不阻断（可能是自定义模型名）
+            // 只在模型列表明确不包含时警告
+            tracing::warn!(
+                model = model_name,
+                available = models.len(),
+                "指定的模型不在 API 返回的模型列表中"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// 检查异步检索结果（非阻塞，每帧调用）
 fn poll_model_fetch(state: &mut SetupState) {
     if let Some(ref rx) = state.model_rx {
@@ -1164,6 +1536,12 @@ fn poll_model_fetch(state: &mut SetupState) {
                     if state.model_name.is_empty() {
                         if let Some(first) = state.fetched_models.first() {
                             state.model_name = first.clone();
+                            // 自动填充上下文大小（如果 API 返回了）
+                            if state.context_window.is_empty() {
+                                if let Some(&ctx) = state.model_contexts.get(&state.model_name) {
+                                    state.context_window = format!("{}", ctx / 1000);
+                                }
+                            }
                         }
                     }
                 }
@@ -1381,6 +1759,12 @@ fn handle_edit(state: &mut SetupState, key: KeyCode, key_modifiers: KeyModifiers
                         };
                         state.model_select_idx = next;
                         state.model_name = state.fetched_models[next].clone();
+                        // 自动填充上下文大小（如果 API 返回了）
+                        if state.context_window.is_empty() {
+                            if let Some(&ctx) = state.model_contexts.get(&state.model_name) {
+                                state.context_window = format!("{}", ctx / 1000);
+                            }
+                        }
                     } else if !state.base_url.is_empty() && !state.api_key.is_empty() {
                         // V41: URL+Key 已填但无模型列表 → 触发获取（而非直接跳走）
                         trigger_model_fetch(state);
@@ -1461,7 +1845,71 @@ pub fn run_setup(
         }
 
         if state.exit {
-            break;
+            // 验证 API 连接
+            state.api_validation = ApiValidation::Validating;
+            terminal.draw(|f| {
+                let area = f.area();
+                let theme = setup_theme();
+                Block::default()
+                    .style(Style::default().bg(theme.bg))
+                    .render(area, f.buffer_mut());
+                f.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        " ⟳ 正在验证 API 连接...",
+                        theme.semantic_style(abacus_ui_kit::SemanticIntent::Info, abacus_ui_kit::Strength::Strong),
+                    ))).alignment(Alignment::Center),
+                    area,
+                );
+            })?;
+
+            match validate_api_connection(&state.base_url, &state.api_key, &state.model_name) {
+                Ok(()) => {
+                    state.api_validation = ApiValidation::Passed;
+                    break; // 验证通过，退出循环保存配置
+                }
+                Err(e) => {
+                    state.api_validation = ApiValidation::Failed;
+                    state.validation_error = Some(e.clone());
+                    state.exit = false; // 重置 exit 状态，返回配置界面
+
+                    // 显示错误信息
+                    let theme = setup_theme();
+                    terminal.draw(|f| {
+                        let area = f.area();
+                        Block::default()
+                            .style(Style::default().bg(theme.bg))
+                            .render(area, f.buffer_mut());
+                        f.render_widget(
+                            Paragraph::new(vec![
+                                Line::from(Span::styled(
+                                    format!(" ✗ API 验证失败"),
+                                    theme.semantic_style(abacus_ui_kit::SemanticIntent::Danger, abacus_ui_kit::Strength::Strong),
+                                )),
+                                Line::raw(""),
+                                Line::from(Span::styled(
+                                    format!("   {}", e),
+                                    Style::default().fg(theme.text),
+                                )),
+                                Line::raw(""),
+                                Line::from(Span::styled(
+                                    "   按任意键返回配置...",
+                                    Style::default().fg(theme.muted),
+                                )),
+                            ]).alignment(Alignment::Center),
+                            area,
+                        );
+                    })?;
+
+                    // 等待用户按键后继续
+                    loop {
+                        if event::poll(Duration::from_millis(100))? {
+                            let _ = event::read()?;
+                            break;
+                        }
+                    }
+                    continue; // 返回配置循环
+                }
+            }
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -1532,7 +1980,7 @@ pub fn run_setup(
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         " ✓ 配置已保存，正在启动...",
-                        final_theme.semantic_style(crate::tui::theme::SemanticIntent::Success, crate::tui::theme::Strength::Strong),
+                        final_theme.semantic_style(abacus_ui_kit::SemanticIntent::Success, abacus_ui_kit::Strength::Strong),
                     ))).alignment(Alignment::Center),
                     area,
                 );

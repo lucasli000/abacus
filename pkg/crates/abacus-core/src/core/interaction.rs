@@ -474,9 +474,10 @@ impl MapAnalyzer {
         let mut decisions = Vec::new();
 
         // Try structured markers: [Decision: chosen=X, alternatives=[Y,Z], rationale="..."]
+        // Pattern is compile-time constant; failure indicates a bug, not runtime error.
         let marker_re = regex::Regex::new(
             r#"\[Decision:\s*chosen=([^,\]]+)(?:,\s*alternatives=\[([^\]]*)\])?(?:,\s*rationale="([^"]*)")?\]"#
-        ).unwrap();
+        ).expect("hard-coded Decision marker regex is valid");
         for cap in marker_re.captures_iter(output) {
             let chosen = cap.get(1).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
             let alternatives = cap.get(2).map(|m| {

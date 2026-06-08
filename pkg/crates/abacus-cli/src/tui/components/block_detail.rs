@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span};
 
 use crate::tui::markdown;
 use crate::tui::state::{BlockKind, TraceEvent, TraceKind, ToolStatus};
-use crate::tui::theme::{TextRole, Theme};
+use abacus_ui_kit::{TextRole, Theme};
 
 /// 按 BlockKind 渲染 Block detail 内容(默认无软上限,保持旧 V12 行为)
 ///

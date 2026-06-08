@@ -4,12 +4,13 @@ members = [
     "crates/abacus-types",
     "crates/abacus-core",
     "crates/abacus-orchestrator",
+    "crates/abacus-ui-kit",
     "crates/abacus-cli",
     "crates/abacus-server",
 ]
 
 [workspace.package]
-version = "1.5.0"
+version = "2.0.0"
 edition = "2021"
 license = "MIT"
 description = "Abacus — LLM Agent kernel: TUI Clarify→Plan→Team→Meeting DAG, CLI, and HTTP+SSE server"

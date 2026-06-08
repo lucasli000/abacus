@@ -94,12 +94,52 @@ impl ValidationGate {
 
     /// 加载 Abacus 默认规则集
     pub fn with_defaults(mut self) -> Self {
+        // ─── API Keys (Warning — 允许部分配置) ────────────────────────
         self.rules.push(Box::new(NonEmptyString { key: "llm.api_key", severity: Severity::Warning, label: "API Key" }));
         self.rules.push(Box::new(NonEmptyString { key: "llm.anthropic_api_key", severity: Severity::Warning, label: "Anthropic Key" }));
         self.rules.push(Box::new(NonEmptyString { key: "llm.openai_api_key", severity: Severity::Warning, label: "OpenAI Key" }));
+
+        // ─── [core] 核心参数 ──────────────────────────────────────────
         self.rules.push(Box::new(NumericRange { key: "core.max_turns", min: 1.0, max: 200.0 }));
         self.rules.push(Box::new(NumericRange { key: "core.temperature", min: 0.0, max: 2.0 }));
-        self.rules.push(Box::new(NumericRange { key: "core.max_tokens", min: 1.0, max: 1_000_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.max_tokens", min: 100.0, max: 1_000_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.max_tool_calls", min: 1.0, max: 1000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.max_escalations", min: 1.0, max: 100.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.context_window", min: 1000.0, max: 10_000_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.context_window_ratio", min: 0.1, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "core.tool_frequency_pruning_turns", min: 1.0, max: 100.0 }));
+
+        // ─── [budget] 资源预算 ────────────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "llm_budget.soft_threshold", min: 0.1, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "llm_budget.hard_threshold", min: 0.1, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "llm_budget.reject_threshold", min: 0.1, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "llm_budget.latency_window", min: 1.0, max: 100.0 }));
+
+        // ─── [server] 服务器 ──────────────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "server.max_sessions", min: 1.0, max: 100_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "server.rate_limit_per_sec", min: 1.0, max: 10_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "server.timeout_ceiling_secs", min: 60.0, max: 86_400.0 }));
+
+        // ─── [progressive] 渐进输出 ──────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "progressive.threshold_passthrough", min: 0.0, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "progressive.threshold_gated", min: 0.0, max: 1.0 }));
+        self.rules.push(Box::new(NumericRange { key: "progressive.checklist_timeout_secs", min: 10.0, max: 3600.0 }));
+        self.rules.push(Box::new(NumericRange { key: "progressive.max_checklist_items", min: 1.0, max: 20.0 }));
+
+        // ─── [subagent] 子代理 ────────────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "subagent.max_steps", min: 1.0, max: 100.0 }));
+        self.rules.push(Box::new(NumericRange { key: "subagent.max_tokens", min: 100.0, max: 100_000.0 }));
+        self.rules.push(Box::new(NumericRange { key: "subagent.max_duration_secs", min: 10.0, max: 3600.0 }));
+
+        // ─── [specialist] 专家 ────────────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "specialist.max_speeches", min: 1.0, max: 20.0 }));
+        self.rules.push(Box::new(NumericRange { key: "specialist.timeout_secs", min: 10.0, max: 3600.0 }));
+
+        // ─── [sandbox] 沙箱 ──────────────────────────────────────────
+        self.rules.push(Box::new(NumericRange { key: "sandbox.max_retries_per_step", min: 0.0, max: 10.0 }));
+        self.rules.push(Box::new(NumericRange { key: "sandbox.default_timeout_secs", min: 10.0, max: 3600.0 }));
+
+        // ─── 系统检查 ────────────────────────────────────────────────
         self.rules.push(Box::new(ConfigDirCheck));
         self
     }

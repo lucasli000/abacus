@@ -81,7 +81,7 @@ pub fn render_overlays(f: &mut Frame, state: &AppState, input_area: Rect, body_a
 pub fn render_body_and_input(f: &mut Frame, state: &AppState, frame: &StandardFrame) -> Rect {
     if state.panel_visible && !matches!(TerminalWidth::classify(frame.body.width), TerminalWidth::Narrow) {
         let main = layout::body_with_panel(frame.body);
-        components::render_messages_in_card(f, state, main.0, state.focus);
+        components::render_cards(f, state, main.0, state.focus);
         components::render_panel(f, state, main.1);
 
         let input_area = Rect {
@@ -95,7 +95,7 @@ pub fn render_body_and_input(f: &mut Frame, state: &AppState, frame: &StandardFr
         components::render_shortcuts_hints(f, state, shortcuts_area);
         input_area
     } else {
-        components::render_messages_in_card(f, state, frame.body, state.focus);
+        components::render_cards(f, state, frame.body, state.focus);
         let input_area = Rect {
             x: frame.body.x, width: frame.body.width, ..frame.input
         };

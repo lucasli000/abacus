@@ -10,7 +10,7 @@
 //! 生命周期：streaming 开始时 lazy 创建（首次 TextDelta），reset_streaming 时 drop
 
 use crate::tui::markdown::{self, StyledLine};
-use crate::tui::theme::Theme;
+use abacus_ui_kit::Theme;
 use mdstream::MdStream;
 
 /// 流式 Markdown 状态管理器
