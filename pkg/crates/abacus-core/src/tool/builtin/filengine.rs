@@ -1725,6 +1725,8 @@ async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // P1-4: 创建新进程组（便于超时后 kill 整组，包括子进程的子进程）
+        // process_group 在 Windows 上不可用，仅在 Unix 上使用
+        #[cfg(unix)]
         .process_group(0)
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
