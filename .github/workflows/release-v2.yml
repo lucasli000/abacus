@@ -53,7 +53,12 @@ jobs:
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             pkg-config \
-            libssl-dev
+            libssl-dev \
+            protobuf-compiler
+
+      - name: Install protobuf compiler (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install protobuf
 
       - name: Cache cargo registry
         uses: actions/cache@v4
