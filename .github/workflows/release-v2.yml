@@ -83,23 +83,22 @@ jobs:
           CARGO_TARGET_DIR: target
 
       - name: Strip binary (macOS/Linux)
+        working-directory: pkg
         if: matrix.os != 'windows-latest'
         run: |
-          strip pkg/target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+          strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
 
       - name: Create archive (macOS/Linux)
+        working-directory: pkg
         if: matrix.os != 'windows-latest'
         run: |
-          cd pkg/target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset_name }} ${{ env.BINARY_NAME }}
-          cd ../../..
+          tar czf ../${{ matrix.asset_name }} -C target/${{ matrix.target }}/release ${{ env.BINARY_NAME }}
 
       - name: Create archive (Windows)
+        working-directory: pkg
         if: matrix.os == 'windows-latest'
         run: |
-          cd pkg/target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.asset_name }} ${{ env.BINARY_NAME }}.exe
-          cd ../../..
+          7z a ../${{ matrix.asset_name }} target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -122,6 +121,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
       - name: Generate checksums
         run: |
