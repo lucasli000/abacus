@@ -92,7 +92,7 @@ pub async fn handle_model(args: &super::ModelArgs, formatter: &mut Box<dyn Outpu
             }
         }
         ModelAction::Ping { name } => {
-            match engine_init::create_engine(name, None, "low").await {
+            match engine_init::create_engine(name, None, "").await {
                 Ok((core, session)) => {
                     match core.process_turn("ping", &session).await {
                         Ok(_) => formatter.format_message("model", "✓ reachable", None),

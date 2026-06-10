@@ -42,9 +42,10 @@ pub enum JobKind {
 }
 
 /// 任务当前状态
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum JobState {
     /// 空闲等待下次触发
+    #[default]
     Idle,
     /// 正在执行
     Running,

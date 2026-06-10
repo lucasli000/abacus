@@ -219,8 +219,9 @@ fn parse_evaluation(output: &str) -> (NodeStatus, String) {
             ll.contains("reason") || ll.contains("理由") || ll.contains("因为")
         })
         .map(|l| {
-            l.splitn(2, ':')
-                .nth(1).unwrap_or(l)
+            l.split_once(':')
+                .map(|(_, after)| after)
+                .unwrap_or(l)
                 .trim().to_string()
         })
         .unwrap_or_else(|| output.lines().last().unwrap_or("").trim().to_string());

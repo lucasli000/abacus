@@ -477,6 +477,53 @@ impl SkillEngine {
         Ok(())
     }
 
+    /// 卸载 skill：从 ToolRegistry 移除所有注册的步骤工具 + 反向映射
+    ///
+    /// ## 与 load() 对称
+    /// - `load()` 注册的每步工具 → unload() 逐个移除
+    /// - `load_compound()` 注册的单工具 → unload() 移除聚合工具
+    /// - 不删除 SkillDef（保留定义和触发器，下次 load() 可重用）
+    pub async fn unload(
+        &mut self,
+        id: &SkillId,
+        registry: &ToolRegistry,
+    ) -> Result<(), String> {
+        if self.loaded.read_or_recover().get(id) != Some(&true) {
+            return Ok(());
+        }
+        let def = self.skills.get(id)
+            .ok_or_else(|| format!("skill not found: {id}"))?;
+
+        let is_compound = def.compound;
+        if is_compound {
+            let tool_name = format!(
+                "skill_{}",
+                crate::llm::tool_view::sanitize_name(&id.0),
+            );
+            let tool_id = ToolId(tool_name.clone());
+            registry.unregister(&tool_id).await;
+            registry.unregister_executor(&tool_id).await;
+            self.name_map.write_or_recover().remove(tool_name.as_str());
+        } else {
+            for step in &def.workflow {
+                let sanitized = format!(
+                    "skill_{}_{}_step_{}",
+                    crate::llm::tool_view::sanitize_name(&id.0),
+                    crate::llm::tool_view::sanitize_name(&step.tool),
+                    crate::llm::tool_view::sanitize_name(&step.id),
+                );
+                let tool_id = ToolId(sanitized.clone());
+                registry.unregister(&tool_id).await;
+                registry.unregister_executor(&tool_id).await;
+                self.name_map.write_or_recover().remove(&sanitized);
+            }
+        }
+
+        self.loaded.write_or_recover().insert(id.clone(), false);
+        tracing::info!("skill unloaded: {}", id.0);
+        Ok(())
+    }
+
     pub fn record_execution(&mut self, record: SkillExecutionRecord) {
         let mut exp_map = self.experiences.write_or_recover();
         let key = record.skill_id.clone();
@@ -833,69 +880,126 @@ impl crate::tool::ToolExecutor for CompoundSkillExecutor {
         let mut steps_run = 0u32;
         let mut steps_ok = 0u32;
 
-        // 串联执行所有 steps（内部驱动，不经过 LLM）
-        'steps: for step in &def.workflow {
-            // 简单条件检查：支持 "xxx != null" 模式
-            if let Some(cond) = &step.condition {
-                if let Some(var) = cond.strip_suffix(" != null").map(|s| s.trim()) {
-                    if step_context.get(var).map(|v| v.is_null()).unwrap_or(true) {
-                        continue 'steps; // 跳过该 step
+        // ── DAG 并行执行（尊重 depends_on，无依赖步骤并发运行）──
+        // 构建依赖映射（owned String 避免借用寿命问题）
+        let deps_map: std::collections::HashMap<String, Vec<String>> = def.workflow.iter()
+            .map(|s| (s.id.clone(), s.depends_on.clone().unwrap_or_default()))
+            .collect();
+
+        let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let aborted = false;
+
+        while done.len() < def.workflow.len() && !aborted {
+            // 第一遍：标记因条件不满足或嵌套 skill 而跳过的 step
+            for step in &def.workflow {
+                if done.contains(&step.id) { continue; }
+                let step_deps = deps_map.get(&step.id)
+                    .map(|d| d.iter().all(|dep| done.contains(dep)))
+                    .unwrap_or(true);
+                if !step_deps { continue; }
+
+                let should_skip = step.condition.as_ref().is_some_and(|cond| {
+                    cond.strip_suffix(" != null")
+                        .and_then(|var| step_context.get(var.trim()))
+                        .map(|v| v.is_null())
+                        .unwrap_or(true)
+                }) || step.tool.starts_with("skill_");
+
+                if should_skip {
+                    if step.tool.starts_with("skill_") {
+                        tracing::warn!(
+                            "CompoundSkillExecutor: skip nested skill tool '{}' in step '{}'",
+                            step.tool, step.id
+                        );
                     }
+                    done.insert(step.id.clone());
                 }
             }
 
-            // 防递归：禁止 compound skill step 嵌套 skill 工具
-            let real_tool_id = ToolId(step.tool.clone());
-            if real_tool_id.0.starts_with("skill_") {
-                tracing::warn!(
-                    "CompoundSkillExecutor: skip nested skill tool '{}' in step '{}'",
-                    real_tool_id.0, step.id
-                );
-                continue 'steps;
+            // 第二遍：找到满足依赖且未被忽略的 step
+            let ready: Vec<&abacus_types::SkillStep> = def.workflow.iter()
+                .filter(|s| !done.contains(&s.id))
+                .filter(|s| deps_map.get(&s.id)
+                    .map(|d| d.iter().all(|dep| done.contains(dep)))
+                    .unwrap_or(true))
+                .collect();
+
+            if ready.is_empty() {
+                break;
             }
 
-            // 执行底层工具（直接调用 ToolRegistry，不经过 LLM）
-            let output = registry_arc.execute(&real_tool_id, step_context.clone(), ctx).await;
-            steps_run += 1;
+            // 并发执行就绪 step
+            let futs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<abacus_types::ToolOutput, KernelError>)> + Send>>> = ready.iter().map(|step| {
+                let step_id = step.id.clone();
+                let real_tool_id = ToolId(step.tool.clone());
+                let step_ctx = step_context.clone();
+                let registry = registry_arc.clone();
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = (String, Result<abacus_types::ToolOutput, KernelError>)> + Send>> = Box::pin(async move {
+                    let output = registry.execute(&real_tool_id, step_ctx, ctx).await;
+                    (step_id, output)
+                });
+                fut
+            }).collect();
 
-            match output {
-                Ok(tool_out) if tool_out.success => {
-                    steps_ok += 1;
-                    last_output = tool_out.output.clone();
-                    // 把这个 step 的输出合并到 step_context（供后续 step 使用）
-                    if let serde_json::Value::Object(map) = &tool_out.output {
-                        if let serde_json::Value::Object(ctx_map) = &mut step_context {
-                            for (k, v) in map {
-                                ctx_map.insert(k.clone(), v.clone());
+            let outputs = futures_util::future::join_all(futs).await;
+
+            for (step_id, output) in outputs {
+                steps_run += 1;
+                match output {
+                    Ok(tool_out) if tool_out.success => {
+                        steps_ok += 1;
+                        last_output = tool_out.output.clone();
+                        if let serde_json::Value::Object(map) = &tool_out.output {
+                            if let serde_json::Value::Object(ctx_map) = &mut step_context {
+                                for (k, v) in map {
+                                    ctx_map.insert(k.clone(), v.clone());
+                                }
                             }
                         }
-                    }
-                    // 同时以 step.id 为 key 保存该 step 结果（供条件表达式引用）
-                    if let serde_json::Value::Object(ctx_map) = &mut step_context {
-                        ctx_map.insert(step.id.clone(), tool_out.output);
-                    }
-                }
-                Ok(tool_out) => {
-                    // step 失败：有 fallback 则取 fallback step 的结果继续
-                    if let Some(fallback_id) = &step.fallback {
-                        if let Some(fb_val) = step_context.get(fallback_id.as_str()) {
-                            last_output = fb_val.clone();
+                        if let serde_json::Value::Object(ctx_map) = &mut step_context {
+                            ctx_map.insert(step_id.clone(), tool_out.output);
                         }
-                    } else if step.condition.is_none() {
-                        // 无条件的必须步骤失败，记录并终止
-                        tracing::warn!(
-                            "CompoundSkillExecutor: required step '{}' failed: {}",
-                            step.id, tool_out.output
-                        );
-                        break 'steps;
+                        done.insert(step_id);
                     }
-                }
-                Err(e) => {
-                    if step.fallback.is_none() && step.condition.is_none() {
-                        tracing::warn!(
-                            "CompoundSkillExecutor: required step '{}' error: {}", step.id, e
-                        );
-                        break 'steps;
+                    Ok(_) | Err(_) => {
+                        // P2-1: Re-Plan — 失败先尝试重试一次，再继续 DAG
+                        let step_def = def.workflow.iter().find(|s| s.id == step_id);
+                        let retry_succeeded = if let Some(s) = step_def {
+                            let tid = ToolId(s.tool.clone());
+                            registry_arc.execute(&tid, step_context.clone(), ctx).await
+                                .ok().is_some_and(|o| o.success)
+                        } else {
+                            false
+                        };
+
+                        if retry_succeeded {
+                            steps_ok += 1;
+                            done.insert(step_id);
+                            continue;
+                        }
+
+                        // 重试失败：检查 fallback 或记录失败并继续
+                        let maybe_fallback = step_def.and_then(|s| s.fallback.as_ref());
+                        if let Some(fallback_id) = maybe_fallback {
+                            if let Some(fb_val) = step_context.get(fallback_id.as_str()) {
+                                last_output = fb_val.clone();
+                            }
+                            done.insert(step_id);
+                        } else if step_def.is_none_or(|s| s.condition.is_none()) {
+                            // 必需步骤失败 → 记录重规划信息，不终止
+                            tracing::warn!(
+                                "CompoundSkillExecutor: replanning required step '{}' after retry", step_id
+                            );
+                            if let serde_json::Value::Object(ctx_map) = &mut step_context {
+                                ctx_map.insert(step_id.clone(), serde_json::json!({
+                                    "replanned": true,
+                                    "replan_reason": format!("step '{}' failed after retry", step_id),
+                                }));
+                            }
+                            done.insert(step_id);
+                        } else {
+                            done.insert(step_id);
+                        }
                     }
                 }
             }

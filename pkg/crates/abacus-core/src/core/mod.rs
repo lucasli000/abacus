@@ -54,6 +54,10 @@ pub mod cot_hook;
 pub mod knowledge_hook;
 pub mod token_budget;
 pub mod llm_budget;
+pub mod triage;
+pub mod reasoning_integration;
+pub mod standby_cache;
+pub mod cold_buffer;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -747,6 +751,15 @@ pub struct CoreConfig {
     /// 是否启用记忆宫殿（palace hints + 到期复习提醒）
     /// **Default: true**
     pub palace_enabled: bool,
+
+    // ─── Reasoning Enhancement ────────────────────────────────────────────
+    /// ToT / Self-Consistency 自动触发配置
+    pub reasoning_config: crate::core::reasoning_integration::ReasoningConfig,
+
+    // ─── W1 (RFC-0001v2): Content Lifecycle Management ──────────────────────
+    /// 事前内容审校引擎——替代 auto_compress_messages
+    /// **Default: disabled**（audit_only = true）
+    pub triage: triage::TriageConfig,
 }
 
 impl Default for CoreConfig {
@@ -812,6 +825,10 @@ impl Default for CoreConfig {
             epistemic_threshold: 3,
             // ─── 记忆宫殿 ──
             palace_enabled: true,
+            // ─── Reasoning Enhancement ──
+            reasoning_config: crate::core::reasoning_integration::ReasoningConfig::default(),
+            // ─── 内容生命周期管理 ──
+            triage: triage::TriageConfig::default(),
         }
     }
 }
@@ -1004,6 +1021,8 @@ pub struct SessionState {
     /// 读取: pipeline execute_loop 构建 provider_timeout 时叠加
     /// 重置: 每个 turn 开始时清零
     pub timeout_extension_secs: u64,
+    /// P2-6: 当前会话模式（Clarify / Meeting），供 TriageEngine 模式感知阈值
+    pub mode: abacus_types::AbacusMode,
     /// MCIP 永久授权工具集合（用户选择「总是允许」后写入）
     ///
     /// ## 生命周期
@@ -1194,6 +1213,7 @@ impl SessionState {
             user_role: UserRole::default(),
             progressive: Arc::new(RwLock::new(progressive)),
             session_focus: Arc::new(RwLock::new(None)),
+            mode: abacus_types::AbacusMode::Clarify,
             mcip_grants: std::sync::RwLock::new(std::collections::HashSet::new()),
             mcip_confirm_channels: std::sync::Mutex::new(std::collections::HashMap::new()),
             task_kind_locked: Arc::new(RwLock::new(None)),
@@ -1348,12 +1368,26 @@ pub struct CoreLoop {
     /// Subsystem health monitoring — checked once per turn.
     provider_registry: Arc<crate::llm::provider_registry::ProviderRegistry>,
     health_registry: Arc<health::HealthRegistry>,
+    /// W4-D1: 统一 EventBus（可选）—— 所有子系统的观测层
+    /// 创建：CoreLoop::new() 时创建（如果 event_sink_enabled）
+    /// 消费方：TriageEngine / pipeline / health 等子系统 emit 事件
+    pub(crate) event_bus: Option<Arc<crate::core::event_sink::EventBus>>,
     /// Resource pressure monitoring — auto load-shedding.
     pressure_monitor: Arc<pressure::ResourcePressureMonitor>,
     /// KB 文档检索（pipeline 层主动 ICL 注入 / SM-2 复习用）
     /// 创建：with_memory() 时注入，与 KbToolExecutor 共享同一 Arc
     /// 消费方：setup() ICL Primer 、 SM-2 到期复习
     pub(crate) knowledge_store: Option<Arc<KnowledgeStore>>,
+    /// W5-D4: 持久化 TriageEngine（跨 turn 保持 sticky/cooldown 状态）
+    /// 创建：CoreLoop::new() 时创建
+    /// 消费方：pipeline setup() 每轮调用 run()
+    pub(crate) triage_engine: Option<Arc<RwLock<crate::core::triage::TriageEngine>>>,
+    /// W4-D3: StandbyCache — 短 TTL 内容缓存层
+    /// 创建：with_memory() 时注入
+    /// 消费方：TriageEngine 写入 STANDBY 块；pipeline setup() warm_up 召回
+    pub(crate) standby_cache: Option<Arc<crate::core::standby_cache::StandbyCache>>,
+    /// W4-D4: ColdBufferWriter — COLD 块批量写入器
+    pub(crate) cold_writer: Option<Arc<crate::core::cold_buffer::ColdBufferWriter>>,
     /// 行为 + 知识记忆（pipeline 层主动读写）
     /// 创建：with_memory() 时注入，与 KbToolExecutor 共享同一 Arc
     /// 消费方：post_process() record_interaction/record_tool_behavior、setup() recommend_next_tools
@@ -1779,7 +1813,7 @@ impl CoreLoop {
             tracing::warn!("LlmBudget triggered shed → caller should switch to fallback provider");
             1  // 成功标记
         }).await;
-        let core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, pressure_monitor, knowledge_store: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget };
+        let mut core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, event_bus: None, pressure_monitor, knowledge_store: None, triage_engine: None, standby_cache: None, cold_writer: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -1794,6 +1828,9 @@ impl CoreLoop {
             let project_dir = crate::paths::current_project_dir();
             // 静默确保父目录（与 process_registry 一样不阻塞 ABACUS_HOME 不可写场景）
             let _ = crate::paths::ensure_current_project_dirs();
+            // W4-D1: 创建 EventBus（统一观测层）
+            let bus = Arc::new(crate::core::event_sink::EventBus::new(&session_id, &project_dir));
+            core_loop.event_bus = Some(bus);
             match crate::core::event_sink::JsonlEventHook::open(&session_id, &project_dir) {
                 Ok(hook) => {
                     core_loop.add_pipeline_hook(250, Arc::new(hook)).await;
@@ -1819,6 +1856,31 @@ impl CoreLoop {
                     );
                 }
             }
+        }
+        // W5-D4: 初始化持久化 TriageEngine
+        {
+            let ctx = core_loop.context_manager.clone();
+            let mut eng = crate::core::triage::TriageEngine::new(
+                core_loop.config.triage.clone(),
+                ctx.clone(),
+            );
+            // 创建 StandbyCache + ColdBufferWriter（从 context_manager.tiers.cold 获取 store）
+            let cold_store = ctx.tiers.cold.clone();
+            let sc = Arc::new(crate::core::standby_cache::StandbyCache::new(
+                core_loop.config.triage.standby_capacity,
+            ));
+            let cw = Arc::new(crate::core::cold_buffer::ColdBufferWriter::new(
+                cold_store,
+                core_loop.config.triage.cold_batch_cap,
+            ));
+            core_loop.standby_cache = Some(sc.clone());
+            core_loop.cold_writer = Some(cw.clone());
+            eng = eng.with_standby(sc);
+            eng = eng.with_cold_writer(cw);
+            if let Some(ref bus) = core_loop.event_bus {
+                eng = eng.with_event_bus(bus.clone());
+            }
+            core_loop.triage_engine = Some(Arc::new(RwLock::new(eng)));
         }
         // Layer 5 (Task #92)：启动 audit —— 输出已激活优化清单
         core_loop.audit_optimizations().await;
@@ -2267,7 +2329,7 @@ impl CoreLoop {
     /// ## KV Cache 安全
     /// 工具列表变化会改变 system_segments hash → 自动触发 KV cache invalidation
     pub(crate) async fn reevaluate_adaptive_subsystems(&self, turn: u32) {
-        if turn % 5 != 0 || turn == 0 { return; }
+        if !turn.is_multiple_of(5) || turn == 0 { return; }
 
         use crate::tool::subsystem_policy::{
             builtin_subsystems, RegistrationMode, EffectivenessHeatProvider,
@@ -2393,18 +2455,18 @@ impl CoreLoop {
     pub async fn tool_health_snapshot(&self, tool_ids: &[ToolId]) -> Vec<crate::llm::stream::ToolHealthEntry> {
         let eff = self.effectiveness.read().await;
         let tools = self.registry.all_tools().await;
-        tool_ids.iter().filter_map(|tid| {
+        tool_ids.iter().map(|tid| {
             let provider = tools.iter()
                 .find(|t| &t.id == tid)
                 .map(|t| &t.provider)
                 .unwrap_or(&abacus_types::ToolProvider::BuiltIn);
             let e = eff.evaluate_with_provider(tid, provider);
-            Some(crate::llm::stream::ToolHealthEntry {
+            crate::llm::stream::ToolHealthEntry {
                 tool_id: tid.0.clone(),
                 tier: format!("{:?}", e.tier),
                 blocked_by_env: e.blocked_by_env,
                 score: e.composite_score,
-            })
+            }
         }).collect()
     }
 
@@ -2512,8 +2574,13 @@ impl CoreLoop {
             store.clone(), 3
         );
         self.prompt_assembly.register_hook(Box::new(gen_knowledge_hook));
-        self.knowledge_store = Some(store);
+        self.knowledge_store = Some(store.clone());
         self.memory_palace = Some(palace.clone());
+        // W5-D4: 将 knowledge_store 传播到持久化 TriageEngine
+        if let Some(ref engine_lock) = self.triage_engine {
+            let mut engine = engine_lock.write().await;
+            engine.set_kb(store);
+        }
         // Phase γ-Palace-D：启用 palace 后重注册 result.expand executor，注入 palace 让 expand 反馈
         crate::tool::builtin::result::register_executors(
             &self.registry,
@@ -3360,6 +3427,25 @@ impl CoreLoop {
         // 注：palace_enabled 由 build_system_output 中的 awareness 层读取
     }
 
+    /// W5-D2: 计算生效的 triage 配置（基础配置 + runtime overrides）
+    pub fn effective_triage_config(&self) -> triage::TriageConfig {
+        use crate::tool::builtin::config::{read_override_bool, read_override_f64, read_override_u32};
+        let mut tc = self.config.triage.clone();
+        let overrides = &self.runtime_overrides;
+        if let Some(v) = read_override_bool(overrides, "triage_enabled") { tc.enabled = v; }
+        if let Some(v) = read_override_bool(overrides, "triage_audit_only") { tc.audit_only = v; }
+        if let Some(v) = read_override_u32(overrides, "triage_keep_count") { tc.keep_count = v as usize; }
+        if let Some(v) = read_override_u32(overrides, "triage_early_keep") { tc.early_keep = v as usize; }
+        if let Some(v) = read_override_f64(overrides, "triage_inject_threshold") { tc.inject_threshold = v; }
+        if let Some(v) = read_override_f64(overrides, "triage_standby_threshold") { tc.standby_threshold = v; }
+        if let Some(v) = read_override_f64(overrides, "triage_cold_threshold") { tc.cold_threshold = v; }
+        if let Some(v) = read_override_f64(overrides, "triage_hysteresis_deadband") { tc.hysteresis_deadband = v; }
+        if let Some(v) = read_override_u32(overrides, "triage_sticky_turns") { tc.sticky_turns = v; }
+        if let Some(v) = read_override_u32(overrides, "triage_cooldown_turns") { tc.cooldown_turns = v; }
+        if let Some(v) = read_override_u32(overrides, "triage_max_compress_depth") { tc.max_compress_depth = v; }
+        tc
+    }
+
     /// 获取记忆宫殿引用（TUI 面板数据拉取用）
     pub fn memory_palace(&self) -> Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>> {
         self.memory_palace.clone()
@@ -3826,6 +3912,7 @@ impl CoreLoop {
         input: &str,
         session: &RwLock<SessionState>,
         preflight: &PreflightReport,
+        triage_summary: Option<String>,
     ) -> SystemPromptOutput {
         // ─── 同步 runtime_overrides 到子系统（每轮调用）─────────────────────
         self.sync_runtime_overrides().await;
@@ -3916,14 +4003,17 @@ impl CoreLoop {
                 })
             }
         };
-        // ─── Awareness Block（全维度态势感知）──────────────────────────────────────
-        // LLM 每轮获得紧凑的状态快照（~60-80 tokens），覆盖三个维度：
-        //   1. 自我感知：当前轮次、token 消耗、剩余预算、已用工具
-        //   2. 环境感知：工作目录、session 模式、task_kind、用户角色
-        //   3. 能力感知：可用模型、thinking 级别、工具集规模、升级余量
-        //
-        // ## 位置：非缓存段（每轮 byte 变化），放 catalog 之后、focus 之前。
-        // ## Token 成本：~60-80 tokens/turn（远小于旧 session_context 的冗余注入）
+        // ─── Awareness Block V2（Mission Brief 置顶）─────────────────────────────
+        // Mission Brief ~100 tok 在意识块顶部，之后是 turn/context 状态行。
+        // 放在 system prompt 最顶部（LLM 认知优先——第一眼看到任务使命）。
+        // 仍包含 palace/deduction/guard 提示（紧凑格式）。
+        // ─── Mission Brief（从 checkpoint 读取，~100 tok）────────────────
+        let mission_brief = {
+            let cps = self.context_manager.get_checkpoints().await;
+            cps.last().map(|cp| cp.mission_brief())
+                .unwrap_or_else(|| "Mission: —".into())
+        };
+
         let (mut awareness_block, last_tool_name) = {
             let s = session.read().await;
             let current_turn = s.turn_count + 1;
@@ -3966,23 +4056,28 @@ impl CoreLoop {
                 .max(2048);
             drop(ctx_window);
 
+            // W4-D2: triage 摘要行（有数据时追加）
+            let triage_line = triage_summary.as_ref()
+                .map(|s| format!("\n{}", s))
+                .unwrap_or_default();
+
             // V43 token 优化：精简 awareness — 仅保留 LLM 决策所需信息
             // 旧格式 ~400 tokens（含 policy/capabilities/context management rules 等冗余）
-            // 新格式 ~80 tokens（turn/ctx 状态 + 临界时的行动指令）
+            // 新格式 ~80 tokens（mission/ctx/turn 状态 + 临界时的行动指令）
             let block = if effective_pct >= 85.0 {
                 // Context 压力大时注入行动指令
                 format!(
                     "[t{}/{} tools:{} ctx:{:.0}%({}) out:{}tok]\n\
-                     ⚠ Context {}. Compress immediately: call context_compress(mode=\"messages\").",
+                     ⚠ Context {}. Compress immediately: call context_compress(mode=\"messages\").{}",
                     current_turn, max_turns, tool_calls_used,
-                    effective_pct, ctx_status, effective_output, ctx_status
+                    effective_pct, ctx_status, effective_output, ctx_status, triage_line
                 )
             } else {
                 // 正常状态：极简状态行
                 format!(
-                    "[t{}/{} tools:{} ctx:{:.0}%({}) out:{}tok]",
+                    "[t{}/{} tools:{} ctx:{:.0}%({}) out:{}tok]{}",
                     current_turn, max_turns, tool_calls_used,
-                    effective_pct, ctx_status, effective_output
+                    effective_pct, ctx_status, effective_output, triage_line
                 )
             };
             (block, last_tool)
@@ -4026,6 +4121,29 @@ impl CoreLoop {
                         .collect::<Vec<_>>()
                         .join(", ");
                     awareness_block.push_str(&format!("\nPalace hints: {}", rec_str));
+                }
+            }
+        }
+
+        // P0-2: Reflexion 检索 — 查询 KnowledgeStore 中的历史失败反思
+        if let Some(ref ks) = self.knowledge_store {
+            let task_kind_label = task_kind.label();
+            let reflection_query = format!("{} reflexion failure", task_kind_label);
+            if let Ok(results) = ks.query(&reflection_query, 2, Some("reflexion://failure")).await {
+                if !results.is_empty() {
+                    let mut pushed_header = false;
+                    for r in &results {
+                        let line = r.content.lines()
+                            .find(|l| l.starts_with("主要失败工具") || l.starts_with("检测到"))
+                            .map(|l| l.to_string());
+                        if let Some(l) = line {
+                            if !pushed_header {
+                                awareness_block.push_str("\n[Past Failure Reflections]");
+                                pushed_header = true;
+                            }
+                            awareness_block.push_str(&format!("\n  · {}", l));
+                        }
+                    }
                 }
             }
         }
@@ -4105,33 +4223,24 @@ impl CoreLoop {
         };
 
         // ─── 构建 text（单 String，用于非 Anthropic）────────────────────────────
-        // 【KV Cache 修复】focus 追加到 assembled 末尾（与 segments 路径对齐）
-        // 之前 focus 顶在最前（primacy），但 focus.render_with_age(age) 每轮 byte 都变（age 增长）
-        //   → DeepSeek/OpenAI 的 prefix cache 从 token 0 起整段 system prompt 全部 miss
-        // 移到末尾后：stable prefix（Kernel + abacusbr_core + Strategy + Constraints）byte-identical
-        //   → DeepSeek 命中率应从 ~0% 提升到接近 prompt_tokens（按 64-token 块对齐）
-        // 对 LLM 注意力的影响：focus 仍在 system prompt 内、紧邻用户消息（recency-adjacent），不弱于 primacy
+        // 稳定前缀置顶（Kernel + abacusbr_core + Strategy），
+        // 保证 DeepSeek/OpenAI prefix cache 命中率。
+        // Mission Brief（task-stable）追加到稳定前缀末尾。
+        // Awareness block（含每轮变化的状态行）最后追加。
         let assembled_with_context = {
             let mut s = assembled;
             if let Some(ref cat) = catalog_block {
                 s = format!("{}\n\n---\n\n{}", s, cat);
             }
-            // Awareness block 每轮变化（turn/tool_calls 递增）→ 放在动态段
-            s = format!("{}\n\n---\n\n{}", s, awareness_block);
 
-            // ─── Entropy Guard（熵增对抗纪律）──────────────────────────────────
-            // 内核级约束：LLM 在创建文件/文件夹/多步任务前先结构化思考
-            // byte-stable（不含变量），被 prefix cache 覆盖
-            // 策略注入（从 policy.toml 加载，运行时可调）
-            let policy = &self.config.policy;
-            if !policy.guard.entropy_guard.is_empty() {
-                s.push_str("\n\n[Entropy Guard]\n");
-                s.push_str(&policy.guard.entropy_guard);
-            }
-            if !policy.guard.explicit_declaration.is_empty() {
-                s.push_str("\n\n[Explicit Declaration]\n");
-                s.push_str(&policy.guard.explicit_declaration);
-            }
+            // Mission Brief 追加到稳定前缀末尾（task-stable，不含每轮变量）
+            // 来自 checkpoint，task 内不变，不影响 prefix cache
+            s = format!("{}\n\n---\n\n{}", s, mission_brief);
+
+            // Awareness block 追加到末尾（recency-adjacent）——
+            // 动态状态行（turn/ctx/tools）每轮变化，放在末尾不破稳定前缀缓存。
+            // LLM 在回复前必然读完，末尾位置不影响理解。
+            s = format!("{}\n\n---\n\n{}", s, awareness_block);
             s
         };
         let text = compose_system_text_with_focus(assembled_with_context, focus_block.as_deref());
@@ -4145,6 +4254,17 @@ impl CoreLoop {
             Some(task_kind),
             false,
         );
+        // Mission Brief 追加到稳定段末尾（cacheable=true，task-stable）
+        segments.push(crate::llm::provider::SystemSegment {
+            text: mission_brief,
+            cacheable: true,
+        });
+        // Awareness block 追加到末尾（cacheable=false 段）——
+        // 与 text 路径对齐：稳定前缀在前，动态内容在后。
+        segments.push(crate::llm::provider::SystemSegment {
+            text: awareness_block,
+            cacheable: false,
+        });
 
         // SessionFocus 应用到 segments —— 与 text 路径策略对齐（统一追加到末尾）
         // 之前 text 路径保留 focus 在前（primacy）属于跨 provider 不一致，DeepSeek/OpenAI 已踩坑
@@ -4180,7 +4300,7 @@ impl CoreLoop {
         session: &RwLock<SessionState>,
         preflight: &PreflightReport,
     ) -> String {
-        self.build_system_output(input, session, preflight).await.text
+        self.build_system_output(input, session, preflight, None).await.text
     }
 
     /// LLM 静默自审：无工具调用，仅分析请求，输出结构化报告。
@@ -4422,7 +4542,7 @@ Output JSON:
                             Some(p) => {
                                 let e = eff.evaluate_at_turn(&ToolId(r.tool_id.clone()), p, cur_turn as u64);
                                 // 过滤条件等同 K3 Phase 1: tier=D 且数据足够 → 不可见
-                                !(matches!(e.tier, abacus_types::VisibilityTier::D) && !e.insufficient_data)
+                                !matches!(e.tier, abacus_types::VisibilityTier::D) || e.insufficient_data
                             }
                             None => true, // 未注册（罕见）→ 保守标可见
                         };
@@ -4863,10 +4983,9 @@ Output JSON:
         // 引用关系：
         // - 依赖：scene_active_prefixes() 自由函数、self.tool_last_invoked、self.config.scene_tool_loading_enabled
         // - 消费方：下游 Phase γ-I 和段 K3 接收过滤后的 tools Vec
-        let tools: Vec<_> = if self.config.scene_tool_loading_enabled && task_kind_label.is_some() {
-            let prefixes = scene_active_prefixes(
-                task_kind_label.expect("guard above ensures is_some()")
-            );
+        let tools: Vec<_> = if self.config.scene_tool_loading_enabled {
+            if let Some(label) = task_kind_label {
+            let prefixes = scene_active_prefixes(label);
             // 修复：未列举的任务类型（general_chat 等）前缀为空列表→过滤掉所有工具→tools=0
             // 修复：前缀为空时跳过过滤，全部工具透传
             if prefixes.is_empty() {
@@ -4887,13 +5006,16 @@ Output JSON:
                 }
                 // Rule 3: explicitly marked for this task_kind (already passed β-D filter above)
                 if let Some(ref kinds) = t.schema.applicable_task_kinds {
-                    if kinds.iter().any(|k| k == task_kind_label.expect("guard above ensures is_some()")) {
+                    if kinds.iter().any(|k| k == label) {
                         return true;
                     }
                 }
                 false
             }).collect()
             } // else (prefixes non-empty)
+            } else {
+                tools
+            }
         } else {
             tools
         };
@@ -4967,7 +5089,7 @@ Output JSON:
                     };
                     by_provider.entry(key).or_default().push(t);
                 }
-                for (_pkey, group) in &by_provider {
+                for group in by_provider.values() {
                     let visible_in_group = group.iter().filter(|t| !hide_candidates.contains(&t.id)).count();
                     if visible_in_group < PROVIDER_FLOOR {
                         // 该 provider 可见数不足，从候选里挑分最高的回放
@@ -4993,7 +5115,7 @@ Output JSON:
                         by_cluster.entry(c.id).or_default().push(t);
                     }
                 }
-                for (_cid, members) in &by_cluster {
+                for members in by_cluster.values() {
                     let visible_in_cluster = members.iter().filter(|t| !hide_candidates.contains(&t.id)).count();
                     if visible_in_cluster == 0 {
                         // 整簇隐藏 → 回放分最高的
@@ -5258,7 +5380,7 @@ pub(crate) fn load_role_caps() -> abacus_types::RoleCapabilities {
             };
         }
         if let Some(budget) = cap_table.get("tool_budget_per_turn").and_then(|v| v.as_integer()) {
-            caps.tool_budget_per_turn = budget.max(1).min(100) as u32;
+            caps.tool_budget_per_turn = budget.clamp(1, 100) as u32;
         }
     }
 

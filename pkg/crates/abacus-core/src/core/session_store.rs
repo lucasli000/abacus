@@ -78,6 +78,45 @@ impl SqliteSessionStore {
             END;
         ").map_err(|e| KernelError::Other(format!("sqlite triggers: {e}")))?;
 
+        // W2 (RFC-0001v2): ColdTier message_blocks table + FTS5
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS message_blocks (
+                recall_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                turn_start INTEGER NOT NULL,
+                turn_end INTEGER NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                content_json TEXT NOT NULL DEFAULT '[]',
+                key_decisions TEXT NOT NULL DEFAULT '[]',
+                original_tokens INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )", [],
+        ).map_err(|e| KernelError::Other(format!("sqlite create message_blocks: {e}")))?;
+
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS block_search USING fts5(
+                recall_id, summary, key_decisions,
+                content='message_blocks', content_rowid='rowid'
+            )", [],
+        ).map_err(|e| KernelError::Other(format!("sqlite block_search fts5: {e}")))?;
+
+        conn.execute_batch("
+            CREATE TRIGGER IF NOT EXISTS block_ai AFTER INSERT ON message_blocks BEGIN
+                INSERT INTO block_search(rowid, recall_id, summary, key_decisions)
+                VALUES (new.rowid, new.recall_id, new.summary, new.key_decisions);
+            END;
+            CREATE TRIGGER IF NOT EXISTS block_ad AFTER DELETE ON message_blocks BEGIN
+                INSERT INTO block_search(block_search, rowid, recall_id, summary, key_decisions)
+                VALUES('delete', old.rowid, old.recall_id, old.summary, old.key_decisions);
+            END;
+            CREATE TRIGGER IF NOT EXISTS block_au AFTER UPDATE ON message_blocks BEGIN
+                INSERT INTO block_search(block_search, rowid, recall_id, summary, key_decisions)
+                VALUES('delete', old.rowid, old.recall_id, old.summary, old.key_decisions);
+                INSERT INTO block_search(rowid, recall_id, summary, key_decisions)
+                VALUES (new.rowid, new.recall_id, new.summary, new.key_decisions);
+            END;
+        ").map_err(|e| KernelError::Other(format!("sqlite block triggers: {e}")))?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -151,6 +190,61 @@ impl SessionStore for SqliteSessionStore {
         }
 
         Ok(snapshots)
+    }
+
+    async fn save_block(&self, block: crate::core::context::BlockRecord) -> Result<(), KernelError> {
+        let decisions_json = serde_json::to_string(&block.key_decisions)
+            .unwrap_or_else(|_| "[]".into());
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT INTO message_blocks (recall_id, session_id, turn_start, turn_end,
+             summary, content_json, key_decisions, original_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(recall_id) DO UPDATE SET
+                turn_start = excluded.turn_start,
+                turn_end = excluded.turn_end,
+                summary = excluded.summary",
+            rusqlite::params![
+                block.recall_id, block.session_id, block.turn_start, block.turn_end,
+                block.summary, block.content_json, decisions_json,
+                block.original_tokens, block.created_at,
+            ],
+        ).map_err(|e| KernelError::Other(format!("sqlite save_block: {e}")))?;
+        Ok(())
+    }
+
+    async fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<crate::core::context::BlockResult>, KernelError> {
+        let escaped = query.replace('"', "\"\"");
+        let fts_query = format!("\"{}\"", escaped);
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT b.recall_id, b.summary, b.key_decisions,
+                    b.original_tokens, b.turn_start, b.turn_end
+             FROM message_blocks b
+             JOIN block_search fts ON b.rowid = fts.rowid
+             WHERE block_search MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        ).map_err(|e| KernelError::Other(format!("sqlite prepare blocks: {e}")))?;
+
+        let rows = stmt.query_map(rusqlite::params![fts_query, limit as i64], |row| {
+            let decisions_json: String = row.get(2)?;
+            let key_decisions: Vec<String> = serde_json::from_str(&decisions_json).unwrap_or_default();
+            Ok(crate::core::context::BlockResult {
+                recall_id: row.get(0)?,
+                summary: row.get(1)?,
+                key_decisions,
+                original_tokens: row.get(3)?,
+                turn_range: (row.get::<_, i64>(4)? as u32, row.get::<_, i64>(5)? as u32),
+                score: 0.5,
+            })
+        }).map_err(|e| KernelError::Other(format!("sqlite query blocks: {e}")))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row.map_err(|e| KernelError::Other(format!("sqlite block row: {e}")))?);
+        }
+        Ok(results)
     }
 
     async fn search(&self, query: &str) -> Result<Vec<SessionSnapshot>, KernelError> {

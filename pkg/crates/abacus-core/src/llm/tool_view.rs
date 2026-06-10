@@ -28,9 +28,55 @@
 //! 每次 LLM 请求构造时调用一次；输出 ToolFunctionSpec 短命周期
 //! （随 LlmRequest 移交 provider 后立即可释放）。
 
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::sync::{LazyLock, RwLock};
+
 use abacus_types::{ToolHandle, ToolProvider, ToolSchema, ToolState};
+use lru::LruCache;
 
 use crate::llm::provider::ToolFunctionSpec;
+
+// ─── Tool Schema Cache ───────────────────────────────────────────────────────
+
+/// 工具 schema 缓存键——hash(name | description | parameters)
+#[derive(Clone)]
+struct ToolSpecKey {
+    full_hash: u64,
+}
+
+impl ToolSpecKey {
+    fn from_spec(name: &str, desc: &str, params: &serde_json::Value) -> Self {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        name.hash(&mut h);
+        desc.hash(&mut h);
+        params.hash(&mut h);
+        Self { full_hash: h.finish() }
+    }
+}
+
+/// 工具 schema 缓存——LRU，128 cap，全 provider 共享
+struct ToolSpecCache {
+    inner: RwLock<LruCache<u64, ToolFunctionSpec>>,
+}
+
+impl ToolSpecCache {
+    fn new(cap: usize) -> Self {
+        Self { inner: RwLock::new(LruCache::new(NonZeroUsize::new(cap).expect("cap > 0"))) }
+    }
+
+    fn get(&self, key: &ToolSpecKey) -> Option<ToolFunctionSpec> {
+        self.inner.write().ok().and_then(|mut cache| cache.get(&key.full_hash).cloned())
+    }
+
+    fn insert(&self, key: ToolSpecKey, spec: ToolFunctionSpec) {
+        if let Ok(mut cache) = self.inner.write() {
+            cache.put(key.full_hash, spec);
+        }
+    }
+}
+
+static TOOL_SPEC_CACHE: LazyLock<ToolSpecCache> = LazyLock::new(|| ToolSpecCache::new(128));
 
 /// 把 ToolHandle 转为 LLM 可见的 ToolFunctionSpec
 ///
@@ -41,7 +87,21 @@ use crate::llm::provider::ToolFunctionSpec;
 /// `[provenance_prefix][raw_description][cost_suffix][cooling_suffix]`
 ///
 /// 各 suffix byte-stable —— 不破 KV cache 前缀。
+///
+/// ## 缓存
+/// Cache hit 时跳过 format! 拼装——省 ~3000 tok/轮 schema 重建。
 pub fn tool_handle_to_llm_spec(handle: &ToolHandle) -> ToolFunctionSpec {
+    let key = ToolSpecKey::from_spec(
+        &handle.schema.name,
+        handle.schema.description.as_str(),
+        &handle.schema.parameters,
+    );
+
+    if let Some(cached) = TOOL_SPEC_CACHE.get(&key) {
+        return cached;
+    }
+
+    // cache miss: 构建逻辑
     let provenance_prefix = provenance_prefix_for(&handle.provider);
     let cost_suffix = cost_suffix_for(&handle.schema);
     let cooling_suffix = cooling_suffix_for(handle);
@@ -55,12 +115,15 @@ pub fn tool_handle_to_llm_spec(handle: &ToolHandle) -> ToolFunctionSpec {
     );
 
     // schema.name 已是 LLM 协议合规形态（注册时一次性保证），直接 clone 不再 sanitize。
-    ToolFunctionSpec {
+    let spec = ToolFunctionSpec {
         name: handle.schema.name.clone(),
         description: Some(description),
         parameters: handle.schema.parameters.clone(),
         strict: None,
-    }
+    };
+
+    TOOL_SPEC_CACHE.insert(key, spec.clone());
+    spec
 }
 
 /// 把外部来源（MCP/Plugin/Skill）的工具名规范化到 LLM 协议要求的字符集。

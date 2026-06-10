@@ -37,6 +37,7 @@ use crate::code_graph::{Symbol, SymbolKind, Visibility, FileDep, DepKind, ImplRe
 ///
 /// 处理 `.py` 和 `.pyi` (stub) 文件。
 /// 无内部状态，满足 Send + Sync 约束。
+#[derive(Default)]
 pub struct PythonAnalyzer;
 
 impl PythonAnalyzer {

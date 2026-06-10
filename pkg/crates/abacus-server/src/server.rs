@@ -732,6 +732,25 @@ impl AbacusServer {
             epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
             // 记忆宫殿
             palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
+            // Reasoning 增强
+            reasoning_config: abacus_core::core::reasoning_integration::ReasoningConfig::default(),
+            // 内容分类引擎
+            triage: abacus_core::core::triage::TriageConfig {
+                enabled: cfg_mgr.get_bool("triage.enabled").unwrap_or(true),
+                audit_only: cfg_mgr.get_bool("triage.audit_only").unwrap_or(true),
+                keep_count: cfg_mgr.get_number("triage.keep_count").map(|n| n as usize).unwrap_or(5),
+                early_keep: cfg_mgr.get_number("triage.early_keep").map(|n| n as usize).unwrap_or(2),
+                inject_threshold: cfg_mgr.get_number("triage.inject_threshold").unwrap_or(0.65),
+                standby_threshold: cfg_mgr.get_number("triage.standby_threshold").unwrap_or(0.40),
+                cold_threshold: cfg_mgr.get_number("triage.cold_threshold").unwrap_or(0.20),
+                hysteresis_deadband: cfg_mgr.get_number("triage.hysteresis_deadband").unwrap_or(0.15),
+                sticky_turns: cfg_mgr.get_number("triage.sticky_turns").map(|n| n as u32).unwrap_or(3),
+                cooldown_turns: cfg_mgr.get_number("triage.cooldown_turns").map(|n| n as u32).unwrap_or(10),
+                max_compress_depth: cfg_mgr.get_number("triage.max_compress_depth").map(|n| n as u32).unwrap_or(3),
+                standby_capacity: cfg_mgr.get_number("triage.standby_capacity").map(|n| n as usize).unwrap_or(200),
+                cold_batch_cap: cfg_mgr.get_number("triage.cold_batch_cap").map(|n| n as usize).unwrap_or(20),
+                skip_below_msg_count: cfg_mgr.get_number("triage.skip_below_msg_count").map(|n| n as usize).unwrap_or(8),
+            },
         };
 
         // ─── Progressive Gate config ────────────────────────────────────

@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::core::triage::TriageStats;
 use abacus_types::{ToolId, ToolOutput, KernelError};
 use tracing;
 
@@ -916,6 +917,13 @@ pub enum PipelineEvent {
         /// 消耗的 completion tokens
         completion_tokens: u64,
     },
+    /// W3 (RFC-0001v2): Triage 分类完成
+    TriageResult {
+        /// triage 统计数据
+        stats: TriageStats,
+        /// 当前 turn 编号
+        turn_number: u32,
+    },
 }
 
 /// Pipeline Hook 的响应动作
@@ -977,6 +985,34 @@ impl PipelineHook for LoggingHook {
                 tracing::debug!(hook = self.prefix.as_str(), turn = turn_number, session = session_id.as_str(), tool_calls, all_success, was_compressed, "turn post fan-out"),
             PipelineEvent::TurnEnd { response_len, tool_calls, latency_ms, completion_tokens } =>
                 tracing::info!(hook = self.prefix.as_str(), response_len, tool_calls, latency_ms, completion_tokens, "turn end"),
+            PipelineEvent::TriageResult { stats, turn_number } =>
+                tracing::info!(hook = self.prefix.as_str(), turn = turn_number, summary = stats.summary_line().as_str(), "triage result"),
+        }
+        Ok(HookAction::Continue)
+    }
+}
+
+// ─── W3 (RFC-0001v2): TriageHook ──────────────────────────────────────────────
+
+/// Pipeline hook 用于记录 triage 结果
+pub struct TriageHook;
+
+#[async_trait::async_trait]
+impl PipelineHook for TriageHook {
+    fn name(&self) -> &str { "triage_hook" }
+
+    fn accepts(&self, event: &PipelineEvent) -> bool {
+        matches!(event, PipelineEvent::TriageResult { .. })
+    }
+
+    async fn on_event(&self, event: &PipelineEvent) -> Result<HookAction, KernelError> {
+        if let PipelineEvent::TriageResult { stats, turn_number } = event {
+            tracing::info!(
+                hook = "triage_hook",
+                turn = *turn_number,
+                summary = stats.summary_line().as_str(),
+                "triage completed"
+            );
         }
         Ok(HookAction::Continue)
     }

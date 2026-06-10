@@ -598,15 +598,12 @@ pub enum BashPolicyLevel {
 }
 
 /// 搜索 provider 抽象
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum SearchProvider {
     BraveApi { api_key: String },
     SearxNg { base_url: String },
+    #[default]
     DuckDuckGo,
-}
-
-impl Default for SearchProvider {
-    fn default() -> Self { Self::DuckDuckGo }
 }
 
 /// Role 能力声明——将限制从工具内移到 Role 层

@@ -245,7 +245,7 @@ pub fn escape_cwd(path: &Path) -> String {
 /// 确保全局目录结构存在
 ///
 /// 目录结构：
-/// ```
+/// ```text
 /// ~/.abacus/
 /// ├── config.toml        # 核心配置
 /// ├── provider.toml      # 供应商配置

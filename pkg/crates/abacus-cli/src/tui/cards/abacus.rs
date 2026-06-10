@@ -106,7 +106,7 @@ impl MessageCard for AbacusCard {
     }
 
     fn streaming(&self) -> CardStreaming { self.streaming }
-    fn default_collapse(&self) -> CardCollapse { CardCollapse::Collapsed }
+    fn default_collapse(&self) -> CardCollapse { CardCollapse::Expanded }
 
     fn body_height(&self, _ctx: &dyn SectionContext, _max_width: u16, collapse: CardCollapse) -> u16 {
         match collapse {

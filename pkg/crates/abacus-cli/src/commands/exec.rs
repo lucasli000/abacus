@@ -6,7 +6,7 @@ use crate::engine_init;
 pub async fn handle_exec(args: &ExecArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
     formatter.format_message("system", &format!("Task: {} | Model: {} | Timeout: {}s", args.task, args.model, args.timeout), None);
 
-    let (core, session) = engine_init::create_engine(&args.model, None, "high").await?;
+    let (core, session) = engine_init::create_engine(&args.model, None, "").await?;
 
     // Execute with timeout
     let result = tokio::time::timeout(

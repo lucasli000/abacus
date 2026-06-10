@@ -123,6 +123,12 @@ impl MinHashSig {
     }
 }
 
+impl Default for MessageTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MessageTracker {
     pub fn new() -> Self {
         Self {
@@ -278,6 +284,10 @@ impl MessageType {
 
         if role == "tool" || role == "Tool" {
             return Self::ToolResult;
+        }
+
+        if role == "system" || role == "System" {
+            return Self::SystemContext;
         }
 
         // Assistant 消息细分
@@ -439,7 +449,7 @@ impl GreedyKnapsackSelector {
     /// ## 返回
     /// (retained_indices, compressed_indices)
     pub fn select(
-        candidates: &mut Vec<SelectionCandidate>,
+        candidates: &mut [SelectionCandidate],
         token_budget: usize,
     ) -> (Vec<usize>, Vec<usize>) {
         // Phase 1: MinHash 去重
@@ -485,7 +495,7 @@ impl GreedyKnapsackSelector {
     /// MinHash 近似去重：相似度 > DEDUP_THRESHOLD 的消息标记为 redundant
     ///
     /// 策略：保留每个相似簇中分数最高的消息
-    fn mark_redundant(candidates: &mut Vec<SelectionCandidate>) {
+    fn mark_redundant(candidates: &mut [SelectionCandidate]) {
         const DEDUP_THRESHOLD: f64 = 0.6;
 
         let n = candidates.len();

@@ -1182,14 +1182,15 @@ pub async fn send_team_message(
         })
     };
 
-    let timeout = tokio::time::sleep(Duration::from_secs(600));
+    let timeout_secs = *handle.request_timeout_secs.read().await;
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
             cancel.cancel();
-            ApiResult::Err("Team 任务超时 (600s)，已取消".to_string())
+            ApiResult::Err(format!("Team 任务超时 ({}s)，已取消", timeout_secs))
         }
     };
 
@@ -1337,13 +1338,14 @@ pub async fn send_meeting_message(
         }
     };
 
-    let timeout = tokio::time::sleep(Duration::from_secs(600));
+    let timeout_secs = *handle.request_timeout_secs.read().await;
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
-            ApiResult::Err("Meeting 轮次超时 (600s)，已放弃".to_string())
+            ApiResult::Err(format!("Meeting 轮次超时 ({}s)，已放弃", timeout_secs))
         }
     };
 
@@ -1647,13 +1649,14 @@ pub async fn send_meeting_message_streaming(
         })
     };
 
-    let timeout = tokio::time::sleep(Duration::from_secs(600));
+    let timeout_secs = *handle.request_timeout_secs.read().await;
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
-            ApiResult::Err("Meeting 会诊超时 (600s)".to_string())
+            ApiResult::Err(format!("Meeting 会诊超时 ({}s)", timeout_secs))
         }
     };
 
@@ -1915,13 +1918,16 @@ pub async fn send_plan_and_execute_streaming(
         })
     };
 
-    let timeout = tokio::time::sleep(Duration::from_secs(900)); // Plan+Execute 更长超时
+    // Plan+Execute 涉及多次 LLM 调用，超时 = 基础超时 × 1.5（至少 900s）
+    let base_timeout = *handle.request_timeout_secs.read().await;
+    let timeout_secs = base_timeout.max(900);
+    let timeout = tokio::time::sleep(Duration::from_secs(timeout_secs));
     tokio::pin!(timeout);
 
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
-            ApiResult::Err("Plan+Execute 超时 (900s)".to_string())
+            ApiResult::Err(format!("Plan+Execute 超时 ({}s)", timeout_secs))
         }
     };
 

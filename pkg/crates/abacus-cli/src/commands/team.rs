@@ -12,7 +12,7 @@ fn manager() -> &'static TeamManager {
 pub async fn handle_team(args: &super::TeamArgs, formatter: &mut Box<dyn OutputFormatter>) -> Result<()> {
     match &args.action {
         super::TeamAction::Start { goal, roles } => {
-            let (core, _session) = crate::engine_init::create_engine("deepseek-v4", None, "high").await?;
+            let (core, _session) = crate::engine_init::create_engine("", None, "").await?;
             let mgr = manager();
             let team_id = format!("team_{}", chrono::Utc::now().timestamp_millis());
 

@@ -24,32 +24,16 @@ use abacus_core::capability::CapabilityHub;
 use abacus_types::{KernelError, ModelId};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "\
-You are Abacus — an autonomous agent kernel running in the user's local environment.
-You are NOT Claude, NOT ChatGPT, NOT any specific LLM. You are Abacus, an independent agent.
+You are Abacus, an autonomous agent kernel in the user's local environment.
 
-## Core Behavior
-- Execute tasks through available tools. Prefer tool verification over memory/assumption.
-- Multi-step tasks: decompose → execute sequentially → verify each step → synthesize.
-- When uncertain: use tools to verify rather than speculate.
-- Language: follow the user's language. Default Chinese for conversation, English for code.
+Execute through tools — tool-verified facts beat memory and speculation.
+Language: follow the user's. Default Chinese for conversation, English for code.
 
-## Output Rules
-- No self-introduction, no filler phrases, no \"I'll help you with that\".
-- No emoji unless the user explicitly requests it.
-- Lead with the answer or action, not the reasoning.
-- Code: always include file path context. Never generate placeholder code.
-- Errors: report the actual error and your diagnosis, not a generic apology.
-- Keep responses concise and direct. No unnecessary padding or meta-commentary.
+Output: direct and concise. No filler, no emoji (unless requested). Lead with the answer.
+Code: include file path. Complete implementations only — no placeholders.
+Errors: report the actual error and your diagnosis.
 
-## Identity
-- If asked \"who are you\", answer: \"I am Abacus, an autonomous agent kernel.\"
-- Never claim to be Claude, GPT, or any other model. Your identity is Abacus.
-- The underlying LLM is an implementation detail — do not mention it unless asked about architecture.
-
-## Safety
-- Never execute destructive operations (rm -rf, DROP TABLE, force push) without explicit confirmation.
-- Never fabricate tool names or API endpoints.
-- If a tool returns an error, diagnose and retry with corrected parameters — don't give up immediately.";
+Safety: no destructive ops without confirmation. No fabricated paths/APIs.";
 
 /// In-memory session store for CLI (no persistence needed for single session).
 struct CliSessionStore;
@@ -149,7 +133,7 @@ pub async fn create_engine(
             abacus_types::ThinkingIntent::from_str_loose(thinking_level)
                 .unwrap_or(abacus_types::ThinkingIntent::Off)
         } else {
-            cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Medium))
+            cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Off)
         };
 
     // L1 后：thinking_intent 直接传给 CoreConfig，无需兼容外壳。
@@ -254,6 +238,25 @@ pub async fn create_engine(
         epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
         // 记忆宫殿：palace hints + 到期复习提醒
         palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
+        // Reasoning 增强（ToT / Self-Consistency）
+        reasoning_config: abacus_core::core::reasoning_integration::ReasoningConfig::default(),
+        // 内容分类引擎
+        triage: abacus_core::core::triage::TriageConfig {
+            enabled: cfg_mgr.get_bool("triage.enabled").unwrap_or(true),
+            audit_only: cfg_mgr.get_bool("triage.audit_only").unwrap_or(true),
+            keep_count: cfg_mgr.get_number("triage.keep_count").map(|n| n as usize).unwrap_or(5),
+            early_keep: cfg_mgr.get_number("triage.early_keep").map(|n| n as usize).unwrap_or(2),
+            inject_threshold: cfg_mgr.get_number("triage.inject_threshold").unwrap_or(0.65),
+            standby_threshold: cfg_mgr.get_number("triage.standby_threshold").unwrap_or(0.40),
+            cold_threshold: cfg_mgr.get_number("triage.cold_threshold").unwrap_or(0.20),
+            hysteresis_deadband: cfg_mgr.get_number("triage.hysteresis_deadband").unwrap_or(0.15),
+            sticky_turns: cfg_mgr.get_number("triage.sticky_turns").map(|n| n as u32).unwrap_or(3),
+            cooldown_turns: cfg_mgr.get_number("triage.cooldown_turns").map(|n| n as u32).unwrap_or(10),
+            max_compress_depth: cfg_mgr.get_number("triage.max_compress_depth").map(|n| n as u32).unwrap_or(3),
+                standby_capacity: cfg_mgr.get_number("triage.standby_capacity").map(|n| n as usize).unwrap_or(200),
+                cold_batch_cap: cfg_mgr.get_number("triage.cold_batch_cap").map(|n| n as usize).unwrap_or(20),
+                skip_below_msg_count: cfg_mgr.get_number("triage.skip_below_msg_count").map(|n| n as usize).unwrap_or(8),
+            },
     };
 
     let mut core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
@@ -307,6 +310,40 @@ pub async fn create_engine(
         if let Err(e) = store.warmup(&*palace.read().await).await {
             tracing::warn!("记忆宫殿 warmup 失败（本次 session 从空宫殿启动）: {e}");
         }
+    }
+
+    // ─── 本地 Embedding/Reranker 服务注入 ───────────────────────────────
+    // 从 config.toml [local] 段读取 vLLM 服务配置，注入到 KnowledgeStore 和 DualPalaceMemory。
+    // 未配置时静默跳过，退化到关键词匹配模式。
+    let _vllm_embedder: Option<Arc<abacus_core::vllm_embedder::VllmEmbedder>> = {
+        let embed_url = cfg_mgr.get_str("local.embedding_url");
+        let embed_model = cfg_mgr.get_str("local.embedding_model");
+        let embed_dim = cfg_mgr.get_number("local.embedding_dim").map(|n| n as usize);
+
+        match (embed_url, embed_model, embed_dim) {
+            (Some(url), Some(model), Some(dim)) => {
+                let embedder = abacus_core::vllm_embedder::create_embedder_from_config(&url, &model, dim);
+                tracing::info!(
+                    embed_url = %url,
+                    embed_model = %model,
+                    embed_dim = dim,
+                    "本地 embedding 服务已配置"
+                );
+                // 注入到 KnowledgeStore 和 DualPalaceMemory
+                kb_store.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>);
+                palace.read().await.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>).await;
+                Some(embedder)
+            }
+            _ => {
+                tracing::info!("本地 embedding 服务未配置，语义搜索降级为关键词匹配");
+                None
+            }
+        }
+    };
+
+    // Reranker 配置（记录到日志，供后续集成使用）
+    if let (Some(url), Some(model)) = (cfg_mgr.get_str("local.reranker_url"), cfg_mgr.get_str("local.reranker_model")) {
+        tracing::info!(reranker_url = %url, reranker_model = %model, "本地 reranker 服务已配置");
     }
 
     // 注册 kb.* 工具执行器（schema 已由 register_all() 在 CoreLoop::new() 内注册）
@@ -392,7 +429,7 @@ pub async fn create_engine(
                 ProviderType::Anthropic => {
                     use abacus_core::llm::providers::anthropic::AnthropicProvider;
                     let p = Arc::new(AnthropicProvider::new(
-                        api_key, models.first().cloned().unwrap_or(ModelId("claude-sonnet-4".into())),
+                        api_key, models.first().cloned().unwrap_or_else(|| ModelId(resolved_model.to_string())),
                         entry.base_url.clone(), None,
                     ));
                     core.register_provider_group(&entry.id, models, p).await;

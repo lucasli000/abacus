@@ -256,9 +256,9 @@ impl McpStdioTransport {
             .spawn()?;
 
         let stdin = child.stdin.take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdin"))?;
+            .ok_or_else(|| std::io::Error::other("no stdin"))?;
         let stdout = child.stdout.take()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no stdout"))?;
+            .ok_or_else(|| std::io::Error::other("no stdout"))?;
 
         Ok(Self {
             child,

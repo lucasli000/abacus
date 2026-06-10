@@ -2685,7 +2685,7 @@ impl AppState {
             available_models: Vec::new(),
             available_providers: Vec::new(),
             pending_model_fetch: false,
-            thinking_depth: "high".to_string(),
+            thinking_depth: "off".to_string(),
             context_window: 1_000_000,
             model_max_context: 1_000_000,
             config_mtime: None,

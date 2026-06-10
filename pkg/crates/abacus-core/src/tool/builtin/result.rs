@@ -68,8 +68,8 @@ impl BoundedResultStore {
 
     /// 插入条目。同 id 重复写入幂等更新值但不改顺序；新 id 超容则 FIFO 淘汰最旧。
     pub fn insert(&mut self, key: String, value: ResultStoreEntry) {
-        if self.map.contains_key(&key) {
-            self.map.insert(key, value);
+        if let Some(existing) = self.map.get_mut(&key) {
+            *existing = value;
             return;
         }
         if self.map.len() >= MAX_RESULT_STORE_ENTRIES {

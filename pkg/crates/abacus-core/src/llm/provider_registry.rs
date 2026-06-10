@@ -68,6 +68,12 @@ pub struct ProviderRegistry {
     fallback: RwLock<Option<Arc<dyn LlmProvider>>>,
 }
 
+impl Default for ProviderRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProviderRegistry {
     /// Create an empty registry. Providers are added via `register()`.
     pub fn new() -> Self {
@@ -188,9 +194,7 @@ impl ProviderRegistry {
                     .into_iter()
                     .collect();
                 if available_providers.is_empty() {
-                    Err(format!(
-                        "没有可用的 LLM Provider。请先配置 API Key：运行 `abacus config set llm.api_key <your-key>` 或设置环境变量 DEEPSEEK_API_KEY"
-                    ))
+                    Err("没有可用的 LLM Provider。请先配置 API Key：运行 `abacus config set llm.api_key <your-key>` 或设置环境变量 DEEPSEEK_API_KEY".to_string())
                 } else {
                     Err(format!(
                         "模型 '{}' 不可用。已注册的 Provider: [{}]。请检查模型名称是否正确，或使用 'provider:model' 格式指定",

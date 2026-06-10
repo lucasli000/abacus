@@ -175,7 +175,7 @@ impl AnalyzeEngine {
         targets: &[&str],
         depth: u32,
     ) -> ImpactReport {
-        let effective_depth = depth.min(10).max(1);
+        let effective_depth = depth.clamp(1, 10);
         let conn = self.db.lock().await;
 
         let mut impact_chains = Vec::new();
@@ -658,11 +658,7 @@ fn iterative_tarjan(adjacency: &HashMap<String, Vec<String>>) -> Vec<Vec<String>
                 // 如果是 SCC 根节点，弹出整个 SCC
                 if finished_lowlink == finished_index {
                     let mut scc: Vec<String> = Vec::new();
-                    loop {
-                        let w = match stack.pop() {
-                            Some(w) => w,
-                            None => break,
-                        };
+                    while let Some(w) = stack.pop() {
                         on_stack.remove(w);
                         scc.push(w.to_string());
                         if w == finished_node {

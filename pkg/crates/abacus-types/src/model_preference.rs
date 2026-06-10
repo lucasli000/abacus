@@ -41,7 +41,7 @@ use crate::model::{ProviderId, QualifiedModelId};
 /// ## Lifecycle
 /// - Created: first `/model` command or explicit config init
 /// - Destroyed: never (persists across sessions); user can manually delete file
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelPreference {
     /// Global default model (used when no task-specific or session override exists).
     #[serde(default)]
@@ -64,18 +64,6 @@ pub struct ModelPreference {
     /// Model aliases: shorthand → full qualified model id (e.g. "opus" → "anthropic:claude-opus-4-7").
     #[serde(default)]
     pub model_aliases: HashMap<String, QualifiedModelId>,
-}
-
-impl Default for ModelPreference {
-    fn default() -> Self {
-        Self {
-            default: None,
-            last_selected: None,
-            task_defaults: HashMap::new(),
-            provider_aliases: HashMap::new(),
-            model_aliases: HashMap::new(),
-        }
-    }
 }
 
 impl ModelPreference {

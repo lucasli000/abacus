@@ -215,8 +215,7 @@ impl UndoEngine {
             read_session_entries_at(&project_dir, &target_session_clone)
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("spawn_blocking panicked: {e}")))??;
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking panicked: {e}")))??;
         let target = entries
             .iter().rfind(|e| !e.undone)
             .cloned()
@@ -234,8 +233,7 @@ impl UndoEngine {
             read_session_entries_at(&project_dir, &session_id_owned)
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("spawn_blocking panicked: {e}")))??;
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking panicked: {e}")))??;
         let target = entries
             .iter()
             .find(|e| e.seq == seq && !e.undone)
@@ -254,8 +252,7 @@ impl UndoEngine {
             read_session_entries_at(&project_dir, &session_id_owned)
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("spawn_blocking panicked: {e}")))??;
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking panicked: {e}")))??;
         let targets: Vec<LogEntry> = entries.iter()
             .filter(|e| e.turn == turn && !e.undone)
             .cloned()
@@ -583,8 +580,7 @@ impl UndoEngine {
             Ok(cleaned)
         })
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other,
-            format!("spawn_blocking panicked: {e}")))??;
+        .map_err(|e| std::io::Error::other(format!("spawn_blocking panicked: {e}")))??;
         Ok(result)
     }
 

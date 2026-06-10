@@ -307,6 +307,18 @@ impl ToolRegistry {
         self.executors.write().await.insert(id, executor);
     }
 
+    /// Remove a tool and its executor from the registry
+    pub async fn unregister(&self, id: &ToolId) {
+        let mut tools = self.tools.write().await;
+        tools.remove(id);
+        *self.tools_cache.write().await = None;
+    }
+
+    /// Remove a tool executor from the registry
+    pub async fn unregister_executor(&self, id: &ToolId) {
+        self.executors.write().await.remove(id);
+    }
+
     /// Execute a tool by id with the given parameters.
     /// Returns ToolOutput with success=false instead of propagating errors,
     /// so that a single tool failure does not interrupt the multi-turn conversation.
@@ -663,6 +675,12 @@ impl OnboardingTier {
 pub struct UsageTracker {
     counters: tokio::sync::RwLock<std::collections::HashMap<String, u32>>,
     thresholds: std::collections::HashMap<String, u32>,
+}
+
+impl Default for UsageTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UsageTracker {

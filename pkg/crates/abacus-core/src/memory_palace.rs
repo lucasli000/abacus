@@ -1067,6 +1067,53 @@ impl DualPalaceMemory {
             cache_miss_domain: domain.to_string(),
         }
     }
+
+    // ─── W3 (RFC-0001v2): Palace × Triage 联动 ─────────────────────────
+
+    /// 记录 triage 决策作为行为模式
+    pub async fn record_triage_action(
+        &self,
+        action: &crate::core::triage::TriageAction,
+        _score: f64,
+        text_snippet: &str,
+    ) {
+        let intent = match action {
+            crate::core::triage::TriageAction::Inject => "triage_inject",
+            crate::core::triage::TriageAction::Compress { .. } => "triage_compress",
+            crate::core::triage::TriageAction::Standby { .. } => "triage_standby",
+            crate::core::triage::TriageAction::Cold { .. } => "triage_cold",
+            crate::core::triage::TriageAction::Discard => "triage_discard",
+        };
+        let domain = extract_domain_simple(text_snippet);
+        let tags = vec![domain, "triage".to_string()];
+        self.record_interaction(intent, &tags).await;
+    }
+
+    /// 对输入推测 triage hint
+    ///
+    /// 利用 behavior palace 中同一 domain 的历史 triage 模式预测分类。
+    /// 返回 `Some((action, confidence))` 或 `None`（无历史记录）。
+    pub async fn triage_hint(&self, input: &str) -> Option<(crate::core::triage::TriageAction, f64)> {
+        let domain = extract_domain_simple(input);
+        let tags = vec![domain, "triage".to_string()];
+        let memories = self.behavior.search(&tags).await;
+
+        // 找置信度最高的 triage 行为
+        memories.iter()
+            .filter(|m| m.pattern.starts_with("triage_"))
+            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|m| {
+                let action = match m.pattern.as_str() {
+                    "triage_inject" => crate::core::triage::TriageAction::Inject,
+                    "triage_compress" => crate::core::triage::TriageAction::Compress { depth: 0 },
+                    "triage_standby" => crate::core::triage::TriageAction::Standby { recall_id: String::new() },
+                    "triage_cold" => crate::core::triage::TriageAction::Cold { recall_id: String::new(), summary: String::new() },
+                    "triage_discard" => crate::core::triage::TriageAction::Discard,
+                    _ => return None,
+                };
+                Some((action, m.confidence))
+            })
+    }
 }
 
 impl Default for DualPalaceMemory {
@@ -1126,6 +1173,21 @@ fn normalize_domain(prefix: &str) -> &str {
     match prefix {
         "fs" | "bash" => "filengine",
         other => other,
+    }
+}
+
+/// W3 (RFC-0001v2): 从文本中提取隐含领域——用于 triage 行为模式学习
+fn extract_domain_simple(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return "unknown".into();
+    }
+    // 取前 2 个空格分隔的单词作为领域提示
+    let words: Vec<&str> = text.split_whitespace().take(2).collect();
+    if words.is_empty() {
+        "unknown".into()
+    } else {
+        words.join("_").to_lowercase()
     }
 }
 

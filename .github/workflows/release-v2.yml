@@ -136,55 +136,55 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "AbacusCode ${{ github.ref_name }}"
           body: |
-            # AbacusCode v2.0.0
+            # AbacusCode v2.5.0
 
-            ## 🚀 Major Features
+            ## 系统提示词架构重构（-62% token）
+            - 稳定前缀从 ~650 tok 压缩到 ~250 tok，prefix cache 命中率大幅提升
+            - 5 层合并为 1 层 Strategy（原 Strategy + Quality Bar + Task Completion + Entropy Guard + Explicit Declaration）
+            - 正向引导重构：命令式约束改为 LLM 权重倾向顺应引导
+            - Awareness Block 移到末尾，Mission Brief 归入稳定前缀
 
-            ### V42-B Streaming Migration
-            - Deleted 5 V40 fields, migrated to CardStream
-            - 8 new V42-B helper methods
-            - writer.rs: ToolAgentResult handling
+            ## 冷块分层系统（RFC-0001v2）
+            - TriageEngine: 消息分层引擎（Standby/Cold/Inject/Compress 四级）
+            - StandbyCache: 待命缓存（LRU + 语义去重 + TTL）
+            - ColdBuffer: 冷块缓冲（双写 + 批量 flush）
+            - SessionStore ColdTier: message_blocks + FTS5 + union_search
+            - 双轨召回: 热路径 FTS5 + 冷路径向量搜索
 
-            ### Config System Overhaul
-            - 17 config sections with validation
-            - Provider.toml unified (deprecated llm.* keys)
-            - 30+ validation rules
+            ## Auto Pipeline 并行化
+            - 串行步骤执行器改为并行 DAG 执行器
+            - 独立步骤 tokio::join! 并发执行
 
-            ### Knowledge Base
-            - 14 seed knowledge entries (Abacus architecture)
-            - 12 behavior patterns + 5 knowledge entries
-            - abacusbr.md with 6 sub-specifications
+            ## Tool View Schema Cache
+            - LRU 缓存（128 cap），全 provider 共享
 
-            ### Setup Wizard
-            - API validation before saving
-            - Latest models (2026-06-08)
-            - URL variants for providers
-            - OpenCodeZen + VolcengineCoding providers
+            ## 锁安全加固
+            - ~55 处嵌套锁修复（clone→drop→acquire 模式）
+            - ContextManager 15 锁排序文档
 
-            ## 📦 Downloads
+            ## Clippy 清零
+            - abacus-core: 15 → 0 warnings
+
+            ## KnowledgeStore 增强
+            - FTS5 预过滤（10K→200 候选）
+
+            ## TUI 改进
+            - 模型名修复、context_window_ratio、thinking_depth 同步
+
+            ## Downloads
 
             | Platform | Architecture | File |
             |----------|-------------|------|
             | macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
             | Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
-            | Windows | x86_64 | `abacus-x86_64-windows-msvc.zip` |
 
-            ## 🔧 Installation
+            ## Installation
 
             ```bash
             # macOS/Linux
             tar xzf abacus-*.tar.gz
             sudo mv abacus /usr/local/bin/
-
-            # Windows
-            # Extract zip and add to PATH
             ```
-
-            ## 📊 Stats
-
-            - 1,490 tests pass
-            - 0 warnings
-            - 0 errors
           draft: false
           prerelease: false
           files: |

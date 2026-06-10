@@ -248,7 +248,7 @@ mod tests {
         assert_eq!(parse_toml_value("true"),  toml::Value::Boolean(true));
         assert_eq!(parse_toml_value("false"), toml::Value::Boolean(false));
         assert_eq!(parse_toml_value("42"),    toml::Value::Integer(42));
-        assert_eq!(parse_toml_value("3.14"),  toml::Value::Float(3.14));
+        assert_eq!(parse_toml_value("2.71"),  toml::Value::Float(2.71));
     }
 
     #[test]

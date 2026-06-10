@@ -758,6 +758,11 @@ fn parse_env_value(s: &str) -> ConfigValue {
 /// - `[pipeline]` — 管道
 /// - `[deduction]` — 推演引擎
 /// - `[palace]` — 记忆宫殿
+/// - `[triage]` — 内容分类引擎
+///   - `[triage.thresholds]` — 分类阈值
+///   - `[triage.cache]` — 缓存容量
+///   - `[triage.embedding]` — embedding 配置
+///   - `[triage.reranker]` — reranker 配置
 /// - `[lsp]` / `[code_graph]` / `[plugins]` — 扩展
 /// - `[dedup]` — 去重
 /// - `[llm]` — 旧版配置 (deprecated，迁移到 provider.toml)
@@ -911,6 +916,47 @@ pub fn default_config() -> HashMap<String, ConfigValue> {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     defaults.insert("palace.enabled".into(), ConfigValue::Bool(true));
     defaults.insert("palace.sync_interval_turns".into(), ConfigValue::Number(5.0));
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // [triage] — 内容分类引擎
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    defaults.insert("triage.enabled".into(), ConfigValue::Bool(true));
+    defaults.insert("triage.audit_only".into(), ConfigValue::Bool(true));
+    defaults.insert("triage.keep_count".into(), ConfigValue::Number(5.0));
+    defaults.insert("triage.early_keep".into(), ConfigValue::Number(2.0));
+    defaults.insert("triage.inject_threshold".into(), ConfigValue::Number(0.65));
+    defaults.insert("triage.standby_threshold".into(), ConfigValue::Number(0.40));
+    defaults.insert("triage.cold_threshold".into(), ConfigValue::Number(0.20));
+    defaults.insert("triage.hysteresis_deadband".into(), ConfigValue::Number(0.15));
+    defaults.insert("triage.sticky_turns".into(), ConfigValue::Number(3.0));
+    defaults.insert("triage.cooldown_turns".into(), ConfigValue::Number(10.0));
+    defaults.insert("triage.max_compress_depth".into(), ConfigValue::Number(3.0));
+    defaults.insert("triage.standby_capacity".into(), ConfigValue::Number(200.0));
+    defaults.insert("triage.cold_batch_cap".into(), ConfigValue::Number(20.0));
+
+    // ── triage.thresholds ──────────────────────────────────────────────
+    defaults.insert("triage.thresholds.inject".into(), ConfigValue::Number(0.65));
+    defaults.insert("triage.thresholds.standby".into(), ConfigValue::Number(0.40));
+    defaults.insert("triage.thresholds.cold".into(), ConfigValue::Number(0.20));
+    defaults.insert("triage.thresholds.hysteresis".into(), ConfigValue::Number(0.15));
+    defaults.insert("triage.thresholds.sticky_turns".into(), ConfigValue::Number(3.0));
+    defaults.insert("triage.thresholds.cooldown_turns".into(), ConfigValue::Number(10.0));
+    defaults.insert("triage.thresholds.max_compress_depth".into(), ConfigValue::Number(3.0));
+
+    // ── triage.cache ───────────────────────────────────────────────────
+    defaults.insert("triage.cache.standby_capacity".into(), ConfigValue::Number(200.0));
+    defaults.insert("triage.cache.standby_ttl_turns".into(), ConfigValue::Number(50.0));
+    defaults.insert("triage.cache.cold_batch_cap".into(), ConfigValue::Number(20.0));
+    defaults.insert("triage.cache.tool_cache_cap".into(), ConfigValue::Number(128.0));
+
+    // ── triage.embedding ───────────────────────────────────────────────
+    defaults.insert("triage.embedding.enabled".into(), ConfigValue::Bool(false));
+    defaults.insert("triage.embedding.provider".into(), ConfigValue::String("vllm".into()));
+    defaults.insert("triage.embedding.minhash_fallback".into(), ConfigValue::Bool(true));
+
+    // ── triage.reranker ───────────────────────────────────────────────
+    defaults.insert("triage.reranker.enabled".into(), ConfigValue::Bool(false));
+    defaults.insert("triage.reranker.provider".into(), ConfigValue::String("vllm".into()));
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // [lsp] — LSP 语言服务

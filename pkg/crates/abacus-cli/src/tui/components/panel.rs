@@ -440,10 +440,8 @@ fn render_tab_scene(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     use ratatui::style::{Style, Modifier};
     use crate::tui::components::bars::format_ctx;
 
-    let sep = Paragraph::new(Line::styled(
-        " ╌╌╌╌╌╌╌╌",
-        Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-    ));
+    // 视觉分隔仅保留空行，不再画 ╌╌╌╌ 横线
+    let sep = Paragraph::new(Line::raw(""));
     let w = (area.width as usize).saturating_sub(4).max(10);
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
 
@@ -711,12 +709,11 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     let w     = (area.width as usize).saturating_sub(4).max(10);
     let mut lines: Vec<Line> = Vec::new();
 
-    let render_header = |label: &str, lines: &mut Vec<Line>, area_w: usize| {
-        let fill = area_w.saturating_sub(label.len() + 5).min(14);
+    let render_header = |label: &str, lines: &mut Vec<Line>, _area_w: usize| {
+        // 与 Stockroom/Timeline 标题统一：不再用长横线，避免视觉杂乱
         lines.push(Line::from(vec![
-            Span::styled("  ─ ", dim),
-            Span::styled(label.to_string(), muted),
-            Span::styled(format!(" {}", "─".repeat(fill)), dim),
+            Span::styled("  ▸ ", muted),
+            Span::styled(label.to_string(), muted.add_modifier(Modifier::BOLD)),
         ]));
     };
 
@@ -817,20 +814,20 @@ fn render_focus_panel(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     render_header(&title, &mut lines, w);
 
     if let Some(ref goal) = state.session_goal {
-        lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("  {}: {}", t("panel.session_goal"), goal.chars().take(w.saturating_sub(8)).collect::<String>()), txt)]));
+        lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("{}: {}", t("panel.session_goal"), goal.chars().take(w.saturating_sub(8)).collect::<String>()), txt)]));
     }
 
     if state.turn_count > 0 {
         if let Some(user_msg) = state.messages.iter().rev().find(|m| matches!(m.role, crate::tui::state::MsgRole::User)) {
             let preview: String = user_msg.parts.iter().filter_map(|p| if let crate::tui::state::MsgContent::Stream(s) = p { Some(s.as_str()) } else { None }).collect::<Vec<_>>().join(" ").chars().take(w.saturating_sub(10)).collect();
             if !preview.is_empty() {
-                lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("  {}: {}", t("panel.last_user"), preview), txt)]));
+                lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("{}: {}", t("panel.last_user"), preview), txt)]));
             }
         }
         if let Some(ai_msg) = state.messages.iter().rev().find(|m| matches!(m.role, crate::tui::state::MsgRole::Session)) {
             let preview: String = ai_msg.parts.iter().filter_map(|p| if let crate::tui::state::MsgContent::Stream(s) = p { Some(s.as_str()) } else { None }).collect::<Vec<_>>().join(" ").chars().take(w.saturating_sub(10)).collect();
             if !preview.is_empty() {
-                lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("  {}: {}", t("panel.last_ai"), preview), txt)]));
+                lines.push(Line::from(vec![Span::styled("    ", dim), Span::styled(format!("{}: {}", t("panel.last_ai"), preview), txt)]));
             }
         }
     }

@@ -33,16 +33,16 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::card::{default_color_for_kind, CardCollapse, CardHeader, CardHit, CardStreaming, MessageCard};
 use crate::section::SectionContext;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 卡片整体高度 = 边框(2) + header(1) + body(N)
+// 卡片整体高度 = header(1) + body(N)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// 卡片在屏幕上的总高度 (含边框 + header)
+/// 卡片在屏幕上的总高度（左侧彩色线不额外占高度）
 pub fn card_total_height(
     card: &dyn MessageCard,
     ctx: &dyn SectionContext,
@@ -52,9 +52,9 @@ pub fn card_total_height(
     let body_h = if matches!(collapse, CardCollapse::Headless) {
         0
     } else {
-        card.body_height(ctx, width.saturating_sub(2), collapse) // 减 2 边框
+        card.body_height(ctx, width.saturating_sub(3), collapse)
     };
-    body_h.saturating_add(2).saturating_add(1) // +2 边框 +1 header
+    body_h.saturating_add(1) // +1 header
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -80,67 +80,48 @@ pub fn render_card(
     collapse: CardCollapse,
     shimmer_pos: i32,
 ) {
-    if rect.width < 3 || rect.height < 3 {
-        return; // 太小无法画边框 + header
+    if rect.width < 3 || rect.height == 0 {
+        return; // 太小无法画左侧线 + header
     }
     let header = card.header(ctx);
     let color = header.color.unwrap_or_else(|| {
         default_color_for_kind(card.kind(), ctx.theme())
     });
 
-    // 边框策略：统一 Rounded（不再切 Double/Plain），border 用弱色
-    // 让消息流视觉连续，避免边框加粗造成割裂感
-    let border_color = match card.streaming() {
+    let line_color = match card.streaming() {
         CardStreaming::Aborted => ctx.theme().error,
-        _ => ctx.theme().border,  // 弱色边框，不抢主色
+        _ => color,
     };
 
-    // 边框 + 标题 + 折叠箭头
+    // 左侧彩色实线 + header 文本，其他边框全部移除
     let title_spans = build_title_spans(&header, &color, ctx, shimmer_pos);
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color))
-        .title(title_spans);
-
-    if matches!(collapse, CardCollapse::Headless) {
-        // 仅画 header (1 行 + 2 边框 = 3 行, rect 至少 3 高)
-        let p = Paragraph::new("").block(block);
-        f.render_widget(p, rect);
-        return;
-    }
-
-    // 计算 body 区域 (扣 1 行 header + 2 行边框)
-    let body_h = card.body_height(ctx, rect.width.saturating_sub(2), collapse);
-    let total = 2u16.saturating_add(1).saturating_add(body_h);
-    if rect.height < total {
-        // 高度不够 — 截断 body 到 (rect.height - 3)
-        let truncated_h = rect.height.saturating_sub(3);
-        let inner = Rect::new(
-            rect.x.saturating_add(1),
-            rect.y.saturating_add(2),
-            rect.width.saturating_sub(2),
-            truncated_h,
+    let line_style = Style::default().fg(line_color);
+    for dy in 0..rect.height {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("▏", line_style))),
+            Rect::new(rect.x, rect.y.saturating_add(dy), 1, 1),
         );
-        let p = Paragraph::new("")
-            .block(block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(p, rect);
-        // 用 inner_area 调 card.render_body 让卡片自己截断
-        card.render_body(f, ctx, inner, collapse);
-        return;
     }
-
-    let inner = Rect::new(
-        rect.x.saturating_add(1),
-        rect.y.saturating_add(2),
-        rect.width.saturating_sub(2),
-        body_h,
+    f.render_widget(
+        Paragraph::new(title_spans),
+        Rect::new(rect.x.saturating_add(2), rect.y, rect.width.saturating_sub(3), 1),
     );
 
-    let p = Paragraph::new("")
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, rect);
+    if matches!(collapse, CardCollapse::Headless) {
+        return;
+    }
+
+    let body_h = card.body_height(ctx, rect.width.saturating_sub(3), collapse);
+    let visible_body_h = body_h.min(rect.height.saturating_sub(1));
+    if visible_body_h == 0 {
+        return;
+    }
+    let inner = Rect::new(
+        rect.x.saturating_add(2),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(3),
+        visible_body_h,
+    );
     card.render_body(f, ctx, inner, collapse);
 
     // 折叠箭头 (右下角) — 仅 Expanded/Collapsed 状态
@@ -151,7 +132,7 @@ pub fn render_card(
     };
     let arrow_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
     let arrow_span = Span::styled(arrow, arrow_style);
-    let arrow_x = rect.x.saturating_add(rect.width.saturating_sub(2));
+    let arrow_x = rect.x.saturating_add(rect.width.saturating_sub(1));
     let arrow_y = rect.y.saturating_add(rect.height.saturating_sub(1));
     f.render_widget(
         Paragraph::new(Line::from(arrow_span)),
@@ -272,8 +253,8 @@ pub fn hit_test_card(
     if (x as i32) < rx || (x as i32) >= rx + rw || y < ry || y >= ry + rh {
         return None;
     }
-    // 折叠箭头位置: (rect.x + rect.width - 2, rect.y + rect.height - 1)
-    let arrow_x = rect.x as i32 + rect.width as i32 - 2;
+    // 折叠箭头位置: (rect.x + rect.width - 1, rect.y + rect.height - 1)
+    let arrow_x = rect.x as i32 + rect.width as i32 - 1;
     let arrow_y = rect.y as i32 + rect.height as i32 - 1;
     if (x as i32) == arrow_x && y == arrow_y {
         return Some(CardHit::CollapseToggle);
@@ -284,10 +265,10 @@ pub fn hit_test_card(
     }
     // body 区域
     let inner = Rect::new(
-        rect.x.saturating_add(1),
-        rect.y.saturating_add(2),
-        rect.width.saturating_sub(2),
-        rect.height.saturating_sub(3),
+        rect.x.saturating_add(2),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(3),
+        rect.height.saturating_sub(1),
     );
     card.hit_test(inner, x, y as u16)
 }
@@ -342,22 +323,22 @@ mod tests {
     fn card_total_height_static() {
         let card = StubCard::new(1, kinds::USER, 5, CardStreaming::Static);
         let ctx = test_ctx();
-        // body=5, +1 header, +2 border = 8
-        assert_eq!(card_total_height(&card, &ctx, 80, CardCollapse::Expanded), 8);
+        // body=5, +1 header = 6
+        assert_eq!(card_total_height(&card, &ctx, 80, CardCollapse::Expanded), 6);
     }
 
     #[test]
     fn card_total_height_headless_is_3() {
         let card = StubCard::new(1, kinds::USER, 5, CardStreaming::Static);
         let ctx = test_ctx();
-        // headless: body=0, +1 header, +2 border = 3
-        assert_eq!(card_total_height(&card, &ctx, 80, CardCollapse::Headless), 3);
+        // headless: body=0, +1 header = 1
+        assert_eq!(card_total_height(&card, &ctx, 80, CardCollapse::Headless), 1);
     }
 
     #[test]
     fn card_total_height_clamps() {
-        // body=u16::MAX - 2 + 3 → 应饱和到 u16::MAX
-        let card = StubCard::new(1, kinds::USER, u16::MAX - 2, CardStreaming::Static);
+        // body=u16::MAX, +1 header → 应饱和到 u16::MAX
+        let card = StubCard::new(1, kinds::USER, u16::MAX, CardStreaming::Static);
         let ctx = test_ctx();
         let h = card_total_height(&card, &ctx, 80, CardCollapse::Expanded);
         assert_eq!(h, u16::MAX);
@@ -462,18 +443,18 @@ mod tests {
     fn hit_test_card_collapse_toggle() {
         let card = StubCard::new(1, kinds::USER, 5, CardStreaming::Static);
         let rect = Rect::new(10, 10, 20, 10);
-        // 折叠箭头: x = 10 + 20 - 2 = 28, y = 10 + 10 - 1 = 19
-        assert_eq!(hit_test_card(&card, rect, 28, 19), Some(CardHit::CollapseToggle));
+        // 折叠箭头: x = 10 + 20 - 1 = 29, y = 10 + 10 - 1 = 19
+        assert_eq!(hit_test_card(&card, rect, 29, 19), Some(CardHit::CollapseToggle));
     }
 
     #[test]
     fn hit_test_card_body_returns_body_with_inner_y() {
         let card = StubCard::new(1, kinds::USER, 5, CardStreaming::Static);
         let rect = Rect::new(10, 10, 20, 10);
-        // (15, 13) 在 body 内, inner_y = 13 - (10 + 2) = 1
+        // (15, 13) 在 body 内, inner_y = 13 - (10 + 1) = 2
         match hit_test_card(&card, rect, 15, 13) {
-            Some(CardHit::Body { inner_y }) => assert_eq!(inner_y, 1),
-            other => panic!("expected Body {{ inner_y: 1 }}, got {:?}", other),
+            Some(CardHit::Body { inner_y }) => assert_eq!(inner_y, 2),
+            other => panic!("expected Body {{ inner_y: 2 }}, got {:?}", other),
         }
     }
 

@@ -81,20 +81,20 @@ fn default_guard() -> GuardConfig {
 }
 
 fn default_entropy_guard() -> String {
-    "Creating files/folders or multi-step tasks → think first:\n\
-     • Read before write. Edit > create. Append > new file.\n\
-     • Follow existing naming/structure. Check siblings.\n\
-     • One task = one coherent change. No speculative files.\n\
-     • Unsure about placement? Ask, don't guess.\n\
-     Exempt: single-file edits, appending to existing, running commands.".into()
+    "Before creating files/folders or starting multi-step tasks, a moment of planning pays off:\n\
+     • Read the existing structure first. Editing what's there is almost always better than creating something new.\n\
+     • Appending to an existing file or following the project's naming conventions feels natural and avoids fragmentation.\n\
+     • One coherent change per task — speculative files tend to cause confusion downstream.\n\
+     • If you're unsure about placement, asking the user takes one message and saves a cleanup cycle.\n\
+     Single-file edits, appending to existing files, and running commands are straightforward — just do them.".into()
 }
 
 fn default_explicit_declaration() -> String {
-    "NEVER go silent. If you encounter ANY of these, you MUST state it explicitly:\n\
-     • Blocked — tool denied, permission missing, file not found, command failed\n\
-     • Stuck — tried multiple approaches, none worked, need different strategy\n\
-     • Need input — ambiguous requirement, multiple valid options, missing context\n\
-     • Partial — task partially done, remaining steps require user action\n\
+    "Transparency is what makes your output trustworthy. When you encounter any of these, stating it explicitly is the most helpful response:\n\
+     • Blocked — tool denied, permission missing, file not found, command failed. Starting with [Blocked] gives the user immediate context.\n\
+     • Stuck — tried multiple approaches, none worked. Starting with [Stuck] signals you need a different strategy, not more retries.\n\
+     • Need input — ambiguous requirement, multiple valid options, missing context. Starting with [Need Input] is direct and respects the user's time.\n\
+     • Partial — task partially done, remaining steps require user action. Starting with [Partial] sets clear expectations.\n\
      Format: start with [Blocked], [Stuck], [Need Input], or [Partial], then explain in 1-2 sentences.".into()
 }
 

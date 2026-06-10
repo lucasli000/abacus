@@ -123,6 +123,16 @@ pub enum EventKind {
     // ── 系统 ────────────────────────────────────────────────
     ConfigChanged { key: String, old_value: String, new_value: String },
     Error { message: String, severity: String },
+
+    // ── 内容分类 ────────────────────────────────────────────
+    TriageDecision {
+        turn: u32,
+        block_id: String,
+        action: String,
+        score: f64,
+        token_saved: usize,
+        was_tool_protocol: bool,
+    },
 }
 
 /// 统一 EventBus
@@ -360,6 +370,13 @@ impl JsonlEventHook {
                     "tool_calls": tool_calls,
                     "latency_ms": latency_ms,
                     "completion_tokens": completion_tokens,
+                }),
+            ),
+            PipelineEvent::TriageResult { stats, turn_number } => (
+                "TriageResult",
+                serde_json::json!({
+                    "summary": stats.summary_line(),
+                    "turn_number": turn_number,
                 }),
             ),
         };
@@ -804,7 +821,7 @@ pub fn search_history(keyword: &str, limit: usize) -> std::io::Result<Vec<Histor
         tracing::warn!(bad_lines, "search_history: skipped malformed jsonl lines");
     }
     // 按 timestamp 倒序（最近在前）
-    matched.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    matched.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
     matched.truncate(limit);
     Ok(matched)
 }

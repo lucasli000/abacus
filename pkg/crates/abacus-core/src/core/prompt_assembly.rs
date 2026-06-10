@@ -181,7 +181,7 @@ impl PromptAssembly {
     /// ```
     pub fn register_hook(&mut self, hook: Box<dyn PromptHook>) {
         self.hooks.push(hook);
-        self.hooks.sort_by(|a, b| b.priority().cmp(&a.priority()));
+        self.hooks.sort_by_key(|h| std::cmp::Reverse(h.priority()));
     }
 
     /// 获取已注册 hooks 数量（用于测试/诊断）
@@ -320,55 +320,35 @@ impl PromptAssembly {
         // ## DeepSeek / OpenAI KV Cache 设计
         // DeepSeek 确定缓存命中基于「从第 0 个 token 开始的连续相同前缀」。
         // 将 core（任务无关）放在 Layer 230，task subscenes 降至 Layer 185（不出现在稳定前缀中）。
-        // 效果：稳定前缀 ~607 token。任务类型切换时岁改动的是 Layer 185 之后的动态内容。
+        // 效果：稳定前缀 ~250 token。任务类型切换时改动的是 Layer 185 之后的动态内容。
         let br_core = self.abacusbr_core_only();
         if !br_core.is_empty() {
             layers.entry(230).or_default().push(br_core);
         }
 
-        // Layer 3 (200): Strategy + AntiPattern
+        // Layer 3 (200): Strategy（合并原 Strategy + Quality Bar + Task Completion + Entropy Guard + Explicit Declaration）
+        // 所有稳定行为规则统一为一层，减少 token 重复，保持 prefix cache 友好
         layers.entry(200).or_default().push(
-            "## Tool Usage\n\
-            You have access to tools via function calling. To use a tool, emit a tool_call with the tool name and JSON parameters — do NOT write tool names or commands in your text response. The system will execute the tool and return results.\n\
-            - To run shell commands: call `bash_exec` with {\"command\": \"...\"}. Do NOT write shell commands in code blocks.\n\
-            - To read files: call `fs_read` with {\"path\": \"/absolute/path\"}. Do NOT write `cat` or `head` in text.\n\
-            - To search files: call `fs_search` (by filename glob) or `fs_grep` (by content regex).\n\
-            - All parameters are JSON objects, not CLI flags. Never use --flag syntax.\n\n\
-            ## Execution Strategy\n\
-            - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
-            - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
-            - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
-            - Large tasks: break into verifiable milestones. Report progress at each milestone.\n\
-            - Maximize single-turn throughput: call multiple tools in parallel when independent. Complete as much as possible before responding.\n\
-            - Prefer autonomous execution over asking: if the next step is unambiguous, do it. Only ask when genuinely blocked.\n\
-            - Context management: when you make important decisions or receive critical user confirmations, call context_pin to protect that turn from compression.".into());
-        layers.entry(190).or_default().push(
-            "## Constraints\n\
-            - NEVER write tool names or commands in text/code blocks — always use function calling.\n\
-            - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\
-            - NEVER skip tool verification by saying \"I believe\" or \"I think\" — use the tool.\n\
-            - NEVER produce placeholder code (TODO, ..., pass) — write complete implementations.\n\
-            - NEVER use CLI flag syntax (--flag) in tool parameters — use JSON key-value pairs.\n\
-            - When output exceeds 50 lines: use structured sections with clear headers.\n\
-            - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
-
-        // Layer 188: 任务完成摘要规则——稳定前缀的一部分（不随 task_kind 变化）
-        // 当 LLM 确认交付完成时，在回复末尾附上单行摘要，供 checkpoint 记录
-        // 格式固定，便于 pipeline 解析提取
-        layers.entry(188).or_default().push(
-            "## Task Completion\n\
-            When you have fully delivered what the user requested (task complete, not mid-task), \
-            append at the very end of your response:\n\
+            "## Tools\n\
+            Shell: bash_exec. File read: fs_read. Search: fs_search/fs_grep.\n\
+            Params are JSON objects (not CLI flags). Batch read-only calls in one turn — system batches them for efficiency.\n\n\
+            ## Execution\n\
+            Gather context → act → verify. Parallel independent tools.\n\
+            Failed: read error, check assumptions, retry 2x with diagnosis.\n\
+            Large tasks: milestones. Autonomy over questions. Context pinning: call context_pin for important decisions.\n\
+            Long output: structured headers. No placeholders (TODO/pass) — complete implementations only.\n\n\
+            ## File Discipline\n\
+            Edit > create. Append > new file. Follow project naming conventions.\n\
+            One coherent change per task. Unsure about placement? Ask.\n\n\
+            ## Completion\n\
+            When done, append at the very end:\n\
             ---\n\
-            ✓ [one-sentence summary: what was done / what was delivered, ≤80 chars, same language as user]\n\n\
-            Rules:\n\
-            - Only output this when the task is truly complete — not when asking questions, not mid-execution.\n\
-            - The summary line must start exactly with `✓ ` (checkmark + space).\n\
-            - Keep it factual and specific: \"✓ 重构认证模块，JWT 替代 session token，cargo check 通过\"".into()
-        );
+            ✓ [one-sentence summary ≤80 chars, same language as user]\n\n\
+            ## Transparency\n\
+            When blocked or stuck, state it explicitly: [Blocked] [Stuck] [Need Input] [Partial] + 1-2 sentences.".into());
 
-        // Layer 185: 任务相关子场景——动态内容，放在 Constraints(190) 之后
-        // 任务切换时只影响该层和后续动态层，对稳定前缀 607 token 无影响
+        // Layer 185: 任务相关子场景——动态内容，放在 Strategy(200) 之后
+        // 任务切换时只影响该层和后续动态层，对稳定前缀 ~250 token 无影响
         // clone：task_kind 后续还需用于构建 HookContext
         let br_subscenes = self.filter_abacusbr_subscenes_only(task_kind.clone());
         if !br_subscenes.is_empty() {
@@ -473,13 +453,13 @@ impl PromptAssembly {
     /// ## 四段式分层（W3 Task #101 + Tier 2.5 扩展）
     /// | 段 | priority | cacheable | 稳定性 | 内容 |
     /// |----|----------|-----------|--------|------|
-    /// | 0 (Tier 1)   | ≥190          | true  | **永久稳定**——session 内字节不变 | Kernel(255) + abacusbr_core(230) + Strategy(200) + Constraints(190) |
+    /// | 0 (Tier 1)   | ≥200          | true  | **永久稳定**——session 内字节不变 | Kernel(255) + abacusbr_core(230) + Strategy(200) |
     /// | 1 (Tier 2)   | =185          | true  | **task-sticky 稳定**——同 task_kind 锁定后字节不变 | abacusbr_subscenes（任务相关行为规范） |
     /// | 2 (Tier 2.5) | 180-184 semi  | true  | **task 内稳定**——同 task 执行中多 turn 不变 | retained_context + 活跃 expert_role（consecutive_hits>1） |
     /// | 3 (Tier 3)   | <185 其余     | false | turn-specific | 非稳定 injector + deduction + preflight + skills + interaction |
     ///
     /// ### 拆分动机
-    /// 之前所有 <190 内容（包括稳定的 br_subscenes）混在 dynamic 段，task switching 时整段失效。
+    /// 之前所有 <200 内容（包括稳定的 br_subscenes）混在 dynamic 段，task switching 时整段失效。
     /// 拆出 Tier 2 后：① 同 task 内连续 turn → Tier 1+2 都命中 ② task 切换 → 仅 Tier 2+dynamic 失效。
     /// Tier 2.5 进一步将 retained_context 和已稳定的 expert_role 从 Dynamic 中分出，
     /// 避免跨 turn 稳定内容因 priority < 185 而被标记为 cacheable=false 浪费 KV cache。
@@ -503,7 +483,7 @@ impl PromptAssembly {
         //
         // ## KV Cache 设计
         // 稳定前缀（≥190）必须字节级不变，否则缓存失效。
-        // 不变的内容：Kernel(255) + abacusbr_core(230) + Strategy(200) + Constraints(190)
+        // 不变的内容：Kernel(255) + abacusbr_core(230) + Strategy(200)
         // 变化的内容：task_subscenes(185) + retained_ctx(180) + expert_role(180) + deduction + skills + session
         // 关键改动： abacusbr 任务子场景从 Layer 230（稳定）降至 Layer 185（动态）
         // 效果：任务切换时稳定块 token 量从 ~2400 降至 ~610，缓存命中率显著提升。
@@ -520,18 +500,23 @@ impl PromptAssembly {
         }
 
         layers.entry(200).or_default().push(
-            "## Execution Strategy\n\
-            - Before acting: identify what information you need → use tools to gather it → then proceed.\n\
-            - Multi-tool chains: execute in dependency order. Verify intermediate results before continuing.\n\
-            - If first approach fails: diagnose the root cause (read error, check assumptions) before switching tactics.\n\
-            - Large tasks: break into verifiable milestones. Report progress at each milestone.".into());
-        layers.entry(190).or_default().push(
-            "## Constraints\n\
-            - NEVER fabricate file paths, function names, or API endpoints — verify they exist first.\n\
-            - NEVER skip tool verification by saying \"I believe\" or \"I think\" — use the tool.\n\
-            - NEVER produce placeholder code (TODO, ..., pass) — write complete implementations.\n\
-            - When output exceeds 50 lines: use structured sections with clear headers.\n\
-            - Error recovery: retry with corrected params (max 2 retries), then report with diagnosis.".into());
+            "## Tools\n\
+            Shell: bash_exec. File read: fs_read. Search: fs_search/fs_grep.\n\
+            Params are JSON objects (not CLI flags). Batch read-only calls in one turn — system batches them for efficiency.\n\n\
+            ## Execution\n\
+            Gather context → act → verify. Parallel independent tools.\n\
+            Failed: read error, check assumptions, retry 2x with diagnosis.\n\
+            Large tasks: milestones. Autonomy over questions. Context pinning: call context_pin for important decisions.\n\
+            Long output: structured headers. No placeholders (TODO/pass) — complete implementations only.\n\n\
+            ## File Discipline\n\
+            Edit > create. Append > new file. Follow project naming conventions.\n\
+            One coherent change per task. Unsure about placement? Ask.\n\n\
+            ## Completion\n\
+            When done, append at the very end:\n\
+            ---\n\
+            ✓ [one-sentence summary ≤80 chars, same language as user]\n\n\
+            ## Transparency\n\
+            When blocked or stuck, state it explicitly: [Blocked] [Stuck] [Need Input] [Partial] + 1-2 sentences.".into());
 
         // Layer 185: 任务相关子场景（动态块，任务切换时内容变化）
         // clone：task_kind 后续还需用于构建 HookContext
@@ -579,7 +564,7 @@ impl PromptAssembly {
 
         // W3 (Task #101) 升级为四段式拆分：
         //
-        // Tier 1 stable（永久稳定）：≥190
+        // Tier 1 stable（永久稳定）：≥200
         // Tier 2 stable（task-sticky）：==185（br_subscenes，同 task_kind 内字节不变）
         // Tier 2.5 semi-stable（task 内稳定）：priority 180-184 且 semi_stable=true（retained_context + 活跃 expert_role）
         // Tier 3 dynamic（不可缓存）：其余 <185
@@ -590,7 +575,7 @@ impl PromptAssembly {
         let mut dynamic_parts = Vec::new();
 
         for (prio, segs) in layers.iter().rev() {
-            if *prio >= 190 {
+            if *prio >= 200 {
                 tier1_stable.extend(segs.iter().cloned());
             } else if *prio == 185 {
                 tier2_stable.extend(segs.iter().cloned());
@@ -601,7 +586,7 @@ impl PromptAssembly {
 
         let mut segments = Vec::new();
 
-        // Tier 1：Kernel(255) + abacusbr_core(230) + Strategy(200) + Constraints(190)
+        // Tier 1：Kernel(255) + abacusbr_core(230) + Strategy(200)
         // 全 session 字节稳定——provider 端 cache_control=ephemeral 命中率最高
         if !tier1_stable.is_empty() {
             segments.push(SystemSegment {
@@ -928,7 +913,7 @@ mod tests {
         assert_eq!(cacheable1, cacheable2, "cacheable segments must be byte-identical across calls");
     }
 
-    /// **契约 2**：跨 task_kind，Tier 1（Kernel + abacusbr_core + Strategy + Constraints）必须一致。
+    /// **契约 2**：跨 task_kind，Tier 1（Kernel + abacusbr_core + Strategy）必须一致。
     /// 这是 W3 拆分的核心收益——task switching 时大头 prefix 仍命中。
     #[test]
     fn assemble_segments_tier1_invariant_across_tasks() {
@@ -945,11 +930,10 @@ mod tests {
             "Tier 1 stable segment must be invariant across task_kinds"
         );
 
-        // Tier 1 必须包含 Kernel/Strategy/Constraints
+        // Tier 1 必须包含 Kernel / Strategy（合并后只有一层 200）
         let t1 = tier1_code.unwrap();
         assert!(t1.contains("KERNEL_PROMPT_TEXT"), "Tier 1 must contain kernel");
-        assert!(t1.contains("Execution Strategy"), "Tier 1 must contain Strategy");
-        assert!(t1.contains("Constraints"), "Tier 1 must contain Constraints");
+        assert!(t1.contains("## Execution"), "Tier 1 must contain Strategy");
         assert!(t1.contains("always stable"), "Tier 1 must contain abacusbr core");
     }
 

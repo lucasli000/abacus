@@ -204,14 +204,13 @@ impl ConfigToolExecutor {
     /// 类型校验：确保 value 能被正确解析为目标类型
     fn validate_value(&self, key: &str, value: &str) -> abacus_types::Result<()> {
         match key {
-            "thinking" => {
-                if ThinkingIntent::from_str_loose(value).is_none() {
-                    return Err(KernelError::Other(format!(
-                        "invalid thinking value: '{}'. Expected: off/adaptive/low/medium/high/max/xhigh or integer budget",
-                        value
-                    )));
-                }
+            "thinking" if ThinkingIntent::from_str_loose(value).is_none() => {
+                return Err(KernelError::Other(format!(
+                    "invalid thinking value: '{}'. Expected: off/adaptive/low/medium/high/max/xhigh or integer budget",
+                    value
+                )));
             }
+            "thinking" => {} // valid thinking value
             "max_turns" | "max_tool_calls" | "max_tokens" | "max_escalations" => {
                 value.parse::<u32>().map_err(|_| KernelError::Other(format!(
                     "invalid u32 value for '{}': '{}'", key, value
