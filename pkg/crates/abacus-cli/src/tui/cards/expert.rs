@@ -94,8 +94,12 @@ impl MessageCard for ExpertCard {
             CardCollapse::Headless => return,
             CardCollapse::Collapsed => {
                 let preview = self.reply_preview();
-                let text = if preview.is_empty() { "(replying…)" } else { preview.as_str() };
-                let p = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(ctx.theme().text))));
+                let (text, style) = if preview.is_empty() {
+                    ("生成中…", Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM))
+                } else {
+                    (preview.as_str(), Style::default().fg(ctx.theme().text))
+                };
+                let p = Paragraph::new(Line::from(Span::styled(text, style)));
                 f.render_widget(p, inner);
             }
             CardCollapse::Expanded => {
@@ -121,13 +125,8 @@ impl MessageCard for ExpertCard {
                     lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(accent).add_modifier(Modifier::DIM))));
                     lines.push(Line::raw(""));
                 }
-                // V42-B 升级: reply 加 1 字符前导 padding, 避免贴左边框
-                if self.reply_text.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "(replying…)",
-                        Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
-                    )));
-                } else {
+                // V42-B 升级: reply 加 1 字符前导 padding, 避免贴左边框；空内容不额外画占位框
+                if !self.reply_text.is_empty() {
                     for line in self.reply_text.lines() {
                         let mut spans = vec![Span::raw(" ")];
                         spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));

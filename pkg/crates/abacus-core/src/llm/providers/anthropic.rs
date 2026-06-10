@@ -731,8 +731,12 @@ impl AnthropicProvider {
                 cached_tokens: cache_read,
                 cache_creation_tokens: cache_creation,
                 // Anthropic API 不返回独立 thinking token 计数，extended thinking 的
-                // 字节计入 output_tokens；置 0 表示"无独立字段曝露"，TUI 不显示思考行
-                thinking_tokens: 0,
+                // 字节计入 output_tokens。这里用 thinking 文本的字符估算作为展示值
+                // （不计入成本，仅 TUI 透传），与流式路径保持一致。
+                thinking_tokens: thinking_text
+                    .as_deref()
+                    .map(crate::core::context::estimate_tokens)
+                    .unwrap_or(0) as u64,
             },
             thinking: thinking_text,
             cache_stats: Some(CacheStats {
@@ -1001,8 +1005,12 @@ impl LlmProvider for AnthropicProvider {
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 // Anthropic 流式当前未拆 cache 字段，extended thinking 计入 completion；
-                // thinking_tokens=0 与非流式路径对齐
-                thinking_tokens: 0,
+                // 用 thinking 文本估算作为展示值（不计入成本，仅 TUI 透传）
+                thinking_tokens: if full_thinking.is_empty() {
+                    0
+                } else {
+                    crate::core::context::estimate_tokens(&full_thinking) as u64
+                },
             },
             thinking: if full_thinking.is_empty() { None } else { Some(full_thinking) },
             cache_stats: None,

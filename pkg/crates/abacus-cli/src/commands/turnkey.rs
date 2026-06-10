@@ -23,7 +23,7 @@ pub async fn handle_turnkey(args: &super::TurnkeyArgs, formatter: &mut Box<dyn O
             formatter.format_message("turnkey", &format!("Turnkey: {}", goal), None);
             formatter.format_message("turnkey", "─────────────────────────", None);
 
-            let (_core, _session) = crate::engine_init::create_engine("deepseek-v4", None, "high").await?;
+            let (_core, _session) = crate::engine_init::create_engine("", None, "").await?;
 
             formatter.format_message("turnkey", "  Estimated steps: ~6-8 (turnkey auto-plan)", None);
             formatter.format_message("turnkey", "", None);

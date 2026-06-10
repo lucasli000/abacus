@@ -259,21 +259,50 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
             // 生命周期：仅首次连接出现（随引擎启动一次性提醒）；重连会重发，不频繁。
             // 引用关系：/help 有完整复制节，用户可查体。
             // 复制提示已在 /help 中有完整说明，不在连接时打扰用户
-            // FIX: 从实际 provider 列表取首模型，而非 config 的硬编码 fallback
-            let first_model_name = e.core.list_models().await.first()
-                .cloned()
-                .unwrap_or_else(|| e.core.config().default_model.0.clone());
-            state.model_name = first_model_name.clone();
-            state.theme.apply_model_brand(&first_model_name);
+            // FIX(v2.0.5): 不再 list_models() 拿第一个 — 那个总是返回 deepseek-v4-flash
+            // （provider 列表里排第一），会覆盖用户在 setup 阶段选的真实 model。
+            // 改用 config 里的 default_model（engine 实际使用的模型）作权威源。
+            // 只有当 state.model_name 完全为空时才用 config 兜底。
+            let config_model = e.core.config().default_model.0.clone();
+            if state.model_name.is_empty() {
+                state.model_name = config_model.clone();
+            }
+            state.theme.apply_model_brand(&state.model_name);
             // V40: 同步 context 到 TUI state
             // model_max_context = LLM 物理上限（model_spec 定义）
-            // context_window = 系统设定有效窗口（首次由 Complete stats.context_max 覆盖）
+            // context_window = 有效窗口（physical × context_window_ratio, 最小 128K）
+            // 引用：abacus-core/src/core/pipeline/mod.rs:598-600 的 available 计算
+            // TUI 用 effective 而非 physical 作分母，progress 条与 pipeline 实际 budget 一致
             if let Some(ref spec) = e.core.config().model_spec {
                 state.model_max_context = spec.context_window;
-                // 初始 context_window 暂用 model_limit（Complete 后会被 stats.context_max 精确覆盖）
-                state.context_window = spec.context_window;
+                let ratio = e.core.config().context_window_ratio.clamp(0.1, 1.0);
+                state.context_window =
+                    ((spec.context_window as f64 * ratio) as usize).max(128_000);
             }
             // 可用模型列表延迟到首次打开 /model picker 时通过 pending_model_fetch 触发
+            // FIX(v2.0.5): 同步 thinking_depth — engine 初始化时已从 config 读取 thinking_intent，
+            // 但 TUI state.thinking_depth 仍是硬编码默认值。用 config 的 thinking_intent 回写，
+            // 让 /thinking picker 和看板 Thinking:xxx 显示真实值。
+            if let Some(ref intent) = e.core.config().thinking_intent {
+                let label = match intent {
+                    abacus_types::ThinkingIntent::Off => "off",
+                    abacus_types::ThinkingIntent::Adaptive => "adaptive",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Minimal) => "minimal",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Low) => "low",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Medium) => "medium",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::High) => "high",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::Max) => "max",
+                    abacus_types::ThinkingIntent::Effort(abacus_types::EffortLevel::XHigh) => "xhigh",
+                    abacus_types::ThinkingIntent::Budget(n) => {
+                        // Budget 用数字字符串，/thinking picker 会识别
+                        state.thinking_depth = n.to_string();
+                        ""
+                    }
+                };
+                if !label.is_empty() {
+                    state.thinking_depth = label.to_string();
+                }
+            }
             // 避免启动时同步阻塞（虽然 list_models 是内存操作，但避免任何潜在 lock 争用）
             state.pending_model_fetch = true;
 
@@ -424,9 +453,11 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     state.available_models = models;
                     state.available_providers = provider_groups;
                     state.provider_statuses = provider_statuses.clone();
-                    // FIX: discover 后同步 model_name — 覆盖引擎初始化时 config 的硬编码 fallback
-                    if let Some(first) = state.available_models.first() {
-                        if state.model_name == "deepseek-v4-flash" || state.model_name.is_empty() {
+                    // FIX(v2.0.5): discover 只更新可选列表，不覆盖当前模型。
+                    // 之前用 `deepseek-v4-flash` 作为 sentinel，会把用户选择的 mimo-v2-pro
+                    // 覆盖成 provider 列表里的第一个模型，导致看板与实际 LLM 卡片不一致。
+                    if state.model_name.is_empty() {
+                        if let Some(first) = state.available_models.first() {
                             state.model_name = first.clone();
                             state.theme.apply_model_brand(first);
                         }
@@ -1509,14 +1540,19 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             // 同步 latest_prompt_tokens — 让 Panel/fallback 路径及时反映最新值
                             state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
                             // V40: 实时更新 token 统计（面板每帧可见最新数据）
-                            state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
-                                .max(stats.prompt_tokens);
-                            state.session_tokens.completion_tokens = state.session_tokens.completion_tokens
-                                .max(stats.completion_tokens);
-                            state.session_tokens.total_tokens = state.session_tokens.total_tokens
-                                .max(stats.total_tokens);
-                            state.session_tokens.cached_tokens = state.session_tokens.cached_tokens
-                                .max(stats.cached_tokens);
+                            // 累加语义（与 line 695 非流式路径一致）：每轮 token 累加到 session 总计
+                            // 历史原因：早期用 .max() 显示"最大单轮"值，语义不一致且对用户误导
+                            // — 几轮后用户看到 0（首次）+ 100K（第二轮）.max() 仍 100K，掩盖累计
+                            state.session_tokens.prompt_tokens =
+                                state.session_tokens.prompt_tokens.saturating_add(stats.prompt_tokens);
+                            state.session_tokens.completion_tokens =
+                                state.session_tokens.completion_tokens.saturating_add(stats.completion_tokens);
+                            state.session_tokens.total_tokens =
+                                state.session_tokens.total_tokens.saturating_add(stats.total_tokens);
+                            state.session_tokens.cached_tokens =
+                                state.session_tokens.cached_tokens.saturating_add(stats.cached_tokens);
+                            state.session_tokens.thinking_tokens =
+                                state.session_tokens.thinking_tokens.saturating_add(stats.thinking_tokens);
                             // context_tokens 覆盖 total_tokens（用 context_manager 的精确值替换 API usage）
                             if let Some(ctx_tok) = stats.context_tokens {
                                 state.session_tokens.total_tokens = ctx_tok;

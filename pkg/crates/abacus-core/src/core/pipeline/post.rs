@@ -612,7 +612,7 @@ impl<'a> TurnPipeline<'a> {
         // prior_accomplishments 来自历轮 ✓ 标记，不替换而是前置合并
         if !prior_accomplishments.is_empty() {
             let mut merged = prior_accomplishments;
-            merged.extend(cp.accomplished.into_iter());
+            merged.extend(cp.accomplished);
             merged.dedup(); // 去重（同一摘要可能多次出现）
             merged.truncate(5);
             cp.accomplished = merged;

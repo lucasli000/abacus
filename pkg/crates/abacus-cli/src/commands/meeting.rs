@@ -171,7 +171,7 @@ async fn handle_live_meeting(
     args: &MeetingArgs,
     formatter: &mut Box<dyn OutputFormatter>,
 ) -> Result<()> {
-    let (core, session) = crate::engine_init::create_engine(&args.model, None, "high").await?;
+    let (core, session) = crate::engine_init::create_engine(&args.model, None, "").await?;
 
     let mut manager = MeetingManager::new(core, session, args.topic.clone());
 

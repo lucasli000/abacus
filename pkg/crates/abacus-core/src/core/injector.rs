@@ -520,7 +520,7 @@ impl DynamicInjector {
                 .sum();
             if total_tokens > cfg_max_tokens {
                 // Sort by TTL desc (keep highest TTL = most recently refreshed)
-                self.knowledge_entries.sort_by(|a, b| b.ttl.cmp(&a.ttl));
+                self.knowledge_entries.sort_by_key(|e| std::cmp::Reverse(e.ttl));
                 let mut budget = 0usize;
                 let mut keep_count = 0;
                 for entry in &self.knowledge_entries {
@@ -658,29 +658,6 @@ impl DynamicInjector {
     pub fn register_defaults(&mut self) {
         self.register_expert_role_injector();
         self.register_source(InjectionSource {
-            source_id: "topic".into(),
-            should_inject: Box::new(|input, _ctx| {
-                let topics = ["rust", "typescript", "python", "react", "api", "database"];
-                topics.iter().any(|t| input.to_lowercase().contains(t))
-            }),
-            inject: Box::new(|input, _ctx| {
-                let lower = input.to_lowercase();
-                let topic = if lower.contains("rust") { "Rust" }
-                    else if lower.contains("typescript") { "TypeScript" }
-                    else if lower.contains("python") { "Python" }
-                    else if lower.contains("react") { "React" }
-                    else if lower.contains("api") { "API Design" }
-                    else if lower.contains("database") { "Database" }
-                    else { return None };
-                Some(PromptSegment {
-                    kind: SegmentKind::Knowledge,
-                    text: format!("[Injector] Topic context: user discussing {topic}. Use relevant best practices and conventions."),
-                    semi_stable: false,
-                })
-            }),
-        });
-
-        self.register_source(InjectionSource {
             source_id: "tool_result".into(),
             should_inject: Box::new(|_input, ctx| {
                 ctx.get("tool_results")
@@ -688,49 +665,15 @@ impl DynamicInjector {
                     .map(|a| !a.is_empty())
                     .unwrap_or(false)
             }),
-            // KV cache 修复：text 不嵌入 count（之前 `{} tool results` 让此 Knowledge 段
-            //   每轮 byte 变化 → dedup 触发 active_knowledge 替换 → Layer 180 之后所有
-            //   层 cache miss）。LLM 能直接从 messages 数组看到实际 tool 结果数，count 是冗余信号。
-            //   稳定文本让相同情境下 dedup（line 181）短路、active_knowledge byte-identical。
             inject: Box::new(|_input, _ctx| {
                 Some(PromptSegment {
                     kind: SegmentKind::Knowledge,
-                    text: "[Injector] Tool results available in current turn. Review them before responding.".to_string(),
+                    text: "Synthesize across results. Let findings shape your next action — not prior assumptions.".to_string(),
                     semi_stable: false,
                 })
             }),
         });
 
-        // V41: ToolAgent batch awareness — 引导 LLM 主动批量发出只读调用
-        //
-        // ## 设计意图
-        // LLM 不知道 pipeline 会自动聚合只读工具调用——它可能分多轮逐个 read。
-        // 注入此 hint 后 LLM 会主动"攒一批"发出，触发 ToolAgent 批量路径。
-        //
-        // ## KV cache 友好
-        // semi_stable=true → Tier 2.5 缓存命中（文本跨 turn 不变）
-        // 固定文本，不含动态变量，字节级稳定
-        //
-        // ## 引用关系
-        // - 消费方: LLM 推理（影响工具调用策略）
-        // - 效果: 更多 tool_calls 被聚合到单轮 → ToolAgent batch → 省 token + 不刷屏
-        self.register_source(InjectionSource {
-            source_id: "toolagent_hint".into(),
-            should_inject: Box::new(|_input, _ctx| true), // 常驻注入
-            inject: Box::new(|_input, _ctx| {
-                Some(PromptSegment {
-                    kind: SegmentKind::Knowledge,
-                    text: concat!(
-                        "[Batch Tools] When you need to read/search multiple files or resources, ",
-                        "issue ALL read-only tool calls in ONE turn (not spread across turns). ",
-                        "The system batches them for efficiency. ",
-                        "Batchable: fs_read, grep, fs_search, cg_query, db_query, web_search, lsp_*. ",
-                        "Write operations (fs_write, fs_edit, bash_exec) remain individual."
-                    ).to_string(),
-                    semi_stable: true, // Tier 2.5: 跨 turn 缓存命中
-                })
-            }),
-        });
     }
 
     /// Register defaults with an external TOML config.
@@ -866,7 +809,7 @@ impl DynamicInjector {
 /// ASCII words count as ~1 token per 4 chars. Simplified to chars/2 for mixed text.
 fn estimate_tokens(text: &str) -> usize {
     // Rough estimate: 1 token per 2 characters for CJK-heavy text
-    (text.len() + 1) / 2
+    text.len().div_ceil(2)
 }
 
 
@@ -1337,12 +1280,13 @@ mod tests {
 
     #[test]
     fn test_topic_injection() {
+        // Topic injector 已移除——LLM 从用户消息本身判断话题，无需冗余注入
         let mut injector = DynamicInjector::new();
         injector.register_defaults();
 
         let segments = injector.inject("how do I use async tokio in rust?", &Value::Null);
-        assert!(!segments.is_empty(), "expected topic injection for rust");
-        assert!(segments[0].text.contains("Rust"));
+        assert!(!segments.iter().any(|s| s.text.contains("Topic context")),
+            "topic injector 已移除，不应注入 topic context");
     }
 
     #[test]
@@ -1351,8 +1295,7 @@ mod tests {
         injector.register_defaults();
 
         let segments = injector.inject("hello world", &Value::Null);
-        // toolagent_hint 是「常驻注入」与 topic 注入无关——不应误判 topic 触发。
-        // 检查无 "Topic context" 类话题段即可。
+        // 检查无 "Topic context" 类话题段（topic injector 已移除，正常情况不应出现）。
         assert!(!segments.iter().any(|s| s.text.contains("Topic context")),
             "irrelevant 输入不应触发 topic 注入，got {:?}", segments);
     }
@@ -1365,8 +1308,7 @@ mod tests {
         let ctx = serde_json::json!({"tool_results": [{"tool": "fs_read", "status": "ok"}]});
         let segments = injector.inject("check the file", &ctx);
         assert!(!segments.is_empty());
-        // 大小写按 stable 文本来——KV cache 修复后改成 "Tool results available..."（无 count）
-        assert!(segments.iter().any(|s| s.text.contains("Tool results available")));
+        assert!(segments.iter().any(|s| s.text.contains("Synthesize across results")));
     }
 
     /// KV cache 回归：tool_result 段在不同 count 下文本必须 byte-identical。
@@ -1398,11 +1340,11 @@ mod tests {
         };
 
         let text_a: Vec<_> = segs_a.iter()
-            .filter(|s| s.text.starts_with("[Injector] Tool results"))
+            .filter(|s| s.text.starts_with("Synthesize"))
             .map(|s| s.text.as_str())
             .collect();
         let text_b: Vec<_> = segs_b.iter()
-            .filter(|s| s.text.starts_with("[Injector] Tool results"))
+            .filter(|s| s.text.starts_with("Synthesize"))
             .map(|s| s.text.as_str())
             .collect();
 

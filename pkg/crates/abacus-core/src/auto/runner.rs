@@ -93,12 +93,6 @@ struct JobRunStats {
     state: JobState,
 }
 
-impl Default for JobState {
-    fn default() -> Self {
-        JobState::Idle
-    }
-}
-
 impl JobRunner {
     pub fn new(engine: Arc<AutoEngine>, config: RunnerConfig) -> Self {
         Self {

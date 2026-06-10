@@ -21,7 +21,7 @@ pub async fn run_pipe_mode(args: &ExecArgs, formatter: &mut Box<dyn OutputFormat
 
     // Execute via engine (same path as `abacus run` without pipe)
     let model = &args.model;
-    match crate::engine_init::create_engine(model, None, "medium").await {
+    match crate::engine_init::create_engine(model, None, "").await {
         Ok((core, session)) => {
             match core.process_turn(&task, &session).await {
                 Ok(result) => {

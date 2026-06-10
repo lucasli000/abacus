@@ -82,8 +82,7 @@ fn try_extract_xml_tool_calls(content: &str) -> Option<(String, Vec<ToolCall>)> 
         let param_open = "<parameter";
         let param_close = "</parameter>";
         let mut param_pos = 0;
-        loop {
-            let Some(ps_rel) = invoke_block[param_pos..].find(param_open) else { break };
+        while let Some(ps_rel) = invoke_block[param_pos..].find(param_open) {
             let ps = param_pos + ps_rel;
             let param_name = extract_xml_attr_value(&invoke_block[ps..], "name")
                 .unwrap_or_default();

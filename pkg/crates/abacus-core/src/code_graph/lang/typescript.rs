@@ -58,6 +58,7 @@ const BUN_BUILTINS: &[&str] = &[
 ///
 /// 同时处理 `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs` 文件。
 /// 无内部状态，满足 Send + Sync 约束。
+#[derive(Default)]
 pub struct TypeScriptAnalyzer;
 
 impl TypeScriptAnalyzer {
@@ -359,7 +360,7 @@ fn extract_symbols_recursive(
 fn extract_calls_recursive(
     node: Node,
     source: &[u8],
-    file_path: &str,
+    _file_path: &str,
     calls: &mut Vec<RawCall>,
 ) {
     if node.is_error() {
@@ -397,7 +398,7 @@ fn extract_calls_recursive(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        extract_calls_recursive(child, source, file_path, calls);
+        extract_calls_recursive(child, source, _file_path, calls);
     }
 }
 

@@ -72,7 +72,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     let ctx = AppContext::new(state);
 
     // 4. 遍历卡片, 按 scroll offset 画可见部分
-    let scroll_offset = state.message_scroll_y;
+    let scroll_offset = state.scroll;
     let mut y = inner.y;
     let mut skipped = 0u16;
 
@@ -85,15 +85,13 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
         }
 
         // scroll: 跳过 scroll_offset 行
-        if skipped < scroll_offset {
-            let remaining = scroll_offset - skipped;
-            if remaining >= h {
-                // 整个卡片被跳过
+        if usize::from(skipped) < scroll_offset {
+            let remaining = scroll_offset - usize::from(skipped);
+            if remaining >= h as usize {
                 skipped = skipped.saturating_add(h);
                 continue;
             } else {
-                // 部分卡片可见（顶部被裁剪）
-                let clip_top = remaining;
+                let clip_top = remaining as u16;
                 let visible_h = h - clip_top;
                 if y >= inner.y + inner.height {
                     break; // 超出可见区

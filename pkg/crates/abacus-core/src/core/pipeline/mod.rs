@@ -329,8 +329,8 @@ impl<'a> TurnPipeline<'a> {
     pub async fn continue_gated(self, responses: Vec<(u32, UserResponse)>) -> Result<TurnResult, KernelError> {
         // Inject confirmation results into progressive controller
         {
-            let s = self.session.read().await;
-            let mut ctrl = s.progressive.write().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let mut ctrl = ctrl.write().await;
             ctrl.on_confirmation(responses);
         }
 
@@ -348,8 +348,8 @@ impl<'a> TurnPipeline<'a> {
 
         // Progressive continuation injection
         {
-            let s = self.session.read().await;
-            let ctrl = s.progressive.read().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let ctrl = ctrl.read().await;
             if let Some((_, prompt_text)) = build_progressive_prompt(ctrl.current_state(), ctrl.current_strategy()) {
                 enriched_system.push_str("\n\n");
                 enriched_system.push_str(&prompt_text);
@@ -369,17 +369,21 @@ impl<'a> TurnPipeline<'a> {
         let (provider_id, provider) = self.core.resolve_provider().await?;
         // V35-1: messages 改为 mut，便于按需追加 prefix=true assistant message
         let mut messages = {
-            let s = self.session.read().await;
-            let guard = s.messages.read().await;
-            guard.clone()
+            let msgs = self.session.read().await.messages.clone();
+            let result = msgs.read().await.clone();
+            drop(msgs);
+            result
         };
 
         // Phase β-D：从 session.task_kind_locked 读取已锁定的 task_kind label，用于工具路由过滤
         // Phase γ-I：从 session.turn_count 取 current turn，用于 frequency pruning
         let (task_kind_label, current_turn) = {
             let s = self.session.read().await;
-            let locked = s.task_kind_locked.read().await;
-            (locked.as_ref().map(|k| k.label().to_string()), Some(s.turn_count as u64))
+            let current_turn = s.turn_count as u64;
+            let locked_arc = s.task_kind_locked.clone();
+            drop(s);
+            let locked = locked_arc.read().await;
+            (locked.as_ref().map(|k| k.label().to_string()), Some(current_turn))
         };
         // Phase γ-Palace-C：每 N turn 同步行为宫殿信号到 effectiveness（降级失败工具）
         // 跳过：interval=None / palace 未启用 / 首轮（turn=0 时同步无意义）
@@ -477,15 +481,15 @@ impl<'a> TurnPipeline<'a> {
 
         // Store in session
         {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
+            let msgs = self.session.read().await.messages.clone();
+            let mut msgs = msgs.write().await;
             msgs.push(response.message.clone());
         }
 
         // Finalize progressive controller
         {
-            let s = self.session.read().await;
-            let mut ctrl = s.progressive.write().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let mut ctrl = ctrl.write().await;
             ctrl.finalize(response.usage.total_tokens);
         }
 
@@ -502,8 +506,8 @@ impl<'a> TurnPipeline<'a> {
 
         let session_id = { let s = self.session.read().await; s.session_id.clone() };
         let progressive_state = {
-            let s = self.session.read().await;
-            let ctrl = s.progressive.read().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let ctrl = ctrl.read().await;
             if ctrl.is_passthrough() { None } else { Some(ctrl.current_state().clone()) }
         };
 
@@ -543,12 +547,151 @@ impl<'a> TurnPipeline<'a> {
         self.core.safety_guard.check_input_length(self.input)
             .map_err(|e| KernelError::Other(e.to_string()))?;
 
-        // Phase Ctx-A: pressure shed pending 检查——若上一轮 pressure_monitor 报警，
-        // 这里立即触发 auto_compress 让 prefix 字节回到稳定区间
-        // 修复：仅在实际压缩发生时才发 CompressStart（避免每轮空弹 toast）
-        if self.core.context_manager.take_shed_pending() {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
+        // Phase Ctx-A: 内容审校（TriageEngine）或压缩（auto_compress）
+        // TriageEngine 启用时每轮主动审校消息，替代被动压缩
+
+        // W4-D3: StandbyCache warm_up — 先召回与当前输入相关的缓存内容
+        if let Some(ref cache) = self.core.standby_cache {
+            let turn_number = {
+                let s = self.session.read().await;
+                s.turn_count + 1
+            };
+            let recalled = cache.warm_up(self.input, turn_number).await;
+            let recall_count = recalled.len();
+            let recall_msg_count: usize = recalled.iter().map(|e| e.content.len()).sum();
+            if !recalled.is_empty() {
+                let msgs_arc = self.session.read().await.messages.clone();
+                let mut msgs = msgs_arc.write().await;
+                for entry in recalled {
+                    let content = entry.content.as_ref().clone();
+                    msgs.extend(content);
+                }
+                tracing::info!(
+                    "standby_cache: warm_up recalled {} entries ({} messages)",
+                    recall_count,
+                    recall_msg_count,
+                );
+            }
+        }
+
+        // W5-D6 + P2-3 + P3-3: 合并冷块召回（FTS5 + MinHash 一次查询）
+        if !self.input.is_empty() {
+            if let Ok((raw_blocks, mh_blocks)) = self.core.context_manager.recall_blocks_dual(self.input, 5, 3).await {
+                if !raw_blocks.is_empty() || !mh_blocks.is_empty() {
+                    let msgs_arc = self.session.read().await.messages.clone();
+                    let mut msgs = msgs_arc.write().await;
+                    for block in &raw_blocks {
+                        msgs.push(cold_block_message("", block));
+                    }
+                    for block in &mh_blocks {
+                        msgs.push(cold_block_message(" by MinHash", block));
+                    }
+                    let total = raw_blocks.len() + mh_blocks.len();
+                    tracing::info!("cold_tier: recalled {} blocks ({} raw + {} MinHash)", total, raw_blocks.len(), mh_blocks.len());
+                }
+            }
+        }
+
+        let triage_cfg = self.core.effective_triage_config();
+        let triage_enabled = triage_cfg.enabled;
+        let triage_stats = if triage_enabled {
+            let turn_number = {
+                let s = self.session.read().await;
+                s.turn_count + 1
+            };
+            let msgs = self.session.read().await.messages.clone();
+            let mut msgs = msgs.write().await;
+
+            // P1-4: 消息量跳过——太少消息不值得跑 triage
+            let result = if msgs.len() < triage_cfg.skip_below_msg_count {
+                tracing::debug!("triage: skipped ({} msgs < threshold {})",
+                    msgs.len(), triage_cfg.skip_below_msg_count);
+                None
+            } else if let Some(ref engine_lock) = self.core.triage_engine {
+                let mut engine = engine_lock.write().await;
+                engine.update_config(&triage_cfg);
+
+                // P2-6: 按会话模式调整阈值
+                {
+                    let s = self.session.read().await;
+                    engine.adjust_for_mode(s.mode.label());
+                }
+
+                // W5-D7: 根据上下文压力调整阈值
+                let pressure = {
+                    let w = self.core.context_manager.window.read().await;
+                    w.usage_pct()
+                };
+                engine.adjust_for_pressure(pressure).await;
+
+                // P2-5: 自适应跳过——多信号融合
+                let recent_text = {
+                    let all_text: String = msgs.iter()
+                        .rev()
+                        .take(10)
+                        .filter_map(|m| match &m.content {
+                            Some(crate::llm::provider::MessageContent::Text(t)) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<&str>>()
+                        .join(" ");
+                    if all_text.len() > 500 { all_text[..500].to_string() } else { all_text }
+                };
+                let should_skip = engine.should_skip(pressure, msgs.len(), self.input, &recent_text).await;
+                if should_skip {
+                    tracing::debug!("triage: adaptive skip (pressure={:.0}%, msgs={})", pressure, msgs.len());
+                    engine.mark_skipped().await;
+                    None
+                } else {
+                    // W5: Palace triage_hint — 预判 triage 行为
+                    if let Some(ref palace) = self.core.memory_palace {
+                        if let Some((hint_action, confidence)) = palace.read().await.triage_hint(self.input).await {
+                            tracing::debug!("triage_hint: {:?} (confidence={:.2})", hint_action, confidence);
+                        }
+                    }
+                    let stats = engine.run(&mut msgs, self.input, turn_number).await;
+                    engine.update_adaptive_skip(&stats, msgs.len()).await;
+                    // W5: Palace record_triage_action — 记录 triage 决策
+                    if let Some(ref palace) = self.core.memory_palace {
+                        let audit = engine.audit_records().await;
+                        for rec in &audit {
+                            palace.read().await.record_triage_action(
+                                &rec.action, rec.score, &format!("turn_{}", turn_number)
+                            ).await;
+                        }
+                    }
+                    Some(stats)
+                }
+            } else {
+                let engine = crate::core::triage::TriageEngine::new(
+                    triage_cfg.clone(),
+                    self.core.context_manager.clone(),
+                );
+                let stats = engine.run(&mut msgs, self.input, turn_number).await;
+                Some(stats)
+            };
+
+            if let Some(ref stats) = result {
+                if triage_cfg.audit_only {
+                    tracing::debug!("triage audit_only mode: recorded decisions only");
+                } else {
+                    tracing::info!(
+                        "triage: inject={} compress={} standby={} cold={} discard={} saved={}tok",
+                        stats.inject_count, stats.compress_count,
+                        stats.standby_count, stats.cold_count,
+                        stats.discard_count, stats.tokens_saved,
+                    );
+                }
+            }
+            result
+        } else {
+            None
+        };
+
+        if !triage_enabled && self.core.context_manager.take_shed_pending() {
+            // 原始 auto_compress 路径（仅在 triage 关闭时生效）
+            let msgs = self.session.read().await.messages.clone();
+            let mut msgs = msgs.write().await;
             let compressed = self.core.context_manager.auto_compress_messages(&mut msgs).await;
             if !compressed.is_empty() {
                 let tokens_saved: usize = compressed.iter()
@@ -588,8 +731,11 @@ impl<'a> TurnPipeline<'a> {
         // Copy session messages to session-level context_messages
         {
             let s = self.session.read().await;
-            let msgs = s.messages.read().await;
-            *s.context_messages.write().await = msgs.clone();
+            let messages_arc = s.messages.clone();
+            let context_messages_arc = s.context_messages.clone();
+            drop(s);
+            let msgs = messages_arc.read().await;
+            *context_messages_arc.write().await = msgs.clone();
         }
 
         let turn_number = { let s = self.session.read().await; s.turn_count + 1 };
@@ -617,9 +763,24 @@ impl<'a> TurnPipeline<'a> {
         let complexity_profile = TaskAnalyzer::analyze_complexity(self.input);
         let classification = TaskAnalyzer::classify(self.input);
         if !self.req_ctx.skip_progressive {
-            let s = self.session.read().await;
-            let mut ctrl = s.progressive.write().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let mut ctrl = ctrl.write().await;
             ctrl.begin_with_task_type(&complexity_profile, classification.kind.label());
+        }
+
+        // W5-D6b: 按 task_kind 二次冷块召回（补充纯文本搜索的遗漏）
+        let task_kind = classification.kind.label();
+        if !task_kind.is_empty() {
+            if let Ok(blocks) = self.core.context_manager.recall_blocks_from_cold(task_kind, 3).await {
+                if !blocks.is_empty() {
+                    let msgs_arc = self.session.read().await.messages.clone();
+                    let mut msgs = msgs_arc.write().await;
+                    for block in &blocks {
+                        msgs.push(cold_block_message(" by task_kind", block));
+                    }
+                    tracing::info!("cold_tier: recalled {} blocks by task_kind '{}'", blocks.len(), task_kind);
+                }
+            }
         }
 
         // Preflight dual-track self-review（RequestContext 可跳过）
@@ -652,7 +813,8 @@ impl<'a> TurnPipeline<'a> {
         // 使用 SystemPromptOutput::push_dynamic() 同步追加动态内容到 text 和 segments，
         // 确保 Anthropic multi-block cache 路径与非 Anthropic 路径行为一致。
         let mut sys_out = self.core.build_system_output(
-            self.input, self.session, &preflight
+            self.input, self.session, &preflight,
+            triage_stats.as_ref().map(|s| s.summary_line()),
         ).await;
 
         // Progressive prompt injection（text + segments 同步）
@@ -675,8 +837,8 @@ impl<'a> TurnPipeline<'a> {
                      Do NOT produce large structured documents this turn."
                 ));
             } else {
-                let s = self.session.read().await;
-                let ctrl = s.progressive.read().await;
+                let ctrl = self.session.read().await.progressive.clone();
+                let ctrl = ctrl.read().await;
                 if let Some((_priority, prompt_text)) = build_progressive_prompt(
                     ctrl.current_state(), ctrl.current_strategy(),
                 ) {
@@ -751,6 +913,24 @@ impl<'a> TurnPipeline<'a> {
             } else { None }
         } else { None };
 
+        // P1-3: 结构化推理步骤注入（Architecture/Planning 等高复杂度任务）
+        {
+            let tot_kinds = &self.core.config.reasoning_config.tot_auto_task_kinds;
+            if complexity.score > 0.50 && tot_kinds.iter().any(|k| k == task_kind) && turn_number <= 1 {
+                sys_out.push_dynamic(
+                    "## Structured Reasoning Protocol\n\
+                     For this task, first output a JSON plan outlining your reasoning steps:\n\
+                     ```json\n\
+                     {\"reasoning_steps\": [\n\
+                       {\"step\": 1, \"focus\": \"...\", \"expected\": \"...\"},\n\
+                       {\"step\": 2, \"focus\": \"...\", \"expected\": \"...\"}\n\
+                     ]}\n\
+                     ```\n\
+                     Then execute each step, producing concrete output for each before moving to the next."
+                );
+            }
+        }
+
         let enriched_system = sys_out.text;
         let dynamic_blocks = sys_out.segments.len().saturating_sub(1); // 稳定段之外的动态块数
         let system_segments = sys_out.segments;
@@ -782,8 +962,8 @@ impl<'a> TurnPipeline<'a> {
 
         // Add user message
         {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
+            let msgs_arc = self.session.read().await.messages.clone();
+            let mut msgs = msgs_arc.write().await;
             msgs.push(Message {
                 role: MessageRole::User,
                 content: Some(MessageContent::Text(self.input.to_string())),
@@ -797,9 +977,10 @@ impl<'a> TurnPipeline<'a> {
         {
             let experience = { self.core.effectiveness.read().await.experience_signal() };
             let session_tools: Vec<ToolId> = {
-                let s = self.session.read().await;
-                let map = s.interaction_map.read().await;
-                map.recent_tools(5)
+                let map = self.session.read().await.interaction_map.clone();
+                let result = map.read().await.recent_tools(5);
+                drop(map);
+                result
             };
             // Phase γ-Palace-E：从行为宫殿取上一个工具的关联推荐
             //
@@ -821,8 +1002,11 @@ impl<'a> TurnPipeline<'a> {
             // Phase β-D + γ-I：路由过滤 + frequency pruning
             let (task_kind_label_inner, current_turn_inner) = {
                 let s = self.session.read().await;
-                let locked = s.task_kind_locked.read().await;
-                (locked.as_ref().map(|k| k.label().to_string()), Some(s.turn_count as u64))
+                let current_turn = s.turn_count as u64;
+                let locked_arc = s.task_kind_locked.clone();
+                drop(s);
+                let locked = locked_arc.read().await;
+                (locked.as_ref().map(|k| k.label().to_string()), Some(current_turn))
             };
             let mut defs = self.core.build_tool_definitions_for(
                 task_kind_label_inner.as_deref(),
@@ -840,8 +1024,11 @@ impl<'a> TurnPipeline<'a> {
             // Phase β-D + γ-I
             let (task_kind_label_inner, current_turn_inner) = {
                 let s = self.session.read().await;
-                let locked = s.task_kind_locked.read().await;
-                (locked.as_ref().map(|k| k.label().to_string()), Some(s.turn_count as u64))
+                let current_turn = s.turn_count as u64;
+                let locked_arc = s.task_kind_locked.clone();
+                drop(s);
+                let locked = locked_arc.read().await;
+                (locked.as_ref().map(|k| k.label().to_string()), Some(current_turn))
             };
             self.core.build_tool_definitions_for(
                 task_kind_label_inner.as_deref(),
@@ -1301,13 +1488,13 @@ impl<'a> TurnPipeline<'a> {
             // V38: 迭代边界信号——TUI 收到后清空 streaming_thinking，避免跨迭代累积
             if let Some(ref stx) = self.stream_tx {
                 let _ = stx.send(crate::llm::stream::StreamChunk::IterationStart {
-                    iteration: loop_iter as u32,
+                    iteration: loop_iter,
                 });
             }
             // V35-1: messages 改为 mut，便于按需追加 prefix=true 的 assistant message
             let mut messages = {
-                let s = self.session.read().await;
-                let mut msgs = s.messages.write().await;
+                let msgs = self.session.read().await.messages.clone();
+                let mut msgs = msgs.write().await;
                 // Sanitize: remove dangling assistant tool_calls without matching tool responses.
                 // This prevents "tool_calls must be followed by tool messages" API errors
                 // when a previous turn was interrupted mid-execution.
@@ -1392,7 +1579,18 @@ impl<'a> TurnPipeline<'a> {
                 thinking_intent: self.req_ctx.thinking_intent.clone()
                     .or_else(|| thinking.clone()),
                 cache_config: Some(crate::llm::prompt_cache::PromptCacheConfig::default()),
-                extra_body: HashMap::new(),
+                // P0-4: 无工具 + 思考启用时强制 JSON 输出格式
+                extra_body: {
+                    let mut eb: HashMap<String, serde_json::Value> = HashMap::new();
+                    let has_tools = !(if ctx.tools_exhausted { Vec::new() } else { ctx.tool_defs.clone() }).is_empty();
+                    let ti = self.req_ctx.thinking_intent.clone()
+                        .or_else(|| thinking.clone())
+                        .unwrap_or_default();
+                    if !has_tools && ti.is_enabled() {
+                        eb.insert("response_format".into(), serde_json::json!({"type": "json_object"}));
+                    }
+                    eb
+                },
                 // Phase 4：主路径 LlmRequest 携带 ctx.user_message_preamble（pipeline 在 setup 阶段写入）
                 user_message_preamble: ctx.user_message_preamble.clone(),
             };
@@ -1511,7 +1709,7 @@ impl<'a> TurnPipeline<'a> {
                 match stream_result {
                     Ok(mut response) => {
                         // 如果 streaming 收集到了 structured tool_calls 且 response 中为空，注入组装结果
-                        if !stream_tool_buf.is_empty() && response.message.tool_calls.as_ref().map_or(true, |v| v.is_empty()) {
+                        if !stream_tool_buf.is_empty() && response.message.tool_calls.as_ref().is_none_or(|v| v.is_empty()) {
                             let assembled: Vec<crate::llm::provider::ToolCall> = stream_tool_buf
                                 .into_iter()
                                 .map(|(id, (name, arguments))| crate::llm::provider::ToolCall {
@@ -1582,8 +1780,8 @@ impl<'a> TurnPipeline<'a> {
                     if is_context_overflow {
                         tracing::warn!("Context overflow detected, triggering emergency compression");
                         let compressed = {
-                            let s = self.session.read().await;
-                            let mut msgs = s.messages.write().await;
+                            let msgs = self.session.read().await.messages.clone();
+                            let mut msgs = msgs.write().await;
                             self.core.context_manager.auto_compress_messages(&mut msgs).await
                         };
                         if !compressed.is_empty() {
@@ -1611,9 +1809,10 @@ impl<'a> TurnPipeline<'a> {
                     }
                     // 尝试根据错误信息修复消息
                     let mut retry_messages = {
-                        let s = self.session.read().await;
-                        let guard = s.messages.read().await;
-                        guard.clone()
+                        let msgs = self.session.read().await.messages.clone();
+                        let x = msgs.read().await.clone();
+                        drop(msgs);
+                        x
                     };
                     let repaired = Self::try_repair_messages(&mut retry_messages, body);
                     if repaired {
@@ -1623,8 +1822,8 @@ impl<'a> TurnPipeline<'a> {
                         );
                         // 写回修复后的消息
                         {
-                            let s = self.session.read().await;
-                            *s.messages.write().await = retry_messages.clone();
+                            let msgs = self.session.read().await.messages.clone();
+                            *msgs.write().await = retry_messages.clone();
                         }
                         // 重建 request 并重试
                         let retry_req = LlmRequest {
@@ -1659,8 +1858,8 @@ impl<'a> TurnPipeline<'a> {
                                     break;
                                 }
                                 {
-                                    let s = self.session.read().await;
-                                    let mut msgs = s.messages.write().await;
+                                    let msgs = self.session.read().await.messages.clone();
+                                    let mut msgs = msgs.write().await;
                                     msgs.push(Message {
                                         role: MessageRole::User,
                                         content: Some(MessageContent::Text(format!(
@@ -1692,8 +1891,8 @@ impl<'a> TurnPipeline<'a> {
                             break;
                         }
                         {
-                            let s = self.session.read().await;
-                            let mut msgs = s.messages.write().await;
+                            let msgs = self.session.read().await.messages.clone();
+                            let mut msgs = msgs.write().await;
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(format!(
@@ -1704,8 +1903,7 @@ impl<'a> TurnPipeline<'a> {
 ③ 若错误持续，终止工具序列并向用户报告具体错误信息",
                                     err_desc
                                 ))),
-                                name: None, tool_calls: None, tool_call_id: None,
-                                reasoning_content: None, prefix: false,
+                                name: None, tool_calls: None, tool_call_id: None, reasoning_content: None, prefix: false,
                             });
                         }
                         continue;
@@ -1734,8 +1932,8 @@ impl<'a> TurnPipeline<'a> {
                         }
                         // 网络错误不注入 messages（LLM 没收到请求，注入无意义）
                         if !is_net {
-                            let s = self.session.read().await;
-                            let mut msgs = s.messages.write().await;
+                            let msgs = self.session.read().await.messages.clone();
+                            let mut msgs = msgs.write().await;
                             msgs.push(Message {
                                 role: MessageRole::User,
                                 content: Some(MessageContent::Text(format!(
@@ -1783,12 +1981,60 @@ impl<'a> TurnPipeline<'a> {
             // 引用关系：CoreLoop::cache_stats / audit_optimizations 读取此聚合
             // 副作用：单 RwLock 写——若 LLM 高频并发调用同 session 不应有竞争
             {
-                let s = self.session.read().await;
-                let mut tele = s.cache_telemetry.write().await;
+                let tele = self.session.read().await.cache_telemetry.clone();
+                let mut tele = tele.write().await;
                 tele.total_input_tokens += response.usage.prompt_tokens;
                 tele.total_cached_tokens += response.usage.cached_tokens;
                 tele.total_cache_creation_tokens += response.usage.cache_creation_tokens;
             }
+
+            // P0-1: Reasoning Enhancement — ToT / Self-Consistency
+            // 仅在 thinking_intent 启用且首轮 tool_calls 为空时触发
+            let response = if response.message.tool_calls.as_ref().is_none_or(|v| v.is_empty()) {
+                let response_text = super::extract_text(&response.message);
+                let thinking = req.thinking_intent.clone()
+                    .or_else(|| thinking.clone())
+                    .unwrap_or_default();
+                if thinking.is_enabled() && !response_text.is_empty() {
+                    let reasoning_cfg = &self.core.config.reasoning_config;
+                    let task_kind = ctx.classification.kind.label();
+                    match crate::core::reasoning_integration::try_reasoning_enhancement(
+                        reasoning_cfg,
+                        ctx.provider.clone(),
+                        &req,
+                        &response_text,
+                        task_kind,
+                        self.input,
+                        false,
+                    ).await {
+                        crate::core::reasoning_integration::ReasoningOutcome::ConsistencyEnhanced(result) => {
+                            tracing::info!("reasoning: consistency enhanced (confidence={:.2})", result.confidence);
+                            let mut resp = response;
+                            resp.message.content = Some(crate::llm::provider::MessageContent::Text(result.answer));
+                            resp
+                        }
+                        crate::core::reasoning_integration::ReasoningOutcome::TotPlan(plan) => {
+                            tracing::info!("reasoning: tot plan generated (nodes={}, sure={})",
+                                plan.nodes_explored, plan.found_sure_path);
+                            let plan_text = format!(
+                                "[Reasoning Plan]\n{}\n\nPlease execute this plan step by step.",
+                                plan.plan.join("\n")
+                            );
+                            ctx.user_message_preamble = Some(match ctx.user_message_preamble.take() {
+                                Some(existing) => format!("{}\n\n{}", existing, plan_text),
+                                None => plan_text,
+                            });
+                            continue;
+                        }
+                        _ => response,
+                    }
+                } else {
+                    response
+                }
+            } else {
+                response
+            };
+
             let tool_calls = response.message.tool_calls.clone().unwrap_or_default();
 
             // V40: 多格式文本工具调用解析（XML / JSON / Markdown fenced）
@@ -1812,8 +2058,8 @@ impl<'a> TurnPipeline<'a> {
 
             // session 历史写入：文本工具调用时用 clean_text，防止 XML 标记残留
             {
-                let s = self.session.read().await;
-                let mut msgs = s.messages.write().await;
+                let msgs = self.session.read().await.messages.clone();
+                let mut msgs = msgs.write().await;
                 let mut msg_to_push = response.message.clone();
                 if !tool_calls.is_empty() && !clean_text.is_empty() {
                     msg_to_push.content =
@@ -1833,8 +2079,8 @@ impl<'a> TurnPipeline<'a> {
                     ctx.recovery_attempts += 1;
                     tracing::warn!("LLM returned empty response after tool calls — requesting summary");
                     {
-                        let s = self.session.read().await;
-                        let mut msgs = s.messages.write().await;
+                        let msgs = self.session.read().await.messages.clone();
+                        let mut msgs = msgs.write().await;
                         msgs.push(Message {
                             role: MessageRole::System,
                             content: Some(MessageContent::Text(
@@ -1874,7 +2120,7 @@ impl<'a> TurnPipeline<'a> {
                         // 额外检查：工具名在反引号内 → 描述性引用，跳过
                         let in_backticks = {
                             let name_pos = text_lower.find(tool_name.as_str());
-                            name_pos.map_or(false, |pos| {
+                            name_pos.is_some_and(|pos| {
                                 let before = &text[..pos];
                                 let after = &text[pos + tool_name.len()..];
                                 // 检查前后是否有反引号或代码块标记
@@ -1903,19 +2149,17 @@ impl<'a> TurnPipeline<'a> {
                             });
                         }
                         {
-                            let s = self.session.read().await;
-                            let mut msgs = s.messages.write().await;
+                            let msgs = self.session.read().await.messages.clone();
+                            let mut msgs = msgs.write().await;
                             // Abacus 内部指令：System 角色避免 LLM 文字确认回复
                             msgs.push(Message {
                                 role: MessageRole::System,
-                                content: Some(MessageContent::Text(
-                                    format!(
-                                        "[Abacus] 你在文本中提到了工具名 \"{}\"，但没有通过 function calling 调用它。\
-                                         \n如果你确实要调用此工具，请使用结构化 tool_call（不要写在文本里）。\
-                                         \n如果你只是正常推理中提到了工具名（并非要调用），请忽略此提示，继续你的回答。",
-                                        tool_name
-                                    ).into()
-                                )),
+                                content: Some(MessageContent::Text(format!(
+                                    "[Abacus] 你在文本中提到了工具名 \"{}\"，但没有通过 function calling 调用它。\
+                                     \n如果你确实要调用此工具，请使用结构化 tool_call（不要写在文本里）。\
+                                     \n如果你只是正常推理中提到了工具名（并非要调用），请忽略此提示，继续你的回答。",
+                                    tool_name
+                                ))),
                                 name: None, tool_calls: None, tool_call_id: None,
                                 reasoning_content: None, prefix: false,
                             });
@@ -1963,26 +2207,35 @@ impl<'a> TurnPipeline<'a> {
                             }
                             // 构建携带失败上下文的续写提示
                             // has_recent_failures=true → last() 一定存在且 success=false
-                            let hint_msg = {
-                                let last = ctx.all_tool_outputs.last().unwrap();
-                                let failed_tool = &last.tool_id.0;
-                                let fk = last.failure_kind.as_deref().unwrap_or("Unknown");
-                                let err_text = last.output.get("error")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("(no detail)");
-                                // 安全截断（避免 multi-byte 边界 panic）
-                                let err_short: String = err_text.chars().take(200).collect();
-                                format!(
-                                    "Tool `{failed_tool}` failed ({fk}): {err_short}\n\
-                                     You MUST either:\n\
-                                     1. Try alternative approaches to complete the task, OR\n\
-                                     2. Explicitly state what happened using [Blocked], [Stuck], [Need Input], or [Partial] prefix.\n\
-                                     Do not stop silently."
-                                )
+                            // 但为防御性（防止 future 改动破坏不变量），用 match 而非 unwrap
+                            let hint_msg = match ctx.all_tool_outputs.last() {
+                                Some(last) => {
+                                    let failed_tool = &last.tool_id.0;
+                                    let fk = last.failure_kind.as_deref().unwrap_or("Unknown");
+                                    let err_text = last.output.get("error")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("(no detail)");
+                                    // 安全截断（避免 multi-byte 边界 panic）
+                                    let err_short: String = err_text.chars().take(200).collect();
+                                    format!(
+                                        "Tool `{failed_tool}` failed ({fk}): {err_short}\n\
+                                         You MUST either:\n\
+                                         1. Try alternative approaches to complete the task, OR\n\
+                                         2. Explicitly state what happened using [Blocked], [Stuck], [Need Input], or [Partial] prefix.\n\
+                                         Do not stop silently."
+                                    )
+                                }
+                                None => {
+                                    // 不变量破坏的兜底——按预期不会走到
+                                    "Tool execution failed. Please try alternative approaches or \
+                                     explicitly state what happened using [Blocked], [Stuck], \
+                                     [Need Input], or [Partial] prefix."
+                                        .to_string()
+                                }
                             };
                             {
-                                let s = self.session.read().await;
-                                let mut msgs = s.messages.write().await;
+                                let msgs = self.session.read().await.messages.clone();
+                                let mut msgs = msgs.write().await;
                                 // Abacus 内部指令：System 角色避免 LLM 文字确认回复
                                 msgs.push(Message {
                                     role: MessageRole::System,
@@ -2010,8 +2263,8 @@ impl<'a> TurnPipeline<'a> {
                     // 把截断的响应存为 assistant message（已在上方 push 了）
                     // 追加一条 user 续写提示
                     {
-                        let s = self.session.read().await;
-                        let mut msgs = s.messages.write().await;
+                        let msgs = self.session.read().await.messages.clone();
+                        let mut msgs = msgs.write().await;
                         // Abacus 内部续写指令：System 角色
                         msgs.push(Message {
                             role: MessageRole::System,
@@ -2041,8 +2294,8 @@ impl<'a> TurnPipeline<'a> {
 
                 // Progressive Output gate check
                 let action = {
-                    let s = self.session.read().await;
-                    let mut ctrl = s.progressive.write().await;
+                    let ctrl = self.session.read().await.progressive.clone();
+                    let mut ctrl = ctrl.write().await;
                     ctrl.on_output_chunk(&text)
                 };
                 match action {
@@ -2071,8 +2324,8 @@ impl<'a> TurnPipeline<'a> {
             // ── 75% Warning：提示 LLM 调整策略（仅一次）──
             if !ctx.tool_warning_emitted && ctx.total_tool_calls >= threshold_75 {
                 ctx.tool_warning_emitted = true;
-                let s = self.session.read().await;
-                let mut msgs = s.messages.write().await;
+                let msgs = self.session.read().await.messages.clone();
+                let mut msgs = msgs.write().await;
                 msgs.push(Message {
                     role: MessageRole::System,
                     content: Some(MessageContent::Text(format!(
@@ -2095,8 +2348,8 @@ impl<'a> TurnPipeline<'a> {
                 if elapsed > budget.mul_f64(0.6) {
                     ctx.time_warning_emitted = true;
                     let remaining_secs = budget.saturating_sub(elapsed).as_secs();
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
@@ -2117,8 +2370,8 @@ impl<'a> TurnPipeline<'a> {
                     let _ = stx.send(crate::llm::stream::StreamChunk::CompressStart);
                 }
                 let compressed = {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     self.core.context_manager.auto_compress_messages(&mut msgs).await
                 };
                 if let Some(ref stx) = self.stream_tx {
@@ -2132,8 +2385,8 @@ impl<'a> TurnPipeline<'a> {
                 }
                 // 注入压缩通知——让 LLM 知道历史已压缩，调整引用策略
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
@@ -2167,8 +2420,8 @@ impl<'a> TurnPipeline<'a> {
                      Provide your final answer in plain text only."
                 );
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
@@ -2250,9 +2503,38 @@ impl<'a> TurnPipeline<'a> {
                         }
                     }).collect();
                     let joined = futures_util::future::join_all(futs).await;
-                    joined.into_iter()
-                        .filter_map(|(id, r)| r.ok().map(|o| (id, o)))
-                        .collect()
+                    let mut pre_outputs = std::collections::HashMap::new();
+                    for (id, r) in joined {
+                        match r {
+                            Ok(o) => { pre_outputs.insert(id, o); }
+                            Err(e) => {
+                                // M6：把失败也注入到 pre_outputs，让 LLM 在下一轮看到失败上下文
+                                // 避免静默丢失 tool result 触发 LLM 误判
+                                let tool_id = ToolId(parallelizable.iter()
+                                    .find(|tc| tc.id == id)
+                                    .map(|tc| tc.function.name.clone())
+                                    .unwrap_or_default());
+                                tracing::warn!(
+                                    tool_call_id = %id,
+                                    tool_name = %tool_id.0,
+                                    error = %e,
+                                    "parallel tool pre-execution failed — exposing error to LLM"
+                                );
+                                pre_outputs.insert(id, ToolOutput {
+                                    tool_id,
+                                    success: false,
+                                    output: serde_json::json!({
+                                        "error": e.to_string(),
+                                        "phase": "parallel_pre_execution",
+                                    }),
+                                    latency_ms: 0,
+                                    failure_kind: Some("PreExecutionError".into()),
+                                    try_instead: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    pre_outputs
                 } else {
                     std::collections::HashMap::new()
                 }
@@ -2402,8 +2684,8 @@ impl<'a> TurnPipeline<'a> {
                 // P0 修复：删除 response.message.clone() 的重复 push
                 // 引用关系：L1713 无条件写入 assistant msg（含 tool_calls 字段），此处仅追加 tool results
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.extend(batch_tool_msgs);
                 }
 
@@ -2470,8 +2752,8 @@ impl<'a> TurnPipeline<'a> {
 
                 // 写入 tool results 到 session
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     for (batch_i, &orig_idx) in matched_idx.iter().enumerate() {
                         let tc = &tool_calls[orig_idx];
                         if let Some(output) = batch_outputs.get(batch_i) {
@@ -2678,9 +2960,10 @@ impl<'a> TurnPipeline<'a> {
 
                         // 应用 bash_policy
                         let bash_policy = {
-                            let s = self.session.read().await;
-                            let fs = s.filengine_session.read().await;
-                            fs.bash_policy
+                            let fs = self.session.read().await.filengine_session.clone();
+                            let x = fs.read().await.bash_policy;
+                            drop(fs);
+                            x
                         };
                         use crate::tool::builtin::filengine::BashDecision;
                         use abacus_types::BashPolicyLevel;
@@ -3099,8 +3382,8 @@ impl<'a> TurnPipeline<'a> {
                         .map(|s| s.len())
                         .unwrap_or(0);
                     if bytes > 0 {
-                        let s = self.session.read().await;
-                        let mut tele = s.cache_telemetry.write().await;
+                        let tele = self.session.read().await.cache_telemetry.clone();
+                        let mut tele = tele.write().await;
                         tele.record_tool_result(&tool_id, bytes);
                     }
                 }
@@ -3198,8 +3481,8 @@ impl<'a> TurnPipeline<'a> {
                 });
             }
             {
-                let s = self.session.read().await;
-                let mut msgs = s.messages.write().await;
+                let msgs = self.session.read().await.messages.clone();
+                let mut msgs = msgs.write().await;
                 msgs.extend(tool_results);
             }
 
@@ -3225,8 +3508,8 @@ impl<'a> TurnPipeline<'a> {
                 };
                 if !user_signals.is_empty() {
                     let combined = user_signals.join("\n");
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.push(Message {
                         role: MessageRole::System,
                         content: Some(MessageContent::Text(format!(
@@ -3315,9 +3598,10 @@ impl<'a> TurnPipeline<'a> {
         // 仅由 handle_model_escalation 内部使用；budget check 通过后再走此 gate。
         let input_short = self.input.len() < 80;
         let session_msg_count = {
-            let s = self.session.read().await;
-            let msgs = s.messages.read().await;
-            msgs.len()
+            let msgs = self.session.read().await.messages.clone();
+            let x = msgs.read().await.len();
+            drop(msgs);
+            x
         };
         let first_input = session_msg_count <= 2;
         if input_short && first_input {
@@ -3351,8 +3635,8 @@ impl<'a> TurnPipeline<'a> {
 
         // Replace flash's [ESCALATE] message
         {
-            let s = self.session.read().await;
-            let mut msgs = s.messages.write().await;
+            let msgs = self.session.read().await.messages.clone();
+            let mut msgs = msgs.write().await;
             msgs.pop();
             if !flash_analysis.is_empty() {
                 msgs.push(Message {
@@ -3372,9 +3656,10 @@ impl<'a> TurnPipeline<'a> {
 
         // V35-1: escalation 路径同样注入 prefix（保证升级模型也遵守同一格式约束）
         let mut messages = {
-            let s = self.session.read().await;
-            let msgs = s.messages.read().await;
-            msgs.clone()
+            let msgs = self.session.read().await.messages.clone();
+            let x = msgs.read().await.clone();
+            drop(msgs);
+            x
         };
         maybe_inject_prefix_message(
             &mut messages,
@@ -3423,8 +3708,8 @@ impl<'a> TurnPipeline<'a> {
                 ctx.thinking_tokens += escalated_resp.usage.thinking_tokens;
                 // Task #95：累积 cache telemetry（含 escalation 路径）
                 {
-                    let s = self.session.read().await;
-                    let mut tele = s.cache_telemetry.write().await;
+                    let tele = self.session.read().await.cache_telemetry.clone();
+                    let mut tele = tele.write().await;
                     tele.total_input_tokens += escalated_resp.usage.prompt_tokens;
                     tele.total_cached_tokens += escalated_resp.usage.cached_tokens;
                     tele.total_cache_creation_tokens += escalated_resp.usage.cache_creation_tokens;
@@ -3435,7 +3720,9 @@ impl<'a> TurnPipeline<'a> {
                 {
                     let s = self.session.read().await;
                     s.escalation_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    *s.escalated_model.write().await = Some(abacus_types::ModelId(escalate_to.to_string()));
+                    let escalated = s.escalated_model.clone();
+                    drop(s);
+                    *escalated.write().await = Some(abacus_types::ModelId(escalate_to.to_string()));
                 }
                 // 发送 ModelEscalation 事件（前端 + LLM 双向感知）
                 if let Some(ref stx) = self.stream_tx {
@@ -3446,8 +3733,8 @@ impl<'a> TurnPipeline<'a> {
                     });
                 }
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.pop();
                     if !flash_analysis.is_empty() { msgs.pop(); }
                     msgs.push(escalated_resp.message);
@@ -3463,8 +3750,8 @@ impl<'a> TurnPipeline<'a> {
                     ));
                 }
                 {
-                    let s = self.session.read().await;
-                    let mut msgs = s.messages.write().await;
+                    let msgs = self.session.read().await.messages.clone();
+                    let mut msgs = msgs.write().await;
                     msgs.pop();
                     if !flash_analysis.is_empty() { msgs.pop(); }
                     msgs.push(Message {
@@ -3487,8 +3774,8 @@ impl<'a> TurnPipeline<'a> {
 
     async fn build_gated_result(&self, ctx: &TurnContext, text: String) -> TurnResult {
         let progressive_state = {
-            let s = self.session.read().await;
-            let ctrl = s.progressive.read().await;
+            let ctrl = self.session.read().await.progressive.clone();
+            let ctrl = ctrl.read().await;
             Some(ctrl.current_state().clone())
         };
         let session_id = { let s = self.session.read().await; s.session_id.clone() };
@@ -3582,13 +3869,18 @@ impl<'a> TurnPipeline<'a> {
             matched_skills: ctx.matched_skills,
             session_id,
             progressive_state: {
-                let s = self.session.read().await;
-                let ctrl = s.progressive.read().await;
+                let ctrl = self.session.read().await.progressive.clone();
+                let ctrl = ctrl.read().await;
                 if ctrl.is_passthrough() { None } else { Some(ctrl.current_state().clone()) }
             },
             inertia_warning: ctx.inertia_warning,
             pending_confirmations: ctx.pending_confirmations,
         };
+
+        // W4-D4: ColdBuffer flush before TurnEnd
+        if let Some(ref cw) = self.core.cold_writer {
+            cw.flush().await;
+        }
 
         // Hook: TurnEnd（持久化后触发，result 已构建）
         let _ = self.core.emit_pipeline_event(crate::mag_chain::PipelineEvent::TurnEnd {
@@ -3812,6 +4104,22 @@ fn summarize_tool_output(tool_name: &str, output: &serde_json::Value, success: b
     // 最终回退：安全截断（按换行符切割，保证不破坏 JSON 结构）
     let lines: Vec<&str> = full.lines().take(10).collect();
     format!("{}\n...[truncated from {} bytes]", lines.join("\n"), full.len())
+}
+
+/// 构造冷块注入消息
+/// suffix: "" → "[Cold Block: ...]", " by MinHash" → "[Cold Block by MinHash: ...]"
+fn cold_block_message(suffix: &str, block: &crate::core::context::BlockResult) -> crate::llm::provider::Message {
+    crate::llm::provider::Message {
+        role: crate::llm::provider::MessageRole::System,
+        content: Some(crate::llm::provider::MessageContent::Text(
+            format!("[Cold Block{}: {}]\n{}", suffix, block.summary, block.key_decisions.join(", "))
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        reasoning_content: None,
+        prefix: false,
+    }
 }
 
 /// 判断是否为网络层错误（连接/DNS/TLS/超时），区别于 API 业务错误（401/429/400）

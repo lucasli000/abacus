@@ -56,6 +56,7 @@ use crate::code_graph::{Symbol, SymbolKind, Visibility, FileDep, DepKind, ImplRe
 /// - 顶层符号：直接从 source_file 的子节点提取
 /// - impl 方法：进入 impl_item → declaration_list → function_item
 /// - derive 宏：从 attribute_item 中提取（标记为 SymbolKind::Macro）
+#[derive(Default)]
 pub struct RustAnalyzer;
 
 impl RustAnalyzer {

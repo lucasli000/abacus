@@ -1493,7 +1493,13 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         }
 
         // 更新内联补全候选（不阻塞输入）+ 清空 Tab 循环状态
-        state.inline_suggestion = state.compute_inline_suggestion();
+        // IME/中文输入法下拼音组合会产生高频 Char 事件；普通文本不做历史补全扫描，
+        // 只对 `/` 开头的命令即时补全，Tab 仍可触发完整候选。
+        state.inline_suggestion = if state.input.trim_start().starts_with('/') {
+            state.compute_inline_suggestion()
+        } else {
+            None
+        };
         state.inline_candidates.clear();
         state.inline_candidate_idx = 0;
 

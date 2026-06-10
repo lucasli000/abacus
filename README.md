@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <code>v1.2.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
+  <code>v2.0.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
 </p>
 
 ---
@@ -223,7 +223,7 @@ rm -rf ~/.abacus  # Remove config + data (optional)
 
 ```bash
 # Option A: Use mirror proxy
-curl -fsSL https://gh-proxy.com/https://github.com/lucasli000/abacus/releases/download/v1.2.0/abacus-aarch64-apple-darwin.tar.gz | tar -xz
+curl -fsSL https://gh-proxy.com/https://github.com/lucasli000/abacus/releases/download/v2.0.0/abacus-aarch64-apple-darwin.tar.gz | tar -xz
 sudo mv abacus /usr/local/bin/
 
 # Option B: Use local SOCKS proxy

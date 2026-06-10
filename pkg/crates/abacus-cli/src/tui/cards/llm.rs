@@ -135,7 +135,11 @@ impl MessageCard for LlmCard {
     }
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
-        let title = format!("● LLM · {} · think:{}", self.model, self.thinking_level);
+        let title = if self.thinking_level.is_empty() || self.thinking_level == "default" {
+            format!("LLM · {}", self.model)
+        } else {
+            format!("LLM · {} · Thinking:{}", self.model, self.thinking_level)
+        };
         CardHeader::new(title, "")
             .with_color(ctx.theme().session)
             .with_preview(self.reply_preview())
@@ -188,15 +192,12 @@ impl MessageCard for LlmCard {
             CardCollapse::Headless => return,
             CardCollapse::Collapsed => {
                 let preview = self.reply_preview();
-                let text = if preview.is_empty() {
-                    "(replying…)"
+                let (text, style) = if preview.is_empty() {
+                    ("生成中…", Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM))
                 } else {
-                    preview.as_str()
+                    (preview.as_str(), Style::default().fg(ctx.theme().text))
                 };
-                let p = Paragraph::new(Line::from(Span::styled(
-                    text,
-                    Style::default().fg(ctx.theme().text),
-                )));
+                let p = Paragraph::new(Line::from(Span::styled(text, style)));
                 f.render_widget(p, inner);
             }
             CardCollapse::Expanded => {
@@ -228,13 +229,8 @@ impl MessageCard for LlmCard {
                     )));
                     lines.push(Line::raw(""));
                 }
-                // reply 部分 — 渲染实际内容
-                if self.reply_text.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        "(replying…)",
-                        Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
-                    )));
-                } else {
+                // reply 部分 — 渲染实际内容；空内容不额外画占位框，避免视觉噪声
+                if !self.reply_text.is_empty() {
                     for line in self.reply_text.lines() {
                         lines.push(Line::from(Span::styled(
                             format!(" {}", line),

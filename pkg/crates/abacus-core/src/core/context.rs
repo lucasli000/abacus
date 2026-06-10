@@ -141,6 +141,20 @@ pub struct SessionCheckpoint {
 }
 
 impl SessionCheckpoint {
+    /// Mission Brief 摘要格式——用于 Awareness Block V2 置顶
+    ///
+    /// 输出 ~100 tok，LLM 第一眼看到：当前主题 + 已完成 + 待办
+    pub fn mission_brief(&self) -> String {
+        let done: Vec<&str> = self.accomplished.iter().map(|s| s.as_str()).collect();
+        let todo: Vec<&str> = self.pending.iter().map(|p| p.task.as_str()).collect();
+        let topic = if self.current_topic.is_empty() { "—" } else { &self.current_topic };
+        format!("Mission: {} | ✓ {} | ↻ {}",
+            topic,
+            done.join(", "),
+            todo.join(", "),
+        )
+    }
+
     /// 压缩精度档位：沟通阶段→Detailed，执行阶段→Brief
     pub fn compression_level(&self) -> CompressLevel {
         match self.overall_phase {
@@ -297,6 +311,72 @@ pub trait SessionStore: Send + Sync {
     async fn save(&self, snapshot: SessionSnapshot) -> Result<(), KernelError>;
     async fn load_recent(&self, limit: usize) -> Result<Vec<SessionSnapshot>, KernelError>;
     async fn search(&self, query: &str) -> Result<Vec<SessionSnapshot>, KernelError>;
+
+    // W2 (RFC-0001v2): ColdTier block storage
+    async fn save_block(&self, _block: BlockRecord) -> Result<(), KernelError> {
+        Err(KernelError::Other("save_block not implemented".into()))
+    }
+    async fn search_blocks(&self, query: &str, limit: usize) -> Result<Vec<BlockResult>, KernelError> {
+        let _ = (query, limit);
+        Ok(Vec::new())
+    }
+    async fn union_search(&self, query: &str, limit: usize) -> Result<Vec<UnionResult>, KernelError> {
+        let blocks = self.search_blocks(query, limit).await?;
+        let snaps = self.search(query).await?;
+        let mut results: Vec<UnionResult> = snaps.into_iter().map(UnionResult::Session).collect();
+        results.extend(blocks.into_iter().map(UnionResult::Block));
+        results.sort_by(|a, b| b.score().partial_cmp(&a.score()).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        Ok(results)
+    }
+}
+
+// ─── W2 (RFC-0001v2): ColdTier types ──────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockRecord {
+    pub recall_id: String,
+    pub session_id: String,
+    pub turn_start: u32,
+    pub turn_end: u32,
+    pub summary: String,
+    pub content_json: String,
+    pub key_decisions: Vec<String>,
+    pub original_tokens: usize,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockResult {
+    pub recall_id: String,
+    pub summary: String,
+    pub key_decisions: Vec<String>,
+    pub original_tokens: usize,
+    pub turn_range: (u32, u32),
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum UnionResult {
+    Session(SessionSnapshot),
+    Block(BlockResult),
+}
+
+impl UnionResult {
+    pub fn score(&self) -> f64 {
+        match self {
+            UnionResult::Session(s) => s.token_estimate as f64 / 1000.0,
+            UnionResult::Block(b) => b.score,
+        }
+    }
+
+    pub fn summary(&self) -> &str {
+        match self {
+            UnionResult::Session(s) => &s.summary,
+            UnionResult::Block(b) => &b.summary,
+        }
+    }
 }
 
 /// Task #80：三层 SessionSnapshot 管理
@@ -598,6 +678,12 @@ struct TokenCache {
     retained_hash: u64,
 }
 
+/// W5 (RFC-0001v2): system prompt 稳定段 token 缓存
+struct SystemTokenCache {
+    stable_hash: u64,
+    stable_tokens: usize,
+}
+
 /// 计算 retained_content 的真实 hash（顺序敏感）
 ///
 /// P3-B: 接受 Iterator 而非 slice，兼容 BoundedFifo 与 Vec
@@ -783,6 +869,46 @@ impl SubsystemUsage {
     }
 }
 
+/// ContextManager：单 session 的上下文压缩/淘汰/缓存子系统
+///
+/// ## 锁顺序约定（重要！防止死锁）
+///
+/// ContextManager 内部有 14+ 个独立 RwLock/Mutex 字段。跨字段访问必须遵循下述顺序，
+/// 反向获取极易在异步 await 链中触发写者饥饿或死锁。
+///
+/// ### 顺序规则（高 → 低）
+/// 1. `tiers.hot_snapshots` / `tiers.warm` / `tiers.cold`（tier 缓存）
+/// 2. `msg_cache` / `msg_cache_l1`（消息 token 增量缓存）
+/// 3. `token_cache`（整 prompt token 缓存）
+/// 4. `system_token_cache`（system prompt 稳定段缓存）
+/// 5. `retained_content`（declared content 暂存）
+/// 6. `pending`（declared content 队列）
+/// 7. `compress_tracker`（数学压缩引擎追踪器）
+/// 8. `message_archive`（recover_id → 原始 messages）
+/// 9. `pinned_turns`（用户标记不可压缩）
+/// 10. `kb_store`（可选 KnowledgeStore 引用）
+/// 11. `summarizer`（可插拔摘要器）
+/// 12. `default_compress_level`（auto_compress 默认档位）
+/// 13. `usage`（子系统占用记账）
+/// 14. `window`（token 预算窗口）
+/// 15. `current_turn` / `shed_pending`（原子字段，无锁）
+///
+/// ### 关键不变量
+/// - **同字段多次获取**：只允许嵌套更短生命周期的 `read`（同字段 write 不允许与自身 read 嵌套）
+/// - **跨字段**：只能从低序号到高序号，禁止反向
+/// - **跨组件**：与 Session（`pipeline/mod.rs`）交互时，ContextManager 锁必须在所有
+///   Session 锁释放后获取；Session 字段通过 Arc clone 取得独立引用
+/// - **不要在持有 ContextManager 锁时调用 LLM/DB/IO**——会持有锁跨 await，
+///   触发其他协程等待。IO 调用前先 clone 数据到本地变量再释放锁
+///
+/// ### 降级策略
+/// - `try_write()` / `try_read()` 失败时返回 `LockBusy` 错误给上层决定（重试/跳过/abort）
+/// - 不允许 `blocking_write()`（会卡 tokio 调度）
+///
+/// ### 维护提示
+/// - 新增字段时，把锁加入上面的顺序表
+/// - 跨字段访问前 review 此表
+/// - 任何反向获取必须用 Arc::clone 把数据从锁里复制出来再 drop guard
 pub struct ContextManager {
     pub window: Arc<RwLock<ContextWindow>>,
     pub tiers: ContextTiers,
@@ -802,6 +928,8 @@ pub struct ContextManager {
     /// 生命周期：与 ContextManager 同生命周期；TTL=300s 让冷数据自然过期。
     /// 容量 64 条目——压缩/分支/回退场景下 ~10 个历史状态足够。
     pub(crate) msg_cache_l1: Arc<crate::cache::L1MemoryCache>,
+    /// W5 (RFC-0001v2): system prompt 稳定段 token 缓存
+    system_token_cache: RwLock<SystemTokenCache>,
     /// Phase Ctx-A：子系统占用记账
     pub usage: RwLock<SubsystemUsage>,
     /// Phase Ctx-A：pressure shed 标记——pressure_monitor 报警时设 true，
@@ -944,6 +1072,10 @@ impl ContextManager {
                 64,
                 std::time::Duration::from_secs(300),
             )),
+            system_token_cache: RwLock::new(SystemTokenCache {
+                stable_hash: 0,
+                stable_tokens: 0,
+            }),
             usage: RwLock::new(SubsystemUsage::default()),
             shed_pending: std::sync::atomic::AtomicBool::new(false),
             kb_store: RwLock::new(None),
@@ -1096,6 +1228,12 @@ impl ContextManager {
         None
     }
 
+    /// W5 (RFC-0001v2): 写入 archive（供 TriageEngine::execute_compress 使用）
+    pub async fn archive_write(&self, recover_id: String, messages: Vec<Message>, meta: ArchiveMeta) {
+        let mut arch = self.message_archive.write().await;
+        arch.push((recover_id, messages, meta));
+    }
+
     /// Phase Z2：archive 当前条目数（诊断/测试）
     pub async fn archive_size(&self) -> usize {
         self.message_archive.read().await.iter().count()
@@ -1144,6 +1282,100 @@ impl ContextManager {
         let mut results = self.tiers.cold.search(query).await?;
         results.truncate(limit);
         Ok(results)
+    }
+
+    /// W5-D6: 从 cold tier 搜索 blocks（message_blocks 表）
+    pub async fn recall_blocks_from_cold(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<BlockResult>, KernelError> {
+        self.tiers.cold.search_blocks(query, limit).await
+    }
+
+    /// P2-3: MinHash 语义冷块召回 — 用 MinHash Jaccard 相似度对 FTS5 结果重排序
+    pub async fn recall_blocks_by_minhash(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<BlockResult>, KernelError> {
+        let limit = limit.min(10);
+        let candidates = self.tiers.cold.search_blocks(query, limit * 5).await?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let query_sig = crate::core::compress_math::MinHashSig::from_text(query);
+
+        let mut scored: Vec<(f64, BlockResult)> = candidates
+            .into_iter()
+            .map(|mut block| {
+                let summary_text = format!("{} {}", block.summary, block.key_decisions.join(" "));
+                let block_sig = crate::core::compress_math::MinHashSig::from_text(&summary_text);
+                let sim = query_sig.jaccard_similarity(&block_sig);
+                // 如果 query 包含 summary 关键词，给予额外 boost
+                let boost = if block.summary.to_lowercase().contains(&query.to_lowercase()) {
+                    0.15
+                } else {
+                    0.0
+                };
+                let total = (sim + boost).min(1.0);
+                block.score = total;
+                (total, block)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scored.into_iter()
+            .filter(|(score, _)| *score > 0.30)
+            .take(limit)
+            .map(|(_, block)| block)
+            .collect())
+    }
+
+    /// P3-3: 合并冷块召回 + MinHash 重排序为一次 FTS5 查询
+    pub async fn recall_blocks_dual(
+        &self,
+        query: &str,
+        raw_limit: usize,
+        mh_limit: usize,
+    ) -> Result<(Vec<BlockResult>, Vec<BlockResult>), KernelError> {
+        let combined = raw_limit + mh_limit.min(10) * 5;
+        let candidates = self.tiers.cold.search_blocks(query, combined).await?;
+        if candidates.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let raw: Vec<BlockResult> = candidates.iter().take(raw_limit).cloned().collect();
+
+        let query_sig = crate::core::compress_math::MinHashSig::from_text(query);
+        let rest: Vec<BlockResult> = candidates.into_iter().skip(raw_limit).collect();
+
+        let mut scored: Vec<(f64, BlockResult)> = rest
+            .into_iter()
+            .map(|mut block| {
+                let summary_text = format!("{} {}", block.summary, block.key_decisions.join(" "));
+                let block_sig = crate::core::compress_math::MinHashSig::from_text(&summary_text);
+                let sim = query_sig.jaccard_similarity(&block_sig);
+                let boost = if block.summary.to_lowercase().contains(&query.to_lowercase()) {
+                    0.15
+                } else {
+                    0.0
+                };
+                let total = (sim + boost).min(1.0);
+                block.score = total;
+                (total, block)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mh: Vec<BlockResult> = scored.into_iter()
+            .filter(|(score, _)| *score > 0.30)
+            .take(mh_limit.min(10))
+            .map(|(_, block)| block)
+            .collect();
+
+        Ok((raw, mh))
     }
 
     /// Phase Z1：取最近 N 条 SessionSnapshot（按 created_at desc）
@@ -1719,6 +1951,27 @@ impl ContextManager {
         }
 
         block
+    }
+
+    /// W5 (RFC-0001v2): system prompt 稳定段 token 缓存
+    pub fn get_system_tokens(&self, system_text: &str) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        system_text.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Ok(cache) = self.system_token_cache.try_read() {
+            if cache.stable_hash == hash {
+                return cache.stable_tokens;
+            }
+        }
+
+        let tokens = estimate_tokens(system_text);
+        if let Ok(mut cache) = self.system_token_cache.try_write() {
+            cache.stable_hash = hash;
+            cache.stable_tokens = tokens;
+        }
+        tokens
     }
 
     pub async fn estimate_total_tokens(&self, messages: &[Message]) -> usize {
@@ -3141,21 +3394,44 @@ impl ToolExecutor for ContextToolExecutor {
             "session_recall" => {
                 let query = params["query"].as_str().unwrap_or("");
                 let limit = params["limit"].as_u64().unwrap_or(5) as usize;
-                let snapshots = if query.is_empty() {
-                    self.manager.recall_recent(limit).await?
-                } else {
-                    self.manager.recall_from_cold(query, limit).await?
-                };
-                Ok(serde_json::json!({
-                    "query": query,
-                    "count": snapshots.len(),
-                    "snapshots": snapshots.iter().map(|s| serde_json::json!({
+                let results = if query.is_empty() {
+                    // 无 query 时只返回最近 session
+                    let snaps = self.manager.recall_recent(limit).await?;
+                    snaps.into_iter().map(|s| serde_json::json!({
+                        "type": "session",
                         "session_id": s.session_id,
                         "turn_count": s.turn_count,
                         "summary": s.summary,
                         "token_estimate": s.token_estimate,
                         "created_at": s.created_at,
-                    })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>()
+                } else {
+                    // W5 (RFC-0001v2): union_search — 同时查 session + blocks
+                    let union = self.manager.tiers.cold.union_search(query, limit).await?;
+                    union.into_iter().map(|u| match u {
+                        UnionResult::Session(s) => serde_json::json!({
+                            "type": "session",
+                            "session_id": s.session_id,
+                            "turn_count": s.turn_count,
+                            "summary": s.summary,
+                            "token_estimate": s.token_estimate,
+                            "created_at": s.created_at,
+                        }),
+                        UnionResult::Block(b) => serde_json::json!({
+                            "type": "block",
+                            "recall_id": b.recall_id,
+                            "summary": b.summary,
+                            "key_decisions": b.key_decisions,
+                            "original_tokens": b.original_tokens,
+                            "turn_range": [b.turn_range.0, b.turn_range.1],
+                            "score": b.score,
+                        }),
+                    }).collect::<Vec<_>>()
+                };
+                Ok(serde_json::json!({
+                    "query": query,
+                    "count": results.len(),
+                    "results": results,
                 }))
             }
 

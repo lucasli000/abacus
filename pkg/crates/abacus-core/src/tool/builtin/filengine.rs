@@ -768,22 +768,21 @@ fn simple_diff<'a>(a: &[&'a str], b: &[&'a str], context: usize) -> Vec<Value> {
     let mut hunk_changes: Vec<Value> = Vec::new();
     let mut keep_count = 0;
 
-    for (_idx, (typ, line, text)) in ops.iter().enumerate() {
+    for (typ, line, text) in ops.iter() {
         match typ {
-            0 => { // keep
-                if in_hunk {
-                    keep_count += 1;
-                    if keep_count > context {
-                        // 结束当前 hunk
-                        changes.push(json!(hunk_changes));
-                        hunk_changes = Vec::new();
-                        in_hunk = false;
-                        keep_count = 0;
-                    } else {
-                        hunk_changes.push(json!({"type": "keep", "line_a": line, "line_b": line, "text": text}));
-                    }
+            0 if in_hunk => {
+                keep_count += 1;
+                if keep_count > context {
+                    // 结束当前 hunk
+                    changes.push(json!(hunk_changes));
+                    hunk_changes = Vec::new();
+                    in_hunk = false;
+                    keep_count = 0;
+                } else {
+                    hunk_changes.push(json!({"type": "keep", "line_a": line, "line_b": line, "text": text}));
                 }
             }
+            0 => {} // keep, outside hunk — no-op
             1 => { // delete
                 in_hunk = true;
                 keep_count = 0;
@@ -1132,13 +1131,9 @@ async fn grep_dir(
 
 // ─── Bash Exec ────────────────────────────────────────────────────
 
-/// Shell metacharacters that could enable injection.
-/// Blocks: ; | & ` $ ( ) < > ! \n \r
-/// Shell metacharacters that enable injection. `!` removed: it's used in legit
-/// commands like `echo "hello!"` and `git commit -m "fix!"`, and history expansion
-/// is disabled in non-interactive sh -c context anyway.
 // 2026-05-28: SHELL_META 已移除——命令通过 `sh -c` 执行，元字符是合法 shell 语法
 // 安全由 classify_bash_command 的语义分类 + MCIP 门控保障
+// Shell metacharacters: ; | & ` $ ( ) < > ! \n \r
 
 /// Bash command classification result.
 ///
@@ -1693,13 +1688,11 @@ fn classify_tar(parts: &[&str]) -> BashDecision {
 /// Inner defense-in-depth guard (called within bash_exec after pipeline-level classification).
 /// Pipeline is the primary gate (classify_bash_command → NeedsConfirm → UI confirm).
 /// Once confirmed, execution reaches bash_exec — inner guard only blocks injection vectors.
-///
 /// ## Referenced by
 /// - `bash_exec()` only (belt-and-suspenders; pipeline classify_bash_command is primary gate)
 // 2026-05-28: is_command_allowed() 已移除
 // 原逻辑（SHELL_META 硬拒）在 `sh -c` 执行模式下是误拒——元字符是合法 shell 语法。
 // 安全由 pipeline 层 classify_bash_command() + MCIP 门控保障。
-
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let command = get_str(&args, "command")?;
     let timeout = args.get("timeout").and_then(|v| v.as_u64())
@@ -2074,21 +2067,15 @@ fn html_to_text(html: &str, max_chars: usize) -> (String, bool) {
     for tag in &["script", "style", "nav", "header", "footer", "aside"] {
         let open = format!("<{}", tag);
         let close = format!("</{}>", tag);
-        loop {
-            match text.find(&open) {
-                Some(start) => {
-                    match text[start..].find(&close) {
-                        Some(end_rel) => {
-                            let end_pos = start + end_rel + close.len();
-                            let mut next = String::with_capacity(text.len() - (end_pos - start));
-                            next.push_str(&text[..start]);
-                            next.push_str(&text[end_pos..]);
-                            text = next;
-                        }
-                        None => break,
-                    }
-                }
-                None => break,
+        while let Some(start) = text.find(&open) {
+            if let Some(end_rel) = text[start..].find(&close) {
+                let end_pos = start + end_rel + close.len();
+                let mut next = String::with_capacity(text.len() - (end_pos - start));
+                next.push_str(&text[..start]);
+                next.push_str(&text[end_pos..]);
+                text = next;
+            } else {
+                break;
             }
         }
     }

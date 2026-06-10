@@ -1,5 +1,54 @@
 # Changelog
 
+## v2.0.0 (2026-06-10) — 配置系统重构 + 知识库 + 全平台 CI
+
+### Architecture
+
+- **V42-B Streaming 迁移** — 流式输出引擎重写，支持增量渲染 + 工具调用交织
+- **配置系统全面重构** — TOML 多层配置（`config.toml` + `provider.toml` + `security.toml`），环境变量 `ABACUS_*` 覆盖，`config set/get/validate` 命令
+- **ARK Provider 接入** — 新增 `openai-compatible` provider 类型，支持任意 OpenAI 兼容 API
+- **LLM 资源感知预算** — `LlmBudget` 实时追踪 cost/token/latency，`ResourcePressureMonitor` 自适应降级
+- **知识库系统** — `KnowledgeStore` + FTS5 全文检索 + `VllmEmbedder` 向量嵌入，`kb_search`/`kb_ingest` 工具
+- **记忆宫殿** — `DualPalaceMemory`（BehaviorPalace + KnowledgePalace），SM2 间隔重复算法
+- **ScriptHook 管道钩子** — Rhai/Shell/Python 三种运行时，`TurnStart`/`TurnEnd` 事件注入
+- **Panel 布局重写** — Dashboard Hooks 改造，Section 优先级布局，可配置面板可见性
+- **渐进输出协议** — `ProgressiveGate` 门控输出，Checklist 驱动多阶段确认
+- **工作流检查器** — `WorkflowChecker` 代码质量/安全/完整性多维检查
+- **代码图谱** — `CodeGraph` 跨文件依赖分析，Rust/Python/Go/TypeScript 语言支持
+- **LSP 集成** — 语言服务器协议客户端，实时诊断 + 补全
+- **WASM 插件系统** — `PluginLoader` 沙箱执行，签名验证
+
+### CI / Build
+
+- **跨平台 Release** — macOS (aarch64 + x86_64) + Linux (aarch64 + x86_64) 四目标构建
+- **Windows 构建支持** — `cfg(unix)` 条件编译拆分，protobuf 路径动态查找
+- **GitHub Actions** — 自动 release 发布 + artifact 上传 + SHA256 checksum
+
+### UI / UX
+
+- **8+3 个 UI/UX 修复** — 边框渲染、数据面板、横线分隔、CJK 折行
+- **输入框 soft-wrap** — `char_width` 精确计算，修复粘贴带格式文本布局错乱
+- **Streaming 内容落档** — 用户中途发消息时自动保存未完成 streaming，不再丢失 trace
+- **模型切换修复** — provider/model 切换去同步问题，认证失败处理
+- **超时可配置** — 默认 300→600s，`/timeout` 命令 + `EngineHandle` 配置字段
+- **Short-Mode 阈值可配** — `tool_prune_after_turns` 控制工具裁剪时机
+
+### Code Quality
+
+- **1510 tests 全部通过**（vs v1.0.0 的 695）
+- **0 clippy errors**，84 warnings 均为设计决策级 `allow`
+- **0 `unimplemented!()` / `todo!()`** 生产代码
+- **3 处 `unsafe`** 均有 `#[allow(unsafe_code)]` 标注（`libc::kill` / `mlock` / `munlock`）
+- 依赖版本统一升级至 2.0.0，workspace 级别版本管理
+
+### Breaking Changes
+
+- `llm.*` 配置键废弃，迁移至 `provider.toml`
+- `default_model` 改为 `auto`（自动选择第一个 provider 的第一个 model）
+- Provider 注册前置检查：缺 base_url 和 key 时不注册
+
+---
+
 ## v1.0.0 (2026-05-24) — 首个稳定版发布
 
 ### TUI 交互模式（V33 4 阶 DAG）

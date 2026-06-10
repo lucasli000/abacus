@@ -214,7 +214,7 @@ impl QueryEngine {
         file_filter: Option<&str>,
         limit: u32,
     ) -> (Vec<SymbolResult>, CgDegradation) {
-        let effective_limit = limit.min(100).max(1);
+        let effective_limit = limit.clamp(1, 100);
         let conn = self.db.lock().await;
 
         // 检查是否有索引数据
@@ -396,8 +396,8 @@ impl QueryEngine {
         depth: u32,
         limit: u32,
     ) -> GraphResult {
-        let effective_depth = depth.min(10).max(1);
-        let effective_limit = limit.min(500).max(1);
+        let effective_depth = depth.clamp(1, 10);
+        let effective_limit = limit.clamp(1, 500);
         let conn = self.db.lock().await;
 
         // 解析起点：如果是符号名而非 ID，先查找 symbol_id

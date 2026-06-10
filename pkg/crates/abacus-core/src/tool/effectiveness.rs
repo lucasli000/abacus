@@ -294,7 +294,7 @@ impl EffectivenessTracker {
             return true; // 刚降级即查询 → 压制
         }
         // 每 PROBATION_INTERVAL_TURNS 周期最后 1 turn 放行
-        elapsed % PROBATION_INTERVAL_TURNS != 0
+        !elapsed.is_multiple_of(PROBATION_INTERVAL_TURNS)
     }
 
     /// Evict least-used tools when stats map exceeds capacity.

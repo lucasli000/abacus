@@ -79,6 +79,12 @@ pub struct ToolAgentRegistry {
     agents: Vec<ToolAgentDef>,
 }
 
+impl Default for ToolAgentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolAgentRegistry {
     pub fn new() -> Self {
         Self { agents: Vec::new() }

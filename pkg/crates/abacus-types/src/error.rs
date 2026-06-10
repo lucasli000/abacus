@@ -91,4 +91,63 @@ impl KernelError {
     }
 }
 
+/// 自动转换：serde_json::Error → KernelError::Serialization
+///
+/// 启用 `?` 操作符在 L0+ crate 中自动把 JSON 解析失败转成内核错误。
+/// 上下文用调用点文件名（通过 `.map_err(|e| e.context("..."))?` 模式补充）。
+impl From<serde_json::Error> for KernelError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Serialization {
+            context: "json".into(),
+            detail: e.to_string(),
+        }
+    }
+}
+
+/// 自动转换：String → KernelError::Other
+///
+/// 简化调用点：函数返回 Result<_, String> 时可通过 `?` 自动升级为内核错误。
+/// 鼓励统一错误类型，避免 String 错误在 crate 边界泄漏。
+impl From<String> for KernelError {
+    fn from(s: String) -> Self {
+        Self::Other(s)
+    }
+}
+
+impl From<&str> for KernelError {
+    fn from(s: &str) -> Self {
+        Self::Other(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_json_error_converts_to_serialization() {
+        let bad_json = "not json{";
+        let parse_err: serde_json::Error =
+            serde_json::from_str::<serde_json::Value>(bad_json).unwrap_err();
+        let kernel_err: KernelError = parse_err.into();
+        match kernel_err {
+            KernelError::Serialization { context, .. } => {
+                assert_eq!(context, "json");
+            }
+            _ => panic!("expected Serialization variant"),
+        }
+    }
+
+    #[test]
+    fn question_mark_operator_works_with_serde_json() {
+        fn parse_user() -> Result<serde_json::Value> {
+            // 使用 ? 操作符自动转换（无需手动 map_err）
+            let v: serde_json::Value = serde_json::from_str("{ invalid")?;
+            Ok(v)
+        }
+        let err = parse_user().unwrap_err();
+        assert!(matches!(err, KernelError::Serialization { .. }));
+    }
+}
+
 pub type Result<T> = std::result::Result<T, KernelError>;

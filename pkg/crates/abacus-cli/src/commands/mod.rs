@@ -33,8 +33,8 @@ pub struct ChatArgs {
     #[arg(long = "session", short = 'S')]
     pub session_id: Option<String>,
 
-    /// Thinking depth: off, low, medium, high (default: high)
-    #[arg(long = "thinking", short = 'T', default_value = "high")]
+    /// Thinking depth: off, low, medium, high (default: off)
+    #[arg(long = "thinking", short = 'T', default_value = "off")]
     pub thinking: String,
 }
 

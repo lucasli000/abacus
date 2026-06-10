@@ -194,6 +194,7 @@ fn event_name(event: &PipelineEvent) -> &'static str {
         PipelineEvent::PostProcess => "PostProcess",
         PipelineEvent::TurnPostFanOut { .. } => "TurnPostFanOut",
         PipelineEvent::TurnEnd { .. } => "TurnEnd",
+        PipelineEvent::TriageResult { .. } => "TriageResult",
     }
 }
 
@@ -233,6 +234,11 @@ fn build_event_value(event: &PipelineEvent) -> serde_json::Value {
             "latency_ms": latency_ms,
             "completion_tokens": completion_tokens,
         }),
+        PipelineEvent::TriageResult { stats, turn_number } => serde_json::json!({
+            "event": "TriageResult",
+            "summary": stats.summary_line(),
+            "turn_number": turn_number,
+        }),
     }
 }
 
@@ -267,6 +273,10 @@ fn build_event_env(event: &PipelineEvent) -> HashMap<String, String> {
             env.insert("ABACUS_TOOL_CALLS".into(), tool_calls.to_string());
             env.insert("ABACUS_LATENCY_MS".into(), latency_ms.to_string());
             env.insert("ABACUS_COMPLETION_TOKENS".into(), completion_tokens.to_string());
+        }
+        PipelineEvent::TriageResult { stats, turn_number } => {
+            env.insert("ABACUS_TRIAGE_SUMMARY".into(), stats.summary_line());
+            env.insert("ABACUS_TURN_NUMBER".into(), turn_number.to_string());
         }
     }
     env

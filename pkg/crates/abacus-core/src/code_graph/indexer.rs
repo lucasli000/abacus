@@ -255,13 +255,12 @@ impl Indexer {
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| !is_hidden_or_ignored(e))
+                .filter_map(|e| e.ok())
             {
-                if let Ok(entry) = entry {
-                    if entry.file_type().is_file() {
-                        if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
-                            if Language::from_extension(ext).is_some() {
-                                files.push(entry.into_path());
-                            }
+                if entry.file_type().is_file() {
+                    if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                        if Language::from_extension(ext).is_some() {
+                            files.push(entry.into_path());
                         }
                     }
                 }
