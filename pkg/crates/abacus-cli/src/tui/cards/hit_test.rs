@@ -41,7 +41,7 @@ use crate::tui::state::AppState;
 /// 本函数不校验 area 边界, 由调用方负责。
 pub fn card_hit_test(state: &AppState, x: u16, y: i32) -> Option<u64> {
     let ctx = AppContext::new(state);
-    let inner_width = state.last_msg_area_width.borrow().saturating_sub(2);
+    let inner_width = *state.last_msg_area_width.borrow();
     let mut current_y = *state.last_msg_area_y.borrow() as i32;
     let y_end = current_y + *state.last_msg_area_height.borrow() as i32;
 

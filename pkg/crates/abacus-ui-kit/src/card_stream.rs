@@ -55,6 +55,9 @@ pub struct CardStream {
     collapse_overrides: HashMap<u64, CardCollapse>,
 }
 
+/// 最大保留卡片数——超出时 FIFO 裁剪最旧卡片，防止长会话滚动卡顿
+const MAX_CARDS: usize = 100;
+
 impl Default for CardStream {
     fn default() -> Self {
         Self::new()
@@ -69,6 +72,38 @@ impl CardStream {
             next_id: 1,
             active: None,
             collapse_overrides: HashMap::new(),
+        }
+    }
+
+    /// FIFO 裁剪：保留最新 MAX_CARDS 张卡片，丢弃最旧的。
+    /// 仅裁剪已完成的静态卡片，active 卡片始终保留。
+    fn trim_if_needed(&mut self) {
+        if self.cards.len() <= MAX_CARDS {
+            return;
+        }
+        // 计算需要裁剪的数量（保留 active 和最近的 MAX_CARDS-1 张）
+        let active_id = self.active;
+        let keep = MAX_CARDS.saturating_sub(1);
+        let drain_count = self.cards.len().saturating_sub(keep);
+        if drain_count == 0 {
+            return;
+        }
+        // 收集要丢弃的 id
+        let drain_ids: Vec<u64> = self.cards[..drain_count]
+            .iter()
+            .map(|c| c.id())
+            .filter(|&id| Some(id) != active_id)
+            .collect();
+        // 丢弃旧卡片
+        self.cards.drain(..drain_count);
+        // 重建 id_to_idx 映射
+        self.id_to_idx.clear();
+        for (i, card) in self.cards.iter().enumerate() {
+            self.id_to_idx.insert(card.id(), i);
+        }
+        // 清理 collapse_overrides
+        for id in &drain_ids {
+            self.collapse_overrides.remove(id);
         }
     }
 
@@ -94,6 +129,7 @@ impl CardStream {
         let idx = self.cards.len();
         self.cards.push(card);
         self.id_to_idx.insert(id, idx);
+        self.trim_if_needed();
         id
     }
 
@@ -112,6 +148,7 @@ impl CardStream {
         self.cards.push(card);
         self.id_to_idx.insert(id, idx);
         self.active = Some(id);
+        self.trim_if_needed();
         id
     }
 

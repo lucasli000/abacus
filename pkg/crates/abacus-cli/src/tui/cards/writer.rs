@@ -1,41 +1,37 @@
 //! CardStream writer —— chunk → CardStream 写入适配器
 //!
-//! V42-B Phase 10: 把 run.rs 的 StreamChunk 转换为 CardStream 操作
-//! (push_active / finish_active / append_reply / append_event)。
+//! V42-B Phase 10: 把 run.rs 的 StreamChunk 转换为 CardStream 操作。
 //!
-//! ## 设计目标
+//! ## 物理时序（严格遵循 LLM 输出顺序）
 //!
-//! 在 run.rs 的 chunk drain 循环末尾调用 [`handle_chunk`],
-//! 把每个 chunk 翻译成 Card 操作。新老字段并存——
-//! 旧 `state.streaming_*` 字段仍被渲染层使用, 保证现有功能不受影响;
-//! `state.cards` 作为"未来唯一数据源"逐步累积, Phase 14 切换。
+//! 任意时刻最多 1 张 active 卡片。新 chunk 触发新卡片时，旧 active 自动 finish。
+//!
+//! ```text
+//! IterationStart   → 不强制 finish（保留跨迭代累积，如需新卡由后续 chunk 触发）
+//! Thinking         → 若 active 不是 ThinkingCard, finish + push ThinkingCard; append
+//! ToolStart        → finish active; push AbacusCard
+//! ToolArgs         → active 必为 AbacusCard, push event
+//! ToolOutput       → 同上
+//! ToolEnd          → finish active AbacusCard
+//! TextDelta        → 若 active 不是 LlmCard/ExpertCard, finish + push LlmCard; append_reply
+//! ToolAgentResult  → 确保 active 是 LlmCard, append_reply
+//! Complete         → finish active
+//! StreamRetryReset → abort_active
+//! Error            → abort_active
+//! ```
 
 use abacus_core::llm::stream::StreamChunk;
-use crate::tui::cards::{AbacusCard, LlmCard, UserCard};
+use crate::tui::cards::{AbacusCard, LlmCard, ThinkingCard, UserCard};
 use crate::tui::state::{AppState, EventLevel, TraceEvent, TraceKind, ToolStatus};
 
 /// 处理单个 chunk, 写入 CardStream
-///
-/// 调用方: run.rs `while let Ok(chunk) = stream_rx.try_recv()`
-/// 的 match 分支末尾。
-///
-/// ## 状态机
-///
-/// ```text
-/// IterationStart   → 若有 active, finish_active
-/// TextDelta        → 若 active 不是 LlmCard, finish + push LlmCard; append_reply
-/// Thinking         → 若 active 不是 LlmCard, finish + push LlmCard; append_thinking
-/// ToolStart        → finish active; push AbacusCard
-/// ToolArgs         → active 必为 AbacusCard, push event
-/// ToolOutput       → 同上
-/// ToolEnd          → finish active AbacusCard
-/// ToolAgentResult  → 确保 active 是 LlmCard, append_reply
-/// Complete         → finish active
-/// ```
 pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
     match chunk {
-        StreamChunk::TextDelta(_) | StreamChunk::Thinking(_) => {
-            ensure_llm_card_active(state);
+        StreamChunk::Thinking(_) => {
+            ensure_thinking_card_active(state);
+        }
+        StreamChunk::TextDelta(_) => {
+            ensure_reply_card_active(state);
         }
         StreamChunk::ToolStart { .. } => {
             ensure_no_active(state);
@@ -52,8 +48,7 @@ pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
             state.cards.finish_active();
         }
         StreamChunk::ToolAgentResult { icon, name, call_count, summary, .. } => {
-            // V42-B: 追加到 active LlmCard 的 reply
-            ensure_llm_card_active(state);
+            ensure_reply_card_active(state);
             let display = format!("\n{} {} · {} calls", icon, name, call_count);
             if let Some(id) = state.cards.active_id() {
                 if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(id) {
@@ -68,8 +63,7 @@ pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
             state.cards.finish_active();
         }
         StreamChunk::IterationStart { .. } => {
-            // V42-B: 迭代边界: 保留当前 LLM Card 内容, 不强制 finish
-            // (active LlmCard 跨迭代累积 reply_text)
+            // V42-B: 迭代边界不强制 finish，让同一轮对话内容跨迭代累积
         }
         StreamChunk::StreamRetryReset { .. } => {
             state.cards.abort_active();
@@ -82,7 +76,7 @@ pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
         }
     }
 
-    // LlmCard 的 append_reply / append_thinking 需要在 push_active 之后
+    // 追加内容到 active 卡片
     if let StreamChunk::TextDelta(t) = chunk {
         if let Some(id) = state.cards.active_id() {
             if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(id) {
@@ -91,19 +85,35 @@ pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
         }
     } else if let StreamChunk::Thinking(t) = chunk {
         if let Some(id) = state.cards.active_id() {
-            if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(id) {
-                llm.append_thinking(t);
+            if let Some(th) = state.cards.card_downcast_mut::<ThinkingCard>(id) {
+                th.append(t);
             }
         }
     }
 }
 
-/// 确保 active 是 LlmCard, 否则 finish + push 新的
-fn ensure_llm_card_active(state: &mut AppState) {
+/// 确保 active 是 ThinkingCard，否则 finish + push 新的
+fn ensure_thinking_card_active(state: &mut AppState) {
     let need_new = match state.cards.active_id() {
         None => true,
         Some(id) => {
-            // 查 active 卡的 kind
+            state.cards.card(id).map(|c| c.kind() != abacus_ui_kit::kinds::THINKING).unwrap_or(true)
+        }
+    };
+    if need_new {
+        state.cards.finish_active();
+        let id = state.cards.alloc_id();
+        let model = if state.model_name.is_empty() { "llm".into() } else { state.model_name.clone() };
+        let card = ThinkingCard::new(id, model);
+        state.cards.push_active(Box::new(card));
+    }
+}
+
+/// 确保 active 是 LlmCard（Reply），否则 finish + push 新的
+fn ensure_reply_card_active(state: &mut AppState) {
+    let need_new = match state.cards.active_id() {
+        None => true,
+        Some(id) => {
             state.cards.card(id).map(|c| c.kind() != abacus_ui_kit::kinds::LLM).unwrap_or(true)
         }
     };
@@ -111,12 +121,12 @@ fn ensure_llm_card_active(state: &mut AppState) {
         state.cards.finish_active();
         let id = state.cards.alloc_id();
         let model = if state.model_name.is_empty() { "llm".into() } else { state.model_name.clone() };
-        let card = LlmCard::new(id, model, "default");
+        let card = LlmCard::new(id, model);
         state.cards.push_active(Box::new(card));
     }
 }
 
-/// 确保无 active (ToolStart 强制切换)
+/// 确保无 active（ToolStart 强制切换）
 fn ensure_no_active(state: &mut AppState) {
     if state.cards.active_id().is_some() {
         state.cards.finish_active();
@@ -132,7 +142,7 @@ fn push_tool_event(state: &mut AppState, _name: &str, _args: &str, status: ToolS
     if let Some(id) = active_id {
         if let Some(abacus) = state.cards.card_downcast_mut::<AbacusCard>(id) {
             let trace = TraceEvent {
-                id: 0, // 占位, AbacusCard 内部不依赖
+                id: 0,
                 time: chrono::Local::now().format("%H:%M").to_string(),
                 category: "tool".into(),
                 level: EventLevel::Info,
@@ -149,21 +159,12 @@ fn push_tool_event(state: &mut AppState, _name: &str, _args: &str, status: ToolS
     }
 }
 
-/// 推送 ToolOutput 到 active AbacusCard
+/// 推送 ToolOutput 到 active AbacusCard —— 直接绑定到最后一个 ToolCall
 fn push_tool_output(state: &mut AppState, _name: &str, output: &str) {
     let active_id = state.cards.active_id();
     if let Some(id) = active_id {
         if let Some(abacus) = state.cards.card_downcast_mut::<AbacusCard>(id) {
-            // 简化: 追加一个 Generic event 表示 output
-            let trace = TraceEvent {
-                id: 0,
-                time: chrono::Local::now().format("%H:%M").to_string(),
-                category: "tool-output".into(),
-                level: EventLevel::Info,
-                kind: TraceKind::Generic { content: output.to_string() },
-                duration_ms: None,
-            };
-            abacus.push_event(trace);
+            abacus.set_last_call_output(output.to_string());
         }
     }
 }
@@ -175,5 +176,3 @@ pub fn push_user_message(state: &mut AppState, text: &str, time: &str) {
     let card = UserCard::new(id, text, time);
     state.cards.push_static(Box::new(card));
 }
-
-

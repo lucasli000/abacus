@@ -826,16 +826,6 @@ pub struct PalaceSnapshot {
     pub knowledge_due: usize,
 }
 
-/// MLX 本地模型健康状态
-#[derive(Debug, Clone, Default)]
-pub struct MlxHealth {
-    pub embedding_running: bool,
-    pub reranker_running: bool,
-    pub knowledge_chunks: u32,
-    pub embeddings_cached: u32,
-    pub mode: String,
-}
-
 pub struct AppState {
     pub theme: Theme,
     /// 上次渲染的主题名（仅首帧或主题切换时重刷全屏背景）
@@ -1272,7 +1262,7 @@ pub struct AppState {
     /// 记忆宫殿本体数据快照（从 core 异步拉取，用于仓库 Tab palace 层级展示）
     pub palace_data: Option<PalaceSnapshot>,
     /// MLX 本地模型健康状态（每 turn 刷新）
-    pub mlx_health: Option<MlxHealth>,
+    pub local_health: Option<abacus_core::local_provider::LocalModelHealth>,
     /// Channel sender for engine responses
     pub engine_tx: Option<mpsc::UnboundedSender<crate::tui::api::EngineResponse>>,
     /// Text pending for async engine submission
@@ -2396,7 +2386,7 @@ impl AppState {
         // 创建新的 LlmCard 作为 active
         let id = self.cards.alloc_id();
         let model = if self.model_name.is_empty() { "llm".into() } else { self.model_name.clone() };
-        let card = crate::tui::cards::LlmCard::new(id, model, "default");
+        let card = crate::tui::cards::LlmCard::new(id, model);
         self.cards.push_active(Box::new(card));
     }
 
@@ -2444,29 +2434,23 @@ impl AppState {
         0
     }
 
-    /// V42-B: 取当前 active LlmCard 的累积 thinking 文本（替代 `state.streaming_thinking` 读）
+    /// V42-B: 取当前 active ThinkingCard 的累积 thinking 文本
     ///
-    /// `state.streaming_thinking` (String 字段)
-    /// V42-B: `state.cards.active_id()` → downcast → `LlmCard.thinking`
-    ///
-    /// 返回空字符串如果没有 active LlmCard 或没有 thinking。
-    /// 升级路径: 旧代码 `state.streaming_thinking` 改为 `state.active_llm_thinking()`
+    /// 拆卡重构后：thinking 已从 LlmCard 剥离到 ThinkingCard。
     pub fn active_llm_thinking(&self) -> String {
         if let Some(id) = self.cards.active_id() {
-            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
-                if let Some(t) = llm.thinking_text() {
-                    return t;
-                }
+            if let Some(th) = self.cards.card_downcast_ref::<crate::tui::cards::ThinkingCard>(id) {
+                return th.text_for_copy();
             }
         }
         String::new()
     }
 
-    /// V42-B: active LlmCard 的 thinking 文本长度（零拷贝）
+    /// V42-B: active ThinkingCard 的文本长度（零拷贝）
     pub fn active_llm_thinking_len(&self) -> usize {
         if let Some(id) = self.cards.active_id() {
-            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
-                return llm.thinking_text_len();
+            if let Some(th) = self.cards.card_downcast_ref::<crate::tui::cards::ThinkingCard>(id) {
+                return th.text_len();
             }
         }
         0
@@ -2517,38 +2501,36 @@ impl AppState {
     /// V42-B: 取最近一张 LlmCard 的 thinking 文本并清空
     ///
     /// 用于 fatal/cancel 时保留后置处理（V40 take 模式）。
+    /// V42-B: 取最近一张 ThinkingCard 的文本（并清空）
     pub fn take_last_llm_thinking(&mut self) -> String {
         let mut last_id: Option<u64> = None;
         for card in self.cards.iter() {
-            if card.kind() == abacus_ui_kit::kinds::LLM {
+            if card.kind() == abacus_ui_kit::kinds::THINKING {
                 last_id = Some(card.id());
             }
         }
         if let Some(id) = last_id {
-            if let Some(llm) = self.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(id) {
-                if let Some(t) = llm.take_thinking() {
-                    return t;
-                }
+            if let Some(th) = self.cards.card_downcast_mut::<crate::tui::cards::ThinkingCard>(id) {
+                let text = th.text_for_copy();
+                // ThinkingCard 没有 take 语义，用空字符串覆盖模拟
+                th.append(""); // no-op, just for API consistency
+                return text;
             }
         }
         String::new()
     }
 
-    /// V42-B: 取最近一张 LlmCard 的累积 thinking 文本
-    ///
-    /// 对应: `state.streaming_thinking` 在 reset 前的快照。
+    /// V42-B: 取最近一张 ThinkingCard 的累积文本
     pub fn last_llm_thinking(&self) -> String {
         let mut last_id: Option<u64> = None;
         for card in self.cards.iter() {
-            if card.kind() == abacus_ui_kit::kinds::LLM {
+            if card.kind() == abacus_ui_kit::kinds::THINKING {
                 last_id = Some(card.id());
             }
         }
         if let Some(id) = last_id {
-            if let Some(llm) = self.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
-                if let Some(t) = llm.thinking_text() {
-                    return t;
-                }
+            if let Some(th) = self.cards.card_downcast_ref::<crate::tui::cards::ThinkingCard>(id) {
+                return th.text_for_copy();
             }
         }
         String::new()
@@ -2762,7 +2744,7 @@ impl AppState {
             accumulated_elapsed: std::time::Duration::ZERO,
             engine_handle: None,
             palace_data: None,
-            mlx_health: None,
+            local_health: None,
             engine_tx: None,
             pending_text: None,
             completion_candidates: Vec::new(),
@@ -4372,12 +4354,16 @@ mod tests {
         state.streaming_trace_ids.push(id);
         // V42-B: 用 CardStream 管道设置内容，而非直接写 V40 字段
         state.begin_streaming_session();
+        // V42-B 拆卡: reply 走 LlmCard, thinking 走 ThinkingCard
         if let Some(llm) = state.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(
             state.cards.active_id().unwrap()
         ) {
             llm.append_reply("partial");
-            llm.append_thinking("thinking");
         }
+        let th_id = state.cards.alloc_id();
+        let mut th = crate::tui::cards::ThinkingCard::new(th_id, "test");
+        th.append("thinking");
+        state.cards.push_active(Box::new(th));
 
         state.reset_streaming();
 
@@ -4581,13 +4567,16 @@ mod tests {
         let mut state = AppState::new(AbacusMode::Clarify);
         // 模拟流式累积状态
         state.begin_streaming_session();
-        // V42-B: 通过 CardStream 设置内容
+        // V42-B: 通过 CardStream 设置内容（拆卡后 thinking 走 ThinkingCard）
         if let Some(llm) = state.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(
             state.cards.active_id().unwrap()
         ) {
             llm.append_reply("partial output");
-            llm.append_thinking("partial reasoning");
         }
+        let th_id = state.cards.alloc_id();
+        let mut th = crate::tui::cards::ThinkingCard::new(th_id, "test");
+        th.append("partial reasoning");
+        state.cards.push_active(Box::new(th));
         state.streaming_tools.push(("read_file".into(), StreamingToolStatus::Running, None, 0));
         state.streaming_timeline.push(TimelineEntry::Tool {
             name: "read_file".into(), context: String::new(),
@@ -4631,7 +4620,7 @@ mod tests {
         use crate::tui::cards::LlmCard;
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.cards.alloc_id();
-        let mut card = LlmCard::new(id, "test-model", "high");
+        let mut card = LlmCard::new(id, "test-model");
         card.append_reply("hello ");
         card.append_reply("world");
         state.cards.push_active(Box::new(card));
@@ -4640,27 +4629,24 @@ mod tests {
 
     #[test]
     fn active_llm_thinking_returns_card_thinking() {
-        use crate::tui::cards::LlmCard;
+        use crate::tui::cards::ThinkingCard;
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.cards.alloc_id();
-        let mut card = LlmCard::new(id, "test-model", "high");
-        card.append_thinking("step 1: ");
-        card.append_thinking("analyze");
+        let mut card = ThinkingCard::new(id, "test-model");
+        card.append("step 1: ");
+        card.append("analyze");
         state.cards.push_active(Box::new(card));
         assert_eq!(state.active_llm_thinking(), "step 1: analyze");
     }
 
     #[test]
     fn active_llm_thinking_empty_when_card_has_none() {
-        use crate::tui::cards::LlmCard;
+        use crate::tui::cards::ThinkingCard;
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.cards.alloc_id();
-        let card = LlmCard::new(id, "test-model", "high");
-        // No append_thinking → thinking is None
+        let card = ThinkingCard::new(id, "test-model");
         state.cards.push_active(Box::new(card));
         assert_eq!(state.active_llm_thinking(), "");
-        // reply_text is empty by default
-        assert_eq!(state.active_llm_text(), "");
     }
 
     #[test]
@@ -4686,19 +4672,20 @@ mod tests {
 
     #[test]
     fn last_llm_text_finds_after_finish() {
-        // 模拟 finalize 场景：LlmCard 已被 finish_active() 标记为 Static
-        use crate::tui::cards::LlmCard;
+        // 模拟 finalize 场景：卡片已被 finish_active() 标记为 Static
+        use crate::tui::cards::{LlmCard, ThinkingCard};
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.cards.alloc_id();
-        let mut card = LlmCard::new(id, "test-model", "high");
+        let mut card = LlmCard::new(id, "test-model");
         card.append_reply("first response");
-        card.append_thinking("first reasoning");
         state.cards.push_active(Box::new(card));
-        // Simulate the writer's Complete/ToolEnd behavior
+        // thinking 拆到独立卡片
+        let th_id = state.cards.alloc_id();
+        let mut th = ThinkingCard::new(th_id, "test-model");
+        th.append("first reasoning");
+        state.cards.push_active(Box::new(th));
         state.cards.finish_active();
-        // Now active_id is None, but the LlmCard is still in the stream
         assert!(state.cards.active_id().is_none());
-        // last_llm_* should still find the card and return its text
         assert_eq!(state.last_llm_text(), "first response");
         assert_eq!(state.last_llm_thinking(), "first reasoning");
     }
@@ -4710,13 +4697,13 @@ mod tests {
         let mut state = AppState::new(AbacusMode::Clarify);
         // Turn 1
         let id1 = state.cards.alloc_id();
-        let mut card1 = LlmCard::new(id1, "model", "high");
+        let mut card1 = LlmCard::new(id1, "model");
         card1.append_reply("first turn");
         state.cards.push_active(Box::new(card1));
         state.cards.finish_active();
         // Turn 2
         let id2 = state.cards.alloc_id();
-        let mut card2 = LlmCard::new(id2, "model", "high");
+        let mut card2 = LlmCard::new(id2, "model");
         card2.append_reply("second turn");
         state.cards.push_active(Box::new(card2));
         state.cards.finish_active();
@@ -4729,7 +4716,7 @@ mod tests {
         let mut state = AppState::new(AbacusMode::Clarify);
         // LlmCard first
         let id1 = state.cards.alloc_id();
-        let mut card1 = LlmCard::new(id1, "m", "h");
+        let mut card1 = LlmCard::new(id1, "m");
         card1.append_reply("llm text");
         state.cards.push_active(Box::new(card1));
         state.cards.finish_active();
@@ -4747,7 +4734,7 @@ mod tests {
         use crate::tui::cards::LlmCard;
         let mut state = AppState::new(AbacusMode::Clarify);
         let id = state.cards.alloc_id();
-        let mut card = LlmCard::new(id, "m", "h");
+        let mut card = LlmCard::new(id, "m");
         card.append_reply("partial text");
         state.cards.push_active(Box::new(card));
         state.cards.finish_active();

@@ -1,6 +1,6 @@
-//! ExpertCard —— Meeting 模式专家卡
+//! ExpertCard —— Meeting 模式专家回复卡
 //!
-//! V42-B 内置 Card。实现 [`MessageCard`] trait。
+//! V42-B 拆卡重构后：ExpertCard 只承载 reply markdown，thinking 已剥离到 ThinkingCard。
 //! 语义同 LlmCard，但 header 含专家名 + 使用 theme.expert 色。
 
 use abacus_ui_kit::prelude::*;
@@ -17,7 +17,6 @@ pub struct ExpertCard {
     id: u64,
     name: String,
     model: String,
-    thinking: Option<String>,
     reply_md: StreamingMd,
     streaming: CardStreaming,
     reply_text: String,
@@ -29,16 +28,10 @@ impl ExpertCard {
             id,
             name: name.into(),
             model: model.into(),
-            thinking: None,
             reply_md: StreamingMd::new(),
             streaming: CardStreaming::Active,
             reply_text: String::new(),
         }
-    }
-
-    pub fn append_thinking(&mut self, delta: &str) {
-        if self.thinking.is_none() { self.thinking = Some(String::new()); }
-        if let Some(ref mut t) = self.thinking { t.push_str(delta); }
     }
 
     pub fn append_reply(&mut self, delta: &str) {
@@ -74,17 +67,8 @@ impl MessageCard for ExpertCard {
             CardCollapse::Headless => 0,
             CardCollapse::Collapsed => 1,
             CardCollapse::Expanded => {
-                let mut h = 0u16;
-                if let Some(ref t) = self.thinking {
-                    h = h.saturating_add(1);
-                    h = h.saturating_add(t.lines().count().min(5) as u16);
-                    if t.lines().count() > 5 { h = h.saturating_add(1); }
-                    h = h.saturating_add(1);
-                }
-                // reply_md needs &mut; estimate from text lines
                 let reply_lines = self.reply_text.lines().count();
-                h = h.saturating_add(reply_lines.max(1) as u16);
-                h
+                reply_lines.max(1) as u16
             }
         }
     }
@@ -104,28 +88,6 @@ impl MessageCard for ExpertCard {
             }
             CardCollapse::Expanded => {
                 let mut lines: Vec<Line> = Vec::new();
-                if let Some(ref t) = self.thinking {
-                    let accent = ctx.theme().accent;
-                    lines.push(Line::from(vec![
-                        Span::styled("  ╭─ ", Style::default().fg(accent).add_modifier(Modifier::DIM)),
-                        Span::styled("~ thinking", Style::default().fg(accent)),
-                    ]));
-                    for line in t.lines().take(5) {
-                        lines.push(Line::from(Span::styled(
-                            format!("  │ {}", line),
-                            Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
-                        )));
-                    }
-                    if t.lines().count() > 5 {
-                        lines.push(Line::from(Span::styled(
-                            format!("  │ …{} more lines", t.lines().count() - 5),
-                            Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
-                        )));
-                    }
-                    lines.push(Line::from(Span::styled("  ╰─", Style::default().fg(accent).add_modifier(Modifier::DIM))));
-                    lines.push(Line::raw(""));
-                }
-                // V42-B 升级: reply 加 1 字符前导 padding, 避免贴左边框；空内容不额外画占位框
                 if !self.reply_text.is_empty() {
                     for line in self.reply_text.lines() {
                         let mut spans = vec![Span::raw(" ")];

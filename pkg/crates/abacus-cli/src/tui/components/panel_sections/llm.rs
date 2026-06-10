@@ -79,22 +79,31 @@ impl Section for LlmSection {
         render_section_header(&mut lines, crate::tui::i18n::t("panel.llm"), w, theme);
 
         // ── 头行: provider + model + thinking ──
+        // 从 provider_statuses 查找 display_name（第三字段），fallback 到 raw ID
+        let provider_info = state
+            .provider_statuses
+            .iter()
+            .find(|(id, _, _)| id == &state.active_provider_id);
         let provider_label = if state.active_provider_id.is_empty() {
             "\u{2014}"
+        } else if let Some((_, _, Some(ref name))) = provider_info {
+            name.as_str()
         } else {
             &state.active_provider_id
         };
-        let (status_icon, status_color) = match state
-            .provider_statuses
-            .iter()
-            .find(|(id, _, _)| id == &state.active_provider_id)
-        {
+        let (status_icon, status_color) = match provider_info {
             Some((_, true, _)) => ("\u{25cf}", theme.success),
             Some((_, false, _)) => ("\u{2717}", theme.error),
             None => ("\u{00b7}", theme.muted),
         };
-        let model_display =
-            abacus_types::lookup_model_or_default(&state.model_name).display_name;
+        // model: 优先用原始 model_name，若 lookup 成功则用 display_name
+        let model_lookup = abacus_types::lookup_model_or_default(&state.model_name);
+        let model_display = if model_lookup.id == state.model_name {
+            // lookup 未命中（返回了 fallback），直接显示原始 model_name
+            state.model_name.as_str()
+        } else {
+            model_lookup.display_name
+        };
         lines.push(Line::from(vec![
             Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
             Span::styled(provider_label, Style::default().fg(status_color)),

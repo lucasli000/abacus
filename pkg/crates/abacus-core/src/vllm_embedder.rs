@@ -110,6 +110,13 @@ impl VllmEmbedder {
             dim,
         }
     }
+
+    /// 轻量健康检查：验证服务端 `/v1/models` 可达
+    ///
+    /// 不消耗 embedding token，仅做 HTTP 探测。
+    pub async fn health_check(&self) -> bool {
+        crate::local_provider::health_check_embedding(&self.base_url).await
+    }
 }
 
 #[async_trait]
@@ -239,6 +246,11 @@ impl VllmReranker {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
         }
+    }
+
+    /// 轻量健康检查
+    pub async fn health_check(&self) -> bool {
+        crate::local_provider::health_check_reranker(&self.base_url).await
     }
 
     /// 对 documents 按 query 相关性重排序，返回 top_n 结果

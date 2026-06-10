@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.5.0"
+version = "2.5.1"
 edition = "2021"
 license = "MIT"
 description = "Abacus — LLM Agent kernel: TUI Clarify→Plan→Team→Meeting DAG, CLI, and HTTP+SSE server"

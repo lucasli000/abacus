@@ -1514,6 +1514,13 @@ pub struct CoreLoop {
     /// 用户在 `config.toml` `[llm_budget]` 显式启用后才生效。
     /// - 销毁：随 CoreLoop drop
     pub(crate) llm_budget: Arc<llm_budget::LlmBudget>,
+    /// V42-B: 本地模型服务健康状态（embedding + reranker）
+    ///
+    /// ## 引用关系
+    /// - 创建: engine_init.rs 在发现/配置本地模型后写入
+    /// - 读取: TUI run.rs → state.local_health 面板展示
+    /// - 默认: None（未配置本地模型时）
+    local_model_health: std::sync::RwLock<Option<crate::local_provider::LocalModelHealth>>,
 }
 
 /// Context window pressure source — reports usage_pct (0~100 scale) normalized to
@@ -1813,7 +1820,7 @@ impl CoreLoop {
             tracing::warn!("LlmBudget triggered shed → caller should switch to fallback provider");
             1  // 成功标记
         }).await;
-        let mut core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, event_bus: None, pressure_monitor, knowledge_store: None, triage_engine: None, standby_cache: None, cold_writer: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget };
+        let mut core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, event_bus: None, pressure_monitor, knowledge_store: None, triage_engine: None, standby_cache: None, cold_writer: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget, local_model_health: std::sync::RwLock::new(None) };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -2597,6 +2604,25 @@ impl CoreLoop {
         });
         self.add_pipeline_hook(100, absorb_hook).await;
         self
+    }
+
+    /// V42-B: 获取本地模型服务健康状态（TUI 面板消费）
+    pub fn local_model_health(&self) -> Option<crate::local_provider::LocalModelHealth> {
+        self.local_model_health.read().ok().and_then(|g| g.clone())
+    }
+
+    /// V42-B: 设置本地模型服务健康状态（engine_init.rs 在发现/配置后写入）
+    pub fn set_local_model_health(&self, health: crate::local_provider::LocalModelHealth) {
+        if let Ok(mut g) = self.local_model_health.write() {
+            *g = Some(health);
+        }
+    }
+
+    /// V42-B: 向 triage_engine 注入 reranker（engine_init.rs 使用）
+    pub async fn inject_reranker(&self, reranker: Arc<dyn crate::core::triage::TriageReranker>) {
+        if let Some(ref te) = self.triage_engine {
+            te.write().await.set_reranker(reranker);
+        }
     }
 
     /// 获取推演引擎引用（供外部调用分析接口）

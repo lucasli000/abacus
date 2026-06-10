@@ -23,6 +23,7 @@ pub mod expert;
 pub mod hit_test;
 pub mod llm;
 pub mod render;
+pub mod thinking;
 pub mod user;
 pub mod writer;
 
@@ -30,4 +31,5 @@ pub use abacus::AbacusCard;
 #[allow(unused_imports)] // 仅 v42b_card_stream.rs example 使用
 pub use expert::ExpertCard;
 pub use llm::LlmCard;
+pub use thinking::ThinkingCard;
 pub use user::UserCard;

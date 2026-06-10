@@ -313,37 +313,77 @@ pub async fn create_engine(
     }
 
     // ─── 本地 Embedding/Reranker 服务注入 ───────────────────────────────
-    // 从 config.toml [local] 段读取 vLLM 服务配置，注入到 KnowledgeStore 和 DualPalaceMemory。
-    // 未配置时静默跳过，退化到关键词匹配模式。
-    let _vllm_embedder: Option<Arc<abacus_core::vllm_embedder::VllmEmbedder>> = {
-        let embed_url = cfg_mgr.get_str("local.embedding_url");
-        let embed_model = cfg_mgr.get_str("local.embedding_model");
-        let embed_dim = cfg_mgr.get_number("local.embedding_dim").map(|n| n as usize);
+    // V42-B: 自动发现 + 手动配置合并 + health check + reranker 实际注入
+    let mut local_health = abacus_core::local_provider::LocalModelHealth::default();
 
-        match (embed_url, embed_model, embed_dim) {
-            (Some(url), Some(model), Some(dim)) => {
-                let embedder = abacus_core::vllm_embedder::create_embedder_from_config(&url, &model, dim);
-                tracing::info!(
-                    embed_url = %url,
-                    embed_model = %model,
-                    embed_dim = dim,
-                    "本地 embedding 服务已配置"
-                );
-                // 注入到 KnowledgeStore 和 DualPalaceMemory
-                kb_store.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>);
-                palace.read().await.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>).await;
-                Some(embedder)
+    // 1. 自动发现本地服务（Ollama / vLLM / Generic）
+    let detector = abacus_core::local_provider::LocalProviderDetector::new();
+    let discovered = detector.discover().await;
+    if !discovered.is_empty() {
+        tracing::info!(count = discovered.len(), endpoints = ?discovered.iter().map(|e| (&e.provider, &e.base_url)).collect::<Vec<_>>(), "本地模型服务自动发现结果");
+    }
+
+    // 2. 从 config 读取手动配置
+    let cfg_embed_url = cfg_mgr.get_str("local.embedding_url");
+    let cfg_embed_model = cfg_mgr.get_str("local.embedding_model");
+    let cfg_embed_dim = cfg_mgr.get_number("local.embedding_dim").map(|n| n as usize);
+    let cfg_rerank_url = cfg_mgr.get_str("local.reranker_url");
+    let cfg_rerank_model = cfg_mgr.get_str("local.reranker_model");
+
+    // 3. 合并：手动配置优先，否则用自动发现推断
+    // V42-B FIX: cfg_mgr.get_str() 返回 Option<&str>，guess_*_config 返回 Option<(String, ...)>，
+    // 必须统一类型（手动配置也转为 String）。
+    let embed_config: Option<(String, String, usize)> = match (cfg_embed_url, cfg_embed_model, cfg_embed_dim) {
+        (Some(u), Some(m), Some(d)) => {
+            tracing::info!("本地 embedding 使用手动配置");
+            Some((u.to_string(), m.to_string(), d))
+        }
+        _ => {
+            let guessed = abacus_core::local_provider::LocalProviderDetector::guess_embedding_config(&discovered);
+            if guessed.is_some() {
+                tracing::info!("本地 embedding 使用自动发现配置");
             }
-            _ => {
-                tracing::info!("本地 embedding 服务未配置，语义搜索降级为关键词匹配");
-                None
-            }
+            guessed
         }
     };
 
-    // Reranker 配置（记录到日志，供后续集成使用）
-    if let (Some(url), Some(model)) = (cfg_mgr.get_str("local.reranker_url"), cfg_mgr.get_str("local.reranker_model")) {
-        tracing::info!(reranker_url = %url, reranker_model = %model, "本地 reranker 服务已配置");
+    let rerank_config: Option<(String, String)> = match (cfg_rerank_url, cfg_rerank_model) {
+        (Some(u), Some(m)) => {
+            tracing::info!("本地 reranker 使用手动配置");
+            Some((u.to_string(), m.to_string()))
+        }
+        _ => {
+            let guessed = abacus_core::local_provider::LocalProviderDetector::guess_reranker_config(&discovered);
+            if guessed.is_some() {
+                tracing::info!("本地 reranker 使用自动发现配置");
+            }
+            guessed
+        }
+    };
+
+    // 4. 创建 embedder + health check + 注入
+    let _vllm_embedder: Option<Arc<abacus_core::vllm_embedder::VllmEmbedder>> = if let Some((url, model, dim)) = embed_config {
+        let embedder = abacus_core::vllm_embedder::create_embedder_from_config(&url, &model, dim);
+        let healthy = embedder.health_check().await;
+        local_health.embedding_running = healthy;
+        local_health.embedding_model = model.clone();
+        if healthy {
+            kb_store.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>);
+            palace.read().await.set_embedder(embedder.clone() as Arc<dyn abacus_core::memory_palace::MemoryEmbedder>).await;
+            tracing::info!(embed_url = %url, embed_model = %model, embed_dim = dim, "本地 embedding 服务已连接并注入");
+            Some(embedder)
+        } else {
+            tracing::warn!(embed_url = %url, "本地 embedding 服务配置/发现成功但 health check 失败，降级为关键词匹配");
+            None
+        }
+    } else {
+        tracing::info!("本地 embedding 服务未配置且未自动发现，语义搜索降级为关键词匹配");
+        None
+    };
+
+    // 5. 记录 provider 类型（用于 TUI 展示）
+    if let Some(ep) = discovered.first() {
+        local_health.provider_type = ep.provider.label().to_string();
     }
 
     // 注册 kb.* 工具执行器（schema 已由 register_all() 在 CoreLoop::new() 内注册）
@@ -355,6 +395,25 @@ pub async fn create_engine(
     // 必须在 register_executors 之后调用（with_memory 内部重注册 result.expand executor）
     let palace_clone = palace.clone();
     core = core.with_memory(kb_store.clone(), palace).await;
+
+    // 6. 创建 reranker + health check + 注入 triage_engine
+    // V42-B: 之前此处仅打印日志，未实际注入。reranker 注入必须在 with_memory 之后
+    //（triage_engine 在 with_memory 中才被完整初始化）。
+    if let Some((url, model)) = rerank_config {
+        let reranker = abacus_core::vllm_embedder::create_reranker_from_config(&url, &model);
+        let healthy = reranker.health_check().await;
+        local_health.reranker_running = healthy;
+        local_health.reranker_model = model.clone();
+        if healthy {
+            core.inject_reranker(reranker).await;
+            tracing::info!(reranker_url = %url, reranker_model = %model, "本地 reranker 服务已连接并注入 triage");
+        } else {
+            tracing::warn!(reranker_url = %url, "本地 reranker 配置/发现成功但 health check 失败，跳过注入");
+        }
+    }
+
+    // 7. 同步本地模型健康状态到 CoreLoop（TUI 通过 core.local_model_health() 读取）
+    core.set_local_model_health(local_health);
 
     // ─── 知识库种子数据 ─────────────────────────────────────────────
     // 首次启动时注入基础编码知识，提升 LLM 代码生成质量

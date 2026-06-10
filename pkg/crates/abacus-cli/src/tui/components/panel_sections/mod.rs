@@ -43,25 +43,23 @@ pub use palace::PalaceSection;
 pub use timeline::TimelineSection;
 pub use focus::FocusSection;
 
-/// Section 标题分隔线渲染 —— 所有内置 Section 复用
+/// Section 标题渲染 —— 所有内置 Section 复用
 ///
-/// 渲染形如：`  ─ LLM ──────────────`
+/// 渲染形如：`  ▸ LLM`
 ///
-/// - 前缀 `  ─ ` (dim muted)
-/// - label (muted)
-/// - 后缀 dashes 填充到固定宽度 (dim muted)
+/// - 前缀 `  ▸ ` (dim muted)
+/// - label (muted + BOLD)
 pub(crate) fn render_section_header(
     lines: &mut Vec<Line>,
     label: &str,
-    width: usize,
+    _width: usize,
     theme: &Theme,
 ) {
+    let _ = _width;
     let dim = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
-    let fill = width.saturating_sub(label.len() + 5).min(14);
     lines.push(Line::from(vec![
-        Span::styled("  \u{2500} ", dim),
-        Span::styled(label.to_string(), Style::default().fg(theme.muted)),
-        Span::styled(format!(" {}", "\u{2500}".repeat(fill)), dim),
+        Span::styled("  \u{25b8} ", dim),
+        Span::styled(label.to_string(), Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)),
     ]));
 }
 

@@ -31,6 +31,7 @@ pub mod script_hook;
 pub mod memory_palace;
 pub mod knowledge_store;
 pub mod vllm_embedder;
+pub mod local_provider;
 pub mod paths;
 pub mod process_registry;
 pub mod deduction;

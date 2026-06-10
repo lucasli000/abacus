@@ -248,7 +248,9 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     let input_block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(bar_color))
+        // V42-B FIX: border_style 必须含 bg，否则 ratatui 渲染边框时将边框 cell 的
+        // bg 重置为终端默认色（Reset），与全局 theme.bg 不一致。
+        .border_style(Style::default().fg(bar_color).bg(state.theme.bg))
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(state.theme.bg)); // 填充背景色，防止旧内容穿透
 
@@ -473,7 +475,12 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     // 清空 inner 区域防残影（text_area_h 变化时旧行内容残留）
     f.render_widget(Clear, inner);
 
-    f.render_widget(Paragraph::new(input_lines), inner);
+    // V42-B FIX: Paragraph 必须显式设置 bg，否则 Clear widget 已将 inner 区域
+    // 所有 cell 的 bg 重置为终端默认色（Reset），而 Paragraph 空白区域不会
+    // 自动继承全局 theme.bg，导致输入框内部背景与全局不一致。
+    let input_widget = Paragraph::new(input_lines)
+        .style(Style::default().bg(state.theme.bg));
+    f.render_widget(input_widget, inner);
 
     // 光标定位：考虑 soft-wrap——visual line 可能不是逻辑行起点
     {

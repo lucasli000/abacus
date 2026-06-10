@@ -308,7 +308,6 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
             // 异步拉取记忆宫殿本体数据（行为宫殿条目数 + 知识宫殿 domain 分布）
             {
-                
                 let palace_opt = e.core.memory_palace();
                 if let Some(palace) = palace_opt {
                     let p = palace.read().await;
@@ -325,6 +324,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     });
                 }
             }
+
+            // V42-B: 同步本地模型服务健康状态到 TUI 面板
+            if let Some(h) = e.core.local_model_health() {
+                state.local_health = Some(h);
+            }
+
             e
         }
         Ok(Err(e)) => {
@@ -503,8 +508,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 config_recheck_ticks = config_recheck_ticks.wrapping_add(1);
                 if config_recheck_ticks >= 20 {
                     config_recheck_ticks = 0;
-                    // 500ms debounce：让 OS 文件系统稳定（编辑器原子保存需要时间）
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // V42-B FIX: 移除阻塞式 sleep(500ms)。spawn_blocking 已隔离 I/O，
+                    // mtime 比较本身就是最好的 debounce；额外 sleep 每 1s 冻结事件循环 500ms，
+                    // 是 TUI 输入/流式卡顿的主因。
                     let config_path = abacus_core::paths::config_toml();
                     // spawn_blocking 隔离：metadata + read 都是阻塞 I/O
                     let check_result = tokio::task::spawn_blocking(move || {

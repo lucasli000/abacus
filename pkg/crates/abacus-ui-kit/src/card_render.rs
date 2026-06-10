@@ -93,18 +93,11 @@ pub fn render_card(
         _ => color,
     };
 
-    // 左侧彩色实线 + header 文本，其他边框全部移除
+    // Header: 直接靠左，无左侧色条
     let title_spans = build_title_spans(&header, &color, ctx, shimmer_pos);
-    let line_style = Style::default().fg(line_color);
-    for dy in 0..rect.height {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("▏", line_style))),
-            Rect::new(rect.x, rect.y.saturating_add(dy), 1, 1),
-        );
-    }
     f.render_widget(
         Paragraph::new(title_spans),
-        Rect::new(rect.x.saturating_add(2), rect.y, rect.width.saturating_sub(3), 1),
+        Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), 1),
     );
 
     if matches!(collapse, CardCollapse::Headless) {
@@ -116,9 +109,20 @@ pub fn render_card(
     if visible_body_h == 0 {
         return;
     }
+
+    // Body 左侧粗色条（▎ = LEFT ONE QUARTER BLOCK，比 ▏ 粗一倍）
+    let line_style = Style::default().fg(line_color);
+    let body_y_start = rect.y.saturating_add(1);
+    for dy in 0..visible_body_h {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("▎", line_style))),
+            Rect::new(rect.x, body_y_start.saturating_add(dy), 1, 1),
+        );
+    }
+
     let inner = Rect::new(
         rect.x.saturating_add(2),
-        rect.y.saturating_add(1),
+        body_y_start,
         rect.width.saturating_sub(3),
         visible_body_h,
     );

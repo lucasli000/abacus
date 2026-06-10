@@ -34,7 +34,7 @@ use crate::tui::components::section_ctx::downcast_app_state;
 use crate::tui::i18n::t;
 use crate::tui::state::{AbacusMode, AppState, ExpertStatus, MsgContent, MsgRole, TaskStatus, ToolStatus};
 
-use super::content_width;
+use super::{content_width, render_section_header};
 
 pub struct FocusSection;
 
@@ -95,17 +95,7 @@ impl Section for FocusSection {
 // 子渲染函数 —— 每个分支独立测试
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// 通用 header 渲染器（带 ─ 填充）
-fn push_header(lines: &mut Vec<Line>, label: &str, theme: &abacus_ui_kit::Theme, area_w: usize) {
-    let dim = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
-    let muted = Style::default().fg(theme.muted);
-    let fill = area_w.saturating_sub(label.len() + 5).min(14);
-    lines.push(Line::from(vec![
-        Span::styled("  ─ ", dim),
-        Span::styled(label.to_string(), muted),
-        Span::styled(format!(" {}", "─".repeat(fill)), dim),
-    ]));
-}
+// render_section_header replaced by render_section_header from mod.rs
 
 /// Plan 分支 —— 任务卡片 + ━╌ 进度条
 fn render_planning(
@@ -127,11 +117,11 @@ fn render_planning(
         .iter()
         .filter(|t| t.status == TaskStatus::Done)
         .count();
-    push_header(
+    render_section_header(
         &mut lines,
         &format!("Focus · {} {}/{}", t("focus.planning"), done, total),
-        theme,
         w,
+        theme,
     );
 
     if let Some(ref goal) = state.session_goal {
@@ -184,11 +174,11 @@ fn render_team(
         .iter()
         .filter(|t| t.status == TaskStatus::Done)
         .count();
-    push_header(
+    render_section_header(
         &mut lines,
         &format!("Focus · {} {}/{}", t("focus.team"), done, total),
-        theme,
         w,
+        theme,
     );
 
     for task in state.tasks.iter().take(4) {
@@ -229,11 +219,11 @@ fn render_meeting(
         .iter()
         .filter(|e| matches!(e.status, ExpertStatus::Active))
         .count();
-    push_header(
+    render_section_header(
         &mut lines,
         &format!("Focus · 会诊 {}/{}", active, total),
-        theme,
         w,
+        theme,
     );
 
     for e in &state.experts {
@@ -324,7 +314,7 @@ fn render_default(
     } else {
         format!("Focus \u{00b7} {} {}", t("panel.round"), state.turn_count)
     };
-    push_header(&mut lines, &title, theme, w);
+    render_section_header(&mut lines, &title, w, theme);
 
     // session_goal
     if let Some(ref goal) = state.session_goal {

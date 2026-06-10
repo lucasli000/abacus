@@ -530,7 +530,7 @@ pub(crate) fn extract_tool_param_summary(args_json: &str) -> String {
 /// output_json: 工具输出 JSON（可选）—— 从中提取 `start_line` 用于显示文件真实行号
 /// fs_edit 在成功时返回 `{"edited":true,"path":"...","start_line":N}`
 /// 无 output_json 或字段缺失时行号从 1 开始（相对编号）
-pub(super) fn try_render_edit_diff(
+pub fn try_render_edit_diff(
     name: &str,
     args_json: &str,
     theme: &Theme,
@@ -540,7 +540,7 @@ pub(super) fn try_render_edit_diff(
 }
 
 /// 返回 `'static` 生命周期：所有 span 内容均为 owned String，可安全缓存在 AppState
-pub(super) fn try_render_edit_diff_with_output(
+pub fn try_render_edit_diff_with_output(
     name: &str,
     args_json: &str,
     output_json: Option<&str>,
@@ -608,7 +608,7 @@ pub(super) fn try_render_edit_diff_with_output(
 ///   - Equal 行显示为 context（theme.muted, 无前缀符号），但只保留变更临近 ±1 行
 ///   - Insert → `+ line` 绿; Delete → `- line` 红; 远离变更的 Equal 跳过
 ///   - Write (old 为空) 时 similar 全产出 Insert — 效果等同旧实现
-fn render_simple_diff(
+pub fn render_simple_diff(
     lines: &mut Vec<Line<'static>>,
     old: &str,
     new: &str,

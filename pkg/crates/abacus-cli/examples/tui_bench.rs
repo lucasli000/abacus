@@ -92,11 +92,14 @@ fn main() {
     // ─── 压测 3: streaming 模式（每帧追加文本）───
     state.scroll = 0;
     state.begin_streaming_session();
-    if let Some(llm) = state.cards.card_downcast_mut::<abacus_cli::tui::cards::LlmCard>(
-        state.cards.active_id().unwrap()
-    ) {
-        llm.append_thinking("正在分析...\n检查依赖...\n规划方案...");
-    }
+    // V42-B 拆卡: thinking 走 ThinkingCard
+    let th_id = state.cards.alloc_id();
+    let mut th = abacus_cli::tui::cards::ThinkingCard::new(th_id, "gpt-4");
+    th.append("正在分析...\n检查依赖...\n规划方案...");
+    state.cards.push_active(Box::new(th));
+    state.cards.finish_active();
+    // reply 走 LlmCard（begin_streaming_session 已推入 LlmCard）
+    state.begin_streaming_session();
     let start = Instant::now();
     for i in 0..frames {
         if let Some(llm) = state.cards.card_downcast_mut::<abacus_cli::tui::cards::LlmCard>(

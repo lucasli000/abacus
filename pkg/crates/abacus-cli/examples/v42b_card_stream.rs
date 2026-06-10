@@ -31,7 +31,7 @@
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
-use abacus_cli::tui::cards::{AbacusCard, ExpertCard, LlmCard, UserCard};
+use abacus_cli::tui::cards::{AbacusCard, ExpertCard, LlmCard, ThinkingCard, UserCard};
 use abacus_cli::tui::modes::common::{render_body_and_input, render_overlays, render_standard_frame};
 use abacus_cli::tui::state::{AbacusMode, AppState};
 
@@ -52,14 +52,20 @@ fn build_demo_state() -> AppState {
         "09:23",
     )));
 
-    // Card 2: LlmCard (active, 流式中) — LLM 思考+回复
+    // Card 2a: ThinkingCard (active) — LLM 思考
     let id2 = state.cards.alloc_id();
-    let mut llm = LlmCard::new(id2, "deepseek-v4", "high");
-    llm.append_thinking("用户要 HTTP server, 简单场景, 不需要框架。直接用 std::net::TcpListener, 手动解析 HTTP/1.1 协议。");
+    let mut thinking = ThinkingCard::new(id2, "deepseek-v4");
+    thinking.append("用户要 HTTP server, 简单场景, 不需要框架。直接用 std::net::TcpListener, 手动解析 HTTP/1.1 协议。");
+    state.cards.push_active(Box::new(thinking));
+    state.cards.finish_active();
+
+    // Card 2b: LlmCard (active) — LLM 回复
+    let id2b = state.cards.alloc_id();
+    let mut llm = LlmCard::new(id2b, "deepseek-v4");
     llm.append_reply("下面是一个用纯 Rust 标准库写的 HTTP server, 支持 GET/POST:\n\n```rust\nuse std::net::TcpListener;\n```");
     state.cards.push_active(Box::new(llm));
 
-    // Card 3: AbacusCard (折叠态) — 工具调用
+    // Card 3: AbacusCard (折叠态) — 工具调用 (含 diff)
     let id3 = state.cards.alloc_id();
     let mut abacus = AbacusCard::new(id3, "fs_edit");
     use abacus_cli::tui::state::{EventLevel, TraceEvent, TraceKind, ToolStatus};
@@ -70,22 +76,15 @@ fn build_demo_state() -> AppState {
         level: EventLevel::Info,
         kind: TraceKind::ToolCall {
             name: "fs_edit".into(),
-            args: r#"{"path": "src/main.rs"}"#.into(),
-            output: Some("OK".into()),
+            args: r#"{"path": "src/main.rs", "old_string": "fn main() {\n    println!(\"hello\");\n}", "new_string": "fn main() {\n    let listener = TcpListener::bind(\"127.0.0.1:8080\").unwrap();\n    println!(\"Server on :8080\");\n}"}"#.into(),
+            output: Some(r#"{"edited":true,"path":"src/main.rs","start_line":1}"#.into()),
             status: ToolStatus::Success,
         },
         duration_ms: Some(12),
     });
-    abacus.push_event(TraceEvent {
-        id: 2,
-        time: "09:24".into(),
-        category: "tool".into(),
-        level: EventLevel::Info,
-        kind: TraceKind::Generic { content: "已重写 main.rs".into() },
-        duration_ms: None,
-    });
     state.cards.push_static(Box::new(abacus));
-    state.cards.set_collapse(id3, CardCollapse::Collapsed);
+    // 设为 Expanded 展示 diff 效果
+    state.cards.set_collapse(id3, CardCollapse::Expanded);
 
     // Card 4: ExpertCard — Meeting 专家
     let id4 = state.cards.alloc_id();

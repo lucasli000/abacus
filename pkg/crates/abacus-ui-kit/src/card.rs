@@ -48,6 +48,8 @@ pub mod kinds {
     pub const LLM: &str = "llm";
     /// Meeting 模式专家卡（含 LLM 内核 + 专家身份）
     pub const EXPERT: &str = "expert";
+    /// LLM Thinking 卡（思考过程独立呈现）
+    pub const THINKING: &str = "thinking";
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -332,6 +334,7 @@ pub fn default_color_for_kind(kind: CardKind, theme: &Theme) -> Color {
         kinds::ABACUS => theme.abacus,
         kinds::LLM => theme.session,
         kinds::EXPERT => theme.expert,
+        kinds::THINKING => theme.accent,
         _ => theme.muted,
     }
 }
@@ -457,5 +460,6 @@ mod tests {
         assert_eq!(kinds::ABACUS, "abacus");
         assert_eq!(kinds::LLM, "llm");
         assert_eq!(kinds::EXPERT, "expert");
+        assert_eq!(kinds::THINKING, "thinking");
     }
 }

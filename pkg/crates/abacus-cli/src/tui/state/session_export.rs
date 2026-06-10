@@ -218,7 +218,7 @@ fn rebuild_cards_from_messages(state: &mut AppState) {
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                let mut card = crate::tui::cards::LlmCard::new(id, "session", "default");
+                let mut card = crate::tui::cards::LlmCard::new(id, "session");
                 card.append_reply(&text);
                 card.set_streaming(CardStreaming::Static);
                 state.cards.push_static(Box::new(card));
