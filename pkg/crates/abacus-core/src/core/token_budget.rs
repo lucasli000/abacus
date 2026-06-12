@@ -77,12 +77,15 @@ impl TokenBudgetMonitor {
     }
 
     /// 根据当前使用率返回压力等级
+    ///
+    /// 2026-06-11 调整: Hot 80-90% → 85-95%, Critical > 90% → > 95%
+    /// 缓解长任务 context 累积时的过早 Critical 警告
     pub fn pressure_level(&self, current_tokens: usize) -> PressureLevel {
         let usage = current_tokens as f64 / self.max_tokens as f64;
         match usage {
             x if x < 0.6 => PressureLevel::Normal,
-            x if x < 0.8 => PressureLevel::Warm,
-            x if x < 0.9 => PressureLevel::Hot,
+            x if x < 0.85 => PressureLevel::Warm,
+            x if x < 0.95 => PressureLevel::Hot,
             _ => PressureLevel::Critical,
         }
     }
@@ -112,10 +115,10 @@ mod tests {
         let monitor = TokenBudgetMonitor::new(100_000);
         assert_eq!(monitor.pressure_level(50_000), PressureLevel::Normal);
         assert_eq!(monitor.pressure_level(60_000), PressureLevel::Warm);
-        assert_eq!(monitor.pressure_level(75_000), PressureLevel::Warm);
-        assert_eq!(monitor.pressure_level(80_000), PressureLevel::Hot);
-        assert_eq!(monitor.pressure_level(89_000), PressureLevel::Hot);
-        assert_eq!(monitor.pressure_level(90_000), PressureLevel::Critical);
+        assert_eq!(monitor.pressure_level(80_000), PressureLevel::Warm);
+        assert_eq!(monitor.pressure_level(85_000), PressureLevel::Hot);
+        assert_eq!(monitor.pressure_level(94_000), PressureLevel::Hot);
+        assert_eq!(monitor.pressure_level(95_000), PressureLevel::Critical);
         assert_eq!(monitor.pressure_level(99_000), PressureLevel::Critical);
     }
 

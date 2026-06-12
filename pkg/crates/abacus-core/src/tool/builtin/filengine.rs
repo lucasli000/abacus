@@ -95,6 +95,9 @@ pub struct FilengineSession {
     pub bash_default_timeout: u64,
     /// Bash 最大超时（秒）— 从 policy.toml 注入，默认 120
     pub bash_max_timeout: u64,
+    /// 2026-06-11: Bash 动态长命令上限（秒）— 编译/构建类命令时生效
+    /// 从 policy.toml 注入，默认 600
+    pub bash_long_timeout: u64,
     /// 文件系统可访问根目录——从 role_caps 注入（替代 allowed_roots() 直调）
     /// 注入：FilengineToolExecutor::execute() 开头从 ctx.role_caps.fs_roots 同步
     /// 消费：NativeFilengine::resolve() 读此字段做 prefix 检查
@@ -147,6 +150,7 @@ impl FilengineSession {
             undo_logger: None,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            bash_long_timeout: 600,
             // 默认与 allowed_roots() / RoleCapabilities::default() 保持一致
             fs_roots: allowed_roots(),
             bash_policy: BashPolicyLevel::DevTools,
@@ -318,6 +322,20 @@ async fn fs_read(args: Value, session: &mut FilengineSession) -> Result<Value, S
 
     let path = get_str(&args, "path")?;
     let p = NativeFilengine::resolve(path, session)?;
+
+    // V42-B payload-guard: 文件大小检查（防止大文件读取导致上下文爆炸）
+    // 阈值 50KB：超过时警告但不阻止（用户可通过 head/tail 参数分段读取）
+    const PAYLOAD_WARN_BYTES: u64 = 50 * 1024;
+    if let Ok(meta) = fs::metadata(&p).await {
+        if meta.len() > PAYLOAD_WARN_BYTES && args.get("head").is_none() && args.get("tail").is_none() {
+            return Err(format!(
+                "payload-guard: 文件 {} 大小 {} 字节，超过 {} 字节阈值。\
+                 请使用 head 或 tail 参数分段读取，或使用 fs_search 定位目标内容。",
+                path, meta.len(), PAYLOAD_WARN_BYTES
+            ));
+        }
+    }
+
     let content = fs::read_to_string(&p).await.map_err(|e| format!("read: {e}"))?;
     session.track_read(path);
     Ok(json!({"content": content, "path": path}))
@@ -384,14 +402,56 @@ async fn fs_write(args: Value, session: &mut FilengineSession) -> Result<Value, 
 
 async fn fs_edit(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let path = get_str(&args, "path")?;
-    let old = get_str(&args, "old_string")?;
-    let new = get_str(&args, "new_string")?;
     let p = NativeFilengine::resolve(path, session)?;
     let content = fs::read_to_string(&p).await.map_err(|e| format!("read: {e}"))?;
+
+    // V42-B: dryRun 模式 — 返回 diff 但不实际写入
+    let dry_run = args.get("dryRun").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // V42-B: 批量替换模式 — replacements 数组 [{old, new}, ...]
+    if let Some(replacements) = args.get("replacements").and_then(|v| v.as_array()) {
+        let mut result = content.clone();
+        let mut replacements_done = 0usize;
+        for rep in replacements {
+            let old = rep.get("old").and_then(|v| v.as_str()).unwrap_or("");
+            let new = rep.get("new").and_then(|v| v.as_str()).unwrap_or("");
+            if old.is_empty() { continue; }
+            if result.contains(old) {
+                result = result.replace(old, new);
+                replacements_done += 1;
+            }
+        }
+        if dry_run {
+            // 返回 diff（简化版：只返回替换后的前 200 行）
+            let preview: String = result.lines().take(200).collect::<Vec<&str>>().join("\n");
+            return Ok(json!({
+                "dry_run": true,
+                "path": path,
+                "replacements_found": replacements_done,
+                "preview": preview,
+            }));
+        }
+        fs::write(&p, &result).await.map_err(|e| format!("write: {e}"))?;
+        session.track_write(path);
+        return Ok(json!({"edited": true, "path": path, "replacements": replacements_done}));
+    }
+
+    // 单次替换模式（原有逻辑）
+    let old = get_str(&args, "old_string")?;
+    let new = get_str(&args, "new_string")?;
     let byte_offset = content.find(old).ok_or("old_string not found")?;
-    // 计算 old_string 在文件中的起始行号（1-based）
-    // 消费方：TUI diff 渲染用此值将相对行号映射为文件实际行号
     let start_line = content[..byte_offset].chars().filter(|&c| c == '\n').count() + 1;
+    if dry_run {
+        // 返回替换后的预览
+        let result = content.replace(old, new);
+        let preview: String = result.lines().take(200).collect::<Vec<&str>>().join("\n");
+        return Ok(json!({
+            "dry_run": true,
+            "path": path,
+            "start_line": start_line,
+            "preview": preview,
+        }));
+    }
     fs::write(&p, content.replace(old, new)).await.map_err(|e| format!("write: {e}"))?;
     session.track_write(path);
     Ok(json!({"edited": true, "path": path, "start_line": start_line}))
@@ -495,6 +555,8 @@ async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value
     // max_chars：extract=true 时默认 8000（可读摘要），extract=false 时默认 512 000（原始体）
     let max_chars = args.get("max_chars").and_then(|v| v.as_u64())
         .unwrap_or(if extract { 8_000 } else { 512_000 }) as usize;
+    // V42-B: format 参数 — 专用返回格式（json/readable/text）
+    let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("text");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout))
@@ -507,18 +569,37 @@ async fn web_fetch(args: Value, _session: &mut FilengineSession) -> Result<Value
     let body = resp.bytes().await
         .map_err(|e| format!("body: {e}"))?;
 
-    if extract {
-        let html = String::from_utf8_lossy(&body).to_string();
-        let (text, truncated) = html_to_text(&html, max_chars);
-        Ok(json!({"status": status, "url": url, "text": text, "truncated": truncated}))
-    } else {
-        let max_bytes = max_chars;
-        let text = if body.len() > max_bytes {
-            format!("[truncated {} bytes] {}", body.len(), String::from_utf8_lossy(&body[..max_bytes]))
-        } else {
-            String::from_utf8_lossy(&body).to_string()
-        };
-        Ok(json!({"status": status, "content_type": content_type, "body": text}))
+    match format {
+        // json 格式：自动解析 JSON 响应
+        "json" => {
+            let text = String::from_utf8_lossy(&body).to_string();
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(json_val) => Ok(json!({"status": status, "content_type": content_type, "json": json_val})),
+                Err(e) => Ok(json!({"status": status, "content_type": content_type, "error": format!("JSON parse error: {}", e), "body": text})),
+            }
+        }
+        // readable 格式：提取可读文本，去除 HTML 标签
+        "readable" => {
+            let html = String::from_utf8_lossy(&body).to_string();
+            let (text, truncated) = html_to_text(&html, max_chars);
+            Ok(json!({"status": status, "url": url, "text": text, "truncated": truncated, "format": "readable"}))
+        }
+        // text 格式（默认）：保持原行为
+        _ => {
+            if extract {
+                let html = String::from_utf8_lossy(&body).to_string();
+                let (text, truncated) = html_to_text(&html, max_chars);
+                Ok(json!({"status": status, "url": url, "text": text, "truncated": truncated}))
+            } else {
+                let max_bytes = max_chars;
+                let text = if body.len() > max_bytes {
+                    format!("[truncated {} bytes] {}", body.len(), String::from_utf8_lossy(&body[..max_bytes]))
+                } else {
+                    String::from_utf8_lossy(&body).to_string()
+                };
+                Ok(json!({"status": status, "content_type": content_type, "body": text}))
+            }
+        }
     }
 }
 
@@ -1693,11 +1774,61 @@ fn classify_tar(parts: &[&str]) -> BashDecision {
 // 2026-05-28: is_command_allowed() 已移除
 // 原逻辑（SHELL_META 硬拒）在 `sh -c` 执行模式下是误拒——元字符是合法 shell 语法。
 // 安全由 pipeline 层 classify_bash_command() + MCIP 门控保障。
+/// 2026-06-11: 判定命令是否属于"编译/构建/长测试"类长任务。
+///
+/// 仅做粗粒度前缀匹配（避免误命中 `cargo install` 之外的小命令）。
+/// 用户可显式传入 `timeout` 参数覆盖此启发式。
+fn is_long_running_command(command: &str) -> bool {
+    // 取首 token（跳过环境变量/前缀）
+    let trimmed = command.trim_start();
+    // 触发词列表：编译、构建、包管理安装、测试运行、容器构建
+    const TRIGGERS: &[&str] = &[
+        "cargo build",
+        "cargo test",
+        "cargo bench",
+        "cargo check",
+        "cargo clippy",
+        "cargo install",
+        "cargo publish",
+        "rustc ",
+        "make ",
+        "make\t",
+        "cmake ",
+        "ninja ",
+        "npm run",
+        "npm install",
+        "npm i ",
+        "pnpm ",
+        "yarn ",
+        "bun run",
+        "bun install",
+        "pip install",
+        "pytest",
+        "go build",
+        "go test",
+        "mvn ",
+        "gradle ",
+        "docker build",
+        "docker compose build",
+        "kubectl apply",
+        "terraform ",
+    ];
+    TRIGGERS.iter().any(|t| trimmed.starts_with(t))
+}
+
 async fn bash_exec(args: Value, session: &mut FilengineSession) -> Result<Value, String> {
     let command = get_str(&args, "command")?;
+    // 2026-06-11: 动态超时上限 — 编译/构建类命令自动扩展到 bash_long_timeout
+    // 常见长任务触发词: cargo build/test/clippy、make、npm/pnpm/yarn run/install、
+    //   pytest、go build/test、cmake/maven/gradle、docker build 等
+    let effective_max = if is_long_running_command(command) {
+        session.bash_long_timeout
+    } else {
+        session.bash_max_timeout
+    };
     let timeout = args.get("timeout").and_then(|v| v.as_u64())
         .unwrap_or(session.bash_default_timeout)
-        .min(session.bash_max_timeout);
+        .min(effective_max);
     let workdir = args.get("workdir").and_then(|v| v.as_str())
         .map(|p| NativeFilengine::resolve(p, session))
         .unwrap_or(Ok(session.cwd.clone()))?;
@@ -1803,6 +1934,8 @@ impl ToolExecutor for FilengineToolExecutor {
         // 引用：ctx.role_caps 由 pipeline 从 SessionState.role_caps 注入，工具返回后 drop
         session.bash_default_timeout = ctx.bash_default_timeout;
         session.bash_max_timeout = ctx.bash_max_timeout;
+        // 2026-06-11: 长命令上限注入（fallback 至 600s 保持向后兼容）
+        session.bash_long_timeout = ctx.bash_long_timeout;
         session.fs_roots = ctx.role_caps.fs_roots.clone();
         session.bash_policy = ctx.role_caps.bash_policy;
         session.search_provider = ctx.role_caps.search_provider.clone();
@@ -1951,7 +2084,8 @@ pub fn schemas() -> Vec<ToolSchema> {
             json!({"url": {"type":"string", "description":"完整 URL"},
                    "timeout": {"type":"number", "description":"超时秒数(默认60)"},
                    "extract": {"type":"boolean", "description":"移除 HTML 标签返回可读文本（默认 false）"},
-                   "max_chars": {"type":"integer", "description":"最大返回字符数（extract=true 时默认 8000）"}}),
+                   "max_chars": {"type":"integer", "description":"最大返回字符数（extract=true 时默认 8000）"},
+                   "format": {"type":"string", "description":"返回格式: text(默认纯文本) / json(自动解析JSON) / readable(提取可读文本去标签)"}}),
             &["url"], false, 128, "1s", "low"),
         schema("web_search", "搜索引擎搜索并返回结果标题/摘要/链接",
             json!({"query": {"type":"string", "description":"搜索关键词"},
@@ -2613,6 +2747,7 @@ mod tests {
             turn_number: 7,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            bash_long_timeout: 1800,
             tool_default_timeout: 60,
             role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };
@@ -2753,6 +2888,7 @@ mod tests {
             turn_number: 1,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            bash_long_timeout: 1800,
             tool_default_timeout: 60,
             role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         };

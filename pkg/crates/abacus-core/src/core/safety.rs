@@ -17,6 +17,43 @@ use abacus_types::UserProfile;
 
 // ─── 提示注入检测 ────────────────────────────────────────────────────────
 
+/// V42-B: Unicode 轻量规范化（去除零宽字符 + 合并连续空白）
+///
+/// ## 设计
+/// 不引入 unicode-normalization crate（太重），只处理已知的零宽字符：
+/// - U+200B (ZERO WIDTH SPACE)
+/// - U+200C (ZERO WIDTH NON-JOINER)
+/// - U+200D (ZERO WIDTH JOINER)
+/// - U+FEFF (BOM / ZERO WIDTH NO-BREAK SPACE)
+/// - U+2060 (WORD JOINER)
+/// - U+00AD (SOFT HYPHEN)
+///
+/// ## 为什么不用 NFKD
+/// NFKD 会把全角字符转为半角（如 ａ→a），但 Abacus 的注入检测是中文+英文，
+/// 全角字符是正常输入，不应被规范化。
+fn normalize_for_injection(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut last_was_space = false;
+    for ch in input.chars() {
+        match ch {
+            // 零宽字符：跳过
+            '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}' | '\u{2060}' | '\u{00AD}' => {}
+            // 空白字符：合并连续空白
+            c if c.is_whitespace() => {
+                if !last_was_space {
+                    result.push(' ');
+                    last_was_space = true;
+                }
+            }
+            c => {
+                result.push(c);
+                last_was_space = false;
+            }
+        }
+    }
+    result
+}
+
 /// 提示注入信号（A4: Adversarial Defense）
 ///
 /// ## 场景
@@ -81,6 +118,9 @@ pub struct SafetyGuard {
     pub max_total_tool_calls: u32,
     /// 敏感操作列表（从 UserProfile 加载，可覆盖默认）
     pub sensitive_operations: Vec<String>,
+    /// V42-B: 用户自定义注入模式（从 ~/.abacus/safety_rules.yaml 加载）
+    /// 与内置 INJECTION_SIGNALS 合并，用户模式优先级更高
+    pub user_injection_patterns: Vec<(String, &'static str)>,
 }
 
 impl Default for SafetyGuard {
@@ -100,6 +140,7 @@ impl SafetyGuard {
                 "bash_exec".into(),
                 "web_fetch".into(),
             ],
+            user_injection_patterns: Vec::new(),
         }
     }
 
@@ -136,7 +177,7 @@ impl SafetyGuard {
 
     /// 检查单轮累计工具调用次数是否超限
     pub fn check_tool_call_count(&self, current_count: u32) -> Result<(), SafetyViolation> {
-        if current_count > self.max_total_tool_calls {
+        if current_count >= self.max_total_tool_calls {
             Err(SafetyViolation::ToolCallLimitExceeded {
                 actual: current_count,
                 limit: self.max_total_tool_calls,
@@ -160,6 +201,10 @@ impl SafetyGuard {
     /// 对原始用户输入（未经处理）做轻量字符串扫描。
     /// O(n×m) 但 n=input_len 和 m=INJECTION_SIGNALS.len() 都很小，<1ms。
     ///
+    /// ## V42-B: Unicode 绕过防护
+    /// 攻击者可能用零宽字符（U+200B 等）或 Unicode 同形字绕过子串匹配。
+    /// 匹配前先做轻量规范化：去除零宽字符 + 合并连续空白。
+    ///
     /// ## 返回
     /// - `None`：未检测到注入信号，正常处理
     /// - `Some(warn)`：检测到注入信号，调用方应通过 push_dynamic 注入系统警告段
@@ -168,7 +213,18 @@ impl SafetyGuard {
     /// - 调用方：pipeline Phase 2（input 验证后、preflight 前）
     /// - 消费方：SystemPromptOutput::push_dynamic（注入警告而非直接拒绝）
     pub fn check_injection(&self, user_input: &str) -> Option<InjectionWarning> {
-        let lower = user_input.to_lowercase();
+        let normalized = normalize_for_injection(user_input);
+        let lower = normalized.to_lowercase();
+        // 先检查用户自定义模式（优先级更高）
+        for (pattern, severity) in &self.user_injection_patterns {
+            if lower.contains(pattern.as_str()) {
+                return Some(InjectionWarning {
+                    signal: pattern.clone(),
+                    severity,
+                });
+            }
+        }
+        // 再检查内置模式
         for &(pattern, severity) in INJECTION_SIGNALS {
             if lower.contains(pattern) {
                 return Some(InjectionWarning {
@@ -178,6 +234,11 @@ impl SafetyGuard {
             }
         }
         None
+    }
+
+    /// 添加用户自定义注入模式
+    pub fn add_injection_pattern(&mut self, pattern: String, severity: &'static str) {
+        self.user_injection_patterns.push((pattern, severity));
     }
 
     /// 返回当前安全限制状态（供 TUI/API 展示）
@@ -233,7 +294,7 @@ mod tests {
     fn test_tool_call_count_check() {
         let guard = SafetyGuard::new();
         assert!(guard.check_tool_call_count(499).is_ok());
-        assert!(guard.check_tool_call_count(500).is_ok());
+        assert!(guard.check_tool_call_count(500).is_err());
         assert!(guard.check_tool_call_count(501).is_err());
     }
 

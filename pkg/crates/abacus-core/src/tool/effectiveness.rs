@@ -623,6 +623,147 @@ impl EffectivenessTracker {
         else if score >= 0.20 { VisibilityTier::C }
         else { VisibilityTier::D }
     }
+
+    // ─── V42-B: 经验系统（辩证验证 + 反模式检测）────────────────────────────
+
+    /// 辩证验证：检查某工具是否应该被信任
+    ///
+    /// ## 验证逻辑
+    /// 1. 最近 10 次调用中，成功率 > 0.5 → 信任
+    /// 2. 最近 10 次调用中，成功率 <= 0.3 → 不信任
+    /// 3. 介于两者之间 → 中性（不判断）
+    ///
+    /// ## 返回
+    /// - `true`：工具可信，可以继续使用
+    /// - `false`：工具不可信，应避免或降级
+    pub fn validate_trust(&self, tool_id: &ToolId) -> bool {
+        let stats = match self.stats.get(tool_id) {
+            Some(s) => s,
+            None => return true, // 无数据 → 信任（冷启动）
+        };
+        if stats.recent_exit_codes.len() < 5 {
+            return true; // 数据不足 → 信任
+        }
+        let recent_success = stats.recent_exit_codes.iter()
+            .filter(|&&c| c == 0)
+            .count() as f64 / stats.recent_exit_codes.len() as f64;
+        recent_success > 0.5
+    }
+
+    /// 反模式检测：连续失败次数
+    ///
+    /// ## 返回
+    /// 最近连续失败的次数（0 = 最近一次成功或无数据）
+    pub fn consecutive_failures(&self, tool_id: &ToolId) -> u32 {
+        let stats = match self.stats.get(tool_id) {
+            Some(s) => s,
+            None => return 0,
+        };
+        let mut count = 0u32;
+        for &code in stats.recent_exit_codes.iter().rev() {
+            if code != 0 {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count
+    }
+
+    /// 反模式检测：是否应该自动避免该工具
+    ///
+    /// ## 规则
+    /// 连续 5 次失败 → 自动避免
+    pub fn should_avoid(&self, tool_id: &ToolId) -> bool {
+        self.consecutive_failures(tool_id) >= 5
+    }
+
+    /// 经验信号：为 SilentRouter 提供经验分数
+    ///
+    /// ## 设计
+    /// - 信任的工具获得正向分数
+    /// - 不信任的工具获得负向分数
+    /// - 应该避免的工具获得强负向分数
+    pub fn experience_scores(&self) -> Vec<(ToolId, f64)> {
+        self.stats.iter()
+            .filter(|(_, s)| s.opportunities >= self.min_samples)
+            .map(|(id, _)| {
+                let score = if self.should_avoid(id) {
+                    -0.5 // 强负向
+                } else if !self.validate_trust(id) {
+                    -0.2 // 负向
+                } else {
+                    let stats = self.stats.get(id).unwrap();
+                    Self::tool_composite_score(stats) * 0.3 // 正向，但权重降低
+                };
+                (id.clone(), score)
+            })
+            .filter(|(_, score)| *score != 0.0)
+            .collect()
+    }
+
+    // ─── V42-B Phase 3-3: 反模式泛化器 ──────────────────────────────────
+
+    /// 跨工具环境失败检测
+    ///
+    /// ## 场景
+    /// 当多个不同工具连续失败时，可能是环境问题（如网络断开、权限丢失），
+    /// 而非单个工具本身的问题。此时应提示 LLM 检查环境，而非换工具重试。
+    ///
+    /// ## 规则
+    /// 最近 N 次调用中，M 个不同工具都失败 → 环境问题信号
+    ///
+    /// ## 返回
+    /// - `None`：未检测到环境问题
+    /// - `Some(msg)`：环境问题描述，注入 system prompt
+    pub fn detect_environment_issue(&self, window: usize, min_distinct_tools: usize) -> Option<String> {
+        // 收集最近 window 次调用的 (tool_id, exit_code) 序列
+        let mut recent_calls: Vec<(&ToolId, u32)> = Vec::new();
+        for (id, stats) in &self.stats {
+            for code in stats.recent_exit_codes.iter().rev().take(3) {
+                recent_calls.push((id, *code));
+            }
+        }
+        if recent_calls.len() < window {
+            return None;
+        }
+        // 取最后 window 次
+        let tail: Vec<_> = recent_calls.into_iter().rev().take(window).collect();
+        let failed_tools: std::collections::HashSet<&ToolId> = tail.iter()
+            .filter(|(_, code)| *code != 0)
+            .map(|(id, _)| *id)
+            .collect();
+        if failed_tools.len() >= min_distinct_tools {
+            Some(format!(
+                "[env-issue] {} 个不同工具在最近 {} 次调用中失败，可能是环境问题（网络/权限/磁盘）",
+                failed_tools.len(), window
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// 单工具连续失败模式检测
+    ///
+    /// ## 返回
+    /// - `None`：无异常
+    /// - `Some((tool_id, failures, suggestion))`：连续失败建议
+    pub fn detect_failure_pattern(&self) -> Option<(ToolId, u32, String)> {
+        for (id, stats) in &self.stats {
+            if stats.recent_exit_codes.len() < 3 {
+                continue;
+            }
+            let consecutive = self.consecutive_failures(id);
+            if consecutive >= 5 {
+                return Some((
+                    id.clone(),
+                    consecutive,
+                    format!("工具 {} 连续 {} 次失败，建议检查输入参数或换用替代方案", id.0, consecutive),
+                ));
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

@@ -250,6 +250,14 @@ fn apply_esc_action(state: &mut AppState, action: EscAction) {
             cancel_completion(state);
         }
         EscAction::CancelOperation => {
+            // Cancel token 传播：取消所有正在运行的 LLM tokio task。
+            // 引用关系:
+            //   - state.task_registry 由 run.rs 各 LLM spawn 点调用 register() 注册
+            //   - cancel_all() 触发所有 tokio 任务在下一个 .await 点被取消
+            //   - 对走 process_turn_*_cancellable 的 API（Clarify streaming/ReviewRole/RoleInvoke），
+            //     in-flight reqwest 也会被对应的 CancellationToken 中断（如果未来传入的话）
+            // 约束: 不改 api/mod.rs 公共签名；当前仅做 JoinHandle::abort() 硬停止。
+            state.task_registry.cancel_all();
             // V42-B: 保留已有 streaming 内容为部分回复（用户打断不丢数据）
             // 条件：last_llm_text 或 streaming_trace_ids 非空 = 已收到内容
             if !state.last_llm_text().is_empty() || !state.streaming_trace_ids.is_empty() {
@@ -352,6 +360,11 @@ fn auto_route_focus(state: &mut AppState, code: KeyCode, mods: KeyModifiers) {
     }
     // 修饰键走显式分支
     if mods.contains(KeyModifiers::CONTROL) || mods.contains(KeyModifiers::ALT) {
+        return;
+    }
+    // 2026-06-11: 全屏编辑器模式 — handle_editor_key 独占所有键盘输入，
+    //   此处不做焦点切换避免把焦点从 editor 抢走导致编辑卡死/光标错位
+    if state.input_state == InputState::Editor {
         return;
     }
     // 弹窗独占焦点：picker / confirm / completion 打开时不做焦点切换
@@ -909,7 +922,7 @@ fn accept_completion(state: &mut AppState) {
 /// 取消补全，清除候选列表。
 fn cancel_completion(state: &mut AppState) {
     state.completion_candidates.clear();
-    state.completion_index = usize::MAX;
+    state.completion_index = 0; // V42-B: 改为 0（usize::MAX 哨兵值改为 0，由 candidates 为空判断）
     state.completion_prefix.clear();
     state.inline_suggestion = None;
     if state.input_state == InputState::Completing {

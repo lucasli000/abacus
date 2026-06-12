@@ -16,8 +16,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use abacus_core::config::{ConfigManager, default_config};
-use abacus_core::core::{CoreConfig, CoreLoop, SessionState};
+use abacus_core::core::{CoreLoop, SessionState};
 use abacus_core::core::context::{ContextManager, SessionSnapshot, SessionStore};
+use abacus_core::mag_chain::PipelineHook;
 use abacus_core::tool::ToolRegistry;
 use abacus_core::skill::SkillEngine;
 use abacus_core::capability::CapabilityHub;
@@ -66,9 +67,15 @@ pub async fn create_engine(
     // 配置加载顺序：默认内置层 < models.toml < config.toml < security.toml < provider.toml < conf.d/*.toml < 环境变量
     // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
     use abacus_core::paths;
-    let _ = cfg_mgr.load_file(paths::models_toml());      // models.toml — 模型能力 catalog 覆盖
-    let _ = cfg_mgr.load_file(paths::config_toml());      // config.toml — Abacus 行为配置
-    let _ = cfg_mgr.load_file(paths::security_toml());    // security.toml — safety / MCIP 安全配置
+    if let Err(e) = cfg_mgr.load_file(paths::models_toml()) {
+        tracing::warn!(path = %paths::models_toml().display(), error = %e, "config load failed");
+    }
+    if let Err(e) = cfg_mgr.load_file(paths::config_toml()) {
+        tracing::warn!(path = %paths::config_toml().display(), error = %e, "config load failed");
+    }
+    if let Err(e) = cfg_mgr.load_file(paths::security_toml()) {
+        tracing::warn!(path = %paths::security_toml().display(), error = %e, "config load failed");
+    }
     let _ = cfg_mgr.load_provider_file(paths::provider_toml()); // provider.toml — 供应商配置（唯一真相源）
     cfg_mgr.load_dir(paths::conf_d_dir());                // conf.d/ — 自定义扩展配置
 
@@ -87,14 +94,15 @@ pub async fn create_engine(
         );
     }
 
-    // Model — prefer config over parameter
-    let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
+    // 2026-06-11: 用 CoreConfig::from_config_manager 统一绑定所有 cfg 驱动字段
+    // 消除 engine_init / server / CoreConfig::default 三处手动映射的漂移风险。
+    // 少数需要特殊处理的字段（system_prompt / model_spec / thinking_intent /
+    // model_catalog / default_model）在 from_config_manager 之后注入。
+    let mut config = abacus_core::core::CoreConfig::from_config_manager(&cfg_mgr);
 
-    let max_turns = cfg_mgr.get_number("core.max_turns").map(|n| n as u32).unwrap_or(200);
-    // V29.14 (Risk 3): max_turns 过高时记录 tracing::warn, 提示 token 费用风险
-    //   阈值 60 = 默认 25 的 2.4x, 是合理"上限警戒线"; <60 静默
-    //   仅记日志, 不阻塞启动 (用户主动调高通常有意图, 不该硬限制)
-    //   引用关系: tui.log / RUST_LOG=warn 时可见; 不进 TUI toast (启动期没有 state)
+    // ─── CLI 参数覆盖 ─────────────────────────────────────
+    // max_turns 高值警告（config 驱动，但警告逻辑是 CLI 特有）
+    let max_turns = config.max_turns_per_request;
     if max_turns > 60 {
         tracing::warn!(
             max_turns,
@@ -103,30 +111,17 @@ pub async fn create_engine(
             max_turns
         );
     }
-    let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls").map(|n| n as u32).unwrap_or(100);
-    let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
-    // V40: 默认 64000 — 对齐 Claude Code/OpenCode 的单轮输出上限
-    // DeepSeek v4-flash thinking 模式支持最高 64K+ output
-    let max_tokens = cfg_mgr.get_number("core.max_tokens").map(|n| n as u32).unwrap_or(64000);
-    let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
-    // 可用窗口比例：用户配置占模型最大上下文的比例（0.1-1.0）
-    // 默认 1.0 = 全用（setup 向导的空填写语义；旧配置文件中若显式写了 0.5 则沿用旧值）
-    let context_window_ratio = cfg_mgr.get_number("core.context_window_ratio").unwrap_or(1.0);
-    let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
 
-    // Phase 3：统一 thinking 入口。
-    //   优先级 1：CLI 参数 thinking_level（运行时显式覆盖）
-    //   优先级 2：ConfigManager.get_thinking_intent()（合并新旧 key + deprecation warn）
-    //   优先级 3：默认 Off（用户未设置任何 key）
-    //
-    // 修复 deprecation gap（2026-05-24）：原实现 if 分支命中即跳过 cfg_mgr 调用，
-    // 由于所有 CLI 调用方（chat/exec/turnkey/model/meeting/team）都传非空 thinking_level，
-    // 旧 key 的 deprecation warn 永远不可达。改为 always 调用 get_thinking_intent() 作
-    // side-effect 触发 warn（OnceLock 守护进程级单次），不影响优先级链最终结果。
-    //
-    // 引用关系：
-    // - 写入：本函数把 intent 传入 CoreConfig.thinking_intent
-    // - 读取：cfg_mgr.get_thinking_intent() 内部 tracing::warn! 命中 stderr 一次
+    // CLI 参数 > config > auto
+    let resolved_model = cfg_mgr.get_str("core.default_model").unwrap_or(model);
+    if resolved_model != "auto" && config.default_model.is_auto() {
+        config.default_model = abacus_types::ModelId(resolved_model.to_string());
+    }
+
+    // context_window 用于构造 model_spec（不是 CoreConfig 字段）
+    let context_window = cfg_mgr.get_number("core.context_window").map(|n| n as usize).unwrap_or(1_000_000);
+
+    // Thinking intent 解析（CLI 参数 > config > default Off）
     let cfg_intent = cfg_mgr.get_thinking_intent();
     let intent: abacus_types::ThinkingIntent =
         if !thinking_level.is_empty() && thinking_level != "default" {
@@ -136,9 +131,6 @@ pub async fn create_engine(
             cfg_intent.unwrap_or(abacus_types::ThinkingIntent::Off)
         };
 
-    // L1 后：thinking_intent 直接传给 CoreConfig，无需兼容外壳。
-    // ModelSpec.thinking_config 仍是旧 ModelThinkingConfig 形态，保留以维持 spec 表达
-    // （主要供 spec.default_budget_tokens / spec.preserve_thinking 等下游字段使用）。
     let legacy_effort: Option<abacus_types::ThinkingEffort> = match &intent {
         abacus_types::ThinkingIntent::Off => None,
         abacus_types::ThinkingIntent::Adaptive => Some(abacus_types::ThinkingEffort::High),
@@ -156,7 +148,7 @@ pub async fn create_engine(
 
     let model_spec = Some(abacus_types::ModelSpec {
         context_window,
-        max_output_tokens: max_tokens,
+        max_output_tokens: config.default_max_tokens,
         thinking_config: abacus_types::ModelThinkingConfig {
             enabled: intent.is_enabled(),
             effort: legacy_effort,
@@ -165,7 +157,7 @@ pub async fn create_engine(
         ..Default::default()
     });
 
-    // Phase 3：模型能力 catalog——builtin + paths::models_toml() 覆盖
+    // 模型能力 catalog：builtin + models.toml 覆盖 + provider per-model 参数
     let mut catalog = abacus_core::llm::ModelCatalog::builtin();
     let toml_path = paths::models_toml();
     match catalog.merge_toml(&toml_path) {
@@ -173,91 +165,22 @@ pub async fn create_engine(
         Ok(n) => tracing::info!("Loaded {} model spec override(s) from {}", n, toml_path.display()),
         Err(e) => tracing::warn!("Failed to merge {}: {}", toml_path.display(), e),
     }
-    // 2026-05-28: 从 providers[].models[] per-model 参数合并到 catalog
-    // 2026-05-30 PR2: 传入 provider_id 写入 qualified_specs（provider-aware 索引）
     let provider_entries_for_catalog = cfg_mgr.parse_providers();
     for entry in &provider_entries_for_catalog {
         for model_entry in &entry.models {
             catalog.merge_model_entry(model_entry, Some(&entry.id));
         }
     }
-    let model_catalog = Some(std::sync::Arc::new(catalog));
 
-    let config = CoreConfig {
-        max_turns_per_request: max_turns,
-        max_tool_calls_per_turn: max_tool_calls,
-        default_model: ModelId(resolved_model.to_string()),
-        default_temperature: temperature,
-        default_max_tokens: max_tokens,
-        context_window_ratio,
-        system_prompt: system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string(),
-        model_spec,
-        thinking_intent,
-        silent_router_enabled: silent_router,
-        model_catalog,
-        tool_visibility_threshold: abacus_types::VisibilityTier::D,
-        // Task #84/#87：按任务类型路由工具（减少 LLM 上下文噪声 1k-3k tokens/turn）
-        task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
-        // 频率剪枝：N turn 未调用的工具隐藏（None = 关闭）
-        tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
-            .map(|n| n as u64)
-            .or(Some(20)),
-        // 记忆宫殿同步频率：每 N 轮写一次（0 或缺省 = 关闭）
-        palace_sync_interval_turns: cfg_mgr.get_number("palace.sync_interval_turns")
-            .map(|n| n as u32)
-            .filter(|&n| n > 0)
-            .or(Some(5)),
-        // V28.7: schema 演化补漏——CoreConfig 新增字段，与 abacus-core 默认值对齐
-        default_compress_level: abacus_core::core::context::CompressLevel::Brief,
-        // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
-        lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
-        // Task #96：单 session 模型升级预算
-        max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
-        // 模型升级目标：从 config 读取；空字符串或缺省视为 None（禁用升级）
-        escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
-            .filter(|s| !s.is_empty())
-            .map(|s| abacus_types::ModelId(s.to_string())),
-        // Tool result dedup：相同幂等工具调用短 TTL 内复用结果
-        tool_result_dedup_enabled: cfg_mgr.get_bool("core.dedup.enabled").unwrap_or(true),
-        tool_result_dedup_ttl_secs: cfg_mgr.get_number("core.dedup.ttl_secs").map(|n| n as u64).unwrap_or(60),
-        tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(2048),
-        adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),
-        // cross-session: 默认开启 jsonl 事件流写入
-        event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
-        scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
-        policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
-        thresholds: abacus_core::core::ThresholdConfig::default(),
-        prompt_roles_path: dirs::home_dir().map(|h| h.join(".abacus/prompt_roles.toml")),
-        subscenes_path: dirs::home_dir().map(|h| h.join(".abacus/subscenes.toml")),
-        // Deduction engine capabilities（默认全开）
-        deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
-        deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),
-        deduction_context_degradation: cfg_mgr.get_bool("deduction.context_degradation").unwrap_or(true),
-        deduction_prompt_impact: cfg_mgr.get_bool("deduction.prompt_impact").unwrap_or(true),
-        // 认识论约束：连续违规 N 次后强制 LLM 显式声明不确定性
-        epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
-        // 记忆宫殿：palace hints + 到期复习提醒
-        palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
-        // Reasoning 增强（ToT / Self-Consistency）
-        reasoning_config: abacus_core::core::reasoning_integration::ReasoningConfig::default(),
-        // 内容分类引擎
-        triage: abacus_core::core::triage::TriageConfig {
-            enabled: cfg_mgr.get_bool("triage.enabled").unwrap_or(true),
-            audit_only: cfg_mgr.get_bool("triage.audit_only").unwrap_or(true),
-            keep_count: cfg_mgr.get_number("triage.keep_count").map(|n| n as usize).unwrap_or(5),
-            early_keep: cfg_mgr.get_number("triage.early_keep").map(|n| n as usize).unwrap_or(2),
-            inject_threshold: cfg_mgr.get_number("triage.inject_threshold").unwrap_or(0.65),
-            standby_threshold: cfg_mgr.get_number("triage.standby_threshold").unwrap_or(0.40),
-            cold_threshold: cfg_mgr.get_number("triage.cold_threshold").unwrap_or(0.20),
-            hysteresis_deadband: cfg_mgr.get_number("triage.hysteresis_deadband").unwrap_or(0.15),
-            sticky_turns: cfg_mgr.get_number("triage.sticky_turns").map(|n| n as u32).unwrap_or(3),
-            cooldown_turns: cfg_mgr.get_number("triage.cooldown_turns").map(|n| n as u32).unwrap_or(10),
-            max_compress_depth: cfg_mgr.get_number("triage.max_compress_depth").map(|n| n as u32).unwrap_or(3),
-                standby_capacity: cfg_mgr.get_number("triage.standby_capacity").map(|n| n as usize).unwrap_or(200),
-                cold_batch_cap: cfg_mgr.get_number("triage.cold_batch_cap").map(|n| n as usize).unwrap_or(20),
-                skip_below_msg_count: cfg_mgr.get_number("triage.skip_below_msg_count").map(|n| n as usize).unwrap_or(8),
-            },
-    };
+    // 注入 from_config_manager 无法推导的字段
+    config.system_prompt = system_prompt.unwrap_or(DEFAULT_SYSTEM_PROMPT).to_string();
+    config.model_spec = model_spec;
+    config.thinking_intent = thinking_intent;
+    config.model_catalog = Some(std::sync::Arc::new(catalog));
+
+    // 保存 config 中需要在 CoreLoop::new() 之后使用的值（config 会被 move）
+    let resource_lock_enabled = config.resource_lock_enabled;
+    let resource_lock_ttl_secs = config.resource_lock_ttl_secs;
 
     let mut core = CoreLoop::new(registry, skill_engine, cap_hub, ctx_mgr, config).await;
 
@@ -446,9 +369,18 @@ pub async fn create_engine(
     // 执行顺序由 priority 决定（lower = earlier）。
     // 注册窗口：CoreLoop::new() 之后、Arc::new(core) 之前（mag_chain_mut 需 &mut self）。
     {
-        use abacus_core::mag_chain::{AuditLogger, CircuitBreaker, PiiRedactor, RateLimiter};
+        use abacus_core::mag_chain::{AuditLogger, CircuitBreaker, PiiRedactor, RateLimiter, ResourceGuard};
         use std::time::Duration;
 
+        // P5: 跨会话资源锁 — 防止多 session 并写同一文件
+        // TTL 从 config 读取（默认 60s），可配置
+        if resource_lock_enabled {
+            let session_id = format!("session-{}", std::process::id());
+            core.add_middleware(5, Arc::new(ResourceGuard::new(
+                resource_lock_ttl_secs,
+                session_id,
+            ))).await;
+        }
         // P10: 熔断 — 连续 10 次失败后熔断，30s 自动恢复
         core.add_middleware(10, Arc::new(CircuitBreaker::new(10, Duration::from_secs(30)))).await;
         // P20: 限流 — 每工具每分钟最多 200 次调用（滑动窗口）
@@ -461,6 +393,64 @@ pub async fn create_engine(
         core.add_middleware(70, Arc::new(PiiRedactor::new())).await;
         // P100: 审计 — 最后执行，记录经上游中间件处理后的最终 output
         core.add_middleware(100, Arc::new(AuditLogger::new(1000))).await;
+    }
+
+    // ─── ScriptHook 加载：从 config.toml [magchain.hooks] 读取用户自定义脚本钩子 ──
+    // 支持 rhai:// / sh:// / py:// 三种运行时，事件类型覆盖 TurnStart/PromptBuilt/
+    // LlmComplete/PostProcess/TurnPostFanOut/TurnEnd/TriageResult
+    //
+    // ## 为什么在这里加载而非 CoreLoop::new()
+    // ConfigManager 的 flatten_toml 会丢失数组-表结构（[[magchain.hooks]] 变成 flat list），
+    // 因此需要直接读取 config.toml 原始 TOML 来解析 hooks 数组。
+    {
+        let config_path = abacus_core::paths::config_toml();
+        if config_path.exists() {
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => {
+                    match content.parse::<toml::Value>() {
+                        Ok(toml_val) => {
+                            if let Some(hooks_arr) = toml_val
+                                .get("magchain")
+                                .and_then(|m| m.get("hooks"))
+                                .and_then(|h| h.as_array())
+                            {
+                                for hook_val in hooks_arr {
+                                    match serde_json::from_value::<abacus_core::script_hook::HookConfig>(
+                                        serde_json::to_value(hook_val).unwrap_or_default(),
+                                    ) {
+                                        Ok(cfg) => {
+                                            let priority = cfg.priority;
+                                            match abacus_core::script_hook::ScriptHook::from_config(cfg) {
+                                                Ok(hook) => {
+                                                    tracing::info!(
+                                                        event = %hook.name(),
+                                                        priority = priority,
+                                                        "script hook 注册成功"
+                                                    );
+                                                    core.add_pipeline_hook(priority, Arc::new(hook)).await;
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(error = %e, "script hook 创建失败，跳过");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "script hook 配置解析失败，跳过");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "config.toml 解析失败，跳过 script hook 加载");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "config.toml 读取失败，跳过 script hook 加载");
+                }
+            }
+        }
     }
 
     // ─── Provider registration ─────────────────────────────────────────

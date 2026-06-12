@@ -305,6 +305,16 @@ fn cmd_help(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 }
 
 fn cmd_clear(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
+    // BUG-3 fix: 流式未落档时 /clear 会导致状态悬空。
+    //   reset_streaming 必须先于 messages.clear()，否则 streaming_trace_ids
+    //   指向的 trace_events 在被 clear 之前会留下悬挂引用。
+    //   顺序：先落档未消费 streaming → 再清消息 → 再 reset_streaming。
+    if s.is_streaming_active() {
+        // 先把累积的流式内容 flush 到一条 session 消息（不丢内容）
+        let _ = s.flush_streaming_to_message();
+        // 再清空 CardStream active + streaming 内部状态
+        s.reset_streaming();
+    }
     s.messages.clear();
     s.expert_names_cache.clear();
     s.events.clear();
@@ -1110,6 +1120,16 @@ fn cmd_done(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
 /// - kind 非法 → toast 提示合法值
 /// - 取末尾 Session 失败（无任何消息）→ toast 提示"先发起对话再审查"
 fn cmd_review(s: &mut AppState, _: &str, args: &[&str]) -> CmdResult {
+    // BUG-3 fix: 流式未落档时审查旧内容 — 自动取末尾 Session 文本路径会拿到陈旧数据
+    //   (当前 active 还在累积、CardStream 还没 finish, messages 末尾仍是上一轮)
+    //   阻断：等流式结束再审。提供显式 content 参数的路径也阻断, 避免歧义
+    if s.is_streaming_active() {
+        s.add_toast(
+            "⏳ 流式输出未结束，请等待 LLM 回复完成后再 /review（或显式传内容）",
+            std::time::Duration::from_secs(3),
+        );
+        return CmdResult::Consumed;
+    }
     if args.is_empty() {
         // 无参 → picker 选类型（handle_slash_command 已拦截，此处作 fallback）
         s.open_picker_review();

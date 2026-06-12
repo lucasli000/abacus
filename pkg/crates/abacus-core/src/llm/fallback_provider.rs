@@ -117,10 +117,15 @@ impl FallbackProvider {
     /// - 4xx: client errors (protocol mismatch, model unavailable, etc.)
     /// - 5xx: server errors (provider degraded, overloaded, etc.)
     ///
-    /// Does NOT trigger fallback for auth errors (401/403) — those are terminal.
+    /// Does NOT trigger fallback for:
+    /// - Auth errors (401/403) — those are terminal
+    /// - Rate limit errors (429) — those should be retried, not fallback
     fn is_fallback_eligible(&self, error: &KernelError) -> bool {
         if self.is_auth_error(error) {
             return false; // auth errors should not trigger fallback
+        }
+        if self.is_rate_limited(error) {
+            return false; // rate limit errors should be retried with backoff, not fallback
         }
         matches!(error, KernelError::ApiError { status: 0, .. })
             || matches!(error, KernelError::ApiError { status: 400..=499, .. })

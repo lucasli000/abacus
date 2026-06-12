@@ -21,7 +21,7 @@
 //! ```
 
 use abacus_core::llm::stream::StreamChunk;
-use crate::tui::cards::{AbacusCard, LlmCard, ThinkingCard, UserCard};
+use crate::tui::cards::{AbacusCard, ExpertCard, LlmCard, ThinkingCard, UserCard};
 use crate::tui::state::{AppState, EventLevel, TraceEvent, TraceKind, ToolStatus};
 
 /// 处理单个 chunk, 写入 CardStream
@@ -175,4 +175,58 @@ pub fn push_user_message(state: &mut AppState, text: &str, time: &str) {
     let id = state.cards.alloc_id();
     let card = UserCard::new(id, text, time);
     state.cards.push_static(Box::new(card));
+}
+
+/// 推送 SessionCard (Session 消息落档时调用, 由 add_message 触发)
+///
+/// ## 修复背景 (BUG-2)
+/// V42-B 拆卡重构后, 渲染层只读 state.cards 不读 state.messages。
+/// 原 add_message 只对 MsgRole::User 调 push_user_message 桥接到 CardStream,
+/// Session/Expert 非流式消息(直接调 add_message 落档, 不经 handle_chunk) 缺失
+/// CardStream 表示 → render_cards 找不到对应 Card → 聊天区不显示。
+///
+/// ## 语义
+/// - 提取引用语义: 拼接所有 MsgContent::Stream 文本作为 reply 主体
+/// - 提取引用: 头(thinking 摘要) + 工具事件 + Stream 文本
+/// - Session 与 Expert 共用 LlmCard (仅专家用 ExpertCard)
+///
+/// ## 设计权衡
+/// - 不重复 finish_active 多重: 上游 add_message 调用方通常保证该消息在落档前
+///   不存在 active (流式路径已 flush), 此处 finish_active 仍是安全兜底
+/// - 不携带 Trace/Block kind: 该层仅展示 plain markdown reply, 详细 trace 由
+///   state.trace_events 单独渲染
+pub fn push_session_message(
+    state: &mut AppState,
+    text: &str,
+    time: &str,
+    expert_name: Option<&str>,
+) {
+    // 兜底: 上游残留 active 先 finish 掉
+    state.cards.finish_active();
+    let id = state.cards.alloc_id();
+    let model = if state.model_name.is_empty() {
+        "llm".into()
+    } else {
+        state.model_name.clone()
+    };
+    if let Some(name) = expert_name {
+        let card = ExpertCard::new(id, name, model);
+        // 非流式落档: 立即 finish_active 让其进入 static 渲染路径
+        state.cards.push_active(Box::new(card));
+        // append_reply 走 mutable borrow, 上面 push_active 借用结束后再操作
+        if let Some(expert) = state.cards.card_downcast_mut::<ExpertCard>(id) {
+            expert.append_reply(text);
+        }
+        state.cards.finish_active();
+    } else {
+        let card = LlmCard::new(id, model);
+        state.cards.push_active(Box::new(card));
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(id) {
+            llm.append_reply(text);
+        }
+        state.cards.finish_active();
+    }
+    // time 当前未挂到 Card header(渲染层从 self.messages 读 time);
+    // 保留参数供未来扩展, 避免破坏现有 API 签名
+    let _ = time;
 }

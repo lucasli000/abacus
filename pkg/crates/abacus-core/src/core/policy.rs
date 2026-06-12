@@ -56,6 +56,10 @@ pub struct ThresholdConfig {
     /// Bash 最大超时（秒）
     #[serde(default = "default_bash_max_timeout")]
     pub bash_max_timeout: u64,
+    /// 2026-06-11: Bash 动态长命令上限（秒）— 编译/构建类命令时自动扩展
+    /// 缺省 600s（10min）
+    #[serde(default = "default_bash_long_timeout")]
+    pub bash_long_timeout: u64,
     /// 通用工具执行超时（秒）— 非 bash 工具的安全网
     ///
     /// 引用关系：注入到 ExecutionContext.tool_default_timeout → ToolRegistry::execute() 消费
@@ -105,15 +109,18 @@ fn default_thresholds() -> ThresholdConfig {
         confirm_timeout_secs: default_confirm_timeout_secs(),
         bash_default_timeout: default_bash_timeout(),
         bash_max_timeout: default_bash_max_timeout(),
+        bash_long_timeout: default_bash_long_timeout(),
         tool_default_timeout: default_tool_timeout(),
     }
 }
 
 fn default_premature_stop_chars() -> usize { 200 }
 fn default_premature_stop_max_retries() -> u32 { u32::MAX }
-fn default_confirm_timeout_secs() -> u64 { 60 }
+fn default_confirm_timeout_secs() -> u64 { 120 } // 2026-06-11: 60→120s，与 ThresholdConfig 统一
 fn default_bash_timeout() -> u64 { 30 }
 fn default_bash_max_timeout() -> u64 { 120 }
+/// 2026-06-11: Bash 动态长命令上限（编译/构建类）— 默认 600s
+fn default_bash_long_timeout() -> u64 { 600 }
 /// 通用工具超时默认 60s（bash 有独立超时，此为其他工具安全网）
 fn default_tool_timeout() -> u64 { 60 }
 
@@ -169,5 +176,29 @@ impl Default for PolicyConfig {
             thresholds: default_thresholds(),
             preflight: default_preflight(),
         }
+    }
+}
+
+impl PolicyConfig {
+    /// 从 ConfigManager 自动绑定策略配置（覆盖默认 + 注入 core.confirm_timeout_secs）
+    ///
+    /// ## 关键设计
+    /// 1. 基础层调用 `PolicyConfig::load()`，行为与旧代码一致（policy.toml 优先）
+    /// 2. 单一来源 `core.confirm_timeout_secs` 注入到 `thresholds.confirm_timeout_secs`，
+    ///    消除 engine_init.rs 之前手写的覆盖逻辑
+    ///
+    /// ## 引用关系
+    /// - 调用方：`CoreConfig::from_config_manager`（统一入口）
+    /// - 旧路径：`engine_init.rs:240-244` 重复实现了 step 2
+    pub fn from_config_manager(cfg: &crate::config::ConfigManager) -> Self {
+        let mut p = Self::load();
+        // 2026-06-11: 单一来源——core.confirm_timeout_secs 同步到 policy.thresholds
+        // 缺省沿用 default_thresholds() 的 120s（与 ThresholdConfig.confirm_timeout_secs 统一）
+        if let Some(n) = cfg.get_number("core.confirm_timeout_secs") {
+            if n >= 0.0 {
+                p.thresholds.confirm_timeout_secs = n as u64;
+            }
+        }
+        p
     }
 }

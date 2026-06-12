@@ -30,6 +30,77 @@ use crate::tui::api::EngineHandle;
 use abacus_ui_kit::{CardStream, Theme};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// TaskRegistry — 后台任务生命周期管理
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 后台任务注册表 —— 管理所有 tokio::spawn 的 LLM/工具任务
+///
+/// ## 根因设计
+/// 之前用 `Option<JoinHandle<()>>` 只能保存一个任务，Meeting 模式多个 specialist
+/// 并发时旧 handle 被覆盖导致无法取消。TaskRegistry 支持多任务并发管理。
+///
+/// ## 使用方式
+/// - `register(handle)` 注册新任务，返回 TaskId
+/// - `cancel(id)` 取消单个任务
+/// - `cancel_all()` 取消所有任务（Esc 取消时调用）
+/// - `reap_finished()` 清理已完成任务（主循环定期调用）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskId(u64);
+
+pub struct TaskRegistry {
+    next_id: u64,
+    active: Vec<(TaskId, tokio::task::JoinHandle<()>)>,
+}
+
+impl TaskRegistry {
+    pub fn new() -> Self {
+        Self { next_id: 0, active: Vec::new() }
+    }
+
+    /// 注册一个新任务，返回 ID
+    pub fn register(&mut self, handle: tokio::task::JoinHandle<()>) -> TaskId {
+        let id = TaskId(self.next_id);
+        self.next_id += 1;
+        self.active.push((id, handle));
+        id
+    }
+
+    /// 取消并移除单个任务
+    pub fn cancel(&mut self, id: TaskId) {
+        if let Some(pos) = self.active.iter().position(|(i, _)| *i == id) {
+            let (_, handle) = self.active.remove(pos);
+            handle.abort();
+        }
+    }
+
+    /// 取消所有任务（Esc 取消或重置会话时用）
+    pub fn cancel_all(&mut self) {
+        for (_, handle) in self.active.drain(..) {
+            handle.abort();
+        }
+    }
+
+    /// 清理已完成的 task（避免 JoinHandle 泄漏）
+    pub fn reap_finished(&mut self) {
+        self.active.retain(|(_, h)| !h.is_finished());
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+}
+
+impl Drop for TaskRegistry {
+    fn drop(&mut self) {
+        // tokio JoinHandle::drop 只 detach 不 abort，
+        // 必须显式 abort 防止任务泄漏到新 session
+        for (_, handle) in self.active.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Enums
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -453,7 +524,7 @@ impl PanelTab {
     pub fn label(&self) -> &'static str {
         match self {
             PanelTab::Timeline => "现场",
-            PanelTab::Tasks => "任务",   // 保留 variant，panel dispatch 不再使用
+            PanelTab::Tasks => "任务",   // V42-B: 保留 variant 用于向后兼容，panel dispatch 不再使用
             PanelTab::Quant => "仓库",   // V35: 量化 → 仓库
             PanelTab::Custom(_) => "自定义",
         }
@@ -584,6 +655,7 @@ impl Focus {
 
 /// 面板焦点（仅在看板 tab 间切换）
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // V42-B: 预留，当前未使用
 pub enum PanelFocus {
     Timeline,
     Memory,
@@ -1267,6 +1339,10 @@ pub struct AppState {
     pub engine_tx: Option<mpsc::UnboundedSender<crate::tui::api::EngineResponse>>,
     /// Text pending for async engine submission
     pub pending_text: Option<String>,
+    /// 后台任务注册表 —— 管理所有 tokio::spawn 的 LLM/工具任务
+    /// 引用关系: run.rs 各 LLM spawn 点调用 register()；event/mod.rs::EscAction::CancelOperation 调用 cancel_all()
+    /// 生命周期: 每次 spawn 注册；正常完成由 reap_finished 清理；Esc 中断时 cancel_all
+    pub task_registry: TaskRegistry,
     /// 补全候选列表（Tab 触发）
     pub completion_candidates: Vec<String>,
     /// 补全选中下标（usize::MAX = 未选中）
@@ -1286,7 +1362,7 @@ pub struct AppState {
     /// 已提交输入的历史（FIFO，上限 100）
     pub input_history: Vec<String>,
     /// 排队的输入（忙碌态下用户 Enter 提交的消息，当前请求完成后自动发送）
-    pub pending_inputs: Vec<String>,
+    pub pending_inputs: VecDeque<String>,
     /// 标记：下一帧需要自动发送 state.input 的内容
     pub pending_send: bool,
     /// 历史导航位置（None = 不在历史模式）
@@ -2611,42 +2687,28 @@ impl AppState {
         Self::new_with_sections(mode, None)
     }
 
-    pub fn new_with_sections(mode: AbacusMode, panel_sections: Option<Vec<String>>) -> Self {
-        let mut theme = Theme::init();
-        theme.set_mode_color(mode.label());
-
-        // 读取 config.toml [tui.panel] sections 覆盖默认布局
-        let panel_layout: Vec<String> = if let Some(sections) = panel_sections {
-            let reg = crate::tui::extensions::new_section_registry();
-            sections.into_iter().filter(|id| {
-                if reg.contains(id) {
-                    true
-                } else {
-                    tracing::warn!("unknown panel section `{id}` in config [tui.panel] sections, ignoring");
-                    false
-                }
-            }).collect()
-        } else {
-            crate::tui::extensions::default_panel_layout()
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        };
-
+    /// 会话状态字段的默认初始化（单一来源）。
+    ///
+    /// ## 根因设计
+    /// 之前 `new_with_sections` 和 `reset_session` 各自手动初始化/清理 200+ 字段，
+    /// 新增字段时极易遗漏其一。本函数是**唯一的字段默认值来源**：
+    /// - `new_with_sections` 调用本函数后覆盖 infra 字段（theme/mode/engine 等）
+    /// - `reset_session` 调用本函数后恢复 infra 字段
+    /// - 新增字段只需在本函数添加一处，两处自动覆盖
+    fn new_session_defaults(mode: AbacusMode, panel_layout: Vec<String>) -> Self {
         Self {
-            theme,
+            theme: Theme::init(),
             mode,
-            mode_artifact: None, // V33: 初始无产出
-            last_review: None, // V39-1: 初始无 review 结果
-            last_review_strict: false, // V39-2: 初始非 strict
-            pending_review_parses: 0, // V39-1: 初始无待解析 review
-            pending_review_strict: false, // V39-2: 初始非 strict
-            auto_review_plan: false, // V40-4: 默认关闭自动 review（高成本 opt-in）
-            review_history: std::collections::VecDeque::with_capacity(20), // V41-4: 历史上限 20
-            pending_review_kind: crate::tui::api::ReviewKind::Plan, // V41-4: 默认 Plan
-            review_required: false, // V41-2: 默认关闭强约束
-            review_max_age_secs: 600, // V41-2: 默认 10 分钟 fresh-age
-            // 2026-05-28: /preset + /set
+            mode_artifact: None,
+            last_review: None,
+            last_review_strict: false,
+            pending_review_parses: 0,
+            pending_review_strict: false,
+            auto_review_plan: false,
+            review_history: std::collections::VecDeque::with_capacity(20),
+            pending_review_kind: crate::tui::api::ReviewKind::Plan,
+            review_required: false,
+            review_max_age_secs: 600,
             runtime_temperature: None,
             runtime_max_tokens: None,
             runtime_context_ratio: None,
@@ -2655,11 +2717,9 @@ impl AppState {
             runtime_router: None,
             runtime_dedup: None,
             active_preset: None,
-            // 2026-05-27: 三模式流转修复
             pending_meeting_execution: None,
             preserved_input: None,
             meeting_suggested_this_session: false,
-            // Session UUID 启动生成；恢复 session 时由 apply_session_export 覆盖。
             session_id: uuid::Uuid::new_v4().to_string(),
             model_name: String::new(),
             active_provider_id: String::new(),
@@ -2682,12 +2742,9 @@ impl AppState {
             scroll: 0,
             user_scrolled_away: std::cell::Cell::new(false),
             scroll_by_mode: std::collections::HashMap::new(),
-            // V29.5: 启动时无渲染历史, clamp 退化为"不限制"; 第一帧后即被覆盖为真实值
             last_visible_h: std::cell::Cell::new(0),
             last_total_lines: std::cell::Cell::new(0),
             last_timeline_visible: std::cell::Cell::new(0),
-            // V29.11: 启动时未渲染, 错赋 0; Space 锁定逻辑看到 0 时退化为 80
-            // B11: 启动时空缓存，第一次 L2 渲染后填充
             input: String::new(),
             input_state: InputState::Ready,
             pre_compress_input_state: None,
@@ -2706,8 +2763,6 @@ impl AppState {
             stream_cursor: 0,
             cmd_scroll: 0,
             cmd_selected: 0,
-            // V13: 单一真相源 — 派生自 slash_commands::registry()，避免双源漂移
-            //   新加命令自动出现在 CommandHint 面板，含别名紧凑展示（"/help [h]"）
             commands: crate::tui::slash_commands::command_inventory(),
             events: Vec::new(),
             trace_events: Vec::new(),
@@ -2746,15 +2801,16 @@ impl AppState {
             palace_data: None,
             local_health: None,
             engine_tx: None,
+            task_registry: TaskRegistry::new(),
             pending_text: None,
             completion_candidates: Vec::new(),
-            completion_index: usize::MAX,
+            completion_index: 0,
             completion_prefix: String::new(),
             inline_suggestion: None,
             inline_candidates: Vec::new(),
             inline_candidate_idx: 0,
             input_history: Vec::new(),
-            pending_inputs: Vec::new(),
+            pending_inputs: VecDeque::new(),
             pending_send: false,
             history_index: None,
             pending_file_completion: None,
@@ -2781,11 +2837,8 @@ impl AppState {
             theme_preview_open: false,
             cached_msg_rows: RefCell::new(Vec::new()),
             cached_width: RefCell::new(0),
-            // Streaming 状态
-            streaming_enabled: true, // 默认启用流式输出
-            // V42-B: is_streaming 字段已删除，改用 is_streaming_active()
-            show_streaming_trace: true, // V38: 默认显示 thinking/tools 内容流 + 状态指示并存
-            // V42-B: streaming_text_started / streaming_thinking_started 已删除
+            streaming_enabled: true,
+            show_streaming_trace: true,
             streaming_complete: false,
             streaming_tools: Vec::new(),
             streaming_timeline: Vec::new(),
@@ -2813,6 +2866,33 @@ impl AppState {
             last_user_keypress_at: None,
             last_magnet_toast_at: None,
         }
+    }
+
+    pub fn new_with_sections(mode: AbacusMode, panel_sections: Option<Vec<String>>) -> Self {
+        let mut theme = Theme::init();
+        theme.set_mode_color(mode.label());
+
+        // 读取 config.toml [tui.panel] sections 覆盖默认布局
+        let panel_layout: Vec<String> = if let Some(sections) = panel_sections {
+            let reg = crate::tui::extensions::new_section_registry();
+            sections.into_iter().filter(|id| {
+                if reg.contains(id) {
+                    true
+                } else {
+                    tracing::warn!("unknown panel section `{id}` in config [tui.panel] sections, ignoring");
+                    false
+                }
+            }).collect()
+        } else {
+            crate::tui::extensions::default_panel_layout()
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+
+        let mut state = Self::new_session_defaults(mode, panel_layout);
+        state.theme = theme;
+        state
     }
 
     /// 切换焦点并记录时间戳（K1 焦点反馈三件套）
@@ -3131,7 +3211,14 @@ impl AppState {
         if let Some(ref engine) = self.engine_handle {
             let core = engine.core.clone();
             let model = next.to_string();
-            tokio::spawn(async move { core.set_model_override(&model).await; });
+            // P1 fix: block_in_place 替代 tokio::spawn fire-and-forget，
+            // 确保 set_model_override 在函数返回前完成，避免后续发消息使用旧模型。
+            // block_in_place 要求 multi-thread runtime（opencode 默认配置满足）。
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    core.set_model_override(&model).await;
+                })
+            });
         }
         next.to_string()
     }
@@ -3579,44 +3666,64 @@ impl AppState {
 
     /// 会话重置 — 清空所有消息/trace/scroll/输入状态
     ///
-    /// Phase 3 去重：统一 event/mod.rs::reset_session_state + slash_commands::cmd_new
-    /// 两处 100% 重复的 session 清理逻辑为单一 SSoT
+    /// ## 根因设计
+    /// 之前手动清理 30+ 字段，每次新增字段极易遗漏。
+    /// 现在通过 `new_session_defaults()` 重建整个状态，只保留 infra 字段。
+    /// 新增字段只需在 `new_session_defaults()` 中添加一处。
     ///
     /// 引用关系：被 event/mod.rs::reset_session_state、slash_commands::cmd_new 调用
     /// 生命周期：调用后 AppState 回到"新会话"初始态（保留 engine_handle/theme/mode 等基础设施）
     pub fn reset_session(&mut self) {
-        self.messages.clear();
-        self.events.clear();
-        self.expert_names_cache.clear();
-        // V28: 同步清 trace_events 与 id 分配器（messages 同步清，无悬挂引用风险）
-        self.trace_events.clear();
-        self.tool_freq_cache.borrow_mut().take();
-        self.tool_freq_dirty.set(true);
-        self.next_trace_id = 0;
-        self.streaming_trace_ids.clear();
-        self.timeline_expanded_ids.clear();
-        self.timeline_row_map.borrow_mut().clear();
-        self.focused_event_id = None;
-        self.tool_records.clear();
-        self.tool_health.clear();
-        // V42-B: streaming_diff_cache 已删除 (无引用)
-        self.thinking_text.clear();
-        self.turn_count = 0;
-        self.set_scroll(ScrollAction::ToBottom);
-        self.input.clear();
-        self.cursor_pos = 0;
-        self.cursor_line = 0;
-        self.cursor_col = 0;
-        self.inline_suggestion = None;
-        // 2026-05-28: reset 时关闭编辑器（防止 editor_state 悬挂）
-        self.editor_state = None;
-        if self.pending_text.is_some() {
-            self.pending_text = None;
-        }
-        self.input_state = InputState::Ready;
-        // trace_event_index 同步清理（与 trace_events 对称）
-        self.trace_event_index.clear();
-        // 标记渲染缓存失效
+        // 取消所有活跃任务（tokio JoinHandle::drop 只 detach 不 abort，
+        // 必须显式取消防止旧任务泄漏到新 session）
+        self.task_registry.cancel_all();
+
+        // 保存 infra 字段（跨会话持久化）
+        let theme = std::mem::replace(&mut self.theme, Theme::init());
+        let mode = self.mode;
+        let engine_handle = self.engine_handle.take();
+        let engine_tx = self.engine_tx.take();
+        let section_registry = std::mem::replace(&mut self.section_registry, crate::tui::extensions::new_section_registry());
+        let dashboard_registry = std::mem::replace(&mut self.dashboard_registry, crate::tui::extensions::new_dashboard_registry());
+        let panel_layout = std::mem::take(&mut self.panel_layout);
+        let always_allow = std::mem::take(&mut self.always_allow);
+        let running = self.running;
+        let streaming_enabled = self.streaming_enabled;
+        // V42-B: 保留基础设施级数据（从引擎获取，跨会话共享）
+        let available_models = std::mem::take(&mut self.available_models);
+        let available_providers = std::mem::take(&mut self.available_providers);
+        let provider_statuses = std::mem::take(&mut self.provider_statuses);
+        let local_health = self.local_health.take();
+        let palace_data = self.palace_data.take();
+        let model_name = self.model_name.clone();
+        let active_provider_id = self.active_provider_id.clone();
+        let context_window = self.context_window;
+        let model_max_context = self.model_max_context;
+
+        // 用 new_session_defaults 重建整个状态（所有 session 字段自动回到默认值）
+        let defaults = Self::new_session_defaults(mode, panel_layout);
+        *self = defaults;
+
+        // 恢复 infra 字段
+        self.theme = theme;
+        self.engine_handle = engine_handle;
+        self.engine_tx = engine_tx;
+        self.section_registry = section_registry;
+        self.dashboard_registry = dashboard_registry;
+        self.always_allow = always_allow;
+        self.running = running;
+        self.streaming_enabled = streaming_enabled;
+        // V42-B: 恢复基础设施级数据
+        self.available_models = available_models;
+        self.available_providers = available_providers;
+        self.provider_statuses = provider_statuses;
+        self.local_health = local_health;
+        self.palace_data = palace_data;
+        self.model_name = model_name;
+        self.active_provider_id = active_provider_id;
+        self.context_window = context_window;
+        self.model_max_context = model_max_context;
+
         self.mark_dirty();
     }
 
@@ -3639,6 +3746,19 @@ impl AppState {
     ///
     /// 新设计：reset_streaming 只清状态, 不写消息。
     /// 需要"落档未消费内容"的调用方显式调用 [`flush_streaming_to_message`].
+    ///
+    /// P2 资源泄漏修复：streaming_timeline 单次 turn 内无上限，可能导致内存无限增长。
+    /// 增加 FIFO 裁剪：超过 `STREAMING_TIMELINE_MAX_ENTRIES` 条目时，移除最早条目。
+    /// 调用方应使用 `push_timeline_entry` 方法而非直接 push。
+    pub fn push_timeline_entry(&mut self, entry: crate::tui::state::TimelineEntry) {
+        const MAX_ENTRIES: usize = 1000;
+        if self.streaming_timeline.len() >= MAX_ENTRIES {
+            // FIFO: 移除最早条目（索引 0）
+            self.streaming_timeline.remove(0);
+        }
+        self.streaming_timeline.push(entry);
+    }
+
     pub fn reset_streaming(&mut self) {
         self.is_streaming_active_set_false();
         self.streaming_complete = false;
@@ -3748,6 +3868,33 @@ impl AppState {
                 .to_string();
             crate::tui::cards::writer::push_user_message(self, &text, &msg.time);
         }
+        // BUG-2 fix: Session / Expert 非流式落档同样需要桥接到 CardStream
+        //   add_message 也被非流式路径直接调用（不经 handle_chunk），
+        //   旧代码仅 User 走桥接，Session/Expert 消息在聊天区不可见
+        //   提取引用: 拼接所有 MsgContent::Stream 段作为 reply 主体
+        //   Expert 走 ExpertCard, Session 走 LlmCard
+        match &msg.role {
+            MsgRole::Session | MsgRole::Expert(_) => {
+                let mut text = String::new();
+                for part in &msg.parts {
+                    if let MsgContent::Stream(s) = part {
+                        text.push_str(s);
+                    }
+                }
+                let expert_name = if let MsgRole::Expert(name) = &msg.role {
+                    Some(name.as_str())
+                } else {
+                    None
+                };
+                crate::tui::cards::writer::push_session_message(
+                    self,
+                    &text,
+                    &msg.time,
+                    expert_name,
+                );
+            }
+            _ => {}
+        }
         // Phase2 性能优化: Expert 消息缓存去重名
         if let MsgRole::Expert(ref name) = msg.role {
             self.expert_names_cache.insert(name.clone());
@@ -3756,6 +3903,10 @@ impl AppState {
         // 先剥离最旧消息的 Trace 部分（Thinking/Tool 记录，内容大但历史价值低），
         // 保留 Stream 文本；若消息仅含 Trace 则整条删除。
         // 当裁剪积累到 COMPRESS_BATCH 条时，在消息列表头插入一行占位摘要。
+        // 2026-06-11: 同步释放 state.cards 关联 Card——V42-B 桥接后 messages 与 cards
+        //   1:1 对应（旧 push_user_message / push_session_message 都按序追加），
+        //   若仅裁 messages 不裁 cards 会让 render_cards 仍展示孤儿卡片，
+        //   占用内存且滚动定位错位。这里用 truncate_keep_last 同步裁剪。
         const COMPRESS_BATCH: usize = 20;
         if self.messages.len() >= MAX_MESSAGES {
             let mut stripped = 0usize;
@@ -3772,8 +3923,19 @@ impl AppState {
             self.messages.retain(|m| !m.parts.is_empty());
             let removed = before - self.messages.len();
             // 若仍超限，直接从头 pop
+            let mut hard_removed = 0usize;
             while self.messages.len() >= MAX_MESSAGES {
                 self.messages.pop_front();
+                hard_removed += 1;
+            }
+            // 2026-06-11: 同步释放 cards 队列前端的对应 Card
+            //   数量 = 实际从 messages 端消失的条目数（removed + hard_removed），
+            //   stripped 仅清空 parts 不删除消息 → cards 仍对应
+            //   占位行在末尾 push_front 不增加 cards，故此处裁 cards 仅
+            //   覆盖"真的消失的"消息。
+            let cards_to_drop = removed + hard_removed;
+            if cards_to_drop > 0 {
+                self.cards.truncate_keep_last(self.cards.len().saturating_sub(cards_to_drop));
             }
             // 在列表头插入压缩占位行（替代被删消息，让用户知道有历史被裁剪）
             if removed > 0 || stripped > 0 {
@@ -4578,7 +4740,7 @@ mod tests {
         th.append("partial reasoning");
         state.cards.push_active(Box::new(th));
         state.streaming_tools.push(("read_file".into(), StreamingToolStatus::Running, None, 0));
-        state.streaming_timeline.push(TimelineEntry::Tool {
+        state.push_timeline_entry(TimelineEntry::Tool {
             name: "read_file".into(), context: String::new(),
             status: StreamingToolStatus::Running, duration_ms: None,
             failure_kind: None, trace_id: 0,

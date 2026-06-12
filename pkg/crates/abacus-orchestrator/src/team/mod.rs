@@ -462,6 +462,7 @@ impl TeamSession {
         task: &TaskSpec,
         role: &AgentRole,
         stream_tx: tokio::sync::mpsc::UnboundedSender<abacus_core::llm::stream::StreamChunk>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<String, KernelError> {
         use tokio::sync::RwLock as TokioRwLock;
         use abacus_core::core::SessionState;
@@ -496,7 +497,10 @@ impl TeamSession {
         }).await?;
 
         // Execute with streaming — agent output flows into caller's stream_tx
-        let result = core.process_turn_streaming(&prompt, &session, stream_tx).await?;
+        let result = match cancel {
+            Some(token) => core.process_turn_streaming_cancellable(&prompt, &session, stream_tx, token).await?,
+            None => core.process_turn_streaming(&prompt, &session, stream_tx).await?,
+        };
 
         // Update task status
         self.update_task_status(&task.id, TaskStatus::Completed {

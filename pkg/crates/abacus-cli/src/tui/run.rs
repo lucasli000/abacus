@@ -34,7 +34,9 @@ use crate::tui::modes;
 use crate::tui::setup;
 // V28 (T4): BlockKind 不再被 run.rs 写入(thinking/tool 走 TraceKind);保留 enum 给 Checklist + 旧 session 兼容
 use crate::tui::state::{AppState, InputState, Message, MsgContent, AbacusMode, SlashCommand, ToolStatus};
-use crate::tui::components::format_ctx;
+
+/// 单次 turn 内 streaming_timeline 条目上限（FIFO 裁剪，防止内存无限增长）
+const STREAMING_TIMELINE_MAX_ENTRIES: usize = 1000;
 
 /// RAII guard: 确保 panic 或提前退出时终端状态恢复
 /// V14：尝试启用 kitty 键盘协议（DISAMBIGUATE）以区分 Ctrl+I 与 Tab；不支持则降级
@@ -94,6 +96,10 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = self.deactivate();
+        // P2 资源泄漏修复：清理 wire trace 临时文件
+        // wire_trace 是 debug-only 功能，但文件在进程退出时不会自动删除
+        #[cfg(debug_assertions)]
+        abacus_core::llm::wire_trace::cleanup_wire_trace();
     }
 }
 
@@ -415,6 +421,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 continue;
             }
             _ = interval.tick() => {
+                // 定期清理已完成的后台任务（避免 JoinHandle 泄漏）
+                state.task_registry.reap_finished();
+
                 if let Ok(size) = terminal.size() {
                     let new_rows = size.height;
                     let new_cols = size.width;
@@ -512,32 +521,48 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     // mtime 比较本身就是最好的 debounce；额外 sleep 每 1s 冻结事件循环 500ms，
                     // 是 TUI 输入/流式卡顿的主因。
                     let config_path = abacus_core::paths::config_toml();
-                    // spawn_blocking 隔离：metadata + read 都是阻塞 I/O
-                    let check_result = tokio::task::spawn_blocking(move || {
-                        let meta = std::fs::metadata(&config_path).ok()?;
-                        let mtime = meta.modified().ok()?;
-                        let content = std::fs::read_to_string(&config_path).ok()?;
-                        Some((mtime, content))
+                    // 优化：先只做 metadata 检查（轻量），mtime 变化后再读文件内容
+                    let mtime_result = tokio::task::spawn_blocking({
+                        let path = config_path.clone();
+                        move || {
+                            std::fs::metadata(&path).ok()
+                                .and_then(|m| m.modified().ok())
+                        }
                     }).await.ok().flatten();
-                    if let Some((mtime, content)) = check_result {
+                    if let Some(mtime) = mtime_result {
                         if state.config_mtime.map_or(true, |t| mtime != t) {
-                            state.config_mtime = Some(mtime);
-                            // 配置变更时重新拉取模型列表（应对新增 API key / provider 变更）
-                            state.pending_model_fetch = true;
-                            // 同步解析（在 spawn_blocking 已经隔离过 I/O，解析是 CPU-bound 可在 async 上下文跑）
-                            if let Ok(toml_val) = toml::from_str::<toml::Value>(&content) {
-                                let cw = toml_val.get("core")
-                                    .and_then(|c| c.get("context_window"))
-                                    .and_then(|v| v.as_integer());
-                                if let Some(cw) = cw {
-                                    let new_val = cw as usize;
-                                    if new_val != state.context_window {
-                                        state.context_window = new_val;
-                                        state.add_toast(
-                                            format!("ctx hot-reload: {}", format_ctx(new_val)),
-                                            std::time::Duration::from_secs(3),
-                                        );
+                            // mtime 变化，再读取文件内容
+                            let check_result = tokio::task::spawn_blocking(move || {
+                                let content = std::fs::read_to_string(&config_path).ok()?;
+                                Some((mtime, content))
+                            }).await.ok().flatten();
+                            if let Some((mtime, content)) = check_result {
+                                state.config_mtime = Some(mtime);
+                                state.pending_model_fetch = true;
+                                if let Ok(toml_val) = toml::from_str::<toml::Value>(&content) {
+                                    if let Some(ref engine) = state.engine_handle {
+                                        let changed = engine.core.reload_from_toml(&toml_val);
+                                        if let Some(cw) = toml_val.get("core")
+                                            .and_then(|c| c.get("context_window"))
+                                            .and_then(|v| v.as_integer())
+                                        {
+                                            let new_val = cw as usize;
+                                            if new_val != state.context_window {
+                                                state.context_window = new_val;
+                                            }
+                                        }
+                                        if !changed.is_empty() {
+                                            state.add_toast(
+                                                format!("config hot-reloaded: {}", changed.join(", ")),
+                                                std::time::Duration::from_secs(2),
+                                            );
+                                        }
                                     }
+                                } else {
+                                    state.add_toast(
+                                        "config.toml parse error, skipped hot-reload".to_string(),
+                                        std::time::Duration::from_secs(5),
+                                    );
                                 }
                             }
                         }
@@ -546,1221 +571,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
 
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {
-                    while let Ok(response) = res_rx.try_recv() {
-                        state.frame_dirty.set(true);
-                        let ts = chrono::Local::now().format("%H:%M").to_string();
-
-                        // V28 (T4): 落档前先 mem::take streaming_trace_ids
-                        // (流式期间已 push 的 ToolCall trace events 都在 trace_events)。
-                        // 顺序: take → 创建 Thinking trace → 检查 tool 兜底(非流式)→ reset_streaming
-                        let mut trace_ids = std::mem::take(&mut state.streaming_trace_ids);
-
-                        // 1. Thinking trace — V42-B 优先用 LlmCard.thinking（流式累积）,
-                        //    fallback 到 response.thinking(非流式 / 一次性返回路径)
-                        let from_card = state.last_llm_thinking();
-                        let thinking_text = if !from_card.is_empty() {
-                            from_card
-                        } else {
-                            response.thinking.clone().unwrap_or_default()
-                        };
-                        if !thinking_text.is_empty() {
-                            let line_count = thinking_text.lines().count();
-                            let tid = state.push_trace_full(
-                                ts.clone(),
-                                "llm".into(),
-                                crate::tui::state::EventLevel::Info,
-                                crate::tui::state::TraceKind::Thinking {
-                                    text: thinking_text.clone(),
-                                    lines: line_count,
-                                },
-                                None,
-                            );
-                            // Thinking 排在 tool calls 前面(更符合"先思考后行动"的认知顺序)
-                            trace_ids.insert(0, tid);
-                            state.thinking_text = thinking_text.clone();
-                        }
-
-                        // 2. Tool calls 兜底 — 流式路径已在 ToolStart/ToolEnd 创建 trace,
-                        //    streaming_trace_ids 已含 ToolCall 类型 ids。如果 trace_ids 中没有
-                        //    任何 ToolCall(走非流式 EngineResponse 路径),从 response.tool_records 重建。
-                        let has_tool_traces = trace_ids.iter().any(|id| {
-                            state.trace_events.iter().any(|e| {
-                                e.id == *id && matches!(e.kind, crate::tui::state::TraceKind::ToolCall { .. })
-                            })
-                        });
-                        if !has_tool_traces {
-                            for rec in &response.tool_records {
-                                let tid = state.push_trace_full(
-                                    ts.clone(),
-                                    "tool".into(),
-                                    if matches!(rec.status, ToolStatus::Failed) {
-                                        crate::tui::state::EventLevel::Warning
-                                    } else {
-                                        crate::tui::state::EventLevel::Notice
-                                    },
-                                    crate::tui::state::TraceKind::ToolCall {
-                                        name: rec.name.clone(),
-                                        args: rec.args.clone(),
-                                        output: None,
-                                        status: rec.status,
-                                    },
-                                    Some(rec.duration_ms as u64),
-                                );
-                                trace_ids.push(tid);
-                            }
-                        }
-
-                        // 3. 组装 parts: Thinking Block（内联可见）→ Trace（工具）→ Reply
-                        let mut parts: Vec<MsgContent> = Vec::new();
-
-                        // thinking 提升为内联 Block：用户不需要展开 trace 即可看到推理过程
-                        // V42-B: thinking_text 来自 LlmCard.thinking 或 response.thinking
-                        // 生命周期：随 Message 持久化，collapsed=true 默认折叠，Space 展开
-                        if !thinking_text.is_empty() {
-                            let line_count = thinking_text.lines().count();
-                            // 摘要：行数 + 首行内容预览（截断到 40 chars）
-                            // 让用户折叠态也能看到思考方向，决定是否展开
-                            let first_line = thinking_text.lines()
-                                .find(|l| !l.trim().is_empty())
-                                .unwrap_or("")
-                                .trim();
-                            let preview: String = first_line.chars().take(40).collect();
-                            let summary = if preview.is_empty() {
-                                format!("💭 {} lines", line_count)
-                            } else {
-                                format!("💭 {} lines · {}", line_count, preview)
-                            };
-                            parts.push(MsgContent::Block {
-                                kind: crate::tui::state::BlockKind::Think,
-                                summary,
-                                collapsed: true,
-                                detail: thinking_text.clone(),
-                            });
-                        }
-
-                        // trace 只保留工具调用（thinking 已单独展示，从 trace_ids 中移除）
-                        let tool_trace_ids: Vec<u64> = trace_ids.iter().copied()
-                            .filter(|id| state.trace_events.iter().any(|e|
-                                e.id == *id && matches!(e.kind, crate::tui::state::TraceKind::ToolCall { .. })
-                            ))
-                            .collect();
-                        if !tool_trace_ids.is_empty() {
-                            parts.push(MsgContent::Trace {
-                                event_ids: tool_trace_ids,
-                                // P1: Trace 默认折叠——减少消息噪音，用户按需展开
-                                collapsed: true,
-                                expanded_event_ids: std::collections::HashSet::new(),
-                            });
-                        }
-
-                        parts.push(MsgContent::Stream(response.text.clone()));
-
-                        state.add_message(Message::new_session(parts, &ts));
-
-                        // V39-1: 若上次发送是 reviewer，立即解析 verdict + toast 暴露
-                        // V39-2: 同步回填 last_review_strict（cmd_review 写入 pending_review_strict）
-                        // 引用关系：state.pending_review_parses 由 ReviewRole 分支 spawn 前 +1
-                        // 设计意图：用户不必滚屏看长输出就能立即看到 verdict + strict 阻断状态
-                        if state.pending_review_parses > 0 {
-                            state.pending_review_parses = state.pending_review_parses.saturating_sub(1);
-                            let kind = state.pending_review_kind;
-                            // V41-4: 注入 kind + 抵达时间到 report，便于历史回放
-                            let report = crate::tui::api::parse_review_report(&response.text)
-                                .with_kind(kind)
-                                .with_time(chrono::Utc::now().to_rfc3339());
-                            let strict = state.pending_review_strict;
-                            state.pending_review_strict = false; // 消费一次
-                            // 渲染 toast：verdict + issues 数 + 装饰
-                            let icon = if report.verdict.is_pass() { "✓" } else if matches!(report.verdict, crate::tui::api::ReviewVerdict::Fail) { "⛔" } else { "⚠" };
-                            let strict_marker = if strict { " · 🔒strict" } else { "" };
-                            state.add_toast(
-                                format!("{} Review: {} · {} issue(s){}", icon, report.verdict.label(), report.issues.len(), strict_marker),
-                                std::time::Duration::from_secs(8),
-                            );
-                            // V41-4: 历史推入（FIFO 上限 20）
-                            // 引用关系：state.review_history（VecDeque，最旧在 front）
-                            // 设计：先 push 后 trim，保证 last_review 永远 == 历史末尾
-                            state.review_history.push_back(report.clone());
-                            while state.review_history.len() > 20 {
-                                state.review_history.pop_front();
-                            }
-                            state.last_review = Some(report);
-                            state.last_review_strict = strict;
-                        }
-
-                        // V42-B: 落档完成，reset CardStream
-                        state.reset_streaming();
-
-                        let response_tool_count = response.tool_records.len();
-                        state.tool_records.extend(response.tool_records);
-                        // 保持 tool_records 有界（最近 200 条）
-                        if state.tool_records.len() > 200 {
-                            state.tool_records.drain(..state.tool_records.len() - 200);
-                        }
-
-                        // V28.7: 更新 Token 统计 + 费用估算（lookup_pricing 单源）
-                        if let Some(stats) = &response.stats {
-                            state.session_tokens.prompt_tokens += stats.prompt_tokens;
-                            state.session_tokens.completion_tokens += stats.completion_tokens;
-                            state.session_tokens.total_tokens += stats.total_tokens;
-                            state.session_tokens.cached_tokens += stats.cached_tokens;
-                            // V30：思考 tokens 累加（completion 子集，仅信息透明）
-                            state.session_tokens.thinking_tokens += stats.thinking_tokens;
-                            // latest_prompt_tokens：set 语义（非累加）——记录最新轮完整 context 大小
-                            // 用途：InputBar context % 显示真实 context 窗口占用，不是累计账单 token
-                            state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
-
-                            // 费用累加：按当轮 model_id 查 pricing 估算 USD
-                            // 引用关系：cost::estimate_turn_cost_usd(本地 pricing 表)
-                            // 注意：cost_usd 是会话级累计，跨模型切换也保留（用户想看总开销）
-                            let model_for_pricing = if stats.model_id.is_empty() {
-                                state.model_name.as_str()
-                            } else {
-                                stats.model_id.as_str()
-                            };
-                            // V31: CNY 是计费 source-of-truth（DeepSeek 官方货币）
-                            // 引用关系：cost::estimate_turn_cost_cny → model_registry::lookup_model_or_default
-                            // USD 经 fx_rate 同步累加，便于历史兼容查询
-                            let fx = crate::tui::cost::DEFAULT_FX_RATE;
-                            let cny_delta = crate::tui::cost::estimate_turn_cost_cny(
-                                model_for_pricing,
-                                stats.prompt_tokens,
-                                stats.completion_tokens,
-                                stats.cached_tokens,
-                            );
-                            state.session_tokens.cost_cny += cny_delta;
-                            state.session_tokens.cost_usd += if fx > 0.0 { cny_delta / fx } else { 0.0 };
-
-                            // V36-3: per_model 拆分累计 — 按 canonical model_id 聚合
-                            // 引用关系：state.session_tokens.per_model 由 render_tab_quant 模型分布区块消费
-                            // 标准化：lookup_model.aliased_to 解析后用 canonical id 作 key
-                            //   - 命中 registry：用 info.aliased_to 或 info.id（解决 deepseek-chat/v4-flash 别名）
-                            //   - 未命中：用 model_for_pricing 原值（不丢失非 DeepSeek 模型的统计）
-                            let canonical_key = abacus_types::lookup_model(model_for_pricing)
-                                .map(|info| info.aliased_to.unwrap_or(info.id).to_string())
-                                .unwrap_or_else(|| model_for_pricing.to_string());
-                            let per = state.session_tokens.per_model
-                                .entry(canonical_key)
-                                .or_default();
-                            per.prompt += stats.prompt_tokens;
-                            per.completion += stats.completion_tokens;
-                            per.cached += stats.cached_tokens;
-                            per.thinking += stats.thinking_tokens;
-                            per.cost_cny += cny_delta;
-                            per.turns += 1;
-
-                            // V39-4: per_mode 维度同步累计 — 关注"在哪个会话阶段花费"
-                            // 引用关系：state.session_tokens.per_mode 由 render_tab_quant 模式分布区块消费
-                            // key：state.mode.label()（与 AbacusMode 枚举字符串解耦，持久化稳定）
-                            let mode_key = state.mode.label().to_string();
-                            let per_m = state.session_tokens.per_mode
-                                .entry(mode_key)
-                                .or_default();
-                            per_m.prompt += stats.prompt_tokens;
-                            per_m.completion += stats.completion_tokens;
-                            per_m.cached += stats.cached_tokens;
-                            per_m.thinking += stats.thinking_tokens;
-                            per_m.cost_cny += cny_delta;
-                            per_m.turns += 1;
-
-                            // Model Escalation 通知：检测到模型切换时同步 state.model_name + 主题色
-                            if !stats.model_id.is_empty() && stats.model_id != state.model_name {
-                                state.model_name = stats.model_id.clone();
-                                state.theme.apply_model_brand(&stats.model_id);
-                                state.add_toast(
-                                    format!("🔄 Auto-escalated to {} for deeper reasoning", stats.model_id),
-                                    Duration::from_secs(5),
-                                );
-                            }
-                        }
-                        // Progressive Gate state — 状态在 status bar 已有显示，无需 toast
-                        // Inertia warning
-                        if let Some(ref w) = response.inertia_warning {
-                            state.add_toast(format!("⚠️ {w}"), Duration::from_secs(8));
-                            state.add_event(&ts, "inertia", w, crate::tui::state::EventLevel::Warning);
-                        }
-
-                        // V28.7: 异常兜底 — Meeting/其他模式失败时显式切回 Clarify
-                        // 引用关系：
-                        //   - 信号源：send_meeting_message fallback 失败时设 auto_fallback_chat
-                        //   - 副作用：切 mode + toast + 事件流（用户清晰知晓兜底）
-                        // 设计：mode 已是 Clarify 时不重复切；toast 解释原因
-                        if let Some(ref reason) = response.auto_fallback_chat {
-                            if state.mode != crate::tui::state::AbacusMode::Clarify {
-                                crate::tui::event::switch_mode(&mut state, crate::tui::state::AbacusMode::Clarify);
-                            }
-                            state.add_toast(
-                                format!("ℹ️ Auto-fallback to Clarify: {}", reason),
-                                Duration::from_secs(6),
-                            );
-                            state.add_event(
-                                &ts,
-                                "session",
-                                &format!("Auto-fallback to Clarify: {}", reason),
-                                crate::tui::state::EventLevel::Warning,
-                            );
-                        }
-
-                        // 2026-05-27: Meeting 路由失败 → needs_clarify 信号 → 自动切到 Clarify
-                        // 引用关系:
-                        //   信号源: send_meeting_message_streaming 路由预检返回 NoMatch 时设 needs_clarify
-                        //   副作用: 切 mode + toast 建议 + 保留用户输入到 preserved_input
-                        if let Some(ref suggestion) = response.needs_clarify {
-                            if state.mode != crate::tui::state::AbacusMode::Clarify {
-                                crate::tui::event::switch_mode(&mut state, crate::tui::state::AbacusMode::Clarify);
-                            }
-                            state.add_toast(
-                                format!("💡 Suggest clarify: {}", suggestion),
-                                Duration::from_secs(8),
-                            );
-                            state.add_event(
-                                &ts,
-                                "session",
-                                "Meeting route no match, auto-switch to Clarify",
-                                crate::tui::state::EventLevel::Notice,
-                            );
-                        }
-
-                        // V41: 策略自动推荐 — Clarify 模式收到响应后分析用户输入复杂度
-                        // 引用关系：TaskAnalyzer(abacus-core) → toast 建议
-                        // 触发条件：Clarify 模式 + 本 session 未建议过 + 用户输入足够长
-                        // 生命周期：meeting_suggested_this_session 标记防重复（/new 重置）
-                        if state.mode == crate::tui::state::AbacusMode::Clarify
-                            && !state.meeting_suggested_this_session
-                        {
-                            let last_user_text: Option<String> = state.messages.iter().rev()
-                                .find(|m| matches!(m.role, crate::tui::state::MsgRole::User))
-                                .and_then(|m| m.parts.iter().find_map(|p| match p {
-                                    crate::tui::state::MsgContent::Stream(t) => Some(t.clone()),
-                                    _ => None,
-                                }));
-                            if let Some(ref input_text) = last_user_text {
-                                if input_text.len() > 20 {
-                                    let cx = abacus_core::core::task_analyzer::TaskAnalyzer::analyze_complexity(input_text);
-                                    if cx.domain_count >= 2 && cx.score > 0.4 {
-                                        state.meeting_suggested_this_session = true;
-                                        state.add_toast(
-                                            "💡 Multi-domain topic, try /meeting for expert panel".to_string(),
-                                            Duration::from_secs(8),
-                                        );
-                                    } else if cx.dimensions.structural > 0.6 && cx.score > 0.5 {
-                                        state.meeting_suggested_this_session = true;
-                                        state.add_toast(
-                                            "💡 Complex task, try /plan for auto planning".to_string(),
-                                            Duration::from_secs(6),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        // V29.10 (C4-Phase2) ── Turnkey plan 缓存到 state ──
-                        // 引用关系:
-                        //   生产者: SlashCommand::TurnkeyPlan dispatch 成功时
-                        //   消费者: cmd_turnkey 'execute' 子命令读 state.pending_turnkey_plan
-                        // 生命周期: 每次 TurnkeyPlan 成功 → 替换旧 plan;
-                        //   /turnkey execute 后 take() 取走;
-                        //   /turnkey clear 显式清空; SessionExport 不持久化(临时审阅状态)
-                        if let Some(task) = response.turnkey_plan.clone() {
-                            let phases = task.phases.len();
-                            let steps: usize = task.phases.iter().map(|p| p.steps.len()).sum();
-                            // V41: 设置 plan_phase = AwaitingApproval（两阶段状态机）
-                            let task_descs: Vec<String> = task.phases.iter()
-                                .map(|p| p.description.clone())
-                                .collect();
-                            state.plan_phase = Some(crate::tui::state::PlanPhase::AwaitingApproval {
-                                plan_summary: task.goal.clone(),
-                                tasks: task_descs,
-                            });
-                            state.pending_turnkey_plan = Some(task);
-                            // 消息流中展示策略选项（用户输入 A/S/T 将在 event/mod.rs 中被拦截）
-                            state.add_message(crate::tui::state::Message::new_session(
-                                vec![crate::tui::state::MsgContent::Stream(format!(
-                                    "📋 Plan ready — {} phases, {} steps\n\n\
-                                     Choose strategy:\n\
-                                     [A] Auto — tool calls auto-approved\n\
-                                     [S] Step-by-step — confirm each op\n\
-                                     [T] Team — multi-agent parallel\n\
-                                     [C] Cancel\n\n\
-                                     Enter A/S/T/C:",
-                                    phases, steps,
-                                ))],
-                                ts.clone(),
-                            ));
-                        }
-
-                        // V28.7 ── Meeting 模式：参会者快照写入 state.experts ──
-                        // 引用关系：
-                        //   生产者：send_meeting_message 从 mtg.session().participants 提取
-                        //   消费者：components::render_panel_meeting_agenda 读 state.experts
-                        // 生命周期：每条 Meeting EngineResponse 抵达时整体替换；非 Meeting 路径
-                        //   meeting_experts=None 不动 state.experts（保留 mock 或上次状态）
-                        if let Some(ref experts) = response.meeting_experts {
-                            let count = experts.len();
-                            state.experts = experts.clone();
-                            // 事件流：让用户知道议程 tab 数据已刷新
-                            state.add_event(
-                                &ts,
-                                "meeting",
-                                &format!("Participants updated ({})", count),
-                                crate::tui::state::EventLevel::Info,
-                            );
-                        }
-
-                        // ── MCIP 工具授权处理 (Gap 2 + 5) ──
-                        // 检查 pending_confirmations：非空 → 需要用户授权
-                        if !response.pending_confirmations.is_empty() {
-                            use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk};
-                            use abacus_core::mcip::McipConfirmKind;
-
-                            let confirmations = response.pending_confirmations.clone();
-
-                            // Gap 5: 检查 always_allow 自动放行
-                            let all_allowed = confirmations.iter().all(|req| {
-                                state.always_allow.contains(&req.tool_id)
-                            });
-
-                            if all_allowed {
-                                // 自动放行：所有工具都在 always_allow 列表中
-                                // 注意：V28 后此分支应为 dead code——pipeline 改用 channel 暂停，
-                                //   ConfirmRequired stream chunk 单独处理 always_allow 短路。
-                                //   保留作为非流式 fallback：如果有 EngineResponse 仍带
-                                //   pending_confirmations 抵达，走旧 channel 通路也能放行。
-                                state.add_event(&ts, "mcip", crate::tui::i18n::t("event.auto_allow_legacy"), crate::tui::state::EventLevel::Info);
-                                state.pending_mcip_confirmations = confirmations;
-                                state.pending_confirmation_response = Some(true);
-                            } else {
-                                // 展示 ConfirmDialog（第一个待确认工具）
-                                use crate::tui::state::ConfirmOption;
-                                let first = &confirmations[0];
-                                // V22 增强：reason 含 `[destructive]` 前缀（mcip.rs 启发式标记）
-                                //   也视为破坏性，避免 McipPolicy kind 把所有 unmatched 工具
-                                //   一律按 Medium risk 处理
-                                let reason_destructive = first.reason.starts_with("[destructive]");
-                                let is_destructive_flag = matches!(first.kind, McipConfirmKind::DestructiveOp)
-                                    || reason_destructive;
-                                let (confirm_type, risk) = if is_destructive_flag {
-                                    (ConfirmType::ShellExec, ConfirmRisk::High)
-                                } else if first.tool_id.contains("bash") || first.tool_id.contains("shell") {
-                                    let cmd_risk = first.params_preview.as_deref()
-                                        .map(|p| crate::tui::state::assess_command_risk(p))
-                                        .unwrap_or(ConfirmRisk::Medium);
-                                    (ConfirmType::ShellExec, cmd_risk)
-                                } else {
-                                    (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
-                                };
-                                let mut details = if confirmations.len() > 1 {
-                                    vec![
-                                        first.reason.clone(),
-                                        format!("(+{} more tools need auth)", confirmations.len() - 1),
-                                    ]
-                                } else {
-                                    vec![first.reason.clone()]
-                                };
-                                if let Some(ref preview) = first.params_preview {
-                                    details.push(format!("params: {}", preview));
-                                }
-                                let is_destructive = is_destructive_flag;
-                                let mut options = vec![
-                                    ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() },
-                                ];
-                                if !is_destructive {
-                                    options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
-                                }
-                                options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
-
-                                state.confirm_dialog = Some(ConfirmDialog {
-                                    title: format!("🔐 {}", first.tool_id),
-                                    confirm_type,
-                                    tool_id: first.tool_id.clone(),
-                                    action: first.tool_id.clone(),
-                                    details,
-                                    risk,
-                                    options,
-                                    callback_id: "mcip".to_string(),
-                                    allow_always: !is_destructive,
-                                    created_at: std::time::Instant::now(),
-                                    details_expanded: false,
-                                    selected: 0,
-                                    interaction_paused: false,
-                                    paused_total: std::time::Duration::ZERO,
-                                    focus_lost_at: None,
-                                    last_active_at: std::time::Instant::now(),
-                                    suggested_action: first.suggested_action,
-                                });
-                                let event_msg = crate::tui::i18n::tf("event.wait_auth_tool", &[&first.tool_id]);
-                                state.pending_mcip_confirmations = confirmations;
-                                state.add_event(&ts, "mcip", &event_msg, crate::tui::state::EventLevel::Warning);
-                            }
-                        }
-
-                        state.add_event(&ts, "llm", crate::tui::i18n::t("event.gen_complete"), crate::tui::state::EventLevel::Notice);
-
-                        // 2026-05-27: Clarify 模式下检测是否建议 Meeting
-                        if state.mode == crate::tui::state::AbacusMode::Clarify
-                            && !state.meeting_suggested_this_session
-                        {
-                            let tool_count = response_tool_count;
-                            if crate::tui::modes::analyzer::suggest_mode_from_response(
-                                &response.text,
-                                tool_count,
-                                state.meeting_suggested_this_session,
-                            ).is_some() {
-                                state.meeting_suggested_this_session = true;
-                                state.add_toast(
-                                    "💡 This topic may suit expert panel (/meeting)".to_string(),
-                                    Duration::from_secs(8),
-                                );
-                            }
-                        }
-
-                        // 有待确认工具时，保持 Executing 状态（等用户确认后再恢复）
-                        if state.pending_mcip_confirmations.is_empty() {
-                            // Editor 态保护：不覆盖用户正在编辑的状态
-                            if state.input_state != InputState::Editor {
-                                state.input_state = InputState::Ready;
-                            }
-                            state.op_started_at = None;
-                            state.accumulated_elapsed = Duration::ZERO;
-
-                            // 自动发送排队消息（用户在忙碌态下 Enter 提交的）
-                            if !state.pending_inputs.is_empty() {
-                                let next_input = state.pending_inputs.remove(0);
-                                state.input = next_input.clone();
-                                // RU7 修复：input 改后必须 recalculate_cursor，否则
-                                // cursor_pos/line/col 持有旧值，渲染时光标位置错位
-                                state.cursor_pos = state.input.len();
-                                state.recalculate_cursor();
-                                state.add_toast(
-                                    format!("Auto-sending queued ({} remaining)", state.pending_inputs.len()),
-                                    Duration::from_secs(2),
-                                );
-                                state.pending_send = true;
-                            }
-                        }
-                    }
+                    let _ = process_engine_response(&mut state, &mut res_rx).await;
                 }
-                // V0.2: 消费 streaming chunks — 实时更新 partial message（渲染前处理）
-                // V40: 全量 drain — 移除 per-frame chunk budget 限制。
-                //   旧设计(FRAME_CHUNK_BUDGET=20)的假设是"每 chunk 触发全量重建导致单帧开销过高"。
-                //   配合分区渲染优化(streaming 期间不再全量 rebuild)，瓶颈消除，
-                //   现在单帧内 drain 所有 pending chunks 再统一渲染一次，延迟从 50ms*N 降为 0。
-                //   LLM 实际产出速率 ~100 tokens/s = ~100 chunks/50ms_frame ≈ 5 chunks/frame,
-                //   全量 drain 无 CPU 压力。
-                let mut had_streaming_update = false;
-                while let Ok(chunk) = stream_rx.try_recv() {
-                    use abacus_core::llm::stream::StreamChunk;
-                    let ts = chrono::Local::now().format("%H:%M").to_string();
-                    let chunk_for_cards = chunk.clone();
-                    match chunk {
-                        StreamChunk::IterationStart { iteration } => {
-                            // V42-B: 迭代边界——CardStream handle_chunk 已在前面处理 clear_thinking
-                            // V42-B: streaming_text_started / streaming_thinking_started 已删除
-                            if iteration > 0 {
-                                state.set_busy_state(InputState::Thinking);
-                                state.processing_phase = format!("· iteration {}", iteration + 1);
-                                // V40: timeline 迭代分隔
-                                state.streaming_timeline.push(
-                                    crate::tui::state::TimelineEntry::Iteration { number: iteration + 1 }
-                                );
-                            }
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::TextDelta(t) => {
-                            // 100ms 门控：实时估算 ctx_live_tokens（流式期间及时更新上下文占用）
-                            // 估算 = latest_prompt_tokens（上轮真实值）+ 本轮已生成字符 / 3
-                            // 除数 3 是英文(~0.25 tok/char)和中文(~1.5 tok/char)的折中
-                            // 100ms 保证视觉平滑跟动（TUI 帧率 ~60fps），O(1) 计算无性能压力
-                            let now = std::time::Instant::now();
-                            let should_refresh = state.ctx_estimate_at
-                                .map(|t| now.duration_since(t).as_millis() >= 100)
-                                .unwrap_or(true);
-                            if should_refresh {
-                                let gen_est = (state.active_llm_text_len() / 3) as u64;
-                                // clamp 到 context_window：估算不可能超过物理上限
-                                let raw = state.session_tokens.latest_prompt_tokens
-                                    .saturating_add(gen_est);
-                                let cap = state.context_window as u64;
-                                state.ctx_live_tokens = if cap > 0 { raw.min(cap) } else { raw };
-                                state.ctx_estimate_at = Some(now);
-                            }
-                            // V42-B: 首次 TextDelta 检测（替代 streaming_text_started 标志）
-                            // handle_chunk 在 match 之后才执行，此时 LlmCard 尚未收到文本
-                            if !t.is_empty() && state.active_llm_text_len() == 0 {
-                                // V38: 切换状态指示到 Outputting
-                                state.set_busy_state(InputState::Outputting);
-                                state.processing_phase.clear();
-                                state.add_event(&ts, "llm", crate::tui::i18n::t("event.outputting"), crate::tui::state::EventLevel::Info);
-                            }
-                            // K6：传入实际行内容数组，flash_state 内部计算 hash（避免"底部偏移"漂移）
-                            let added: Vec<&str> = t.lines().collect();
-                            if !added.is_empty() {
-                                state.flash_state.mark_new_lines(&added);
-                            }
-                            // V42-B: timeline Text entry — 从 active LlmCard 取累计长度（零拷贝）
-                            let card_len = state.active_llm_text_len();
-                            if let Some(crate::tui::state::TimelineEntry::Text { end, .. }) =
-                                state.streaming_timeline.last_mut()
-                            {
-                                *end = card_len;
-                            } else {
-                                state.streaming_timeline.push(
-                                    crate::tui::state::TimelineEntry::Text { start: card_len.saturating_sub(t.len()), end: card_len }
-                                );
-                            }
-                            // 增量送入 streaming md 引擎（mdstream committed/pending 分割）
-                            {
-                                let mut smd_ref = state.streaming_md.borrow_mut();
-                                if smd_ref.is_none() {
-                                    *smd_ref = Some(crate::tui::md_stream::StreamingMd::new());
-                                }
-                                if let Some(ref mut smd) = *smd_ref {
-                                    smd.append(&t);
-                                }
-                            }
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::Thinking(t) => {
-                            // V42-B: 首次 Thinking 检测（替代 streaming_thinking_started 标志）
-                            if !t.is_empty() && state.active_llm_thinking_len() == 0 {
-                                state.set_busy_state(InputState::Thinking);
-                                state.processing_phase.clear();
-                                state.add_event(&ts, "llm", crate::tui::i18n::t("event.thinking"), crate::tui::state::EventLevel::Info);
-                                // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
-                                // 存最近 2 行非空内容（\n 分隔），渲染层展示 2 行 live preview
-                                let summary = {
-                                    let lines: Vec<String> = t.lines()
-                                        .filter(|l| !l.trim().is_empty())
-                                        .take(2)
-                                        .map(|l| if l.chars().count() > 50 {
-                                            format!("{}…", l.chars().take(47).collect::<String>())
-                                        } else { l.to_string() })
-                                        .collect();
-                                    lines.join("\n")
-                                };
-                                state.streaming_timeline.push(
-                                    crate::tui::state::TimelineEntry::Thinking { summary }
-                                );
-                            } else if !t.is_empty() {
-                                // V42-B: 后续 thinking chunk: 更新 timeline 摘要
-                                let thinking_preview = state.active_llm_thinking();
-                                let last2: Vec<String> = thinking_preview
-                                    .lines()
-                                    .filter(|l| !l.trim().is_empty())
-                                    .collect::<Vec<_>>()
-                                    .into_iter().rev().take(2).rev()
-                                    .map(|l| if l.chars().count() > 50 {
-                                        format!("{}…", l.chars().take(47).collect::<String>())
-                                    } else { l.to_string() })
-                                    .collect();
-                                if let Some(crate::tui::state::TimelineEntry::Thinking { summary }) =
-                                    state.streaming_timeline.iter_mut().rev()
-                                        .find(|e| matches!(e, crate::tui::state::TimelineEntry::Thinking { .. }))
-                                {
-                                    if !last2.is_empty() {
-                                        *summary = last2.join("\n");
-                                    }
-                                }
-                            }
-                            // V42-B: thinking 已累积到 CardStream（handle_chunk 处理）
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::ToolStart { name } => {
-                            // V28 (T3): 创建 ToolCall trace 拿 trace_id, 缓存到 streaming_tools
-                            let trace_id = state.push_trace_full(
-                                ts.clone(),
-                                "tool".into(),
-                                crate::tui::state::EventLevel::Info,
-                                crate::tui::state::TraceKind::ToolCall {
-                                    name: name.clone(),
-                                    args: String::new(),
-                                    output: None,
-                                    status: crate::tui::state::ToolStatus::Running,
-                                },
-                                None,
-                            );
-                            state.streaming_trace_ids.push(trace_id);
-                            // streaming_tools Vec 上限 100（防止长 turn 积累过多条目）
-                            if state.streaming_tools.len() >= 100 {
-                                state.streaming_tools.remove(0); // FIFO 淘汰最旧
-                            }
-                            state.streaming_tools.push((
-                                name.clone(),
-                                crate::tui::state::StreamingToolStatus::Running,
-                                None,
-                                trace_id,
-                            ));
-                            // V38: 状态栏实时反映当前工具名（Working · tool_name）
-                            state.set_busy_state(InputState::Executing);
-                            state.processing_phase = format!("· {}", name);
-                            // V40: timeline Tool entry（ToolArgs/ToolEnd 会原地更新）
-                            state.streaming_timeline.push(
-                                crate::tui::state::TimelineEntry::Tool {
-                                    name: name.clone(),
-                                    context: String::new(), // ToolArgs 到达后填充
-                                    status: crate::tui::state::StreamingToolStatus::Running,
-                                    duration_ms: None,
-                                    failure_kind: None,
-                                    trace_id,
-                                }
-                            );
-                            had_streaming_update = true;
-                        }
-                        // V29.11: 工具输入参数 — 回填 trace event 的 args 字段
-                        //   触发 try_render_edit_diff: args 含 old_string/new_string → 走 diff 视图
-                        StreamChunk::ToolArgs { name, args_json } => {
-                            // T-1 fix: 用 trace_event_index O(1) 查找，替代原来 O(n) iter().find()
-                            // 2026-05-28: 用 trace_id 精确匹配（修复并行同名工具只更新最后一个的 bug）
-                            let matched_tid = state.streaming_tools.iter().rev()
-                                .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
-                                .map(|t| t.3);
-                            if let Some(tid) = matched_tid {
-                                // 更新 trace event 的 args
-                                if let Some(&idx) = state.trace_event_index.get(&tid) {
-                                    if let Some(ev) = state.trace_events.get_mut(idx) {
-                                        if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
-                                            *args = args_json.clone();
-                                        }
-                                    }
-                                }
-                                // 更新 timeline Tool entry 的 context — 用 trace_id 精确匹配
-                                let summary = crate::tui::components::block_detail::extract_tool_param_summary(&args_json);
-                                if let Some(crate::tui::state::TimelineEntry::Tool { context, .. }) =
-                                    state.streaming_timeline.iter_mut().rev()
-                                        .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { trace_id: t, .. } if *t == tid))
-                                {
-                                    *context = summary;
-                                }
-                            }
-                            had_streaming_update = true;
-                        }
-                        // V29.11: 工具输出内容 — 回填 trace event 的 output 字段
-                        StreamChunk::ToolOutput { name, output_json } => {
-                            // V38: 拦截 mode_switch 工具输出，执行模式切换
-                            if name == "mode_switch" {
-                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
-                                    if val.get("action").and_then(|v| v.as_str()) == Some("switch_mode") {
-                                        if let Some(target_str) = val.get("target").and_then(|v| v.as_str()) {
-                                            if let Some(target) = abacus_types::AbacusMode::from_label(target_str) {
-                                                let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-                                                let display = val.get("display_name").and_then(|v| v.as_str()).unwrap_or(target_str);
-                                                state.set_mode(target);
-                                                state.add_toast(
-                                                    format!("🤖 Mode switch: {} — {}", display, reason),
-                                                    std::time::Duration::from_secs(5),
-                                                );
-                                                state.add_event(&ts, "session", &format!("LLM switch → {}", display), crate::tui::state::EventLevel::Notice);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // V40: timeline ToolOutput — bash/read 工具推送输出摘要
-                            // 先提取摘要（借用 output_json），再 move 给 trace（避免 clone）
-                            let tool_lower = name.to_lowercase();
-                            let is_bash = tool_lower.contains("bash") || tool_lower.contains("exec");
-                            let is_read = tool_lower.contains("read");
-                            if (is_bash || is_read) && !output_json.is_empty() {
-                                let summary = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
-                                    let text = val.as_str()
-                                        .or_else(|| val.get("stdout").and_then(|v| v.as_str()))
-                                        .or_else(|| val.get("output").and_then(|v| v.as_str()))
-                                        .unwrap_or("");
-                                    let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                                    if first_line.chars().count() > 60 {
-                                        format!("{}…", first_line.chars().take(57).collect::<String>())
-                                    } else {
-                                        first_line.to_string()
-                                    }
-                                } else {
-                                    // 非 JSON 输出：取首行
-                                    let first_line = output_json.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
-                                    if first_line.chars().count() > 60 {
-                                        format!("{}…", first_line.chars().take(57).collect::<String>())
-                                    } else {
-                                        first_line.to_string()
-                                    }
-                                };
-                                if !summary.is_empty() {
-                                    state.streaming_timeline.push(
-                                        crate::tui::state::TimelineEntry::ToolOutput { summary }
-                                    );
-                                }
-                            }
-                            // T-1 fix: O(1) index 查找回填 trace event output
-                            if let Some(tool) = state.streaming_tools.iter().rev()
-                                .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
-                            {
-                                let tid = tool.3;
-                                if let Some(&idx) = state.trace_event_index.get(&tid) {
-                                    if let Some(ev) = state.trace_events.get_mut(idx) {
-                                        if let crate::tui::state::TraceKind::ToolCall { output, .. } = &mut ev.kind {
-                                            *output = Some(output_json);
-                                        }
-                                    }
-                                }
-                            }
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::ToolEnd { name, success, duration_ms, failure_kind } => {
-                            // V28 (T3): 反查 streaming_tools 拿 trace_id, 直接定位 trace_events
-                            // 中对应条目更新 status + duration_ms(替代 add_event 重复事件)。
-                            let new_status = if success {
-                                crate::tui::state::StreamingToolStatus::Success
-                            } else {
-                                crate::tui::state::StreamingToolStatus::Failed
-                            };
-                            let mut updated_trace_id: Option<u64> = None;
-                            if let Some(tool) = state.streaming_tools.iter_mut().rev()
-                                .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
-                            {
-                                tool.1 = new_status;
-                                tool.2 = Some(duration_ms);
-                                updated_trace_id = Some(tool.3);
-                            }
-
-                            // V32: knowledge_calls 修复 —— 旧实现 `name.find("→ ")` 永远 fail
-                            // (ToolEnd.name = tc.function.name, 工具函数名不含 "→ " 也不含路径)。
-                            // 真实 path 在 trace_events.kind.ToolCall.args 的 JSON 字段。
-                            // 引用关系：trace_event 在 ToolStart 时建立, args 已写入。
-                            // 触发条件：仅当 path 命中知识库/记忆宫殿语义路径时才追踪
-                            // (避免任意文件读写都被算作知识调用)
-                            // T-1 fix: ToolEnd 中两处 iter().find() 改为 O(1) index 查找
-                            if success {
-                                if let Some(tid) = updated_trace_id {
-                                    if let Some(&idx) = state.trace_event_index.get(&tid) {
-                                        if let Some(ev) = state.trace_events.get(idx) {
-                                            if let crate::tui::state::TraceKind::ToolCall { args, .. } = &ev.kind {
-                                                if !args.is_empty() {
-                                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
-                                                        let path_opt = json.get("path")
-                                                            .or_else(|| json.get("file_path"))
-                                                            .and_then(|v| v.as_str());
-                                                        if let Some(p) = path_opt {
-                                                            state.track_knowledge_call(p);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(tid) = updated_trace_id {
-                                if let Some(&idx) = state.trace_event_index.get(&tid) {
-                                    if let Some(ev) = state.trace_events.get_mut(idx) {
-                                        ev.duration_ms = Some(duration_ms);
-                                        ev.level = if success {
-                                            crate::tui::state::EventLevel::Notice
-                                        } else {
-                                            crate::tui::state::EventLevel::Warning
-                                        };
-                                        if let crate::tui::state::TraceKind::ToolCall { status, .. } = &mut ev.kind {
-                                            *status = if success {
-                                                crate::tui::state::ToolStatus::Success
-                                            } else {
-                                                crate::tui::state::ToolStatus::Failed
-                                            };
-                                        }
-                                    }
-                                }
-                            }
-                            // V40: 更新 timeline Tool entry（status + duration + failure_kind）
-                            let tl_status = if success {
-                                crate::tui::state::StreamingToolStatus::Success
-                            } else {
-                                crate::tui::state::StreamingToolStatus::Failed
-                            };
-                            if let Some(crate::tui::state::TimelineEntry::Tool {
-                                status: ref mut st, duration_ms: ref mut dur, failure_kind: ref mut fk, ..
-                            }) = state.streaming_timeline.iter_mut().rev()
-                                .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { name: ref n, status: ref s, .. }
-                                    if *n == name && *s == crate::tui::state::StreamingToolStatus::Running))
-                            {
-                                *st = tl_status;
-                                *dur = Some(duration_ms);
-                                *fk = failure_kind;
-                            }
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::ConfirmRequired(req) => {
-                            // V28：实时授权请求——pipeline dispatch 已挂起等待用户决策
-                            //   弹 ConfirmDialog；用户响应后通过 SessionState.mcip_confirm_channels[nonce]
-                            //   直发 oneshot::Sender（不再 grant_and_rerun 重发整个 turn）
-                            use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk, ConfirmOption};
-                            use abacus_core::mcip::McipConfirmKind;
-
-                            // 授权决策：只有用户主动永久授权的工具直接放行
-                            // 工具语义判断已移至引擎层（pipeline 计算 suggested_action）
-                            // TUI 不再做关键词匹配，始终弹窗展示系统建议，由系统+用户共同决策
-                            let auto_allow = state.always_allow.contains(&req.tool_id);
-
-                            if auto_allow {
-                                let nonce = req.nonce.clone();
-                                let engine = state.engine_handle.clone();
-                                tokio::spawn(async move {
-                                    if let Some(eng) = engine {
-                                        // 提前取出 sender 释放 std::sync::MutexGuard，
-                                        // 避免与 SessionState read guard 跨 await 冲突
-                                        let tx_one = {
-                                            let s = eng.session.read().await;
-                                            let mut guard = s.mcip_confirm_channels.lock().unwrap_or_else(|e| e.into_inner());
-                                            let removed = guard.remove(&nonce);
-                                            drop(guard);
-                                            removed
-                                        };
-                                        if let Some(tx) = tx_one {
-                                            let _ = tx.send(true);
-                                        }
-                                    }
-                                });
-                                state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auto_allow_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Info);
-                            } else {
-                                // 弹窗 — 使用 assess_command_risk 做细粒度分级
-                                let reason_destructive = req.reason.starts_with("[destructive]");
-                                let is_destructive_flag = matches!(req.kind, McipConfirmKind::DestructiveOp) || reason_destructive;
-                                let (confirm_type, risk) = if is_destructive_flag {
-                                    (ConfirmType::ShellExec, ConfirmRisk::High)
-                                } else if req.tool_id.contains("bash") || req.tool_id.contains("shell") {
-                                    // bash 工具：从 params_preview 提取命令做精确风险评估
-                                    let cmd_risk = req.params_preview.as_deref()
-                                        .map(|p| crate::tui::state::assess_command_risk(p))
-                                        .unwrap_or(ConfirmRisk::Medium);
-                                    (ConfirmType::ShellExec, cmd_risk)
-                                } else {
-                                    (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
-                                };
-                                let mut details = vec![req.reason.clone()];
-                                if let Some(ref preview) = req.params_preview {
-                                    details.push(format!("params: {}", preview));
-                                }
-                                let mut options = vec![ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() }];
-                                if !is_destructive_flag {
-                                    options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
-                                }
-                                options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
-                                state.confirm_dialog = Some(ConfirmDialog {
-                                    title: format!("🔐 {}", req.tool_id),
-                                    confirm_type,
-                                    tool_id: req.tool_id.clone(),
-                                    action: req.tool_id.clone(),
-                                    details,
-                                    risk,
-                                    options,
-                                    callback_id: format!("mcip:{}", req.nonce),
-                                    allow_always: !is_destructive_flag,
-                                    created_at: std::time::Instant::now(),
-                                    details_expanded: false,
-                                    selected: 0,
-                                    interaction_paused: false,
-                                    paused_total: std::time::Duration::ZERO,
-                                    focus_lost_at: None,
-                                    last_active_at: std::time::Instant::now(),
-                                    suggested_action: req.suggested_action,
-                                });
-                                state.pending_mcip_confirmations = vec![req.clone()];
-                                state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.wait_auth_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Warning);
-                            }
-                            state.mark_render_dirty();
-                        }
-                        StreamChunk::CompressStart => {
-                            // 显式状态切换：压缩是可见操作阶段
-                            state.pre_compress_input_state = Some(state.input_state);
-                            state.set_busy_state(InputState::Executing);
-                            state.processing_phase = crate::tui::i18n::t("compress.phase").to_string();
-                            state.add_toast(crate::tui::i18n::t("compress.toast_start"), Duration::from_secs(3));
-                            state.mark_render_dirty();
-                            state.frame_dirty.set(true);
-                        }
-                        StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
-                            // 显式恢复压缩前状态
-                            if let Some(prev) = state.pre_compress_input_state.take() {
-                                state.input_state = prev;
-                            }
-                            if messages_compressed > 0 {
-                                state.add_event(
-                                    &ts, "context",
-                                    &format!("{} {} msgs · ~{} tok", crate::tui::i18n::t("compress.event"), messages_compressed, tokens_saved),
-                                    crate::tui::state::EventLevel::Info,
-                                );
-                                let note = format!(
-                                    "--- {} ---\n{} messages → summary (~{} tokens freed)",
-                                    crate::tui::i18n::t("compress.note"), messages_compressed, tokens_saved
-                                );
-                                state.push_system_note(&note);
-                                state.session_tokens.total_tokens = state.session_tokens.total_tokens
-                                    .saturating_sub(tokens_saved as u64);
-                                state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
-                                    .saturating_sub(tokens_saved as u64);
-                                state.session_tokens.compress_count += 1;
-                                state.session_tokens.compress_tokens_saved += tokens_saved as u64;
-                                state.add_toast(
-                                    format!("{} · -{} tok", crate::tui::i18n::t("compress.toast_done"), tokens_saved),
-                                    Duration::from_secs(3),
-                                );
-                            }
-                            state.processing_phase.clear();
-                            // pending_compress_input 保留：
-                            //   Execution 阶段 → CompressAutoResume 来了会消费它
-                            //   Communication 阶段 → interval tick 检测到非 busy 时消费（见下方）
-                            state.mark_render_dirty();
-                            state.frame_dirty.set(true);
-                        }
-                        StreamChunk::CompressAutoResume => {
-                            // Execution 阶段压缩完成，自动续行
-                            // 优先使用用户暂存消息；无暂存则发送续行提示
-                            let msg = state.pending_compress_input.take()
-                                .unwrap_or_else(|| "continue current task".to_string());
-                            // 压缩完成 toast 已由 CompressEnd 发出，AutoResume 不再重复
-                            state.input = msg;
-                            crate::tui::event::submit_message(&mut state);
-                            state.mark_render_dirty();
-                            state.frame_dirty.set(true);
-                        }
-                        StreamChunk::ToolHealth(entries) => {
-                            // 工具健康快照：写入 state 供 panel 渲染
-                            // 引用关系：api/mod.rs 在 Complete 前发送 → 此处消费
-                            for entry in entries {
-                                state.tool_health.insert(entry.tool_id.clone(), entry);
-                            }
-                        }
-                        StreamChunk::Complete(stats) => {
-                            // 成功完成：清除网络异常标记
-                            state.connection_error = false;
-                            // 同步当前 provider_id（配置中的实际 provider，非推断）
-                            if !stats.provider_id.is_empty() {
-                                state.active_provider_id = stats.provider_id.clone();
-                            }
-                            // 同步当前 model_id（LLM 端 alias 解析后的真实模型名）
-                            // 修复：之前 model_name 只在 setup/discover 阶段更新，chat 完成后没同步
-                            // 导致看板显示 setup 选的模型名，但实际 LLM 调用的是 alias 解析后的名字
-                            if !stats.model_id.is_empty() && stats.model_id != state.model_name {
-                                state.theme.apply_model_brand(&stats.model_id);
-                                state.model_name = stats.model_id.clone();
-                            }
-                            // Complete: ctx_live_tokens 优先用 context_tokens（含 system prompt/tools），
-                            // fallback 到 prompt+completion（API usage 返回值）
-                            state.ctx_live_tokens = stats.context_tokens
-                                .unwrap_or_else(|| stats.prompt_tokens.saturating_add(stats.completion_tokens));
-                            state.ctx_estimate_at = None;
-                            // 同步 latest_prompt_tokens — 让 Panel/fallback 路径及时反映最新值
-                            state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
-                            // V40: 实时更新 token 统计（面板每帧可见最新数据）
-                            // 累加语义（与 line 695 非流式路径一致）：每轮 token 累加到 session 总计
-                            // 历史原因：早期用 .max() 显示"最大单轮"值，语义不一致且对用户误导
-                            // — 几轮后用户看到 0（首次）+ 100K（第二轮）.max() 仍 100K，掩盖累计
-                            state.session_tokens.prompt_tokens =
-                                state.session_tokens.prompt_tokens.saturating_add(stats.prompt_tokens);
-                            state.session_tokens.completion_tokens =
-                                state.session_tokens.completion_tokens.saturating_add(stats.completion_tokens);
-                            state.session_tokens.total_tokens =
-                                state.session_tokens.total_tokens.saturating_add(stats.total_tokens);
-                            state.session_tokens.cached_tokens =
-                                state.session_tokens.cached_tokens.saturating_add(stats.cached_tokens);
-                            state.session_tokens.thinking_tokens =
-                                state.session_tokens.thinking_tokens.saturating_add(stats.thinking_tokens);
-                            // context_tokens 覆盖 total_tokens（用 context_manager 的精确值替换 API usage）
-                            if let Some(ctx_tok) = stats.context_tokens {
-                                state.session_tokens.total_tokens = ctx_tok;
-                            }
-                            if let Some(ctx_max) = stats.context_max {
-                                state.context_window = ctx_max as usize;
-                            }
-                            if let Some(ml) = stats.model_limit {
-                                state.model_max_context = ml as usize;
-                            }
-                            // P1: 不在 Complete 时清空 streaming 内容——等 EngineResponse 到达后统一处理
-                            // 避免 Complete→EngineResponse 间隔导致内容"闪跳"（ST1 改进）
-                            state.streaming_complete = true;
-                            // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"
-                            // Pipeline 可能继续执行工具 + 发起新 LLM 调用。
-                            // 只有 EngineResponse 到达才真正设 Ready。
-                            // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
-                            state.set_busy_state(InputState::Executing);
-                            state.processing_phase = "· wrapping up...".into();
-                            state.mark_render_dirty();
-                            // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
-                            // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
-                        }
-                        StreamChunk::AuthResult { tool, approved } => {
-                            // 授权结果通知：显示 toast，不产生假工具 trace
-                            let msg = if approved {
-                                format!("✓ Authorized {}", tool)
-                            } else {
-                                format!("✗ Denied {} (unsafe op)", tool)
-                            };
-                            let dur = if approved {
-                                Duration::from_secs(2)
-                            } else {
-                                Duration::from_secs(4)
-                            };
-                            state.add_toast(msg, dur);
-                            state.mark_render_dirty();
-                        }
-                        StreamChunk::Error(e) => {
-                            let is_net = e.starts_with("NETWORK_ERROR:");
-                            let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
-
-                            // 2026-05-28: 保留已流式的部分内容（fatal 时不丢弃）
-                            let partial_text = if is_fatal_net && !state.last_llm_text().is_empty() {
-                                Some(state.take_last_llm_text())
-                            } else {
-                                None
-                            };
-
-                            state.reset_streaming();
-                            if state.input_state != InputState::Editor {
-                                state.input_state = InputState::Ready;
-                            }
-                            state.op_started_at = None;
-                            state.accumulated_elapsed = Duration::ZERO;
-                            state.mark_render_dirty();
-
-                            if is_net {
-                                // 网络错误：标记状态 + 专属提示
-                                state.connection_error = true;
-                                let msg = if is_fatal_net {
-                                    "Network connection failed, please check and retry".to_string()
-                                } else {
-                                    // 重试中：不弹 toast，只更新 processing_phase
-                                    let phase_msg = e.trim_start_matches("NETWORK_ERROR:")
-                                        .trim_start_matches("retrying ")
-                                        .to_string();
-                                    state.processing_phase = format!("⚠ {}", phase_msg);
-                                    state.add_event(&ts, "network", "Network failed, retrying...", crate::tui::state::EventLevel::Warning);
-                                    while stream_rx.try_recv().is_ok() {}
-                                    // 继续处理下一个 chunk（等待重试结果），不 break
-                                    continue;
-                                };
-                                // 2026-05-28: 如果有部分内容，保留为系统消息（不丢弃用户已看到的内容）
-                                if let Some(partial) = partial_text {
-                                    state.push_system_note(&format!(
-                                        "--- Output interrupted (partial received) ---\n{}\n\n⚠ {}",
-                                        partial, msg
-                                    ));
-                                } else {
-                                    state.push_system_note(&format!("--- Network error ---\n{}", msg));
-                                }
-                                state.add_event(&ts, "network", &msg, crate::tui::state::EventLevel::Warning);
-                                state.add_toast(
-                                    format!("⚠ {}", msg),
-                                    Duration::from_secs(8),
-                                );
-                            } else {
-                                // API / 其他错误
-                                state.add_event(&ts, "llm", &format!("Error: {}", e), crate::tui::state::EventLevel::Warning);
-                                state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
-                            }
-                            while stream_rx.try_recv().is_ok() {}
-                            break;
-                        }
-                        // 2026-05-28: 流中断后重试——清除已渲染的部分内容，等待重新生成
-                        StreamChunk::StreamRetryReset { partial_text } => {
-                            // V42-B: CardStream handle_chunk 已清除 current LlmCard 内容
-                            // P2: 重置 markdown 增量解析引擎——text 清空后 md 内部偏移不一致
-                            *state.streaming_md.borrow_mut() = None;
-                            *state.streaming_md.borrow_mut() = None;
-                            // 在 timeline 中标注中断点
-                            if !partial_text.is_empty() {
-                                let truncated = if partial_text.len() > 60 {
-                                    format!("{}...", &partial_text[..60])
-                                } else {
-                                    partial_text
-                                };
-                                state.add_event(&ts, "stream", &format!("Output interrupted ({} chars), retrying...", truncated.len()),
-                                    crate::tui::state::EventLevel::Warning);
-                            }
-                            state.processing_phase = "Stream interrupted, retrying...".to_string();
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
-                            state.processing_phase = format!("Retry {}/{}: {}", attempt, max_attempts, reason);
-                            had_streaming_update = true;
-                        }
-                        // ── Team 模式进度通知 → 更新 state.tasks 面板 ──
-                        StreamChunk::TeamProgress { phase, tasks } => {
-                            state.tasks = tasks.iter().map(|t| {
-                                crate::tui::state::TaskCard {
-                                    id: t.id.clone(),
-                                    title: t.title.clone(),
-                                    assignee: String::new(),
-                                    status: match t.status.as_str() {
-                                        "running" => crate::tui::state::TaskStatus::InProgress,
-                                        "done" => crate::tui::state::TaskStatus::Done,
-                                        "failed" => crate::tui::state::TaskStatus::Blocked,
-                                        _ => crate::tui::state::TaskStatus::Pending,
-                                    },
-                                    progress: match t.status.as_str() {
-                                        "done" => 100,
-                                        "running" => 50,
-                                        _ => 0,
-                                    },
-                                    deps: vec![],
-                                    description: t.output_preview.clone().unwrap_or_default(),
-                                }
-                            }).collect();
-                            state.processing_phase = format!("team/{}", phase);
-                            had_streaming_update = true;
-                        }
-                        // ── 预留事件处理（轻量级 — trace event + toast）──
-                        StreamChunk::ModelEscalation { from_model, to_model, reason } => {
-                            state.add_event(&ts, "model", &format!("{} → {} ({})", from_model, to_model, reason), crate::tui::state::EventLevel::Info);
-                            state.add_toast(format!("Model escalation: {} → {}", from_model, to_model), Duration::from_secs(3));
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::SessionFocusUpdate { goal, phase, .. } => {
-                            state.add_event(&ts, "focus", &format!("[{}] {}", phase, goal), crate::tui::state::EventLevel::Info);
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::ToolBlocked { tool_id, kind, message, .. } => {
-                            state.add_event(&ts, "tool", &format!("⚠ {} blocked: {} ({})", tool_id, message, kind), crate::tui::state::EventLevel::Warning);
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::MeetingStatusChange { new_status, .. } => {
-                            state.add_event(&ts, "meeting", &format!("Status: {}", new_status), crate::tui::state::EventLevel::Info);
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::SpecialistThinking { specialist_id, content } => {
-                            state.add_event(&ts, "specialist", &format!("[{}] {}", specialist_id, content.chars().take(60).collect::<String>()), crate::tui::state::EventLevel::Info);
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::SandboxProgress { phase, message } => {
-                            state.processing_phase = format!("sandbox/{}", phase);
-                            state.add_event(&ts, "sandbox", &message, crate::tui::state::EventLevel::Info);
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::InertiaDetected { recommendation, .. } => {
-                            state.add_event(&ts, "inertia", &recommendation, crate::tui::state::EventLevel::Warning);
-                            state.add_toast(format!("⚠ Loop detected: {}", recommendation), Duration::from_secs(5));
-                            had_streaming_update = true;
-                        }
-                        StreamChunk::LongOperation { tool_name, estimated_secs } => {
-                            state.add_toast(
-                                format!("Long operation ~{}s, please wait...", estimated_secs),
-                                Duration::from_secs(estimated_secs.min(10)),
-                            );
-                            state.add_event(&ts, "tool", &format!("{} est. {}s", tool_name, estimated_secs), crate::tui::state::EventLevel::Info);
-                            had_streaming_update = true;
-                        }
-                        // V41: ToolAgent 批量执行结果 — 替代多条 ToolStart/ToolEnd 刷屏
-                        StreamChunk::ToolAgentResult { agent_id: _, icon, name, call_count, summary, details } => {
-                            // V42-B: LlmCard 写入已由 writer::handle_chunk 处理
-                            // 这里仅记录 timeline（V40 字段，暂无 CardStream 等价物）
-                            state.streaming_timeline.push(
-                                crate::tui::state::TimelineEntry::ToolAgent {
-                                    icon: icon.clone(),
-                                    name: name.clone(),
-                                    call_count,
-                                    summary: summary.clone(),
-                                    details,
-                                }
-                            );
-                            had_streaming_update = true;
-                        }
-                    }
-                    // V42-B: forward to CardStream writer (clone consumed by match above)
-                    crate::tui::cards::writer::handle_chunk(&mut state, &chunk_for_cards);
-                }
+                let had_streaming_update = process_streaming_chunks(&mut state, &mut stream_rx).await;
                 // V40: 全量 drain 后统一设一次 dirty（替代每 chunk 重复设置）
                 // had_streaming_update 同时作为分区渲染信号：true = 仅 streaming 尾部需重建
                 if had_streaming_update {
@@ -1889,6 +702,13 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                             }
                         });
                         // input_state 保持 Executing：pipeline 还在跑，等 Complete/Error chunk 到达
+                    } else {
+                        // P1 fix: pending_confirmation_response 有值但 pending_mcip_confirmations 为空
+                        // → 决策丢失，pipeline 永久死锁。记录 error 日志便于排查。
+                        tracing::error!(
+                            allowed,
+                            "pending_confirmation_response consumed but pending_mcip_confirmations is empty — decision lost, pipeline may deadlock"
+                        );
                     }
                 }
 
@@ -2064,7 +884,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                     }
                                     state.reset_streaming();
                                     state.begin_streaming_session();
-                                    tokio::spawn(async move {
+                                    state.task_registry.register(tokio::spawn(async move {
                                         match send_meeting_message_streaming(&engine, &text, stx).await {
                                             ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                             ApiResult::Err(e) => {
@@ -2078,12 +898,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                     pending_confirmations: vec![],
                                                     meeting_experts: None,
                                                     auto_fallback_chat: None,
-                                                    turnkey_plan: None, needs_clarify: None,
+                                                    turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                                 });
                                             }
                                             _ => { let _ = tx.send(EngineResponse::default()); }
                                         }
-                                    });
+                                    }));
                                 }
                                 // ═══ Clarify 模式: 单 Agent 循环（默认路径） ═══
                                 AbacusMode::Clarify => {
@@ -2123,7 +943,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         }
                                         state.reset_streaming();
                                         state.begin_streaming_session();
-                                        tokio::spawn(async move {
+                                        state.task_registry.register(tokio::spawn(async move {
                                             use crate::tui::api::send_chat_message_streaming;
                                             match send_chat_message_streaming(&engine, &text, stx, chat_req_ctx).await {
                                                 ApiResult::Ok(resp) => { let _ = tx.send(resp); }
@@ -2138,14 +958,14 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         pending_confirmations: vec![],
                                                         meeting_experts: None,
                                                         auto_fallback_chat: None,
-                                                        turnkey_plan: None, needs_clarify: None,
+                                                        turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                                     });
                                                 }
                                                 _ => { let _ = tx.send(EngineResponse::default()); }
                                             }
-                                        });
+                                        }));
                                     } else {
-                                        tokio::spawn(async move {
+                                        state.task_registry.register(tokio::spawn(async move {
                                             match send_chat_message(&engine, &text, chat_req_ctx).await {
                                                 ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                                 ApiResult::Err(e) => {
@@ -2159,12 +979,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                         pending_confirmations: vec![],
                                                         meeting_experts: None,
                                                         auto_fallback_chat: None,
-                                                        turnkey_plan: None, needs_clarify: None,
+                                                        turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                                     });
                                                 }
                                                 _ => { let _ = tx.send(EngineResponse::default()); }
                                             }
-                                        });
+                                        }));
                                     }
                                 }
                             }
@@ -2210,7 +1030,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.op_started_at = Some(std::time::Instant::now());
                                 // V39-1: 标记下次 EngineResponse 需 parse_review_report
                                 state.pending_review_parses = state.pending_review_parses.saturating_add(1);
-                                tokio::spawn(async move {
+                                state.task_registry.register(tokio::spawn(async move {
                                     use crate::tui::api::send_reviewer_message_streaming;
                                     let req_ctx = abacus_core::core::RequestContext::default();
                                     match send_reviewer_message_streaming(&engine, kind, &content, stx, req_ctx).await {
@@ -2226,12 +1046,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None, needs_clarify: None,
+                                                turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                             });
                                         }
                                         _ => {}
                                     }
-                                });
+                                }));
                             } else if let crate::tui::state::SlashCommand::ExecuteWithPlan { task } = cmd {
                                 // V34: /plan <task> 执行策略 — 调 send_plan_and_execute_streaming，不切换 mode
                                 // 引用关系：cmd 由 slash_commands.rs::cmd_plan 构造
@@ -2249,7 +1069,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "planning".into();
                                 state.op_started_at = Some(std::time::Instant::now());
-                                tokio::spawn(async move {
+                                state.task_registry.register(tokio::spawn(async move {
                                     match send_plan_and_execute_streaming(&engine, &task, stx, plan_req_ctx).await {
                                         ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                         ApiResult::Err(e) => {
@@ -2263,12 +1083,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None, needs_clarify: None,
+                                                turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                             });
                                         }
                                         _ => { let _ = tx.send(EngineResponse::default()); }
                                     }
-                                });
+                                }));
                             } else if let crate::tui::state::SlashCommand::ExecuteWithTeam { task } = cmd {
                                 // V34: /team <task> 执行策略 — 调 send_team_message，不切换 mode
                                 // 引用关系：cmd 由 slash_commands.rs::cmd_team 构造
@@ -2281,7 +1101,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.set_busy_state(InputState::Thinking);
                                 state.processing_phase = "team".into();
                                 state.op_started_at = Some(std::time::Instant::now());
-                                tokio::spawn(async move {
+                                state.task_registry.register(tokio::spawn(async move {
                                     match send_team_message(&engine, &task, stx).await {
                                         ApiResult::Ok(resp) => { let _ = tx.send(resp); }
                                         ApiResult::Err(e) => {
@@ -2295,12 +1115,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None, needs_clarify: None,
+                                                turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                             });
                                         }
                                         _ => { let _ = tx.send(EngineResponse::default()); }
                                     }
-                                });
+                                }));
                             } else if let crate::tui::state::SlashCommand::RoleInvoke { role, content } = cmd {
                                 // L-3/L-4/L-5: 通用 Agent 角色调用 — 走流式 LLM 路径
                                 // 引用关系：cmd 由 cmd_role 解析后构造；send_role_message_streaming 设置 system_prompt_override + 可选 prefix
@@ -2313,7 +1133,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                 state.set_busy_state(InputState::Outputting);
                                 state.processing_phase = format!("team/{}", role.label());
                                 state.op_started_at = Some(std::time::Instant::now());
-                                tokio::spawn(async move {
+                                state.task_registry.register(tokio::spawn(async move {
                                     use crate::tui::api::send_role_message_streaming;
                                     let req_ctx = abacus_core::core::RequestContext::default();
                                     match send_role_message_streaming(&engine, role, &content, stx, req_ctx).await {
@@ -2329,21 +1149,22 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                                 pending_confirmations: vec![],
                                                 meeting_experts: None,
                                                 auto_fallback_chat: None,
-                                                turnkey_plan: None, needs_clarify: None,
+                                                turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                                             });
                                         }
                                         _ => {}
                                     }
-                                });
+                                }));
                             } else {
                                 let engine = engine.clone();
                                 let tx = res_tx.clone();
                                 let sbox_tx = sandbox_evt_tx.clone();
-                                tokio::spawn(async move {
-                                    // V29.10 (C4-Phase2): execute_slash_command 现在返回 (text, Option<TaskSpec>)
+                                state.task_registry.register(tokio::spawn(async move {
+                                    // V29.10 (C4-Phase2): execute_slash_command 现在返回 (text, Option<TaskSpec>, Option<usize>)
                                     //   非 turnkey 命令: turnkey_plan 恒 None
                                     //   turnkey plan_from_nl 成功: turnkey_plan = Some(task), run.rs 写 state.pending_turnkey_plan
-                                    let (output, turnkey_plan) = execute_slash_command(&engine, cmd, sbox_tx).await;
+                                    //   tokens_freed: compress 命令返回释放的 token 数，用于同步 session_tokens
+                                    let (output, turnkey_plan, tokens_freed) = execute_slash_command(&engine, cmd, sbox_tx).await;
                                     let _ = tx.send(EngineResponse {
                                         text: output,
                                         thinking: None,
@@ -2356,8 +1177,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                                         auto_fallback_chat: None,
                                         turnkey_plan,
                                         needs_clarify: None,
+                                        tokens_freed,
                                     });
-                                });
+                                }));
                             }
                         }
                     }
@@ -2429,15 +1251,15 @@ async fn execute_slash_command(
     engine: &EngineHandle,
     cmd: SlashCommand,
     sandbox_event_tx: tokio::sync::mpsc::UnboundedSender<abacus_types::sandbox::SandboxEvent>,
-) -> (String, Option<abacus_types::sandbox::TaskSpec>) {
+) -> (String, Option<abacus_types::sandbox::TaskSpec>, Option<usize>) {
     match cmd {
         SlashCommand::TurnkeyPlan(goal) => {
             match engine.core.sandbox_engine().plan_from_nl(&goal).await {
                 Ok(task) => {
                     let text = format_turnkey_plan(&goal, &task);
-                    (text, Some(task))
+                    (text, Some(task), None)
                 }
-                Err(e) => (format!("⚠️ Turnkey plan failed: {}\n\nGoal: {}", e, goal), None),
+                Err(e) => (format!("⚠️ Turnkey plan failed: {}\n\nGoal: {}", e, goal), None, None),
             }
         }
         SlashCommand::TurnkeyExecute(task) => {
@@ -2458,45 +1280,65 @@ async fn execute_slash_command(
                 Ok(task_state) => format_turnkey_result_with_events(&task, task_state, &events),
                 Err(e) => format!("⚠️ Turnkey execute failed: {}", e),
             };
-            (text, None)
+            (text, None, None)
         }
-        other => (execute_slash_command_text(engine, other).await, None),
+        other => {
+            let r = execute_slash_command_text(engine, other).await;
+            (r.text, None, r.tokens_freed)
+        }
     }
+}
+
+/// Slash 命令执行结果 — 包含文本输出和可选的 token 统计
+struct SlashCommandResult {
+    text: String,
+    tokens_freed: Option<usize>,
 }
 
 /// V29.10: 拆出来的 String-only 子集 — 兼容老调用者
 /// 仅处理非 Turnkey* 路径的命令
-async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) -> String {
+async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) -> SlashCommandResult {
     match cmd {
         SlashCommand::ContextStatus => {
             let status = engine.core.context_status().await;
-            format!(
-                "📊 Context status\n  Usage: {:.1}% ({}/{} tokens)\n  Compressed: {} messages",
-                status.usage_pct, status.current_tokens, status.max_tokens, status.compressed_count,
-            )
+            SlashCommandResult {
+                text: format!(
+                    "📊 Context status\n  Usage: {:.1}% ({}/{} tokens)\n  Compressed: {} messages",
+                    status.usage_pct, status.current_tokens, status.max_tokens, status.compressed_count,
+                ),
+                tokens_freed: None,
+            }
         }
         SlashCommand::BudgetStatus => {
-            use abacus_core::core::llm_budget::LlmBudgetConfig;
             let snap = engine.core.llm_budget().snapshot().await;
-            // 区分"未启用"和"已启用但当前为 0"
-            let cfg = LlmBudgetConfig::default();
+            // BUG-3 fix: 区分"未启用"和"已启用但当前为 0"
+            //   旧实现用 LlmBudgetConfig::default() 的字段当 hint，
+            //   而 default 永远是 0.0/0, 用户看到的提示与 config 无关。
+            //   snap 字段直接从 cfg 拷贝, 反映用户真实配置的上限值。
             let enabled = snap.max_cost_usd > 0.0 || snap.max_total_tokens > 0;
-            if !enabled {
+            let text = if !enabled {
                 format!(
                     "💰 LLM budget: **DISABLED**\n  Set [llm_budget] in config.toml:\n    max_cost_usd = {}\n    max_total_tokens = {}\n    (currently unlimited)",
-                    cfg.max_cost_usd, cfg.max_total_tokens
+                    snap.max_cost_usd, snap.max_total_tokens
                 )
             } else {
                 format!("💰 LLM budget: **{snap}**")
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::ContextCompress => {
-            let compressed = engine.core.compress_context(&engine.session).await;
-            format!("🗜️ Compressed {} messages", compressed)
+            let result = engine.core.compress_context(&engine.session).await;
+            SlashCommandResult {
+                text: format!("🗜️ Compressed {} messages, freed {} tokens", result.compressed_count, result.tokens_freed),
+                tokens_freed: Some(result.tokens_freed),
+            }
         }
         SlashCommand::ContextInject(content) => {
             engine.core.inject_context("user_inject", &content).await;
-            format!("💉 Injected ephemeral knowledge (next turn): {}", content.chars().take(50).collect::<String>())
+            SlashCommandResult {
+                text: format!("💉 Injected ephemeral knowledge (next turn): {}", content.chars().take(50).collect::<String>()),
+                tokens_freed: None,
+            }
         }
         SlashCommand::ToolList => {
             let tools = engine.core.tool_registry_ref().all_tools().await;
@@ -2508,7 +1350,7 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
                 out.push_str(&format!("  • {} — {}\n", t.schema.name, t.schema.description.chars().take(40).collect::<String>()));
             }
             if active.len() > 20 { out.push_str(&format!("  ... +{} more\n", active.len() - 20)); }
-            out
+            SlashCommandResult { text: out, tokens_freed: None }
         }
         SlashCommand::ToolStats => {
             let stats = engine.core.tool_stats().await;
@@ -2518,88 +1360,101 @@ async fn execute_slash_command_text(engine: &EngineHandle, cmd: SlashCommand) ->
             for (name, s) in sorted.iter().take(10) {
                 out.push_str(&format!("  [{:?}] {:.2} {}\n", s.tier, s.composite_score, name));
             }
-            out
+            SlashCommandResult { text: out, tokens_freed: None }
         }
         SlashCommand::SafetyStatus => {
             let s = engine.core.safety_status();
-            format!("🔒 Safety limits (per turn)\n  Max input: {} chars\n  Max tool calls: {}\n  Session: unlimited",
-                s.max_input_length, s.max_total_tool_calls)
+            SlashCommandResult {
+                text: format!("🔒 Safety limits (per turn)\n  Max input: {} chars\n  Max tool calls: {}\n  Session: unlimited",
+                    s.max_input_length, s.max_total_tool_calls),
+                tokens_freed: None,
+            }
         }
         SlashCommand::ModelList => {
             let models = engine.core.list_models().await;
-            if models.is_empty() { "🤖 No registered models".to_string() }
-            else {
+            if models.is_empty() {
+                SlashCommandResult { text: "🤖 No registered models".to_string(), tokens_freed: None }
+            } else {
                 let mut out = format!("🤖 Available models ({}):\n", models.len());
                 for m in &models { out.push_str(&format!("  • {}\n", m)); }
-                out
+                SlashCommandResult { text: out, tokens_freed: None }
             }
         }
         SlashCommand::SessionInfo => {
             let s = engine.session.read().await;
             let msg_count = s.messages.read().await.len();
             let map = s.interaction_map.read().await;
-            format!("📋 Session\n  ID: {}\n  Turns: {}\n  Messages: {}\n  Checkpoints: {}",
-                s.session_id, s.turn_count, msg_count, map.checkpoints.len())
+            SlashCommandResult {
+                text: format!("📋 Session\n  ID: {}\n  Turns: {}\n  Messages: {}\n  Checkpoints: {}",
+                    s.session_id, s.turn_count, msg_count, map.checkpoints.len()),
+                tokens_freed: None,
+            }
         }
         SlashCommand::Provider => {
             let providers = engine.core.list_providers().await;
             if providers.is_empty() {
-                "⚠️ No registered providers".to_string()
+                SlashCommandResult { text: "⚠️ No registered providers".to_string(), tokens_freed: None }
             } else {
                 let lines: Vec<String> = providers.iter()
                     .map(|(id, models)| format!("  {} → [{}]", id, models.join(", ")))
                     .collect();
-                format!("🔌 Providers ({})\n{}", providers.len(), lines.join("\n"))
+                SlashCommandResult { text: format!("🔌 Providers ({})\n{}", providers.len(), lines.join("\n")), tokens_freed: None }
             }
         }
 
         // ─── Phase 4 file-undo dispatch ─────────────────────────
         SlashCommand::UndoLast { session_id } => {
-            match engine.undo_engine.undo_last(session_id.as_deref()).await {
+            let text = match engine.undo_engine.undo_last(session_id.as_deref()).await {
                 Ok(r) => format_undo_result(&r),
                 Err(e) => format!("⚠️ undo failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::UndoSeq { session_id, seq } => {
-            match engine.undo_engine.undo_seq(&session_id, seq).await {
+            let text = match engine.undo_engine.undo_seq(&session_id, seq).await {
                 Ok(r) => format_undo_result(&r),
                 Err(e) => format!("⚠️ undo seq={seq} failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::UndoTurn { session_id, turn } => {
-            match engine.undo_engine.undo_turn(&session_id, turn).await {
+            let text = match engine.undo_engine.undo_turn(&session_id, turn).await {
                 Ok(rs) if rs.is_empty() => format!("turn={turn} no undoable entries"),
                 Ok(rs) => {
                     let parts: Vec<String> = rs.iter().map(format_undo_result).collect();
                     format!("⏪ undo turn={} ({} entries):\n{}", turn, rs.len(), parts.join("\n"))
                 }
                 Err(e) => format!("⚠️ undo turn={turn} failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::Redo { session_id } => {
-            match engine.undo_engine.redo(&session_id).await {
+            let text = match engine.undo_engine.redo(&session_id).await {
                 Ok(r) => format!("⏩ redo seq={} → {:?}", r.seq, r.action),
                 Err(e) => format!("⚠️ redo failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::UndoHistory { session_id, limit } => {
-            match engine.undo_engine.history(session_id.as_deref(), limit) {
+            let text = match engine.undo_engine.history(session_id.as_deref(), limit) {
                 Ok(entries) if entries.is_empty() => "📜 No undo history".to_string(),
                 Ok(entries) => format_history(&entries),
                 Err(e) => format!("⚠️ history read failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         SlashCommand::UndoTimeline { since_hours } => {
             let since = chrono::Utc::now() - chrono::Duration::hours(since_hours as i64);
             // Phase 6：把当前 session_id 传给渲染，用 [you] 标识本窗口
             // 引用：state.session_id 是 EngineHandle 创建时的 session uuid
             let cur_sid = engine.session.read().await.session_id.clone();
-            match engine.undo_engine.timeline(since) {
+            let text = match engine.undo_engine.timeline(since) {
                 Ok(entries) if entries.is_empty() =>
                     format!("📜 No writes in past {since_hours}h"),
                 Ok(entries) => format_timeline(&entries, since_hours, &cur_sid),
                 Err(e) => format!("⚠️ timeline read failed: {e}"),
-            }
+            };
+            SlashCommandResult { text, tokens_freed: None }
         }
         // V29.10: TurnkeyPlan / TurnkeyExecute 已被外层 execute_slash_command 提前拦截,
         //         此处理论上不可达; unreachable! 既保持 match 完整性又能在意外路径
@@ -3018,6 +1873,1245 @@ mod undo_timeline_render_tests {
 /// sections = ["llm", "tools", "local", "palace", "timeline", "focus"]
 /// ```
 /// 未配置时返回 `None`（使用默认布局）。
+
+/// Process engine responses from the response channel.
+/// Extracted from `run_tui()` to reduce main loop complexity.
+/// Returns `true` if the main loop should break (currently always returns `false`).
+async fn process_engine_response(
+    state: &mut AppState,
+    res_rx: &mut mpsc::UnboundedReceiver<EngineResponse>,
+) -> bool {
+    while let Ok(response) = res_rx.try_recv() {
+        state.frame_dirty.set(true);
+        let ts = chrono::Local::now().format("%H:%M").to_string();
+
+        // V28 (T4): 落档前先 mem::take streaming_trace_ids
+        // (流式期间已 push 的 ToolCall trace events 都在 trace_events)。
+        // 顺序: take → 创建 Thinking trace → 检查 tool 兜底(非流式)→ reset_streaming
+        let mut trace_ids = std::mem::take(&mut state.streaming_trace_ids);
+
+        // 1. Thinking trace — V42-B 优先用 LlmCard.thinking（流式累积）,
+        //    fallback 到 response.thinking(非流式 / 一次性返回路径)
+        let from_card = state.last_llm_thinking();
+        let thinking_text = if !from_card.is_empty() {
+            from_card
+        } else {
+            response.thinking.clone().unwrap_or_default()
+        };
+        if !thinking_text.is_empty() {
+            let line_count = thinking_text.lines().count();
+            let tid = state.push_trace_full(
+                ts.clone(),
+                "llm".into(),
+                crate::tui::state::EventLevel::Info,
+                crate::tui::state::TraceKind::Thinking {
+                    text: thinking_text.clone(),
+                    lines: line_count,
+                },
+                None,
+            );
+            // Thinking 排在 tool calls 前面(更符合"先思考后行动"的认知顺序)
+            trace_ids.insert(0, tid);
+            state.thinking_text = thinking_text.clone();
+        }
+
+        // 2. Tool calls 兜底 — 流式路径已在 ToolStart/ToolEnd 创建 trace,
+        //    streaming_trace_ids 已含 ToolCall 类型 ids。如果 trace_ids 中没有
+        //    任何 ToolCall(走非流式 EngineResponse 路径),从 response.tool_records 重建。
+        let has_tool_traces = trace_ids.iter().any(|id| {
+            state.trace_events.iter().any(|e| {
+                e.id == *id && matches!(e.kind, crate::tui::state::TraceKind::ToolCall { .. })
+            })
+        });
+        if !has_tool_traces {
+            for rec in &response.tool_records {
+                let tid = state.push_trace_full(
+                    ts.clone(),
+                    "tool".into(),
+                    if matches!(rec.status, ToolStatus::Failed) {
+                        crate::tui::state::EventLevel::Warning
+                    } else {
+                        crate::tui::state::EventLevel::Notice
+                    },
+                    crate::tui::state::TraceKind::ToolCall {
+                        name: rec.name.clone(),
+                        args: rec.args.clone(),
+                        output: None,
+                        status: rec.status,
+                    },
+                    Some(rec.duration_ms as u64),
+                );
+                trace_ids.push(tid);
+            }
+        }
+
+        // 3. 组装 parts: Thinking Block（内联可见）→ Trace（工具）→ Reply
+        let mut parts: Vec<MsgContent> = Vec::new();
+
+        // thinking 提升为内联 Block：用户不需要展开 trace 即可看到推理过程
+        // V42-B: thinking_text 来自 LlmCard.thinking 或 response.thinking
+        // 生命周期：随 Message 持久化，collapsed=true 默认折叠，Space 展开
+        if !thinking_text.is_empty() {
+            let line_count = thinking_text.lines().count();
+            // 摘要：行数 + 首行内容预览（截断到 40 chars）
+            // 让用户折叠态也能看到思考方向，决定是否展开
+            let first_line = thinking_text.lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            let preview: String = first_line.chars().take(40).collect();
+            let summary = if preview.is_empty() {
+                format!("💭 {} lines", line_count)
+            } else {
+                format!("💭 {} lines · {}", line_count, preview)
+            };
+            parts.push(MsgContent::Block {
+                kind: crate::tui::state::BlockKind::Think,
+                summary,
+                collapsed: true,
+                detail: thinking_text.clone(),
+            });
+        }
+
+        // trace 只保留工具调用（thinking 已单独展示，从 trace_ids 中移除）
+        let tool_trace_ids: Vec<u64> = trace_ids.iter().copied()
+            .filter(|id| state.trace_events.iter().any(|e|
+                e.id == *id && matches!(e.kind, crate::tui::state::TraceKind::ToolCall { .. })
+            ))
+            .collect();
+        if !tool_trace_ids.is_empty() {
+            parts.push(MsgContent::Trace {
+                event_ids: tool_trace_ids,
+                // P1: Trace 默认折叠——减少消息噪音，用户按需展开
+                collapsed: true,
+                expanded_event_ids: std::collections::HashSet::new(),
+            });
+        }
+
+        // 2026-06-11: response.text 为空时不要 push 空 Stream part，
+        //   避免 add_message 收到一条仅含空内容的消息（浪费渲染 + 噪声占位）
+        if !response.text.is_empty() {
+            parts.push(MsgContent::Stream(response.text.clone()));
+        }
+        // 若 parts 仍为空（无 thinking / 无 trace / 无 reply），跳过 add_message
+        //   防止 state.messages 累积全空 Message 触发后续渲染 panics
+        if parts.is_empty() {
+            // 用 warning 事件通知用户，UI 不显示占位消息
+            state.add_event(&ts, "llm", "Empty response (no text, no thinking, no tools)", crate::tui::state::EventLevel::Warning);
+            continue;
+        }
+
+        state.add_message(Message::new_session(parts, &ts));
+
+        // V39-1: 若上次发送是 reviewer，立即解析 verdict + toast 暴露
+        // V39-2: 同步回填 last_review_strict（cmd_review 写入 pending_review_strict）
+        // 引用关系：state.pending_review_parses 由 ReviewRole 分支 spawn 前 +1
+        // 设计意图：用户不必滚屏看长输出就能立即看到 verdict + strict 阻断状态
+        if state.pending_review_parses > 0 {
+            state.pending_review_parses = state.pending_review_parses.saturating_sub(1);
+            let kind = state.pending_review_kind;
+            // V41-4: 注入 kind + 抵达时间到 report，便于历史回放
+            let report = crate::tui::api::parse_review_report(&response.text)
+                .with_kind(kind)
+                .with_time(chrono::Utc::now().to_rfc3339());
+            let strict = state.pending_review_strict;
+            state.pending_review_strict = false; // 消费一次
+            // 渲染 toast：verdict + issues 数 + 装饰
+            let icon = if report.verdict.is_pass() { "✓" } else if matches!(report.verdict, crate::tui::api::ReviewVerdict::Fail) { "⛔" } else { "⚠" };
+            let strict_marker = if strict { " · 🔒strict" } else { "" };
+            state.add_toast(
+                format!("{} Review: {} · {} issue(s){}", icon, report.verdict.label(), report.issues.len(), strict_marker),
+                std::time::Duration::from_secs(8),
+            );
+            // V41-4: 历史推入（FIFO 上限 20）
+            // 引用关系：state.review_history（VecDeque，最旧在 front）
+            // 设计：先 push 后 trim，保证 last_review 永远 == 历史末尾
+            state.review_history.push_back(report.clone());
+            while state.review_history.len() > 20 {
+                state.review_history.pop_front();
+            }
+            state.last_review = Some(report);
+            state.last_review_strict = strict;
+        }
+
+        // V42-B: 落档完成，reset CardStream
+        state.reset_streaming();
+
+        let response_tool_count = response.tool_records.len();
+        state.tool_records.extend(response.tool_records);
+        // 保持 tool_records 有界（最近 200 条）
+        if state.tool_records.len() > 200 {
+            state.tool_records.drain(..state.tool_records.len() - 200);
+        }
+
+        // V28.7: 更新 Token 统计 + 费用估算（lookup_pricing 单源）
+        if let Some(stats) = &response.stats {
+            state.session_tokens.prompt_tokens += stats.prompt_tokens;
+            state.session_tokens.completion_tokens += stats.completion_tokens;
+            state.session_tokens.total_tokens += stats.total_tokens;
+            state.session_tokens.cached_tokens += stats.cached_tokens;
+            // V30：思考 tokens 累加（completion 子集，仅信息透明）
+            state.session_tokens.thinking_tokens += stats.thinking_tokens;
+            // latest_prompt_tokens：set 语义（非累加）——记录最新轮完整 context 大小
+            // 用途：InputBar context % 显示真实 context 窗口占用，不是累计账单 token
+            state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
+
+            // 费用累加：按当轮 model_id 查 pricing 估算 USD
+            // 引用关系：cost::estimate_turn_cost_usd(本地 pricing 表)
+            // 注意：cost_usd 是会话级累计，跨模型切换也保留（用户想看总开销）
+            let model_for_pricing = if stats.model_id.is_empty() {
+                state.model_name.as_str()
+            } else {
+                stats.model_id.as_str()
+            };
+            // V31: CNY 是计费 source-of-truth（DeepSeek 官方货币）
+            // 引用关系：cost::estimate_turn_cost_cny → model_registry::lookup_model_or_default
+            // USD 经 fx_rate 同步累加，便于历史兼容查询
+            let fx = crate::tui::cost::DEFAULT_FX_RATE;
+            let cny_delta = crate::tui::cost::estimate_turn_cost_cny(
+                model_for_pricing,
+                stats.prompt_tokens,
+                stats.completion_tokens,
+                stats.cached_tokens,
+            );
+            state.session_tokens.cost_cny += cny_delta;
+            state.session_tokens.cost_usd += if fx > 0.0 { cny_delta / fx } else { 0.0 };
+
+            // V36-3: per_model 拆分累计 — 按 canonical model_id 聚合
+            // 引用关系：state.session_tokens.per_model 由 render_tab_quant 模型分布区块消费
+            // 标准化：lookup_model.aliased_to 解析后用 canonical id 作 key
+            //   - 命中 registry：用 info.aliased_to 或 info.id（解决 deepseek-chat/v4-flash 别名）
+            //   - 未命中：用 model_for_pricing 原值（不丢失非 DeepSeek 模型的统计）
+            let canonical_key = abacus_types::lookup_model(model_for_pricing)
+                .map(|info| info.aliased_to.unwrap_or(info.id).to_string())
+                .unwrap_or_else(|| model_for_pricing.to_string());
+            let per = state.session_tokens.per_model
+                .entry(canonical_key)
+                .or_default();
+            per.prompt += stats.prompt_tokens;
+            per.completion += stats.completion_tokens;
+            per.cached += stats.cached_tokens;
+            per.thinking += stats.thinking_tokens;
+            per.cost_cny += cny_delta;
+            per.turns += 1;
+
+            // V39-4: per_mode 维度同步累计 — 关注"在哪个会话阶段花费"
+            // 引用关系：state.session_tokens.per_mode 由 render_tab_quant 模式分布区块消费
+            // key：state.mode.label()（与 AbacusMode 枚举字符串解耦，持久化稳定）
+            let mode_key = state.mode.label().to_string();
+            let per_m = state.session_tokens.per_mode
+                .entry(mode_key)
+                .or_default();
+            per_m.prompt += stats.prompt_tokens;
+            per_m.completion += stats.completion_tokens;
+            per_m.cached += stats.cached_tokens;
+            per_m.thinking += stats.thinking_tokens;
+            per_m.cost_cny += cny_delta;
+            per_m.turns += 1;
+
+            // Model Escalation 通知：检测到模型切换时同步 state.model_name + 主题色
+            if !stats.model_id.is_empty() && stats.model_id != state.model_name {
+                state.model_name = stats.model_id.clone();
+                state.theme.apply_model_brand(&stats.model_id);
+                state.add_toast(
+                    format!("🔄 Auto-escalated to {} for deeper reasoning", stats.model_id),
+                    Duration::from_secs(5),
+                );
+            }
+        }
+        // /compress 命令释放的 token 数 — 同步扣减 session_tokens
+        if let Some(freed) = response.tokens_freed {
+            state.session_tokens.total_tokens = state.session_tokens.total_tokens.saturating_sub(freed as u64);
+            state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens.saturating_sub(freed as u64);
+            state.session_tokens.compress_count += 1;
+            state.session_tokens.compress_tokens_saved += freed as u64;
+        }
+        // Progressive Gate state — 状态在 status bar 已有显示，无需 toast
+        // Inertia warning
+        if let Some(ref w) = response.inertia_warning {
+            state.add_toast(format!("⚠️ {w}"), Duration::from_secs(8));
+            state.add_event(&ts, "inertia", w, crate::tui::state::EventLevel::Warning);
+        }
+
+        // V28.7: 异常兜底 — Meeting/其他模式失败时显式切回 Clarify
+        // 引用关系：
+        //   - 信号源：send_meeting_message fallback 失败时设 auto_fallback_chat
+        //   - 副作用：切 mode + toast + 事件流（用户清晰知晓兜底）
+        // 设计：mode 已是 Clarify 时不重复切；toast 解释原因
+        if let Some(ref reason) = response.auto_fallback_chat {
+            if state.mode != crate::tui::state::AbacusMode::Clarify {
+                                crate::tui::event::switch_mode(state, crate::tui::state::AbacusMode::Clarify);
+                            }
+                            state.add_toast(
+                                format!("ℹ️ Auto-fallback to Clarify: {}", reason),
+                Duration::from_secs(6),
+            );
+            state.add_event(
+                &ts,
+                "session",
+                &format!("Auto-fallback to Clarify: {}", reason),
+                crate::tui::state::EventLevel::Warning,
+            );
+        }
+
+        // 2026-05-27: Meeting 路由失败 → needs_clarify 信号 → 自动切到 Clarify
+        // 引用关系:
+        //   信号源: send_meeting_message_streaming 路由预检返回 NoMatch 时设 needs_clarify
+        //   副作用: 切 mode + toast 建议 + 保留用户输入到 preserved_input
+        if let Some(ref suggestion) = response.needs_clarify {
+            if state.mode != crate::tui::state::AbacusMode::Clarify {
+                                crate::tui::event::switch_mode(state, crate::tui::state::AbacusMode::Clarify);
+                            }
+                            state.add_toast(
+                                format!("💡 Suggest clarify: {}", suggestion),
+                Duration::from_secs(8),
+            );
+            state.add_event(
+                &ts,
+                "session",
+                "Meeting route no match, auto-switch to Clarify",
+                crate::tui::state::EventLevel::Notice,
+            );
+        }
+
+        // V41: 策略自动推荐 — Clarify 模式收到响应后分析用户输入复杂度
+        // 引用关系：TaskAnalyzer(abacus-core) → toast 建议
+        // 触发条件：Clarify 模式 + 本 session 未建议过 + 用户输入足够长
+        // 生命周期：meeting_suggested_this_session 标记防重复（/new 重置）
+        if state.mode == crate::tui::state::AbacusMode::Clarify
+            && !state.meeting_suggested_this_session
+        {
+            let last_user_text: Option<String> = state.messages.iter().rev()
+                .find(|m| matches!(m.role, crate::tui::state::MsgRole::User))
+                .and_then(|m| m.parts.iter().find_map(|p| match p {
+                    crate::tui::state::MsgContent::Stream(t) => Some(t.clone()),
+                    _ => None,
+                }));
+            if let Some(ref input_text) = last_user_text {
+                if input_text.len() > 20 {
+                    let cx = abacus_core::core::task_analyzer::TaskAnalyzer::analyze_complexity(input_text);
+                    if cx.domain_count >= 2 && cx.score > 0.4 {
+                        state.meeting_suggested_this_session = true;
+                        state.add_toast(
+                            "💡 Multi-domain topic, try /meeting for expert panel".to_string(),
+                            Duration::from_secs(8),
+                        );
+                    } else if cx.dimensions.structural > 0.6 && cx.score > 0.5 {
+                        state.meeting_suggested_this_session = true;
+                        state.add_toast(
+                            "💡 Complex task, try /plan for auto planning".to_string(),
+                            Duration::from_secs(6),
+                        );
+                    }
+                }
+            }
+        }
+
+        // V29.10 (C4-Phase2) ── Turnkey plan 缓存到 state ──
+        // 引用关系:
+        //   生产者: SlashCommand::TurnkeyPlan dispatch 成功时
+        //   消费者: cmd_turnkey 'execute' 子命令读 state.pending_turnkey_plan
+        // 生命周期: 每次 TurnkeyPlan 成功 → 替换旧 plan;
+        //   /turnkey execute 后 take() 取走;
+        //   /turnkey clear 显式清空; SessionExport 不持久化(临时审阅状态)
+        if let Some(task) = response.turnkey_plan.clone() {
+            let phases = task.phases.len();
+            let steps: usize = task.phases.iter().map(|p| p.steps.len()).sum();
+            // V41: 设置 plan_phase = AwaitingApproval（两阶段状态机）
+            let task_descs: Vec<String> = task.phases.iter()
+                .map(|p| p.description.clone())
+                .collect();
+            state.plan_phase = Some(crate::tui::state::PlanPhase::AwaitingApproval {
+                plan_summary: task.goal.clone(),
+                tasks: task_descs,
+            });
+            state.pending_turnkey_plan = Some(task);
+            // 消息流中展示策略选项（用户输入 A/S/T 将在 event/mod.rs 中被拦截）
+            state.add_message(crate::tui::state::Message::new_session(
+                vec![crate::tui::state::MsgContent::Stream(format!(
+                    "📋 Plan ready — {} phases, {} steps\n\n\
+                     Choose strategy:\n\
+                     [A] Auto — tool calls auto-approved\n\
+                     [S] Step-by-step — confirm each op\n\
+                     [T] Team — multi-agent parallel\n\
+                     [C] Cancel\n\n\
+                     Enter A/S/T/C:",
+                    phases, steps,
+                ))],
+                ts.clone(),
+            ));
+        }
+
+        // V28.7 ── Meeting 模式：参会者快照写入 state.experts ──
+        // 引用关系：
+        //   生产者：send_meeting_message 从 mtg.session().participants 提取
+        //   消费者：components::render_panel_meeting_agenda 读 state.experts
+        // 生命周期：每条 Meeting EngineResponse 抵达时整体替换；非 Meeting 路径
+        //   meeting_experts=None 不动 state.experts（保留 mock 或上次状态）
+        if let Some(ref experts) = response.meeting_experts {
+            let count = experts.len();
+            state.experts = experts.clone();
+            // 事件流：让用户知道议程 tab 数据已刷新
+            state.add_event(
+                &ts,
+                "meeting",
+                &format!("Participants updated ({})", count),
+                crate::tui::state::EventLevel::Info,
+            );
+        }
+
+        // ── MCIP 工具授权处理 (Gap 2 + 5) ──
+        // 检查 pending_confirmations：非空 → 需要用户授权
+        if !response.pending_confirmations.is_empty() {
+            use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk};
+            use abacus_core::mcip::McipConfirmKind;
+
+            let confirmations = response.pending_confirmations.clone();
+
+            // Gap 5: 检查 always_allow 自动放行
+            let all_allowed = confirmations.iter().all(|req| {
+                state.always_allow.contains(&req.tool_id)
+            });
+
+            if all_allowed {
+                // 自动放行：所有工具都在 always_allow 列表中
+                // 注意：V28 后此分支应为 dead code——pipeline 改用 channel 暂停，
+                //   ConfirmRequired stream chunk 单独处理 always_allow 短路。
+                //   保留作为非流式 fallback：如果有 EngineResponse 仍带
+                //   pending_confirmations 抵达，走旧 channel 通路也能放行。
+                state.add_event(&ts, "mcip", crate::tui::i18n::t("event.auto_allow_legacy"), crate::tui::state::EventLevel::Info);
+                state.pending_mcip_confirmations = confirmations;
+                state.pending_confirmation_response = Some(true);
+            } else {
+                // 展示 ConfirmDialog（第一个待确认工具）
+                use crate::tui::state::ConfirmOption;
+                let first = &confirmations[0];
+                // V22 增强：reason 含 `[destructive]` 前缀（mcip.rs 启发式标记）
+                //   也视为破坏性，避免 McipPolicy kind 把所有 unmatched 工具
+                //   一律按 Medium risk 处理
+                let reason_destructive = first.reason.starts_with("[destructive]");
+                let is_destructive_flag = matches!(first.kind, McipConfirmKind::DestructiveOp)
+                    || reason_destructive;
+                let (confirm_type, risk) = if is_destructive_flag {
+                    (ConfirmType::ShellExec, ConfirmRisk::High)
+                } else if first.tool_id.contains("bash") || first.tool_id.contains("shell") {
+                    let cmd_risk = first.params_preview.as_deref()
+                        .map(|p| crate::tui::state::assess_command_risk(p))
+                        .unwrap_or(ConfirmRisk::Medium);
+                    (ConfirmType::ShellExec, cmd_risk)
+                } else {
+                    (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
+                };
+                let mut details = if confirmations.len() > 1 {
+                    vec![
+                        first.reason.clone(),
+                        format!("(+{} more tools need auth)", confirmations.len() - 1),
+                    ]
+                } else {
+                    vec![first.reason.clone()]
+                };
+                if let Some(ref preview) = first.params_preview {
+                    details.push(format!("params: {}", preview));
+                }
+                let is_destructive = is_destructive_flag;
+                let mut options = vec![
+                    ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() },
+                ];
+                if !is_destructive {
+                    options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
+                }
+                options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
+
+                state.confirm_dialog = Some(ConfirmDialog {
+                    title: format!("🔐 {}", first.tool_id),
+                    confirm_type,
+                    tool_id: first.tool_id.clone(),
+                    action: first.tool_id.clone(),
+                    details,
+                    risk,
+                    options,
+                    callback_id: "mcip".to_string(),
+                    allow_always: !is_destructive,
+                    created_at: std::time::Instant::now(),
+                    details_expanded: false,
+                    selected: 0,
+                    interaction_paused: false,
+                    paused_total: std::time::Duration::ZERO,
+                    focus_lost_at: None,
+                    last_active_at: std::time::Instant::now(),
+                    suggested_action: first.suggested_action,
+                });
+                let event_msg = crate::tui::i18n::tf("event.wait_auth_tool", &[&first.tool_id]);
+                state.pending_mcip_confirmations = confirmations;
+                state.add_event(&ts, "mcip", &event_msg, crate::tui::state::EventLevel::Warning);
+            }
+        }
+
+        state.add_event(&ts, "llm", crate::tui::i18n::t("event.gen_complete"), crate::tui::state::EventLevel::Notice);
+
+        // 2026-05-27: Clarify 模式下检测是否建议 Meeting
+        if state.mode == crate::tui::state::AbacusMode::Clarify
+            && !state.meeting_suggested_this_session
+        {
+            let tool_count = response_tool_count;
+            if crate::tui::modes::analyzer::suggest_mode_from_response(
+                &response.text,
+                tool_count,
+                state.meeting_suggested_this_session,
+            ).is_some() {
+                state.meeting_suggested_this_session = true;
+                state.add_toast(
+                    "💡 This topic may suit expert panel (/meeting)".to_string(),
+                    Duration::from_secs(8),
+                );
+            }
+        }
+
+        // 有待确认工具时，保持 Executing 状态（等用户确认后再恢复）
+        if state.pending_mcip_confirmations.is_empty() {
+            // Editor 态保护：不覆盖用户正在编辑的状态
+            if state.input_state != InputState::Editor {
+                state.input_state = InputState::Ready;
+            }
+            state.op_started_at = None;
+            state.accumulated_elapsed = Duration::ZERO;
+
+            // 自动发送排队消息（用户在忙碌态下 Enter 提交的）
+            if !state.pending_inputs.is_empty() {
+                let next_input = state.pending_inputs.pop_front().unwrap();
+                state.input = next_input.clone();
+                // RU7 修复：input 改后必须 recalculate_cursor，否则
+                // cursor_pos/line/col 持有旧值，渲染时光标位置错位
+                state.cursor_pos = state.input.len();
+                state.recalculate_cursor();
+                state.add_toast(
+                    format!("Auto-sending queued ({} remaining)", state.pending_inputs.len()),
+                    Duration::from_secs(2),
+                );
+                state.pending_send = true;
+            }
+        }
+    }
+    false
+}
+
+/// Process streaming chunks from the stream channel.
+/// Extracted from `run_tui()` to reduce main loop complexity.
+/// Returns `true` if any streaming update occurred.
+async fn process_streaming_chunks(
+    state: &mut AppState,
+    stream_rx: &mut mpsc::UnboundedReceiver<abacus_core::llm::stream::StreamChunk>,
+) -> bool {
+    // V0.2: 消费 streaming chunks — 实时更新 partial message（渲染前处理）
+    // V40: 全量 drain — 移除 per-frame chunk budget 限制。
+    //   旧设计(FRAME_CHUNK_BUDGET=20)的假设是"每 chunk 触发全量重建导致单帧开销过高"。
+    //   配合分区渲染优化(streaming 期间不再全量 rebuild)，瓶颈消除，
+    //   现在单帧内 drain 所有 pending chunks 再统一渲染一次，延迟从 50ms*N 降为 0。
+    //   LLM 实际产出速率 ~100 tokens/s = ~100 chunks/50ms_frame ≈ 5 chunks/frame,
+    //   全量 drain 无 CPU 压力。
+    let mut had_streaming_update = false;
+    while let Ok(chunk) = stream_rx.try_recv() {
+        use abacus_core::llm::stream::StreamChunk;
+        let ts = chrono::Local::now().format("%H:%M").to_string();
+        let chunk_for_cards = chunk.clone();
+        match chunk {
+            StreamChunk::IterationStart { iteration } => {
+                // V42-B: 迭代边界——CardStream handle_chunk 已在前面处理 clear_thinking
+                // V42-B: streaming_text_started / streaming_thinking_started 已删除
+                if iteration > 0 {
+                    state.set_busy_state(InputState::Thinking);
+                    state.processing_phase = format!("· iteration {}", iteration + 1);
+                    // V40: timeline 迭代分隔
+                    state.push_timeline_entry(
+                        crate::tui::state::TimelineEntry::Iteration { number: iteration + 1 }
+                    );
+                }
+                had_streaming_update = true;
+            }
+            StreamChunk::TextDelta(t) => {
+                // 100ms 门控：实时估算 ctx_live_tokens（流式期间及时更新上下文占用）
+                // 估算 = latest_prompt_tokens（上轮真实值）+ 本轮已生成字符 / 3
+                // 除数 3 是英文(~0.25 tok/char)和中文(~1.5 tok/char)的折中
+                // 100ms 保证视觉平滑跟动（TUI 帧率 ~60fps），O(1) 计算无性能压力
+                let now = std::time::Instant::now();
+                let should_refresh = state.ctx_estimate_at
+                    .map(|t| now.duration_since(t).as_millis() >= 100)
+                    .unwrap_or(true);
+                if should_refresh {
+                    let gen_est = (state.active_llm_text_len() / 3) as u64;
+                    // clamp 到 context_window：估算不可能超过物理上限
+                    let raw = state.session_tokens.latest_prompt_tokens
+                        .saturating_add(gen_est);
+                    let cap = state.context_window as u64;
+                    state.ctx_live_tokens = if cap > 0 { raw.min(cap) } else { raw };
+                    state.ctx_estimate_at = Some(now);
+                }
+                // V42-B: 首次 TextDelta 检测（替代 streaming_text_started 标志）
+                // handle_chunk 在 match 之后才执行，此时 LlmCard 尚未收到文本
+                if !t.is_empty() && state.active_llm_text_len() == 0 {
+                    // V38: 切换状态指示到 Outputting
+                    state.set_busy_state(InputState::Outputting);
+                    state.processing_phase.clear();
+                    state.add_event(&ts, "llm", crate::tui::i18n::t("event.outputting"), crate::tui::state::EventLevel::Info);
+                }
+                // K6：传入实际行内容数组，flash_state 内部计算 hash（避免"底部偏移"漂移）
+                let added: Vec<&str> = t.lines().collect();
+                if !added.is_empty() {
+                    state.flash_state.mark_new_lines(&added);
+                }
+                // V42-B: timeline Text entry — 从 active LlmCard 取累计长度（零拷贝）
+                let card_len = state.active_llm_text_len();
+                if let Some(crate::tui::state::TimelineEntry::Text { end, .. }) =
+                    state.streaming_timeline.last_mut()
+                {
+                    *end = card_len;
+                } else {
+                    state.push_timeline_entry(
+                        crate::tui::state::TimelineEntry::Text { start: card_len.saturating_sub(t.len()), end: card_len }
+                    );
+                }
+                // 增量送入 streaming md 引擎（mdstream committed/pending 分割）
+                {
+                    let mut smd_ref = state.streaming_md.borrow_mut();
+                    if smd_ref.is_none() {
+                        *smd_ref = Some(crate::tui::md_stream::StreamingMd::new());
+                    }
+                    if let Some(ref mut smd) = *smd_ref {
+                        smd.append(&t);
+                    }
+                }
+                had_streaming_update = true;
+            }
+            StreamChunk::Thinking(t) => {
+                // V42-B: 首次 Thinking 检测（替代 streaming_thinking_started 标志）
+                if !t.is_empty() && state.active_llm_thinking_len() == 0 {
+                    state.set_busy_state(InputState::Thinking);
+                    state.processing_phase.clear();
+                    state.add_event(&ts, "llm", crate::tui::i18n::t("event.thinking"), crate::tui::state::EventLevel::Info);
+                    // V40: timeline Thinking entry（首次创建，后续仅更新 summary）
+                    // 存最近 2 行非空内容（\n 分隔），渲染层展示 2 行 live preview
+                    let summary = {
+                        let lines: Vec<String> = t.lines()
+                            .filter(|l| !l.trim().is_empty())
+                            .take(2)
+                            .map(|l| if l.chars().count() > 50 {
+                                format!("{}…", l.chars().take(47).collect::<String>())
+                            } else { l.to_string() })
+                            .collect();
+                        lines.join("\n")
+                    };
+                    state.push_timeline_entry(
+                        crate::tui::state::TimelineEntry::Thinking { summary }
+                    );
+                } else if !t.is_empty() {
+                    // V42-B: 后续 thinking chunk: 更新 timeline 摘要
+                    let thinking_preview = state.active_llm_thinking();
+                    let last2: Vec<String> = thinking_preview
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect::<Vec<_>>()
+                        .into_iter().rev().take(2).rev()
+                        .map(|l| if l.chars().count() > 50 {
+                            format!("{}…", l.chars().take(47).collect::<String>())
+                        } else { l.to_string() })
+                        .collect();
+                    if let Some(crate::tui::state::TimelineEntry::Thinking { summary }) =
+                        state.streaming_timeline.iter_mut().rev()
+                            .find(|e| matches!(e, crate::tui::state::TimelineEntry::Thinking { .. }))
+                    {
+                        if !last2.is_empty() {
+                            *summary = last2.join("\n");
+                        }
+                    }
+                }
+                // V42-B: thinking 已累积到 CardStream（handle_chunk 处理）
+                had_streaming_update = true;
+            }
+            StreamChunk::ToolStart { name } => {
+                // V28 (T3): 创建 ToolCall trace 拿 trace_id, 缓存到 streaming_tools
+                let trace_id = state.push_trace_full(
+                    ts.clone(),
+                    "tool".into(),
+                    crate::tui::state::EventLevel::Info,
+                    crate::tui::state::TraceKind::ToolCall {
+                        name: name.clone(),
+                        args: String::new(),
+                        output: None,
+                        status: crate::tui::state::ToolStatus::Running,
+                    },
+                    None,
+                );
+                state.streaming_trace_ids.push(trace_id);
+                // streaming_tools Vec 上限 100（防止长 turn 积累过多条目）
+                if state.streaming_tools.len() >= 100 {
+                    state.streaming_tools.remove(0); // FIFO 淘汰最旧
+                }
+                state.streaming_tools.push((
+                    name.clone(),
+                    crate::tui::state::StreamingToolStatus::Running,
+                    None,
+                    trace_id,
+                ));
+                // V38: 状态栏实时反映当前工具名（Working · tool_name）
+                state.set_busy_state(InputState::Executing);
+                state.processing_phase = format!("· {}", name);
+                // V40: timeline Tool entry（ToolArgs/ToolEnd 会原地更新）
+                state.push_timeline_entry(
+                    crate::tui::state::TimelineEntry::Tool {
+                        name: name.clone(),
+                        context: String::new(), // ToolArgs 到达后填充
+                        status: crate::tui::state::StreamingToolStatus::Running,
+                        duration_ms: None,
+                        failure_kind: None,
+                        trace_id,
+                    }
+                );
+                had_streaming_update = true;
+            }
+            // V29.11: 工具输入参数 — 回填 trace event 的 args 字段
+            //   触发 try_render_edit_diff: args 含 old_string/new_string → 走 diff 视图
+            StreamChunk::ToolArgs { name, args_json } => {
+                // T-1 fix: 用 trace_event_index O(1) 查找，替代原来 O(n) iter().find()
+                // 2026-05-28: 用 trace_id 精确匹配（修复并行同名工具只更新最后一个的 bug）
+                let matched_tid = state.streaming_tools.iter().rev()
+                    .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
+                    .map(|t| t.3);
+                if let Some(tid) = matched_tid {
+                    // 更新 trace event 的 args
+                    if let Some(&idx) = state.trace_event_index.get(&tid) {
+                        if let Some(ev) = state.trace_events.get_mut(idx) {
+                            if let crate::tui::state::TraceKind::ToolCall { args, .. } = &mut ev.kind {
+                                *args = args_json.clone();
+                            }
+                        }
+                    }
+                    // 更新 timeline Tool entry 的 context — 用 trace_id 精确匹配
+                    let summary = crate::tui::components::block_detail::extract_tool_param_summary(&args_json);
+                    if let Some(crate::tui::state::TimelineEntry::Tool { context, .. }) =
+                        state.streaming_timeline.iter_mut().rev()
+                            .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { trace_id: t, .. } if *t == tid))
+                    {
+                        *context = summary;
+                    }
+                }
+                had_streaming_update = true;
+            }
+            // V29.11: 工具输出内容 — 回填 trace event 的 output 字段
+            StreamChunk::ToolOutput { name, output_json } => {
+                // V38: 拦截 mode_switch 工具输出，执行模式切换
+                if name == "mode_switch" {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
+                        if val.get("action").and_then(|v| v.as_str()) == Some("switch_mode") {
+                            if let Some(target_str) = val.get("target").and_then(|v| v.as_str()) {
+                                if let Some(target) = abacus_types::AbacusMode::from_label(target_str) {
+                                    let reason = val.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                                    let display = val.get("display_name").and_then(|v| v.as_str()).unwrap_or(target_str);
+                                    state.set_mode(target);
+                                    state.add_toast(
+                                        format!("🤖 Mode switch: {} — {}", display, reason),
+                                        std::time::Duration::from_secs(5),
+                                    );
+                                    state.add_event(&ts, "session", &format!("LLM switch → {}", display), crate::tui::state::EventLevel::Notice);
+                                }
+                            }
+                        }
+                    }
+                }
+                // V40: timeline ToolOutput — bash/read 工具推送输出摘要
+                // 先提取摘要（借用 output_json），再 move 给 trace（避免 clone）
+                let tool_lower = name.to_lowercase();
+                let is_bash = tool_lower.contains("bash") || tool_lower.contains("exec");
+                let is_read = tool_lower.contains("read");
+                if (is_bash || is_read) && !output_json.is_empty() {
+                    let summary = if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output_json) {
+                        let text = val.as_str()
+                            .or_else(|| val.get("stdout").and_then(|v| v.as_str()))
+                            .or_else(|| val.get("output").and_then(|v| v.as_str()))
+                            .unwrap_or("");
+                        let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                        if first_line.chars().count() > 60 {
+                            format!("{}…", first_line.chars().take(57).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        }
+                    } else {
+                        // 非 JSON 输出：取首行
+                        let first_line = output_json.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                        if first_line.chars().count() > 60 {
+                            format!("{}…", first_line.chars().take(57).collect::<String>())
+                        } else {
+                            first_line.to_string()
+                        }
+                    };
+                    if !summary.is_empty() {
+                        state.push_timeline_entry(
+                            crate::tui::state::TimelineEntry::ToolOutput { summary }
+                        );
+                    }
+                }
+                // T-1 fix: O(1) index 查找回填 trace event output
+                if let Some(tool) = state.streaming_tools.iter().rev()
+                    .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
+                {
+                    let tid = tool.3;
+                    if let Some(&idx) = state.trace_event_index.get(&tid) {
+                        if let Some(ev) = state.trace_events.get_mut(idx) {
+                            if let crate::tui::state::TraceKind::ToolCall { output, .. } = &mut ev.kind {
+                                *output = Some(output_json);
+                            }
+                        }
+                    }
+                }
+                had_streaming_update = true;
+            }
+            StreamChunk::ToolEnd { name, success, duration_ms, failure_kind } => {
+                // V28 (T3): 反查 streaming_tools 拿 trace_id, 直接定位 trace_events
+                // 中对应条目更新 status + duration_ms(替代 add_event 重复事件)。
+                let new_status = if success {
+                    crate::tui::state::StreamingToolStatus::Success
+                } else {
+                    crate::tui::state::StreamingToolStatus::Failed
+                };
+                let mut updated_trace_id: Option<u64> = None;
+                if let Some(tool) = state.streaming_tools.iter_mut().rev()
+                    .find(|(n, s, _, _)| *n == name && *s == crate::tui::state::StreamingToolStatus::Running)
+                {
+                    tool.1 = new_status;
+                    tool.2 = Some(duration_ms);
+                    updated_trace_id = Some(tool.3);
+                }
+
+                // V32: knowledge_calls 修复 —— 旧实现 `name.find("→ ")` 永远 fail
+                // (ToolEnd.name = tc.function.name, 工具函数名不含 "→ " 也不含路径)。
+                // 真实 path 在 trace_events.kind.ToolCall.args 的 JSON 字段。
+                // 引用关系：trace_event 在 ToolStart 时建立, args 已写入。
+                // 触发条件：仅当 path 命中知识库/记忆宫殿语义路径时才追踪
+                // (避免任意文件读写都被算作知识调用)
+                // T-1 fix: ToolEnd 中两处 iter().find() 改为 O(1) index 查找
+                if success {
+                    if let Some(tid) = updated_trace_id {
+                        if let Some(&idx) = state.trace_event_index.get(&tid) {
+                            if let Some(ev) = state.trace_events.get(idx) {
+                                if let crate::tui::state::TraceKind::ToolCall { args, .. } = &ev.kind {
+                                    if !args.is_empty() {
+                                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(args) {
+                                            let path_opt = json.get("path")
+                                                .or_else(|| json.get("file_path"))
+                                                .and_then(|v| v.as_str());
+                                            if let Some(p) = path_opt {
+                                                state.track_knowledge_call(p);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(tid) = updated_trace_id {
+                    if let Some(&idx) = state.trace_event_index.get(&tid) {
+                        if let Some(ev) = state.trace_events.get_mut(idx) {
+                            ev.duration_ms = Some(duration_ms);
+                            ev.level = if success {
+                                crate::tui::state::EventLevel::Notice
+                            } else {
+                                crate::tui::state::EventLevel::Warning
+                            };
+                            if let crate::tui::state::TraceKind::ToolCall { status, .. } = &mut ev.kind {
+                                *status = if success {
+                                    crate::tui::state::ToolStatus::Success
+                                } else {
+                                    crate::tui::state::ToolStatus::Failed
+                                };
+                            }
+                        }
+                    }
+                }
+                // V40: 更新 timeline Tool entry（status + duration + failure_kind）
+                let tl_status = if success {
+                    crate::tui::state::StreamingToolStatus::Success
+                } else {
+                    crate::tui::state::StreamingToolStatus::Failed
+                };
+                if let Some(crate::tui::state::TimelineEntry::Tool {
+                    status: ref mut st, duration_ms: ref mut dur, failure_kind: ref mut fk, ..
+                }) = state.streaming_timeline.iter_mut().rev()
+                    .find(|e| matches!(e, crate::tui::state::TimelineEntry::Tool { name: ref n, status: ref s, .. }
+                        if *n == name && *s == crate::tui::state::StreamingToolStatus::Running))
+                {
+                    *st = tl_status;
+                    *dur = Some(duration_ms);
+                    *fk = failure_kind;
+                }
+                had_streaming_update = true;
+            }
+            StreamChunk::ConfirmRequired(req) => {
+                // V28：实时授权请求——pipeline dispatch 已挂起等待用户决策
+                //   弹 ConfirmDialog；用户响应后通过 SessionState.mcip_confirm_channels[nonce]
+                //   直发 oneshot::Sender（不再 grant_and_rerun 重发整个 turn）
+                use crate::tui::state::{ConfirmDialog, ConfirmType, ConfirmRisk, ConfirmOption};
+                use abacus_core::mcip::McipConfirmKind;
+
+                // 授权决策：只有用户主动永久授权的工具直接放行
+                // 工具语义判断已移至引擎层（pipeline 计算 suggested_action）
+                // TUI 不再做关键词匹配，始终弹窗展示系统建议，由系统+用户共同决策
+                let auto_allow = state.always_allow.contains(&req.tool_id);
+
+                if auto_allow {
+                    let nonce = req.nonce.clone();
+                    let engine = state.engine_handle.clone();
+                    tokio::spawn(async move {
+                        if let Some(eng) = engine {
+                            // 提前取出 sender 释放 std::sync::MutexGuard，
+                            // 避免与 SessionState read guard 跨 await 冲突
+                            let tx_one = {
+                                let s = eng.session.read().await;
+                                let mut guard = s.mcip_confirm_channels.lock().unwrap_or_else(|e| e.into_inner());
+                                let removed = guard.remove(&nonce);
+                                drop(guard);
+                                removed
+                            };
+                            if let Some(tx) = tx_one {
+                                let _ = tx.send(true);
+                            }
+                        }
+                    });
+                    state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.auto_allow_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Info);
+                } else {
+                    // 弹窗 — 使用 assess_command_risk 做细粒度分级
+                    let reason_destructive = req.reason.starts_with("[destructive]");
+                    let is_destructive_flag = matches!(req.kind, McipConfirmKind::DestructiveOp) || reason_destructive;
+                    let (confirm_type, risk) = if is_destructive_flag {
+                        (ConfirmType::ShellExec, ConfirmRisk::High)
+                    } else if req.tool_id.contains("bash") || req.tool_id.contains("shell") {
+                        // bash 工具：从 params_preview 提取命令做精确风险评估
+                        let cmd_risk = req.params_preview.as_deref()
+                            .map(|p| crate::tui::state::assess_command_risk(p))
+                            .unwrap_or(ConfirmRisk::Medium);
+                        (ConfirmType::ShellExec, cmd_risk)
+                    } else {
+                        (ConfirmType::NetworkRequest, ConfirmRisk::Medium)
+                    };
+                    let mut details = vec![req.reason.clone()];
+                    if let Some(ref preview) = req.params_preview {
+                        details.push(format!("params: {}", preview));
+                    }
+                    let mut options = vec![ConfirmOption { key: 'Y', label: crate::tui::i18n::t("confirm.allow").to_string() }];
+                    if !is_destructive_flag {
+                        options.push(ConfirmOption { key: 'A', label: crate::tui::i18n::t("confirm.always").to_string() });
+                    }
+                    options.push(ConfirmOption { key: 'N', label: crate::tui::i18n::t("confirm.deny").to_string() });
+                    state.confirm_dialog = Some(ConfirmDialog {
+                        title: format!("🔐 {}", req.tool_id),
+                        confirm_type,
+                        tool_id: req.tool_id.clone(),
+                        action: req.tool_id.clone(),
+                        details,
+                        risk,
+                        options,
+                        callback_id: format!("mcip:{}", req.nonce),
+                        allow_always: !is_destructive_flag,
+                        created_at: std::time::Instant::now(),
+                        details_expanded: false,
+                        selected: 0,
+                        interaction_paused: false,
+                        paused_total: std::time::Duration::ZERO,
+                        focus_lost_at: None,
+                        last_active_at: std::time::Instant::now(),
+                        suggested_action: req.suggested_action,
+                    });
+                    state.pending_mcip_confirmations = vec![req.clone()];
+                    state.add_event(&ts, "mcip", &crate::tui::i18n::tf("event.wait_auth_tool", &[&req.tool_id]), crate::tui::state::EventLevel::Warning);
+                }
+                state.mark_render_dirty();
+            }
+            StreamChunk::CompressStart => {
+                // 显式状态切换：压缩是可见操作阶段
+                state.pre_compress_input_state = Some(state.input_state);
+                state.set_busy_state(InputState::Executing);
+                state.processing_phase = crate::tui::i18n::t("compress.phase").to_string();
+                state.add_toast(crate::tui::i18n::t("compress.toast_start"), Duration::from_secs(3));
+                state.mark_render_dirty();
+                state.frame_dirty.set(true);
+            }
+            StreamChunk::CompressEnd { messages_compressed, tokens_saved } => {
+                // 显式恢复压缩前状态
+                if let Some(prev) = state.pre_compress_input_state.take() {
+                    state.input_state = prev;
+                }
+                if messages_compressed > 0 {
+                    state.add_event(
+                        &ts, "context",
+                        &format!("{} {} msgs · ~{} tok", crate::tui::i18n::t("compress.event"), messages_compressed, tokens_saved),
+                        crate::tui::state::EventLevel::Info,
+                    );
+                    let note = format!(
+                        "--- {} ---\n{} messages → summary (~{} tokens freed)",
+                        crate::tui::i18n::t("compress.note"), messages_compressed, tokens_saved
+                    );
+                    state.push_system_note(&note);
+                    state.session_tokens.total_tokens = state.session_tokens.total_tokens
+                        .saturating_sub(tokens_saved as u64);
+                    state.session_tokens.prompt_tokens = state.session_tokens.prompt_tokens
+                        .saturating_sub(tokens_saved as u64);
+                    state.session_tokens.compress_count += 1;
+                    state.session_tokens.compress_tokens_saved += tokens_saved as u64;
+                    state.add_toast(
+                        format!("{} · -{} tok", crate::tui::i18n::t("compress.toast_done"), tokens_saved),
+                        Duration::from_secs(3),
+                    );
+                }
+                state.processing_phase.clear();
+                // pending_compress_input 保留：
+                //   Execution 阶段 → CompressAutoResume 来了会消费它
+                //   Communication 阶段 → interval tick 检测到非 busy 时消费（见下方）
+                state.mark_render_dirty();
+                state.frame_dirty.set(true);
+            }
+            StreamChunk::CompressAutoResume => {
+                // Execution 阶段压缩完成，自动续行
+                // 优先使用用户暂存消息；无暂存则发送续行提示
+                let msg = state.pending_compress_input.take()
+                    .unwrap_or_else(|| "continue current task".to_string());
+                // 压缩完成 toast 已由 CompressEnd 发出，AutoResume 不再重复
+                state.input = msg;
+                crate::tui::event::submit_message(state);
+                state.mark_render_dirty();
+                state.frame_dirty.set(true);
+            }
+            StreamChunk::ToolHealth(entries) => {
+                // 工具健康快照：写入 state 供 panel 渲染
+                // 引用关系：api/mod.rs 在 Complete 前发送 → 此处消费
+                for entry in entries {
+                    state.tool_health.insert(entry.tool_id.clone(), entry);
+                }
+            }
+            StreamChunk::Complete(stats) => {
+                // 成功完成：清除网络异常标记
+                state.connection_error = false;
+                // 同步当前 provider_id（配置中的实际 provider，非推断）
+                if !stats.provider_id.is_empty() {
+                    state.active_provider_id = stats.provider_id.clone();
+                }
+                // 同步当前 model_id（LLM 端 alias 解析后的真实模型名）
+                // 修复：之前 model_name 只在 setup/discover 阶段更新，chat 完成后没同步
+                // 导致看板显示 setup 选的模型名，但实际 LLM 调用的是 alias 解析后的名字
+                if !stats.model_id.is_empty() && stats.model_id != state.model_name {
+                    state.theme.apply_model_brand(&stats.model_id);
+                    state.model_name = stats.model_id.clone();
+                }
+                // Complete: ctx_live_tokens 优先用 context_tokens（含 system prompt/tools），
+                // fallback 到 prompt+completion（API usage 返回值）
+                state.ctx_live_tokens = stats.context_tokens
+                    .unwrap_or_else(|| stats.prompt_tokens.saturating_add(stats.completion_tokens));
+                state.ctx_estimate_at = None;
+                // 同步 latest_prompt_tokens — 让 Panel/fallback 路径及时反映最新值
+                state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
+                // V40: 实时更新上下文窗口占用（面板每帧可见最新数据）
+                state.session_tokens.latest_prompt_tokens = stats.prompt_tokens;
+                // context_tokens 覆盖 total_tokens（用 context_manager 的精确值替换 API usage）
+                if let Some(ctx_tok) = stats.context_tokens {
+                    state.session_tokens.total_tokens = ctx_tok;
+                }
+                if let Some(ctx_max) = stats.context_max {
+                    state.context_window = ctx_max as usize;
+                }
+                if let Some(ml) = stats.model_limit {
+                    state.model_max_context = ml as usize;
+                }
+                // P1: 不在 Complete 时清空 streaming 内容——等 EngineResponse 到达后统一处理
+                // 避免 Complete→EngineResponse 间隔导致内容"闪跳"（ST1 改进）
+                state.streaming_complete = true;
+                // V40: Complete = "当前 LLM 调用完成"，不是 "整个 turn 结束"
+                // Pipeline 可能继续执行工具 + 发起新 LLM 调用。
+                // 只有 EngineResponse 到达才真正设 Ready。
+                // 这里切到 Executing（表示 pipeline 还在工作，可能调工具）
+                state.set_busy_state(InputState::Executing);
+                state.processing_phase = "· wrapping up...".into();
+                state.mark_render_dirty();
+                // 不 break — 继续监听后续 chunks（下一轮 ToolStart/TextDelta）
+                // 但如果 EngineResponse 已经在 res_rx 里，外层循环会处理
+            }
+            StreamChunk::AuthResult { tool, approved } => {
+                // 授权结果通知：显示 toast，不产生假工具 trace
+                let msg = if approved {
+                    format!("✓ Authorized {}", tool)
+                } else {
+                    format!("✗ Denied {} (unsafe op)", tool)
+                };
+                let dur = if approved {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_secs(4)
+                };
+                state.add_toast(msg, dur);
+                state.mark_render_dirty();
+            }
+            StreamChunk::Error(e) => {
+                let is_net = e.starts_with("NETWORK_ERROR:");
+                let is_fatal_net = e.starts_with("NETWORK_ERROR:FATAL:");
+
+                // 2026-05-28: 保留已流式的部分内容（fatal 时不丢弃）
+                let partial_text = if is_fatal_net && !state.last_llm_text().is_empty() {
+                    Some(state.take_last_llm_text())
+                } else {
+                    None
+                };
+
+                state.reset_streaming();
+                if state.input_state != InputState::Editor {
+                    state.input_state = InputState::Ready;
+                }
+                state.op_started_at = None;
+                state.accumulated_elapsed = Duration::ZERO;
+                state.mark_render_dirty();
+
+                if is_net {
+                    // 网络错误：标记状态 + 专属提示
+                    state.connection_error = true;
+                    let msg = if is_fatal_net {
+                        "Network connection failed, please check and retry".to_string()
+                    } else {
+                        // 重试中：不弹 toast，只更新 processing_phase
+                        let phase_msg = e.trim_start_matches("NETWORK_ERROR:")
+                            .trim_start_matches("retrying ")
+                            .to_string();
+                        state.processing_phase = format!("⚠ {}", phase_msg);
+                        state.add_event(&ts, "network", "Network failed, retrying...", crate::tui::state::EventLevel::Warning);
+                        while stream_rx.try_recv().is_ok() {}
+                        // 继续处理下一个 chunk（等待重试结果），不 break
+                        continue;
+                    };
+                    // 2026-05-28: 如果有部分内容，保留为系统消息（不丢弃用户已看到的内容）
+                    if let Some(partial) = partial_text {
+                        state.push_system_note(&format!(
+                            "--- Output interrupted (partial received) ---\n{}\n\n⚠ {}",
+                            partial, msg
+                        ));
+                    } else {
+                        state.push_system_note(&format!("--- Network error ---\n{}", msg));
+                    }
+                    state.add_event(&ts, "network", &msg, crate::tui::state::EventLevel::Warning);
+                    state.add_toast(
+                        format!("⚠ {}", msg),
+                        Duration::from_secs(8),
+                    );
+                } else {
+                    // API / 其他错误
+                    state.add_event(&ts, "llm", &format!("Error: {}", e), crate::tui::state::EventLevel::Warning);
+                    state.add_toast(format!("Stream error: {}", e), Duration::from_secs(5));
+                }
+                while stream_rx.try_recv().is_ok() {}
+                break;
+            }
+            // 2026-05-28: 流中断后重试——清除已渲染的部分内容，等待重新生成
+            StreamChunk::StreamRetryReset { partial_text } => {
+                // V42-B: CardStream handle_chunk 已清除 current LlmCard 内容
+                // P2: 重置 markdown 增量解析引擎——text 清空后 md 内部偏移不一致
+                *state.streaming_md.borrow_mut() = None;
+                // 在 timeline 中标注中断点
+                if !partial_text.is_empty() {
+                    let truncated = if partial_text.len() > 60 {
+                        format!("{}...", &partial_text[..60])
+                    } else {
+                        partial_text
+                    };
+                    state.add_event(&ts, "stream", &format!("Output interrupted ({} chars), retrying...", truncated.len()),
+                        crate::tui::state::EventLevel::Warning);
+                }
+                state.processing_phase = "Stream interrupted, retrying...".to_string();
+                had_streaming_update = true;
+            }
+            StreamChunk::RetryProgress { attempt, max_attempts, reason } => {
+                state.processing_phase = format!("Retry {}/{}: {}", attempt, max_attempts, reason);
+                had_streaming_update = true;
+            }
+            // ── Team 模式进度通知 → 更新 state.tasks 面板 ──
+            StreamChunk::TeamProgress { phase, tasks } => {
+                state.tasks = tasks.iter().map(|t| {
+                    crate::tui::state::TaskCard {
+                        id: t.id.clone(),
+                        title: t.title.clone(),
+                        assignee: String::new(),
+                        status: match t.status.as_str() {
+                            "running" => crate::tui::state::TaskStatus::InProgress,
+                            "done" => crate::tui::state::TaskStatus::Done,
+                            "failed" => crate::tui::state::TaskStatus::Blocked,
+                            _ => crate::tui::state::TaskStatus::Pending,
+                        },
+                        progress: match t.status.as_str() {
+                            "done" => 100,
+                            "running" => 50,
+                            _ => 0,
+                        },
+                        deps: vec![],
+                        description: t.output_preview.clone().unwrap_or_default(),
+                    }
+                }).collect();
+                state.processing_phase = format!("team/{}", phase);
+                had_streaming_update = true;
+            }
+            // ── 预留事件处理（轻量级 — trace event + toast）──
+            StreamChunk::ModelEscalation { from_model, to_model, reason } => {
+                state.add_event(&ts, "model", &format!("{} → {} ({})", from_model, to_model, reason), crate::tui::state::EventLevel::Info);
+                state.add_toast(format!("Model escalation: {} → {}", from_model, to_model), Duration::from_secs(3));
+                had_streaming_update = true;
+            }
+            StreamChunk::SessionFocusUpdate { goal, phase, .. } => {
+                state.add_event(&ts, "focus", &format!("[{}] {}", phase, goal), crate::tui::state::EventLevel::Info);
+                had_streaming_update = true;
+            }
+            StreamChunk::ToolBlocked { tool_id, kind, message, .. } => {
+                state.add_event(&ts, "tool", &format!("⚠ {} blocked: {} ({})", tool_id, message, kind), crate::tui::state::EventLevel::Warning);
+                had_streaming_update = true;
+            }
+            StreamChunk::MeetingStatusChange { new_status, .. } => {
+                state.add_event(&ts, "meeting", &format!("Status: {}", new_status), crate::tui::state::EventLevel::Info);
+                had_streaming_update = true;
+            }
+            StreamChunk::SpecialistThinking { specialist_id, content } => {
+                state.add_event(&ts, "specialist", &format!("[{}] {}", specialist_id, content.chars().take(60).collect::<String>()), crate::tui::state::EventLevel::Info);
+                had_streaming_update = true;
+            }
+            StreamChunk::SandboxProgress { phase, message } => {
+                state.processing_phase = format!("sandbox/{}", phase);
+                state.add_event(&ts, "sandbox", &message, crate::tui::state::EventLevel::Info);
+                had_streaming_update = true;
+            }
+            StreamChunk::InertiaDetected { recommendation, .. } => {
+                state.add_event(&ts, "inertia", &recommendation, crate::tui::state::EventLevel::Warning);
+                state.add_toast(format!("⚠ Loop detected: {}", recommendation), Duration::from_secs(5));
+                had_streaming_update = true;
+            }
+            StreamChunk::LongOperation { tool_name, estimated_secs } => {
+                state.add_toast(
+                    format!("Long operation ~{}s, please wait...", estimated_secs),
+                    Duration::from_secs(estimated_secs.min(10)),
+                );
+                state.add_event(&ts, "tool", &format!("{} est. {}s", tool_name, estimated_secs), crate::tui::state::EventLevel::Info);
+                had_streaming_update = true;
+            }
+            // V41: ToolAgent 批量执行结果 — 替代多条 ToolStart/ToolEnd 刷屏
+            StreamChunk::ToolAgentResult { agent_id: _, icon, name, call_count, summary, details } => {
+                // V42-B: LlmCard 写入已由 writer::handle_chunk 处理
+                // 这里仅记录 timeline（V40 字段，暂无 CardStream 等价物）
+                state.push_timeline_entry(
+                    crate::tui::state::TimelineEntry::ToolAgent {
+                        icon: icon.clone(),
+                        name: name.clone(),
+                        call_count,
+                        summary: summary.clone(),
+                        details,
+                    }
+                );
+                had_streaming_update = true;
+            }
+        }
+        // V42-B: forward to CardStream writer (clone consumed by match above)
+        crate::tui::cards::writer::handle_chunk(state, &chunk_for_cards);
+    }
+    had_streaming_update
+}
 fn load_panel_sections_from_config() -> Option<Vec<String>> {
     let path = abacus_core::paths::config_toml();
     let content = std::fs::read_to_string(&path).ok()?;

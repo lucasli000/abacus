@@ -18,5 +18,11 @@ ratatui = "0.28"
 # workspace 共享版本 + derive feature
 serde = { workspace = true }
 
+# Unicode width — CJK/全角字符显示列宽计算
+# 引用关系：card_render.rs build_title_spans + 各 Card header 实现
+# 设计动机：chars().count() 在 CJK 文本下会少算（每个全角 2 列），
+#          用 display_width 防止 CardHeader 填充/对齐错位
+unicode-width = "0.1"
+
 [lints]
 workspace = true

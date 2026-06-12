@@ -86,6 +86,106 @@ impl Default for MagChain {
 
 // ─── Circuit Breaker ───────────────────────────────────────────────────
 
+/// 跨会话资源锁（防止多 session 并写同一文件）
+///
+/// ## 设计
+/// - 仅对 fs_write / fs_edit / fs_move 等写操作生效
+/// - 锁存储在内存中（HashMap<path, LockInfo>），进程退出自动释放
+/// - TTL 超时自动释放（防止进程崩溃后锁泄漏）
+/// - 同一 session 内的重复写入不触发锁（只检查 session_id）
+///
+/// ## 引用关系
+/// - 注册：engine_init.rs / server.rs 在 MagChain 中注册
+/// - 消费：MagChain::before_execute 调用
+/// - 配置：CoreConfig.resource_lock_enabled / resource_lock_ttl_secs
+pub struct ResourceGuard {
+    /// path → (session_id, acquired_at)
+    locks: RwLock<HashMap<String, (String, Instant)>>,
+    /// 锁 TTL
+    ttl: Duration,
+    /// 当前 session ID
+    session_id: String,
+}
+
+impl ResourceGuard {
+    pub fn new(ttl_secs: u64, session_id: String) -> Self {
+        Self {
+            locks: RwLock::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+            session_id,
+        }
+    }
+
+    /// 从路径提取文件路径参数
+    fn extract_path(tool_id: &ToolId, params: &serde_json::Value) -> Option<String> {
+        match tool_id.0.as_str() {
+            "fs_write" | "fs_edit" | "fs_move" => {
+                params.get("path").or(params.get("destination"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Middleware for ResourceGuard {
+    async fn before_execute(&self, tool_id: &ToolId, params: &serde_json::Value) -> Result<(), KernelError> {
+        let path = match Self::extract_path(tool_id, params) {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let mut locks = self.locks.write().await;
+
+        // 清理过期锁
+        locks.retain(|_, (_, acquired)| acquired.elapsed() < self.ttl);
+
+        // 检查锁
+        if let Some((owner, acquired)) = locks.get(&path) {
+            if owner != &self.session_id {
+                if acquired.elapsed() < self.ttl {
+                    return Err(KernelError::Other(format!(
+                        "resource locked: {} is being edited by another session (TTL {}s remaining)",
+                        path,
+                        self.ttl.as_secs().saturating_sub(acquired.elapsed().as_secs())
+                    )));
+                }
+            }
+        }
+
+        // 获取锁
+        locks.insert(path, (self.session_id.clone(), Instant::now()));
+        Ok(())
+    }
+
+    async fn after_execute(&self, tool_id: &ToolId, _output: &mut ToolOutput) -> Result<(), KernelError> {
+        // 写操作完成后释放锁（仅释放自己持有的锁）
+        // 注意：after_execute 的 trait 签名不传 params，所以无法提取 path。
+        // 解决方案：遍历 locks 找到当前 session 持有的、且工具类型匹配的锁释放。
+        let write_tools = ["fs_write", "fs_edit", "fs_move"];
+        if !write_tools.contains(&tool_id.0.as_str()) {
+            return Ok(());
+        }
+
+        let mut locks = self.locks.write().await;
+        // 找到当前 session 持有的锁并释放（通常是最后一个）
+        let to_release: Vec<String> = locks.iter()
+            .filter(|(_, (owner, _))| owner == &self.session_id)
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in to_release {
+            locks.remove(&path);
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str { "resource_guard" }
+}
+
+// ─── Circuit Breaker ───────────────────────────────────────────────────
+
 /// 熔断器中间件
 pub struct CircuitBreaker {
     state: RwLock<HashMap<ToolId, CircuitState>>,
@@ -924,6 +1024,26 @@ pub enum PipelineEvent {
         /// 当前 turn 编号
         turn_number: u32,
     },
+    /// V42-B: 工具调用前（安全检查通过后、实际执行前）
+    /// 用于 payload-guard、资源协调器、经验采集器等
+    PreToolUse {
+        /// 工具 ID
+        tool_id: String,
+        /// 工具参数 JSON
+        params: String,
+    },
+    /// V42-B: 工具调用后（执行完成、结果返回前）
+    /// 用于文件分类器、经验采集器、效果追踪等
+    PostToolUse {
+        /// 工具 ID
+        tool_id: String,
+        /// 工具参数 JSON（用于文件分类器提取路径）
+        params: String,
+        /// 执行是否成功
+        success: bool,
+        /// 执行耗时（ms）
+        latency_ms: u64,
+    },
 }
 
 /// Pipeline Hook 的响应动作
@@ -987,6 +1107,10 @@ impl PipelineHook for LoggingHook {
                 tracing::info!(hook = self.prefix.as_str(), response_len, tool_calls, latency_ms, completion_tokens, "turn end"),
             PipelineEvent::TriageResult { stats, turn_number } =>
                 tracing::info!(hook = self.prefix.as_str(), turn = turn_number, summary = stats.summary_line().as_str(), "triage result"),
+            PipelineEvent::PreToolUse { tool_id, .. } =>
+                tracing::debug!(hook = self.prefix.as_str(), tool_id = tool_id.as_str(), "pre tool use"),
+            PipelineEvent::PostToolUse { tool_id, success, latency_ms, .. } =>
+                tracing::debug!(hook = self.prefix.as_str(), tool_id = tool_id.as_str(), success, latency_ms, "post tool use"),
         }
         Ok(HookAction::Continue)
     }

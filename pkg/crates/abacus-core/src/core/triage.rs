@@ -105,6 +105,43 @@ impl Default for TriageConfig {
     }
 }
 
+impl TriageConfig {
+    /// 从 ConfigManager 自动绑定所有字段（单一来源）
+    ///
+    /// ## 缺省行为
+    /// 任何未在 config 中显式配置的键，回退到 `Self::default()` 的值。
+    pub fn from_config_manager(cfg: &crate::config::ConfigManager) -> Self {
+        let mut t = Self::default();
+        t.enabled = cfg.get_bool("triage.enabled").unwrap_or(t.enabled);
+        t.audit_only = cfg.get_bool("triage.audit_only").unwrap_or(t.audit_only);
+        t.keep_count = cfg.get_number("triage.keep_count")
+            .map(|n| n as usize).unwrap_or(t.keep_count);
+        t.early_keep = cfg.get_number("triage.early_keep")
+            .map(|n| n as usize).unwrap_or(t.early_keep);
+        t.inject_threshold = cfg.get_number("triage.inject_threshold")
+            .unwrap_or(t.inject_threshold);
+        t.standby_threshold = cfg.get_number("triage.standby_threshold")
+            .unwrap_or(t.standby_threshold);
+        t.cold_threshold = cfg.get_number("triage.cold_threshold")
+            .unwrap_or(t.cold_threshold);
+        t.hysteresis_deadband = cfg.get_number("triage.hysteresis_deadband")
+            .unwrap_or(t.hysteresis_deadband);
+        t.sticky_turns = cfg.get_number("triage.sticky_turns")
+            .map(|n| n as u32).unwrap_or(t.sticky_turns);
+        t.cooldown_turns = cfg.get_number("triage.cooldown_turns")
+            .map(|n| n as u32).unwrap_or(t.cooldown_turns);
+        t.max_compress_depth = cfg.get_number("triage.max_compress_depth")
+            .map(|n| n as u32).unwrap_or(t.max_compress_depth);
+        t.standby_capacity = cfg.get_number("triage.standby_capacity")
+            .map(|n| n as usize).unwrap_or(t.standby_capacity);
+        t.cold_batch_cap = cfg.get_number("triage.cold_batch_cap")
+            .map(|n| n as usize).unwrap_or(t.cold_batch_cap);
+        t.skip_below_msg_count = cfg.get_number("triage.skip_below_msg_count")
+            .map(|n| n as usize).unwrap_or(t.skip_below_msg_count);
+        t
+    }
+}
+
 // ─── Audit Record ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -395,7 +432,18 @@ impl Default for AdaptiveSkip {
 }
 
 impl AdaptiveSkip {
+    /// 自适应跳过判断：是否应该执行本轮 triage
+    ///
+    /// ## 设计意图
+    /// 默认每 2 轮执行一次 triage（减少 CPU 开销），但在以下情况立即执行：
+    /// - 上下文压力 >= 70%（接近压缩阈值）
+    /// - 消息数量增长 >= 20 条或 >= 30%（大量新内容注入）
+    /// - 输入与最近上下文相似度 < 0.15（新话题）
+    /// - 连续稳定 < 2 轮（刚开始收敛，需要更频繁检查）
+    ///
+    /// 连续稳定 >= 5 轮后，跳过间隔从 2 扩展到 max_skip（默认 5）
     fn should_run(&self, pressure: f64, current_msg_count: usize, input: &str, recent_text: &str) -> bool {
+        // 强制执行条件
         if self.skipped_since_last >= self.max_skip {
             return true;
         }
@@ -421,10 +469,12 @@ impl AdaptiveSkip {
         if self.last_entropy > 0.0 && self.consecutive_stable < 2 {
             return true;
         }
+        // 稳定后扩展跳过间隔
         if self.consecutive_stable >= 5 {
-            return false;
+            return self.skipped_since_last >= self.max_skip;
         }
-        self.skipped_since_last >= 1
+        // 默认：每 2 轮执行一次
+        self.skipped_since_last >= 2
     }
 
     fn update(&mut self, stats: &TriageStats, current_msg_count: usize) {
@@ -467,6 +517,9 @@ pub struct TriageEngine {
     cold_writer: Option<Arc<ColdBufferWriter>>,
     event_bus: Option<Arc<EventBus>>,
     reranker: Option<Arc<dyn TriageReranker>>,
+    /// V42-B 冷层桥接：DualPalaceMemory 引用（可选 — 未注入时走旧 ColdBufferWriter 路径）
+    /// COLD 块同时写入知识宫殿，享受 SM-2 衰减 + MemoryBridge 关系链
+    memory_palace: Option<Arc<tokio::sync::RwLock<crate::memory_palace::DualPalaceMemory>>>,
     audit: RwLock<Vec<TriageAuditRecord>>,
     /// W4-D5: block_id → (last_action, remaining_sticky_turns)
     sticky_tracker: RwLock<HashMap<String, (TriageAction, u32)>>,
@@ -481,12 +534,12 @@ pub struct TriageEngine {
 impl TriageEngine {
     pub fn new(config: TriageConfig, ctx: Arc<ContextManager>) -> Self {
         let scorer = Arc::new(DefaultScorer::new(1.2));
-        Self { config, scorer, ctx, kb: None, standby_cache: None, cold_writer: None, event_bus: None, reranker: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
+        Self { config, scorer, ctx, kb: None, standby_cache: None, cold_writer: None, event_bus: None, reranker: None, memory_palace: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
     }
 
     pub fn with_kb(config: TriageConfig, ctx: Arc<ContextManager>, kb: Arc<KnowledgeStore>) -> Self {
         let scorer = Arc::new(DefaultScorer::with_kb(1.2, kb.clone()));
-        Self { config, scorer, ctx, kb: Some(kb), standby_cache: None, cold_writer: None, event_bus: None, reranker: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
+        Self { config, scorer, ctx, kb: Some(kb), standby_cache: None, cold_writer: None, event_bus: None, reranker: None, memory_palace: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
     }
 
     pub fn with_standby(mut self, cache: Arc<StandbyCache>) -> Self {
@@ -505,7 +558,7 @@ impl TriageEngine {
     }
 
     pub fn with_scorer(config: TriageConfig, ctx: Arc<ContextManager>, scorer: Arc<dyn TriageScorer>) -> Self {
-        Self { config, scorer, ctx, kb: None, standby_cache: None, cold_writer: None, event_bus: None, reranker: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
+        Self { config, scorer, ctx, kb: None, standby_cache: None, cold_writer: None, event_bus: None, reranker: None, memory_palace: None, audit: RwLock::new(Vec::new()), sticky_tracker: RwLock::new(HashMap::new()), cooldown_tracker: RwLock::new(HashMap::new()), base_thresholds: RwLock::new(None), adaptive_skip: RwLock::new(AdaptiveSkip::default()) }
     }
 
     /// W5-D4: 更新运行时配置（支持 hot-reload）
@@ -531,6 +584,18 @@ impl TriageEngine {
     /// W5-D5: 注入 TriageReranker
     pub fn set_reranker(&mut self, reranker: Arc<dyn TriageReranker>) {
         self.reranker = Some(reranker);
+    }
+
+    /// V42-B: 注入 DualPalaceMemory（冷层桥接）
+    /// COLD 块同时写入知识宫殿，享受 SM-2 衰减 + MemoryBridge 关系链
+    pub fn with_memory_palace(mut self, palace: Arc<tokio::sync::RwLock<crate::memory_palace::DualPalaceMemory>>) -> Self {
+        self.memory_palace = Some(palace);
+        self
+    }
+
+    /// V42-B: 延迟注入 DualPalaceMemory（CoreLoop::with_memory 后调用）
+    pub fn set_memory_palace(&mut self, palace: Arc<tokio::sync::RwLock<crate::memory_palace::DualPalaceMemory>>) {
+        self.memory_palace = Some(palace);
     }
 
     /// W5-D7: 根据上下文压力调整阈值（压力高时更激进地冷却）
@@ -1148,6 +1213,33 @@ impl TriageEngine {
                             .unwrap_or(0),
                     };
                     writer.push(record).await;
+                }
+            }
+        }
+
+        // V42-B 冷层桥接: COLD 块同时写入 DualPalaceMemory（知识宫殿）
+        // 让冷层数据享受 SM-2 衰减管理 + MemoryBridge 关系链
+        if let Some(ref palace) = self.memory_palace {
+            let palace = palace.read().await;
+            for block in blocks.iter() {
+                if let TriageAction::Cold { recall_id, summary } = &block.action {
+                    let content = block.messages.iter()
+                        .filter_map(|m| match &m.content {
+                            Some(MessageContent::Text(t)) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<&str>>()
+                        .join("\n");
+                    if content.is_empty() && summary.is_empty() {
+                        continue;
+                    }
+                    let entry = crate::memory_palace::KnowledgeEntry::new(
+                        recall_id.clone(),
+                        format!("Cold block @ turn {}", turn),
+                        if content.is_empty() { summary.clone() } else { content },
+                        "cold_archive",
+                    );
+                    palace.store_knowledge(entry).await;
                 }
             }
         }

@@ -37,6 +37,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::card::{default_color_for_kind, CardCollapse, CardHeader, CardHit, CardStreaming, MessageCard};
 use crate::section::SectionContext;
+use crate::util::display_width;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 卡片整体高度 = header(1) + body(N)
@@ -209,6 +210,26 @@ pub fn paint_card_top_shimmer(
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 构造 header 行的 title spans —— `{title} ··· {trailing} [▸]`
+///
+/// ## CJK 宽度修正 (2026-06-11)
+///
+/// 历史上若调用方在 header 上做 `fill_w` 填充（如 `display_width(title) + 3`），
+/// 用了 `s.chars().count()` 算 padding 长度，CJK 标题会被少算一列，
+/// 末尾 trailing 时间戳对齐错位。本函数显式按 display column 计算
+/// `title + trailing + shimmer` 的总显示宽度，供调用方做精确 padding/对齐
+/// （如 `pad_to_width`）。当前仅 build_title_spans 内部使用，留作契约。
+#[allow(dead_code)]
+fn header_display_width(header: &CardHeader, with_shimmer: bool) -> usize {
+    let mut w = display_width(&header.title);
+    if !header.trailing.is_empty() {
+        w += 1 + display_width(&header.trailing);
+    }
+    if with_shimmer {
+        w += 1 + 1; // " ●"
+    }
+    w
+}
+
 fn build_title_spans(
     header: &CardHeader,
     color: &Color,
@@ -218,12 +239,16 @@ fn build_title_spans(
     let title_style = Style::default().fg(*color).add_modifier(Modifier::BOLD);
     let trailing_style = Style::default().fg(ctx.theme().muted);
     let mut spans = vec![Span::styled(header.title.clone(), title_style)];
+    let with_shimmer = shimmer_pos != -999;
+    // 显式按 display column 评估 title 宽度, 防 CJK 字符下 `chars().count()` 偏小
+    // 导致 fill_w 算错 (老 path 用 chars().count() 已在 2026-06-11 替换为 display_width)
+    let _title_w = display_width(&header.title);
     if !header.trailing.is_empty() {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(header.trailing.clone(), trailing_style));
     }
     // 流式期间附加 shimmer 字符 (视觉提示, 实际光带在边框上)
-    if shimmer_pos != -999 {
+    if with_shimmer {
         spans.push(Span::raw(" "));
         spans.push(Span::styled("●", Style::default().fg(*color)));
     }

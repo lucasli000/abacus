@@ -133,6 +133,14 @@ pub enum EventKind {
         token_saved: usize,
         was_tool_protocol: bool,
     },
+
+    // ── V42-B: 会话轨迹 ────────────────────────────────────────
+    /// 会话结束事件（用于轨迹持久化）
+    SessionEnd {
+        session_id: String,
+        turn_count: u32,
+        total_latency_ms: u64,
+    },
 }
 
 /// 统一 EventBus
@@ -149,6 +157,12 @@ pub struct EventBus {
     session_id: String,
     jsonl_sink: Option<Arc<JsonlEventHook>>,
     start: Instant,
+    /// V42-B: 双向化 — 订阅者接收所有事件，自行过滤
+    /// 设计：Vec<UnboundedSender> 而非 HashMap<EventKind, Vec<Sender>>
+    /// 原因：EventKind 有数据字段（如 tool_id），无法直接做 key 匹配；
+    /// 订阅者通常关心一类事件，自行 filter 比 EventBus 维护 filter 逻辑更灵活。
+    /// 使用 RwLock 支持内部可变性（Arc<EventBus> 共享时仍可 subscribe）
+    subscribers: tokio::sync::RwLock<Vec<tokio::sync::mpsc::UnboundedSender<EventKind>>>,
 }
 
 impl EventBus {
@@ -160,7 +174,25 @@ impl EventBus {
             session_id: sid,
             jsonl_sink,
             start: Instant::now(),
+            subscribers: tokio::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// 订阅 EventBus 事件（返回 UnboundedReceiver，接收所有事件）
+    ///
+    /// ## 使用方式
+    /// ```ignore
+    /// let mut rx = event_bus.subscribe().await;
+    /// while let Ok(event) = rx.recv().await {
+    ///     if matches!(event, EventKind::ConfigChanged { .. }) {
+    ///         // 处理配置变更
+    ///     }
+    /// }
+    /// ```
+    pub async fn subscribe(&self) -> tokio::sync::mpsc::UnboundedReceiver<EventKind> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.subscribers.write().await.push(tx);
+        rx
     }
 
     /// 发射事件（所有子系统统一入口）
@@ -168,9 +200,11 @@ impl EventBus {
     /// ## 路径
     /// 1. 转化为 tracing event（span 关联）
     /// 2. 写入 JSONL（如果 sink 存在）—— EventKind 数据嵌入 data 字段
+    /// 3. 通知所有订阅者
     ///
     /// ## 失败语义
     /// 写入失败 → 仅 warn，不阻塞调用方
+    /// 订阅者已 drop → 静默移除
     pub fn emit(&self, kind: EventKind) {
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -193,6 +227,14 @@ impl EventBus {
             tokio::spawn(async move {
                 let _ = sink.write_json(&json_line).await;
             });
+        }
+
+        // 3. 通知订阅者（保留已 drop 的 subscriber 不影响其他）
+        // 使用 try_read 避免在 emit 的同步上下文中阻塞
+        if let Ok(subscribers) = self.subscribers.try_read() {
+            for tx in subscribers.iter() {
+                let _ = tx.send(kind.clone());
+            }
         }
     }
 
@@ -301,6 +343,49 @@ impl JsonlEventHook {
                 *file = new_f;
             }
         }
+
+        // P2 资源泄漏修复：清理旧 archive 文件，最多保留 20 个
+        // （测试会创建 ~8 个 archive，20 足够；生产环境仍有效限制积累）
+        const MAX_ARCHIVE_FILES: usize = 20;
+        if let Some(parent) = path.parent() {
+            let archive_prefix = format!("{}.", session_id);
+            let active_name = format!("{}.jsonl", session_id);
+            let mut archive_files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
+            
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = match p.file_name().and_then(|s| s.to_str()) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    // 只匹配当前 session 的 archive 文件
+                    if !name.starts_with(&archive_prefix) || !name.ends_with(".jsonl") {
+                        continue;
+                    }
+                    // 跳过 active 文件
+                    if name == active_name {
+                        continue;
+                    }
+                    let mtime = entry.metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    archive_files.push((mtime, p));
+                }
+            }
+            
+            // 按修改时间排序（最旧的在前）
+            archive_files.sort_by_key(|(mt, _)| *mt);
+            
+            // 删除超过限制的旧文件
+            while archive_files.len() > MAX_ARCHIVE_FILES {
+                if let Some((_, old_path)) = archive_files.first() {
+                    let _ = std::fs::remove_file(old_path);
+                }
+                archive_files.remove(0);
+            }
+        }
+
         Ok(())
     }
 
@@ -378,6 +463,14 @@ impl JsonlEventHook {
                     "summary": stats.summary_line(),
                     "turn_number": turn_number,
                 }),
+            ),
+            PipelineEvent::PreToolUse { tool_id, .. } => (
+                "PreToolUse",
+                serde_json::json!({"tool_id": tool_id}),
+            ),
+            PipelineEvent::PostToolUse { tool_id, success, latency_ms, .. } => (
+                "PostToolUse",
+                serde_json::json!({"tool_id": tool_id, "success": success, "latency_ms": latency_ms}),
             ),
         };
         serde_json::json!({
@@ -858,7 +951,39 @@ impl PipelineHook for GlobalHistoryHook {
         let line_str = serde_json::to_string(&entry).unwrap_or_else(|_| "{}".into());
 
         let file = self.file.clone();
+        let history_path = crate::paths::history_jsonl();
         let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            // P2 资源泄漏修复：history.jsonl 无限增长，增加按行数截断
+            // 检查文件大小，如果超过阈值（10MB），则截断保留最近 10,000 行
+            const MAX_HISTORY_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+            const MAX_HISTORY_LINES: usize = 10_000;
+
+            if history_path.exists() {
+                let meta = std::fs::metadata(&history_path)?;
+                if meta.len() > MAX_HISTORY_FILE_SIZE {
+                    if let Ok(content) = std::fs::read_to_string(&history_path) {
+                        let lines: Vec<&str> = content.lines().collect();
+                        let skip_count = lines.len().saturating_sub(MAX_HISTORY_LINES);
+                        if skip_count > 0 {
+                            let keep: String = lines.into_iter().skip(skip_count)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            // 加回尾部换行
+                            let truncated = format!("{}\n", keep);
+                            let _ = std::fs::write(&history_path, &truncated);
+                        }
+                    }
+                    // 重新打开文件句柄（write 截断了内容，需要重新打开以追加）
+                    // 注意：持有锁时不会并发写入，但外部文件可能已被 write 重建
+                    let mut f = file.blocking_lock();
+                    if let Ok(new_f) = std::fs::OpenOptions::new()
+                        .create(true).append(true).open(&history_path)
+                    {
+                        *f = new_f;
+                    }
+                }
+            }
+
             let mut f = file.blocking_lock();
             writeln!(f, "{}", line_str)?;
             f.flush()?;

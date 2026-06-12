@@ -19,7 +19,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use subtle::ConstantTimeEq;
 
 use abacus_core::config::{ConfigManager, default_config};
-use abacus_core::core::{CoreConfig, CoreLoop, SessionState};
+use abacus_core::core::{CoreLoop, SessionState};
 use abacus_core::core::context::{ContextManager, SessionSnapshot, SessionStore};
 use abacus_core::core::progressive_gate::{GateConfig, ProgressiveGate};
 use abacus_core::llm::fallback_provider::FallbackProvider;
@@ -613,9 +613,15 @@ impl AbacusServer {
         // 配置加载顺序：默认层 < models.toml < config.toml < security.toml < provider.toml < conf.d/*.toml < 环境变量
         // 路径走 abacus_core::paths，遵循 ABACUS_HOME 覆盖。
         use abacus_core::paths;
-        let _ = cfg_mgr.load_file(paths::models_toml());
-        let _ = cfg_mgr.load_file(paths::config_toml());
-        let _ = cfg_mgr.load_file(paths::security_toml());
+        if let Err(e) = cfg_mgr.load_file(paths::models_toml()) {
+            tracing::warn!(path = %paths::models_toml().display(), error = %e, "config load failed");
+        }
+        if let Err(e) = cfg_mgr.load_file(paths::config_toml()) {
+            tracing::warn!(path = %paths::config_toml().display(), error = %e, "config load failed");
+        }
+        if let Err(e) = cfg_mgr.load_file(paths::security_toml()) {
+            tracing::warn!(path = %paths::security_toml().display(), error = %e, "config load failed");
+        }
         let _ = cfg_mgr.load_provider_file(paths::provider_toml());
         cfg_mgr.load_dir(paths::conf_d_dir());
 
@@ -624,17 +630,6 @@ impl AbacusServer {
 
         let default_model = cfg_mgr.get_str("core.default_model")
             .unwrap_or(abacus_types::ModelId::AUTO);
-        let max_turns = cfg_mgr.get_number("core.max_turns")
-            .map(|n| n as u32).unwrap_or(50);
-        let max_tool_calls = cfg_mgr.get_number("core.max_tool_calls")
-            .map(|n| n as u32).unwrap_or(100);
-        let temperature = cfg_mgr.get_number("core.temperature").unwrap_or(0.6);
-        // V40: 对齐 TUI 默认值 64000（支持 DeepSeek thinking 长输出）
-        let max_tokens = cfg_mgr.get_number("core.max_tokens")
-            .map(|n| n as u32).unwrap_or(64000);
-        let context_window = cfg_mgr.get_number("core.context_window")
-            .map(|n| n as usize).unwrap_or(128_000);
-        let silent_router = cfg_mgr.get_bool("core.silent_router_enabled").unwrap_or(true);
         let system_prompt = cfg_mgr.get_str("core.system_prompt")
             .unwrap_or("You are Abacus, an intelligent assistant.");
 
@@ -642,32 +637,10 @@ impl AbacusServer {
         let intent: abacus_types::ThinkingIntent =
             cfg_mgr.get_thinking_intent().unwrap_or(abacus_types::ThinkingIntent::Off);
 
-        // L1 后：thinking_intent 直接传 CoreConfig，无兼容外壳。
-        let legacy_effort: Option<abacus_types::ThinkingEffort> = match &intent {
-            abacus_types::ThinkingIntent::Off => None,
-            abacus_types::ThinkingIntent::Adaptive => Some(abacus_types::ThinkingEffort::High),
-            abacus_types::ThinkingIntent::Effort(level) => Some(match level {
-                abacus_types::EffortLevel::Minimal | abacus_types::EffortLevel::Low => abacus_types::ThinkingEffort::Low,
-                abacus_types::EffortLevel::Medium => abacus_types::ThinkingEffort::Medium,
-                abacus_types::EffortLevel::High | abacus_types::EffortLevel::Max | abacus_types::EffortLevel::XHigh => abacus_types::ThinkingEffort::High,
-            }),
-            abacus_types::ThinkingIntent::Budget(_) => Some(abacus_types::ThinkingEffort::High),
-        };
         let thinking_intent = match &intent {
             abacus_types::ThinkingIntent::Off => None,
             _ => Some(intent.clone()),
         };
-
-        let model_spec = Some(abacus_types::ModelSpec {
-            context_window,
-            max_output_tokens: max_tokens,
-            thinking_config: abacus_types::ModelThinkingConfig {
-                enabled: intent.is_enabled(),
-                effort: legacy_effort,
-                preserve_thinking: false,
-            },
-            ..Default::default()
-        });
 
         // Phase 3：模型能力 catalog——builtin + ~/.abacus/models.toml 覆盖
         let mut catalog = abacus_core::llm::ModelCatalog::builtin();
@@ -682,76 +655,32 @@ impl AbacusServer {
                 Err(e) => tracing::warn!("Failed to merge {}: {}", toml_path.display(), e),
             }
         }
-        let model_catalog = Some(std::sync::Arc::new(catalog));
 
-        let config = CoreConfig {
-            max_turns_per_request: max_turns,
-            max_tool_calls_per_turn: max_tool_calls,
-            default_model: ModelId(default_model.to_string()),
-            default_temperature: temperature,
-            default_max_tokens: max_tokens,
-            context_window_ratio: 1.0,
-            system_prompt: system_prompt.to_string(),
-            model_spec,
-            thinking_intent,
-            silent_router_enabled: silent_router,
-            model_catalog,
-            tool_visibility_threshold: abacus_types::VisibilityTier::D,
-            // Task #84/#87：按任务类型路由工具
-            task_kind_routing_enabled: cfg_mgr.get_bool("core.task_kind_routing").unwrap_or(true),
-            tool_frequency_pruning_turns: cfg_mgr.get_number("core.tool_frequency_pruning_turns")
-                .map(|n| n as u64)
-                .or(Some(20)),
-            palace_sync_interval_turns: None,
-            default_compress_level: abacus_core::core::context::CompressLevel::Brief,
-            // Phase 3 (lint)：从 cfg_mgr 读 lint 配置；缺省 None
-            lint_overrides: cfg_mgr.get_typed::<abacus_core::tool::schema_lint::LintOverrides>("lint"),
-            // Task #96：单 session 模型升级预算
-            max_escalations: cfg_mgr.get_number("core.max_escalations").map(|n| n as u32).unwrap_or(10),
-            // 模型升级目标：从 config 读取；空字符串或缺省视为 None（禁用升级）
-            escalation_model: cfg_mgr.get_str("pipeline.escalation_target_model")
-                .filter(|s| !s.is_empty())
-                .map(|s| abacus_types::ModelId(s.to_string())),
-            // W2 (Task #100)：tool result dedup —— 默认关；运维通过 core.dedup.* 显式开启
-            tool_result_dedup_enabled: cfg_mgr.get_bool("core.dedup.enabled").unwrap_or(false),
-            tool_result_dedup_ttl_secs: cfg_mgr.get_number("core.dedup.ttl_secs").map(|n| n as u64).unwrap_or(60),
-            tool_result_dedup_capacity_kb: cfg_mgr.get_number("core.dedup.capacity_kb").map(|n| n as usize).unwrap_or(2048),
-            adaptive_d_tier_hide: cfg_mgr.get_bool("core.adaptive_d_tier_hide").unwrap_or(true),
-            event_sink_enabled: cfg_mgr.get_bool("core.event_sink_enabled").unwrap_or(true),
-            scene_tool_loading_enabled: cfg_mgr.get_bool("core.scene_tool_loading").unwrap_or(true),
-            policy: std::sync::Arc::new(abacus_core::core::policy::PolicyConfig::load()),
-            thresholds: abacus_core::core::ThresholdConfig::default(),
-            prompt_roles_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/prompt_roles.toml")),
-            subscenes_path: std::env::var("HOME").ok().map(|h| std::path::PathBuf::from(h).join(".abacus/subscenes.toml")),
-            // 推演引擎
-            deduction_observer_contamination: cfg_mgr.get_bool("deduction.observer_contamination").unwrap_or(true),
-            deduction_cross_session: cfg_mgr.get_bool("deduction.cross_session").unwrap_or(true),
-            deduction_prompt_impact: cfg_mgr.get_bool("deduction.prompt_impact").unwrap_or(true),
-            deduction_context_degradation: cfg_mgr.get_bool("deduction.context_degradation").unwrap_or(true),
-            // 认识论约束
-            epistemic_threshold: cfg_mgr.get_number("epistemic.threshold").map(|n| n as u32).unwrap_or(3),
-            // 记忆宫殿
-            palace_enabled: cfg_mgr.get_bool("palace.enabled").unwrap_or(true),
-            // Reasoning 增强
-            reasoning_config: abacus_core::core::reasoning_integration::ReasoningConfig::default(),
-            // 内容分类引擎
-            triage: abacus_core::core::triage::TriageConfig {
-                enabled: cfg_mgr.get_bool("triage.enabled").unwrap_or(true),
-                audit_only: cfg_mgr.get_bool("triage.audit_only").unwrap_or(true),
-                keep_count: cfg_mgr.get_number("triage.keep_count").map(|n| n as usize).unwrap_or(5),
-                early_keep: cfg_mgr.get_number("triage.early_keep").map(|n| n as usize).unwrap_or(2),
-                inject_threshold: cfg_mgr.get_number("triage.inject_threshold").unwrap_or(0.65),
-                standby_threshold: cfg_mgr.get_number("triage.standby_threshold").unwrap_or(0.40),
-                cold_threshold: cfg_mgr.get_number("triage.cold_threshold").unwrap_or(0.20),
-                hysteresis_deadband: cfg_mgr.get_number("triage.hysteresis_deadband").unwrap_or(0.15),
-                sticky_turns: cfg_mgr.get_number("triage.sticky_turns").map(|n| n as u32).unwrap_or(3),
-                cooldown_turns: cfg_mgr.get_number("triage.cooldown_turns").map(|n| n as u32).unwrap_or(10),
-                max_compress_depth: cfg_mgr.get_number("triage.max_compress_depth").map(|n| n as u32).unwrap_or(3),
-                standby_capacity: cfg_mgr.get_number("triage.standby_capacity").map(|n| n as usize).unwrap_or(200),
-                cold_batch_cap: cfg_mgr.get_number("triage.cold_batch_cap").map(|n| n as usize).unwrap_or(20),
-                skip_below_msg_count: cfg_mgr.get_number("triage.skip_below_msg_count").map(|n| n as usize).unwrap_or(8),
+        // 2026-06-11: 用 CoreConfig::from_config_manager 统一绑定所有 cfg 驱动字段
+        // 消除 engine_init / server / CoreConfig::default 三处手动映射的漂移风险
+        let mut config = abacus_core::core::CoreConfig::from_config_manager(&cfg_mgr);
+
+        // 注入 from_config_manager 无法推导的字段
+        if default_model != abacus_types::ModelId::AUTO && config.default_model.is_auto() {
+            config.default_model = abacus_types::ModelId(default_model.to_string());
+        }
+        config.system_prompt = system_prompt.to_string();
+        config.thinking_intent = thinking_intent;
+        config.model_catalog = Some(std::sync::Arc::new(catalog));
+
+        // model_spec：Server 路径也需要构造（否则 TUI context 展示失效）
+        let context_window = cfg_mgr.get_number("core.context_window")
+            .map(|n| n as usize).unwrap_or(128_000);
+        config.model_spec = Some(abacus_types::ModelSpec {
+            context_window,
+            max_output_tokens: config.default_max_tokens,
+            thinking_config: abacus_types::ModelThinkingConfig {
+                enabled: config.thinking_intent.as_ref().map(|i| i.is_enabled()).unwrap_or(false),
+                effort: None,
+                preserve_thinking: false,
             },
-        };
+            ..Default::default()
+        });
 
         // ─── Progressive Gate config ────────────────────────────────────
         // R1: 从 ConfigManager 读取 progressive 配置，替代硬编码默认值

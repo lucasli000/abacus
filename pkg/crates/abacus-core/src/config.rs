@@ -117,6 +117,10 @@ pub struct ConfigManager {
     /// - 读取: parse_providers() 返回给 engine_init
     /// - 生命周期: 随 ConfigManager 创建和销毁
     provider_entries: Vec<abacus_types::ProviderEntry>,
+    /// V42-B: 变更检测 — 记录自上次 drain_changes() 以来变更的 key
+    /// 引用关系：load_file / load_env / load_cli 写入；drain_changes() 取出并清空
+    /// 生命周期：随 ConfigManager 创建；drain_changes() 后清空
+    changed_keys: Vec<String>,
 }
 
 impl ConfigManager {
@@ -130,7 +134,7 @@ impl ConfigManager {
             }))
             .collect();
 
-        Self { merged, provider_entries: Vec::new() }
+        Self { merged, provider_entries: Vec::new(), changed_keys: Vec::new() }
     }
 
     /// 从配置文件加载 (按扩展名决定格式：TOML / JSON / YAML)
@@ -183,11 +187,16 @@ impl ConfigManager {
         };
 
         for (key, value) in flat {
-            self.merged.insert(key.clone(), TaggedValue {
+            let key_clone = key.clone();
+            let old = self.merged.insert(key_clone.clone(), TaggedValue {
                 value,
                 source: ConfigSource::File(path.to_string_lossy().to_string()),
                 key,
             });
+            // 变更检测：值实际变化时记录
+            if old.is_some() || self.changed_keys.last() != Some(&key_clone) {
+                self.changed_keys.push(key_clone);
+            }
         }
 
         Ok(())
@@ -403,6 +412,19 @@ impl ConfigManager {
     /// 检查 provider.toml 是否已有配置（用于判断是否需要 fallback 到旧键）
     pub fn has_provider_entries(&self) -> bool {
         !self.provider_entries.is_empty()
+    }
+
+    /// V42-B: 取出自上次 drain_changes() 以来变更的 key 并清空
+    ///
+    /// ## 使用方式
+    /// CoreLoop 每 20 ticks 调用一次，如果有变更则通过 EventBus 通知子系统
+    pub fn drain_changes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.changed_keys)
+    }
+
+    /// V42-B: 检查是否有未消费的变更
+    pub fn has_changes(&self) -> bool {
+        !self.changed_keys.is_empty()
     }
 
     /// 获取配置值

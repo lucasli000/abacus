@@ -23,6 +23,7 @@ use crate::mcip::McipDecision;
 use crate::skill::SkillCandidate;
 
 use crate::core::fallible::MutexExt;
+use crate::tool::builtin::config::{read_override_f64, read_override_u32};
 
 use super::CoreLoop;
 use super::SessionState;
@@ -422,9 +423,10 @@ impl<'a> TurnPipeline<'a> {
             system: Some(enriched_system),
             system_segments: Vec::new(),
             tools: tool_defs,
-            temperature: Some(self.core.config.default_temperature),
-            max_tokens: Some(self.core.config.model_spec.as_ref()
-                .map(|s| s.max_output_tokens)
+            temperature: Some(read_override_f64(&self.core.runtime_overrides, "temperature")
+                .unwrap_or(self.core.config.default_temperature)),
+            max_tokens: Some(read_override_u32(&self.core.runtime_overrides, "max_tokens")
+                .or_else(|| self.core.config.model_spec.as_ref().map(|s| s.max_output_tokens))
                 .unwrap_or(self.core.config.default_max_tokens)),
             top_p: None, stop: Vec::new(), stream: false,
             // L1 + Task #94: thinking_intent 单通道——continue_gated 路径只读 sticky
@@ -1289,6 +1291,12 @@ impl<'a> TurnPipeline<'a> {
                         last.content = Some(MessageContent::Text(
                             format!("{}\n\n{}", existing, incoming)
                         ));
+                        // V42-B FIX: 合并 reasoning_content（保留思考过程）
+                        let existing_reasoning = last.reasoning_content.take().unwrap_or_default();
+                        let incoming_reasoning = msg.reasoning_content.unwrap_or_default();
+                        if !existing_reasoning.is_empty() || !incoming_reasoning.is_empty() {
+                            last.reasoning_content = Some(format!("{}\n\n{}", existing_reasoning, incoming_reasoning));
+                        }
                         continue;
                     }
                 }
@@ -1532,9 +1540,10 @@ impl<'a> TurnPipeline<'a> {
             ).await;
             let effective_temperature = self.req_ctx.temperature
                 .or(ctx.complexity_temperature)
+                .or_else(|| read_override_f64(&self.core.runtime_overrides, "temperature"))
                 .unwrap_or(self.core.config.default_temperature);
             // V40: 动态自适应 max_tokens — 确保 prompt + max_tokens ≤ context_window
-            // 优先级：req_ctx 显式覆盖 > model_spec.max_output_tokens > config.default_max_tokens
+            // 优先级：req_ctx 显式覆盖 > runtime_overrides (config_set) > model_spec.max_output_tokens > config.default_max_tokens
             // 策略：min(configured_max, context_remaining - safety_margin)
             // safety_margin = 1024：留余量给 token 估算误差 + 系统开销
             // 下限 clamp 2048：即使 context 紧张也保证最低输出空间（触发压缩而非静默截断）
@@ -1542,6 +1551,7 @@ impl<'a> TurnPipeline<'a> {
                 .map(|s| s.max_output_tokens)
                 .unwrap_or(self.core.config.default_max_tokens);
             let configured_max = self.req_ctx.max_tokens
+                .or_else(|| read_override_u32(&self.core.runtime_overrides, "max_tokens"))
                 .unwrap_or(model_max_output);
             let effective_max_tokens = {
                 let w = self.core.context_manager.window.read().await;
@@ -2480,6 +2490,7 @@ impl<'a> TurnPipeline<'a> {
                             turn_number: ctx.turn_number,
                             bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                             bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                            bash_long_timeout: self.core.config.policy.thresholds.bash_long_timeout,
                             tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
                             role_caps: Arc::clone(&s.role_caps),
                         }
@@ -2569,6 +2580,7 @@ impl<'a> TurnPipeline<'a> {
                         turn_number: ctx.turn_number,
                         bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                         bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                        bash_long_timeout: self.core.config.policy.thresholds.bash_long_timeout,
                         tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
                         role_caps: Arc::clone(&s.role_caps),
                     }
@@ -2710,6 +2722,7 @@ impl<'a> TurnPipeline<'a> {
                         turn_number: ctx.turn_number,
                         bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                         bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                        bash_long_timeout: self.core.config.policy.thresholds.bash_long_timeout,
                         tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
                         role_caps: Arc::clone(&s.role_caps),
                     }
@@ -2902,8 +2915,13 @@ impl<'a> TurnPipeline<'a> {
                 } else {
                     // V41: ToolActionClassifier 安全预检（在 MCIP 之前）
                     // 决策优先级：hard_deny → soft_deny → allow_rules → MCIP → user_grant
+                    // V42-B: 历史感知 — 查询 EffectivenessTracker 的历史表现
                     use crate::core::action_classifier::ClassifyResult;
-                    let safety_result = self.core.action_classifier.classify(tool_id.0.as_str(), &params);
+                    let effectiveness = self.core.effectiveness.read().await;
+                    let safety_result = self.core.action_classifier.classify_with_history(
+                        tool_id.0.as_str(), &params, &effectiveness
+                    );
+                    drop(effectiveness);
                     if let ClassifyResult::Deny(ref reason) = safety_result {
                         ctx.consecutive_blocks += 1;
                         Ok(ToolOutput {
@@ -2919,7 +2937,7 @@ impl<'a> TurnPipeline<'a> {
                     // 授权检查：优先于session 永久授权和本 turn 单次授权，匹配则跳过 MCIP 策略
                     let is_user_granted = {
                         let s = self.session.read().await;
-                        let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
+                        let grants = s.mcip_grants.read().await;
                         grants.contains(tool_id.0.as_str())
                     } || self.req_ctx.mcip_once_grants.contains(tool_id.0.as_str());
 
@@ -2995,7 +3013,7 @@ impl<'a> TurnPipeline<'a> {
                                     .take(2).collect::<Vec<_>>().join(" ");
                                 let bash_granted = {
                                     let s = self.session.read().await;
-                                    let grants = s.mcip_grants.read().unwrap_or_else(|p| p.into_inner());
+                                    let grants = s.mcip_grants.read().await;
                                     grants.contains(&format!("bash:{}", cmd_prefix))
                                 };
                                 if bash_granted {
@@ -3101,13 +3119,23 @@ impl<'a> TurnPipeline<'a> {
                                 self.core.config.policy.thresholds.confirm_timeout_secs
                             );
                             let wait_result = if let Some(ref ct) = self.cancel {
-                                tokio::select! {
+                                let r = tokio::select! {
                                     r = tokio::time::timeout(timeout_dur, rx_one) => r.map(|inner| inner.unwrap_or(false)).ok(),
                                     _ = ct.cancelled() => {
+                                        // BUG-1 fix: ct.cancelled() 触发时 sender 仍挂在
+                                        // mcip_confirm_channels 里未释放。rx_one 已被 drop,
+                                        // tx_one 持有端若不主动 remove 会出现 HashMap 长期占用
+                                        // (sender 永不被消费直到下一次同 nonce 碰撞)。
+                                        // 显式 remove 释放 oneshot sender 资源。
+                                        {
+                                            let s = self.session.read().await;
+                                            s.mcip_confirm_channels.lock_or_recover().remove(&nonce);
+                                        }
                                         tracing::debug!(tool = %tool_id.0, "MCIP confirm cancelled by user");
                                         Some(false)
                                     }
-                                }
+                                };
+                                r
                             } else {
                                 tokio::time::timeout(timeout_dur, rx_one).await
                                     .map(|inner| inner.unwrap_or(false)).ok()
@@ -3147,11 +3175,16 @@ impl<'a> TurnPipeline<'a> {
                                             .take(2).collect::<Vec<_>>().join(" ");
                                         let grant_key = format!("bash:{}", prefix);
                                         let s = self.session.read().await;
-                                        s.mcip_grants.write().unwrap_or_else(|p| p.into_inner()).insert(grant_key);
+                                        s.mcip_grants.write().await.insert(grant_key);
                                     }
                                 }
                                 // 走真 execute 路径（mag_chain.before → registry.execute → wrap → after）
                                 // 使用 async block 捕获错误以确保 ToolEnd 在 Fix 5 outer match 中发送
+                                // V42-B: PreToolUse 事件（工具执行前，用于 payload-guard、经验采集等）
+                                let _ = self.core.emit_pipeline_event(crate::mag_chain::PipelineEvent::PreToolUse {
+                                    tool_id: tool_id.0.clone(),
+                                    params: serde_json::to_string(&params).unwrap_or_default(),
+                                }).await;
                                 let exec_result: Result<ToolOutput, KernelError> = async {
                                     self.core.mag_chain.read().await.before(&tool_id, &params).await?;
                                     let exec_ctx = {
@@ -3162,6 +3195,7 @@ impl<'a> TurnPipeline<'a> {
                                             turn_number: ctx.turn_number,
                                             bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                                             bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                                            bash_long_timeout: self.core.config.policy.thresholds.bash_long_timeout,
                                             tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
                                             role_caps: Arc::clone(&s.role_caps),
                                         }
@@ -3169,6 +3203,23 @@ impl<'a> TurnPipeline<'a> {
                                     let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
                                     output = self.core.mcip_gateway.wrap_output(output);
                                     self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
+                                    // V42-B: PostToolUse 事件（工具执行后）
+                                    let _ = self.core.emit_pipeline_event(crate::mag_chain::PipelineEvent::PostToolUse {
+                                        tool_id: tool_id.0.clone(),
+                                        params: serde_json::to_string(&params).unwrap_or_default(),
+                                        success: output.success,
+                                        latency_ms: output.latency_ms,
+                                    }).await;
+                                    // V42-B Phase 3-2: 经验验证器 — 更新 EffectivenessTracker
+                                    {
+                                        let outcome = if output.success {
+                                            crate::tool::effectiveness::ToolOutcome::Success
+                                        } else {
+                                            crate::tool::effectiveness::ToolOutcome::ToolFailure
+                                        };
+                                        let mut eff = self.core.effectiveness.write().await;
+                                        eff.record_outcome(&tool_id, outcome, output.latency_ms);
+                                    }
                                     Ok(output)
                                 }.await;
                                 exec_result
@@ -3263,6 +3314,7 @@ impl<'a> TurnPipeline<'a> {
                                             turn_number: ctx.turn_number,
                                             bash_default_timeout: self.core.config.policy.thresholds.bash_default_timeout,
                                             bash_max_timeout: self.core.config.policy.thresholds.bash_max_timeout,
+                                            bash_long_timeout: self.core.config.policy.thresholds.bash_long_timeout,
                                             tool_default_timeout: self.core.config.policy.thresholds.tool_default_timeout,
                                             role_caps: Arc::clone(&s.role_caps),
                                         }
@@ -3271,6 +3323,23 @@ impl<'a> TurnPipeline<'a> {
                                     let mut output = self.core.registry.execute(&tool_id, params.clone(), &exec_ctx).await?;
                                     output = self.core.mcip_gateway.wrap_output(output);
                                     self.core.mag_chain.read().await.after(&tool_id, &mut output).await?;
+                                    // V42-B: PostToolUse 事件（工具执行后）
+                                    let _ = self.core.emit_pipeline_event(crate::mag_chain::PipelineEvent::PostToolUse {
+                                        tool_id: tool_id.0.clone(),
+                                        params: serde_json::to_string(&params).unwrap_or_default(),
+                                        success: output.success,
+                                        latency_ms: output.latency_ms,
+                                    }).await;
+                                    // V42-B Phase 3-2: 经验验证器 — 更新 EffectivenessTracker
+                                    {
+                                        let outcome = if output.success {
+                                            crate::tool::effectiveness::ToolOutcome::Success
+                                        } else {
+                                            crate::tool::effectiveness::ToolOutcome::ToolFailure
+                                        };
+                                        let mut eff = self.core.effectiveness.write().await;
+                                        eff.record_outcome(&tool_id, outcome, output.latency_ms);
+                                    }
                                     Ok(output)
                                 }.await;
                                 exec_result
@@ -3560,7 +3629,10 @@ impl<'a> TurnPipeline<'a> {
         if effective_for_esc.0.contains("pro") {
             return Ok(None);
         }
-        let escalate_to = "deepseek-v4-pro";
+        let escalate_to = self.core.config.escalation_model
+            .as_ref()
+            .map(|m| m.0.as_str())
+            .unwrap_or("deepseek-v4-pro");
 
         // Task #96：Budget check —— 防止 cache 振荡
         // 引用关系：SessionState.escalation_count 跨 turn 持续；CoreConfig.max_escalations 阈值
@@ -3672,9 +3744,10 @@ impl<'a> TurnPipeline<'a> {
             system: Some(ctx.enriched_system.clone()),
             system_segments: ctx.system_segments.clone(),
             tools: ctx.tool_defs.clone(),
-            temperature: Some(self.core.config.default_temperature),
-            max_tokens: Some(self.core.config.model_spec.as_ref()
-                .map(|s| s.max_output_tokens)
+            temperature: Some(read_override_f64(&self.core.runtime_overrides, "temperature")
+                .unwrap_or(self.core.config.default_temperature)),
+            max_tokens: Some(read_override_u32(&self.core.runtime_overrides, "max_tokens")
+                .or_else(|| self.core.config.model_spec.as_ref().map(|s| s.max_output_tokens))
                 .unwrap_or(self.core.config.default_max_tokens)),
             top_p: None, stop: Vec::new(), stream: false,
             // L1: thinking_intent 单通道——per-request 覆盖优先，否则 escalation 沿用 sticky 决策

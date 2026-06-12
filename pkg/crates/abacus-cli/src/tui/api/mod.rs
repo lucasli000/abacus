@@ -235,7 +235,7 @@ pub async fn send_chat_message_streaming(
 
     // A2 修复：用 process_turn_streaming_cancellable + 自管 CancellationToken
     // Gap A 修复：streaming 路径同步接通 RequestContext。引用关系：
-    // process_turn_streaming_cancellable_with_context 定义于 core/mod.rs:2293
+    // process_turn_streaming_cancellable_with_context 定义于 core/mod.rs:3903
     let cancel = tokio_util::sync::CancellationToken::new();
     let work = handle.core.process_turn_streaming_cancellable_with_context(
         message,
@@ -1035,7 +1035,7 @@ pub async fn send_team_message(
 
                 // 执行任务（流式: agent 的 thinking/tool/text 实时流入主消息区）
                 match team.execute_task_with_core_streaming(
-                    &handle.core, task, role, stream_tx.clone()
+                    &handle.core, task, role, stream_tx.clone(), None
                 ).await {
                     Ok(r) => {
                         // ── SubAgent 分隔标识: 完成 ──
@@ -1178,7 +1178,7 @@ pub async fn send_team_message(
             pending_confirmations: vec![],
             meeting_experts: None,
             auto_fallback_chat: None,
-            turnkey_plan: None, needs_clarify: None,
+            turnkey_plan: None, needs_clarify: None, tokens_freed: None,
         })
     };
 
@@ -1249,6 +1249,11 @@ pub async fn send_meeting_message(
         _ => return ApiResult::Err("请求排队超时，请稍后再试".to_string()),
     };
 
+    // 2026-06-11: 外层 cancel token — 当 overall timeout 触发时主动取消后台 LLM 调用，
+    // 避免 worker 任务泄漏并在 background 持续消耗资源
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_work = cancel.clone();
+
     let work = async {
         // Ensure meeting handle exists
         if let Err(e) = handle.ensure_meeting_handle(message).await {
@@ -1277,7 +1282,8 @@ pub async fn send_meeting_message(
         }
 
         // Execute turn through meeting handle
-        match mtg.process(message, &handle.core, &handle.session).await {
+        // 2026-06-11: 改用 process_cancellable，外层 timeout 触发时 cancel 内部 LLM
+        match mtg.process_cancellable(message, &handle.core, &handle.session, cancel_for_work).await {
             Ok(result) => {
                 let specialist_name = result.target_specialist.0.clone();
                 let text = format!(
@@ -1331,7 +1337,7 @@ pub async fn send_meeting_message(
                     pending_confirmations: vec![],
                     meeting_experts: Some(experts),
                     auto_fallback_chat: None,
-                    turnkey_plan: None, needs_clarify: None,
+                    turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                 })
             }
             Err(e) => ApiResult::Err(format!("Meeting 轮次失败: {}", e)),
@@ -1345,6 +1351,8 @@ pub async fn send_meeting_message(
     let result = tokio::select! {
         r = work => r,
         _ = &mut timeout => {
+            // 2026-06-11: 主动 cancel 内部 LLM 调用，避免后台继续运行
+            cancel.cancel();
             ApiResult::Err(format!("Meeting 轮次超时 ({}s)，已放弃", timeout_secs))
         }
     };
@@ -1410,7 +1418,7 @@ pub async fn send_meeting_message(
                             pending_confirmations: vec![],
                             meeting_experts: None,
                             auto_fallback_chat: Some("Meeting + Chat 双失败".to_string()),
-                            turnkey_plan: None, needs_clarify: None,
+                            turnkey_plan: None, needs_clarify: None, tokens_freed: None,
                         })
                     }
                     other => other,
@@ -1447,6 +1455,12 @@ pub async fn send_meeting_message_streaming(
 ) -> ApiResult<EngineResponse> {
     // 不获取 inflight_guard：内部子调用 (process_turn_streaming) 直接走 core 层，
     // 由 run.rs dispatch 层保证同一时刻只有一条用户消息在处理
+
+    // 2026-06-11: 外层 cancel token — overall timeout 触发时主动取消后台 LLM 调用。
+    // 与 send_meeting_message（非流式）一致的 pattern：work 块内 clone 到 specialist 调用。
+    // Esc 取消：run.rs spawn 外层 JoinHandle::abort() 仍可作为兜底硬停止。
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_for_work = cancel.clone();
 
     let work = async {
         // Phase 1: 确保 Meeting 存在并 Running
@@ -1557,7 +1571,8 @@ pub async fn send_meeting_message_streaming(
                 &sp_session,
                 stream_tx.clone(),
                 req_ctx,
-                tokio_util::sync::CancellationToken::new(),
+                // 2026-06-11: 复用外层 cancel_for_work，overall timeout 触发时可级联取消后台 LLM
+                cancel_for_work.clone(),
             ).await {
                 Ok(result) => {
                     let opinion = abacus_orchestrator::specialist::SpecialistOpinion {
@@ -1645,7 +1660,7 @@ pub async fn send_meeting_message_streaming(
             pending_confirmations: vec![],
             meeting_experts: Some(experts),
             auto_fallback_chat: None,
-            turnkey_plan: None, needs_clarify: None,
+            turnkey_plan: None, needs_clarify: None, tokens_freed: None,
         })
     };
 
@@ -1752,7 +1767,7 @@ pub async fn send_plan_and_execute_streaming(
                 pending_confirmations: vec![],
                 meeting_experts: None,
                 auto_fallback_chat: None,
-                turnkey_plan: None, needs_clarify: None,
+                turnkey_plan: None, needs_clarify: None, tokens_freed: None,
             });
         }
 
@@ -1785,6 +1800,7 @@ pub async fn send_plan_and_execute_streaming(
                 }).collect(),
             }),
             needs_clarify: None,
+            tokens_freed: None,
         });
 
         #[allow(unreachable_code)]
@@ -1842,7 +1858,7 @@ pub async fn send_plan_and_execute_streaming(
                 ));
 
                 match team.execute_task_with_core_streaming(
-                    &handle.core, task, role, stream_tx.clone()
+                    &handle.core, task, role, stream_tx.clone(), None
                 ).await {
                     Ok(r) => {
                         let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
@@ -1914,7 +1930,7 @@ pub async fn send_plan_and_execute_streaming(
             pending_confirmations: vec![],
             meeting_experts: None,
             auto_fallback_chat: None,
-            turnkey_plan: None, needs_clarify: None,
+            turnkey_plan: None, needs_clarify: None, tokens_freed: None,
         })
     };
 
@@ -2115,6 +2131,8 @@ pub struct EngineResponse {
     /// ## 生命周期
     /// 单条 response 消费；非 Meeting 路径恒为 None
     pub needs_clarify: Option<String>,
+    /// /compress 命令释放的 token 数 — 用于同步扣减 session_tokens
+    pub tokens_freed: Option<usize>,
 }
 
 impl Default for EngineResponse {
@@ -2131,6 +2149,7 @@ impl Default for EngineResponse {
             auto_fallback_chat: None,
             turnkey_plan: None,
             needs_clarify: None,
+            tokens_freed: None,
         }
     }
 }
@@ -2170,7 +2189,7 @@ impl EngineResponse {
             pending_confirmations: result.pending_confirmations,
             meeting_experts: None,  // 非 meeting 路径恒 None；Meeting 路径在 send_meeting_message 内单独填充
             auto_fallback_chat: None,  // V28.7: 默认无兜底，send_meeting_message 失败 fallback 时单独设置
-            turnkey_plan: None, needs_clarify: None,  // V29.10: 非 turnkey 路径恒 None；TurnkeyPlan 分支在 execute_slash_command 内填充
+            turnkey_plan: None, needs_clarify: None, tokens_freed: None,  // V29.10: 非 turnkey 路径恒 None；TurnkeyPlan 分支在 execute_slash_command 内填充
         }
     }
 }

@@ -27,6 +27,11 @@ pub fn wire_trace_path(provider: &str) -> PathBuf {
 /// 写入请求 body 到 per-pid wire trace 路径。
 ///
 /// 失败时静默（debug-only，不能影响主流程）。返回 `()` 让调用方 `;` 续接。
+///
+/// ## P2 资源泄漏修复
+/// wire_trace 文件在进程退出时不会自动删除。调用方应在进程退出前调用
+/// [`cleanup_wire_trace`] 清理当前进程的 wire trace 文件。
+/// 本函数仅在 debug build 中被调用（调用方已添加 `#[cfg(debug_assertions)]`）。
 pub fn write_wire_trace(provider: &str, base_url: &str, body: &str) {
     let path = wire_trace_path(provider);
     let prefixed = format!("// PROVIDER: {}\n// BASE_URL: {}\n{}", provider, base_url, body);
@@ -39,6 +44,31 @@ pub fn write_wire_trace(provider: &str, base_url: &str, body: &str) {
                 let mut perms = meta.permissions();
                 perms.set_mode(0o600);
                 let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+    }
+}
+
+/// 清理当前进程的所有 wire trace 文件。
+///
+/// ## 使用场景
+/// 在进程退出前调用（如 TermGuard drop），清理临时文件。
+/// 遍历 temp_dir 中所有 `abacus_wire_*.{pid}.json` 文件并删除。
+///
+/// ## 失败语义
+/// 单个文件删除失败静默忽略（临时文件，不阻塞退出）。
+pub fn cleanup_wire_trace() {
+    let pid = std::process::id();
+    let temp_dir = std::env::temp_dir();
+    
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                // 匹配 abacus_wire_*.{pid}.json 模式
+                if name.starts_with("abacus_wire_") && name.ends_with(&format!(".{}.json", pid)) {
+                    let _ = std::fs::remove_file(&path);
+                }
             }
         }
     }

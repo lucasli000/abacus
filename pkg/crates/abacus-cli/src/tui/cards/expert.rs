@@ -17,7 +17,7 @@ pub struct ExpertCard {
     id: u64,
     name: String,
     model: String,
-    reply_md: StreamingMd,
+    reply_md: std::cell::RefCell<StreamingMd>,
     streaming: CardStreaming,
     reply_text: String,
 }
@@ -28,7 +28,7 @@ impl ExpertCard {
             id,
             name: name.into(),
             model: model.into(),
-            reply_md: StreamingMd::new(),
+            reply_md: std::cell::RefCell::new(StreamingMd::new()),
             streaming: CardStreaming::Active,
             reply_text: String::new(),
         }
@@ -36,7 +36,7 @@ impl ExpertCard {
 
     pub fn append_reply(&mut self, delta: &str) {
         self.reply_text.push_str(delta);
-        self.reply_md.append(delta);
+        self.reply_md.borrow_mut().append(delta);
     }
 
     pub fn set_streaming(&mut self, s: CardStreaming) {
@@ -62,13 +62,19 @@ impl MessageCard for ExpertCard {
     fn streaming(&self) -> CardStreaming { self.streaming }
     fn default_collapse(&self) -> CardCollapse { CardCollapse::Expanded }
 
-    fn body_height(&self, _ctx: &dyn SectionContext, _max_width: u16, collapse: CardCollapse) -> u16 {
+    fn body_height(&self, ctx: &dyn SectionContext, max_width: u16, collapse: CardCollapse) -> u16 {
         match collapse {
             CardCollapse::Headless => 0,
             CardCollapse::Collapsed => 1,
             CardCollapse::Expanded => {
-                let reply_lines = self.reply_text.lines().count();
-                reply_lines.max(1) as u16
+                // 2026-06-11 FIX: 与 render_body 走相同的 markdown 路径计算高度
+                // 之前用 self.reply_text.lines().count() 在 markdown 代码块场景会低估
+                // (代码块 1 行原始文本 = N 行渲染输出)
+                let styled = self.reply_md.borrow_mut().all_styled(
+                    ctx.theme(), false, max_width as usize,
+                );
+                let h = styled.len();
+                h.max(1) as u16
             }
         }
     }
@@ -88,11 +94,23 @@ impl MessageCard for ExpertCard {
             }
             CardCollapse::Expanded => {
                 let mut lines: Vec<Line> = Vec::new();
-                if !self.reply_text.is_empty() {
+                // 2026-06-11 FIX: 走 StreamingMd 渲染 markdown, 与 body_height 一致
+                let styled = self.reply_md.borrow_mut().all_styled(
+                    ctx.theme(), false, inner.width as usize,
+                );
+                for sl in styled {
+                    let spans: Vec<Span> = sl.spans.into_iter()
+                        .map(|s| Span::styled(s.text, s.style))
+                        .collect();
+                    lines.push(Line::from(spans));
+                }
+                // fallback: md 渲染为空 (如首帧) → 显示原始文本
+                if lines.is_empty() && !self.reply_text.is_empty() {
                     for line in self.reply_text.lines() {
-                        let mut spans = vec![Span::raw(" ")];
-                        spans.push(Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)));
-                        lines.push(Line::from(spans));
+                        lines.push(Line::from(Span::styled(
+                            format!(" {}", line),
+                            Style::default().fg(ctx.theme().text),
+                        )));
                     }
                 }
                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });

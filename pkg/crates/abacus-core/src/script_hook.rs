@@ -195,6 +195,8 @@ fn event_name(event: &PipelineEvent) -> &'static str {
         PipelineEvent::TurnPostFanOut { .. } => "TurnPostFanOut",
         PipelineEvent::TurnEnd { .. } => "TurnEnd",
         PipelineEvent::TriageResult { .. } => "TriageResult",
+        PipelineEvent::PreToolUse { .. } => "PreToolUse",
+        PipelineEvent::PostToolUse { .. } => "PostToolUse",
     }
 }
 
@@ -239,6 +241,17 @@ fn build_event_value(event: &PipelineEvent) -> serde_json::Value {
             "summary": stats.summary_line(),
             "turn_number": turn_number,
         }),
+        PipelineEvent::PreToolUse { tool_id, params } => serde_json::json!({
+            "event": "PreToolUse",
+            "tool_id": tool_id,
+            "params": params,
+        }),
+        PipelineEvent::PostToolUse { tool_id, success, latency_ms, .. } => serde_json::json!({
+            "event": "PostToolUse",
+            "tool_id": tool_id,
+            "success": success,
+            "latency_ms": latency_ms,
+        }),
     }
 }
 
@@ -277,6 +290,15 @@ fn build_event_env(event: &PipelineEvent) -> HashMap<String, String> {
         PipelineEvent::TriageResult { stats, turn_number } => {
             env.insert("ABACUS_TRIAGE_SUMMARY".into(), stats.summary_line());
             env.insert("ABACUS_TURN_NUMBER".into(), turn_number.to_string());
+        }
+        PipelineEvent::PreToolUse { tool_id, params } => {
+            env.insert("ABACUS_TOOL_ID".into(), tool_id.clone());
+            env.insert("ABACUS_TOOL_PARAMS".into(), params.clone());
+        }
+        PipelineEvent::PostToolUse { tool_id, success, latency_ms, .. } => {
+            env.insert("ABACUS_TOOL_ID".into(), tool_id.clone());
+            env.insert("ABACUS_TOOL_SUCCESS".into(), success.to_string());
+            env.insert("ABACUS_TOOL_LATENCY_MS".into(), latency_ms.to_string());
         }
     }
     env

@@ -18,6 +18,7 @@ use crate::core::context::{SessionCheckpoint, SessionPhase, PendingItem};
 use crate::core::interaction::{MapAnalyzer, ToolCallRecord};
 use crate::core::inertia;
 use crate::llm::{LlmRequest, Message, MessageContent, MessageRole};
+use crate::tool::builtin::config::{read_override_f64, read_override_u32};
 
 use super::TurnContext;
 use super::TurnPipeline;
@@ -851,8 +852,10 @@ impl<'a> TurnPipeline<'a> {
                         system: Some(ctx.enriched_system.clone()),
                         system_segments: ctx.system_segments.clone(),
                         tools: ctx.tool_defs.clone(),
-                        temperature: Some(self.core.config.default_temperature),
-                        max_tokens: Some(self.core.config.default_max_tokens),
+                        temperature: Some(read_override_f64(&self.core.runtime_overrides, "temperature")
+                            .unwrap_or(self.core.config.default_temperature)),
+                        max_tokens: Some(read_override_u32(&self.core.runtime_overrides, "max_tokens")
+                            .unwrap_or(self.core.config.default_max_tokens)),
                         top_p: None, stop: Vec::new(), stream: false,
                         // L1: thinking_intent 单通道——retry 路径用 per-request 或 config 默认
                         thinking_intent: self.req_ctx.thinking_intent.clone()

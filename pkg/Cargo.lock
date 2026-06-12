@@ -161,6 +161,7 @@ version = "2.5.1"
 dependencies = [
  "ratatui",
  "serde",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]

@@ -47,9 +47,11 @@ pub mod hooks;
 pub mod scrollable_stack;
 pub mod section;
 pub mod theme;
+pub mod util;
 
 // ── 顶层 re-export ──
 pub use card::{default_color_for_kind, CardCollapse, CardHeader, CardHit, CardKind, CardStreaming, MessageCard};
+pub use util::{char_width, display_width, pad_to_width};
 pub use card::kinds;
 pub use card_render::{card_total_height, hit_test_card, paint_card_top_shimmer, render_card};
 pub use card_stream::CardStream;

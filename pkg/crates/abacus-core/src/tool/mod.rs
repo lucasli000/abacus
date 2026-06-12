@@ -96,6 +96,9 @@ pub struct ExecutionContext {
     pub bash_default_timeout: u64,
     /// Bash 最大超时（秒）— 从 policy.toml 注入
     pub bash_max_timeout: u64,
+    /// 2026-06-11: Bash 动态长命令上限（秒）— 编译/构建类命令时生效
+    /// 从 policy.toml 注入，默认 600
+    pub bash_long_timeout: u64,
     /// 通用工具执行超时（秒）— 从 policy.toml 注入
     ///
     /// 引用关系：由 pipeline 从 PolicyConfig.thresholds.tool_default_timeout 注入
@@ -124,6 +127,7 @@ impl ExecutionContext {
             turn_number: 0,
             bash_default_timeout: 30,
             bash_max_timeout: 120,
+            bash_long_timeout: 600,
             tool_default_timeout: 60,
             role_caps: std::sync::Arc::new(abacus_types::RoleCapabilities::default()),
         }

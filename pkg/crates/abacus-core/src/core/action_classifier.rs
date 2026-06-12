@@ -95,7 +95,21 @@ impl PatternCondition {
             }
             PatternCondition::PathOutsideCwd { field } => {
                 extract_field(args, field)
-                    .map(|v| !v.starts_with(cwd))
+                    .map(|v| {
+                        // 规范化路径防止遍历绕过（/project/../../../etc/passwd）
+                        let path = std::path::Path::new(v.as_str());
+                        let normalized = path.components()
+                            .fold(std::path::PathBuf::new(), |mut acc, comp| {
+                                match comp {
+                                    std::path::Component::ParentDir => { acc.pop(); }
+                                    std::path::Component::CurDir => {}
+                                    other => acc.push(other),
+                                }
+                                acc
+                            });
+                        let cwd_path = std::path::Path::new(cwd);
+                        !normalized.starts_with(cwd_path)
+                    })
                     .unwrap_or(false)
             }
             PatternCondition::All { conditions } => {
@@ -183,6 +197,61 @@ impl ToolActionClassifier {
         ClassifyResult::Allow
     }
 
+    /// 历史感知的安全分类（静态规则 + 工具历史表现）
+    ///
+    /// ## 设计
+    /// 先执行静态规则分类，如果结果是 Allow，再查询 EffectivenessTracker：
+    /// - 连续失败 >= 5 次 → 自动 Deny（反模式检测）
+    /// - 连续失败 >= 3 次 → 自动 NeedsConfirm（警告）
+    /// - validate_trust == false → 自动 NeedsConfirm
+    ///
+    /// ## 为什么不在 classify() 中直接查询
+    /// - classify() 是同步函数，EffectivenessTracker 查询是 async
+    /// - 保持 classify() 的纯函数语义（便于测试）
+    /// - 历史感知是可选增强，不是必须的
+    pub fn classify_with_history(
+        &self,
+        tool_id: &str,
+        args: &serde_json::Value,
+        effectiveness: &crate::tool::effectiveness::EffectivenessTracker,
+    ) -> ClassifyResult {
+        // 1. 先执行静态规则
+        let static_result = self.classify(tool_id, args);
+        if !matches!(static_result, ClassifyResult::Allow) {
+            return static_result;
+        }
+
+        // 2. 静态规则放行后，查询历史表现
+        let tid = abacus_types::ToolId(tool_id.to_string());
+
+        // 连续失败 >= 5 → 自动 Deny（反模式检测）
+        let consecutive = effectiveness.consecutive_failures(&tid);
+        if consecutive >= 5 {
+            return ClassifyResult::Deny(format!(
+                "工具 '{}' 连续 {} 次调用失败，疑似反模式，自动拒绝",
+                tool_id, consecutive
+            ));
+        }
+
+        // 连续失败 >= 3 → 自动 NeedsConfirm
+        if consecutive >= 3 {
+            return ClassifyResult::NeedsConfirm(format!(
+                "工具 '{}' 连续 {} 次调用失败，建议确认后重试",
+                tool_id, consecutive
+            ));
+        }
+
+        // 信任验证失败 → 自动 NeedsConfirm
+        if !effectiveness.validate_trust(&tid) {
+            return ClassifyResult::NeedsConfirm(format!(
+                "工具 '{}' 最近成功率较低，建议确认后重试",
+                tool_id
+            ));
+        }
+
+        ClassifyResult::Allow
+    }
+
     /// 加载内置硬编码规则
     fn load_builtin_rules(&mut self) {
         // ── Hard Deny: 绝对禁止 ──
@@ -218,6 +287,48 @@ impl ToolActionClassifier {
                     substring: "mkfs".into(),
                 },
                 reason: "禁止格式化磁盘".into(),
+            },
+            // V42-B circuit-breaker: 正则匹配的破坏性命令
+            ActionPattern {
+                tool_id: "bash_exec".into(),
+                condition: PatternCondition::Contains {
+                    field: "command".into(),
+                    substring: "git push --force".into(),
+                },
+                reason: "禁止强制推送到远程".into(),
+            },
+            ActionPattern {
+                tool_id: "bash_exec".into(),
+                condition: PatternCondition::Contains {
+                    field: "command".into(),
+                    substring: "git reset --hard".into(),
+                },
+                reason: "禁止硬重置（丢失未提交更改）".into(),
+            },
+            // V42-B circuit-breaker: 凭据泄漏防护
+            ActionPattern {
+                tool_id: "bash_exec".into(),
+                condition: PatternCondition::Contains {
+                    field: "command".into(),
+                    substring: "cat .env".into(),
+                },
+                reason: "禁止读取 .env 文件（可能含密钥）".into(),
+            },
+            ActionPattern {
+                tool_id: "bash_exec".into(),
+                condition: PatternCondition::Contains {
+                    field: "command".into(),
+                    substring: "echo $SECRET".into(),
+                },
+                reason: "禁止输出环境变量密钥".into(),
+            },
+            ActionPattern {
+                tool_id: "bash_exec".into(),
+                condition: PatternCondition::Contains {
+                    field: "command".into(),
+                    substring: "echo $API_KEY".into(),
+                },
+                reason: "禁止输出 API 密钥".into(),
             },
         ]);
 
@@ -355,10 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn test_soft_deny_force_push() {
+    fn test_hard_deny_force_push() {
+        // V42-B: git push --force 升级为 hard_deny（禁止强制推送）
         let c = make_classifier();
         let result = c.classify("bash_exec", &json!({"command": "git push --force origin main"}));
-        assert!(matches!(result, ClassifyResult::NeedsConfirm(_)));
+        assert!(matches!(result, ClassifyResult::Deny(_)));
     }
 
     #[test]

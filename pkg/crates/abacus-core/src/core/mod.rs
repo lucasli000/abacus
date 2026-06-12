@@ -97,10 +97,48 @@ use crate::sandbox::{SandboxOrchestrator, SandboxToolExecutor, SandboxConfig};
 use crate::tool::builtin::filengine::FilengineSession;
 use crate::tool::effectiveness::EffectivenessTracker;
 use crate::tool::ToolRegistry;
-use crate::core::fallible::RwLockExt;
 use crate::core::pipeline::TurnPipeline;
 use crate::llm::providers::openai_compatible::OpenAICompatibleProvider;
 use crate::llm::providers::anthropic::AnthropicProvider;
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// 声明式配置字段映射宏 — 单一来源，消除手动映射漂移
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 绑定单个配置字段到 ConfigManager（简化 from_config_manager 中的手动映射）
+///
+/// ## 设计意图
+/// 之前每个字段需要 3 行手动代码：
+/// ```ignore
+/// c.field = cfg.get_number("key")
+///     .map(|n| n as u32).unwrap_or(c.field);
+/// ```
+/// 现在只需 1 行：
+/// ```ignore
+/// cfg_bind!(c, cfg, u32, field, "key");
+/// ```
+///
+/// ## 支持的类型
+/// - `f64`: `cfg.get_number().unwrap_or()`
+/// - `u32`/`u64`/`usize`: `cfg.get_number().map(|n| n as T).unwrap_or()`
+/// - `bool`: `cfg.get_bool().unwrap_or()`
+macro_rules! cfg_bind {
+    ($c:expr, $cfg:expr, f64, $field:ident, $key:expr) => {
+        $c.$field = $cfg.get_number($key).unwrap_or($c.$field);
+    };
+    ($c:expr, $cfg:expr, u32, $field:ident, $key:expr) => {
+        $c.$field = $cfg.get_number($key).map(|n| n as u32).unwrap_or($c.$field);
+    };
+    ($c:expr, $cfg:expr, u64, $field:ident, $key:expr) => {
+        $c.$field = $cfg.get_number($key).map(|n| n as u64).unwrap_or($c.$field);
+    };
+    ($c:expr, $cfg:expr, usize, $field:ident, $key:expr) => {
+        $c.$field = $cfg.get_number($key).map(|n| n as usize).unwrap_or($c.$field);
+    };
+    ($c:expr, $cfg:expr, bool, $field:ident, $key:expr) => {
+        $c.$field = $cfg.get_bool($key).unwrap_or($c.$field);
+    };
+}
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // ContextWindowStatus — 上下文窗口使用状态
@@ -424,8 +462,13 @@ pub struct ThresholdConfig {
     pub turn_premature_stop_retries: u32,
 
     // ─── Execution 级（资源保护层）────────────────────────────────
-    /// Bash 命令最大执行时间（秒）
+    /// Bash 命令默认执行时间（秒）
     pub tool_bash_timeout_secs: u64,
+    /// 2026-06-11: Bash 动态长命令上限（秒）。
+    /// 当检测到 `cargo build` / `make` / `npm run` 等编译/构建类命令时，
+    /// 自动将执行超时从此上限扩展到此上限（默认 600s = 10min）。
+    /// 保持向后兼容：未在 config 中显式设置时沿用旧 120s 行为以外的兜底。
+    pub tool_bash_long_timeout_secs: u64,
     /// 通用工具执行超时（秒）
     pub tool_default_timeout_secs: u64,
     /// SubAgent 最大执行时间（秒）
@@ -458,27 +501,69 @@ impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
             // Turn 级
-            turn_max_tool_calls: 50, // 2026-05-27: 从 100 降至 50，对齐 Claude Code 量级
+            turn_max_tool_calls: 75, // 2026-06-11: 50→75，对齐 Claude Code 长任务
             turn_max_iterations: 200,
             turn_max_recovery: 5,
-            // V41: 300→600s — thinking model (R1/o3) 首 token 时间可达 2-5 分钟
-            turn_provider_timeout_secs: 600,
+            // 2026-06-11: 600→1200s — o1/o3 长链路支持，首 token 可达 5-10 分钟
+            turn_provider_timeout_secs: 1200,
             turn_premature_stop_retries: 3,
             // Execution 级
             tool_bash_timeout_secs: 120,
+            // 2026-06-11: 新增长命令上限，编译/构建类命令动态扩展到此值
+            tool_bash_long_timeout_secs: 600,
             tool_default_timeout_secs: 60,
             subagent_max_duration_secs: 900,
             subagent_max_tokens: 200_000,
             specialist_timeout_secs: 900,
             meeting_max_duration_mins: 60,
-            confirm_timeout_secs: 15,
-            max_turn_timeout_secs: None, // 默认 None → 使用硬编码 1800s (30min)
+            // 2026-06-11: 15→120s — 与 policy.confirm_timeout_secs 统一，给用户充分决策时间
+            confirm_timeout_secs: 120,
+            // 2026-06-11: 默认 None → 使用硬编码 3600s (1h)，支持长链路
+            max_turn_timeout_secs: None,
             // Quality 级
             context_compress_ratio: 0.55,  // P0-C3: 提前压缩，避免 context 堆积后质量骤降
             tool_prune_after_turns: 10,     // P0-C3: 更积极隐藏长期不用工具，省 token
             max_model_escalations: 10,
             input_max_chars: 100_000,
         }
+    }
+}
+
+impl ThresholdConfig {
+    /// 从 ConfigManager 自动绑定所有字段（单一来源，消除 engine_init.rs / server.rs 重复）
+    ///
+    /// ## 缺省行为
+    /// 配置中未设置任何键时，回退到 `Self::default()` 的值——保持向后兼容。
+    ///
+    /// ## 关键差异
+    /// 之前 engine_init.rs 与 server.rs 各自写一套 `.unwrap_or(...)` 默认值，且不一致：
+    ///   - `context_window` 在 CLI 端默认 1_000_000、server 端默认 128_000 → 行为漂移
+    ///   - `turn_max_tool_calls` / `turn_provider_timeout_secs` 同样有偏移
+    ///   - server 路径缺少 `tool_bash_long_timeout_secs` / `confirm_timeout_secs` 覆盖
+    /// 现在由本函数统一，调用方无须再关心默认值语义。
+    pub fn from_config_manager(cfg: &crate::config::ConfigManager) -> Self {
+        let mut t = Self::default();
+        // ─── Turn 级（防呆层）──
+        cfg_bind!(t, cfg, u32, turn_max_tool_calls, "turn.max_tool_calls");
+        cfg_bind!(t, cfg, u32, turn_max_iterations, "turn.max_iterations");
+        cfg_bind!(t, cfg, u32, turn_max_recovery, "turn.max_recovery");
+        cfg_bind!(t, cfg, u64, turn_provider_timeout_secs, "turn.provider_timeout_secs");
+        cfg_bind!(t, cfg, u32, turn_premature_stop_retries, "turn.premature_stop_retries");
+        // ─── Execution 级（资源保护层）──
+        cfg_bind!(t, cfg, u64, tool_bash_timeout_secs, "bash.timeout_secs");
+        cfg_bind!(t, cfg, u64, tool_bash_long_timeout_secs, "bash.long_timeout_secs");
+        cfg_bind!(t, cfg, u64, tool_default_timeout_secs, "tool.timeout_secs");
+        cfg_bind!(t, cfg, u64, subagent_max_duration_secs, "subagent.max_duration_secs");
+        cfg_bind!(t, cfg, usize, subagent_max_tokens, "subagent.max_tokens");
+        // V41: 显式 0 视为禁用（None），正数 Some 包装，缺省沿用 default() 的 None
+        t.max_turn_timeout_secs = cfg
+            .get_number("core.max_turn_timeout_secs")
+            .and_then(|n| if n <= 0.0 { None } else { Some(n as u64) });
+        // ─── confirm_timeout_secs 单一来源 ──
+        // 2026-06-11: 之前 engine_init.rs 单独把 core.confirm_timeout_secs 映射到 policy.thresholds
+        // 这里不再映射到本字段（ThresholdConfig.confirm_timeout_secs 当前为预留未消费），
+        // 真正的统一入口在 PolicyConfig::from_config_manager 中处理
+        t
     }
 }
 
@@ -760,14 +845,22 @@ pub struct CoreConfig {
     /// 事前内容审校引擎——替代 auto_compress_messages
     /// **Default: disabled**（audit_only = true）
     pub triage: triage::TriageConfig,
+
+    // ─── V42-B: 跨会话资源锁 (resource-broker) ────────────────────────────
+    /// 是否启用跨会话文件锁（防止多 session 并写同一文件）
+    /// **Default: true**
+    pub resource_lock_enabled: bool,
+    /// 文件锁 TTL（秒）—— 超过此时间未释放的锁自动过期
+    /// **Default: 60**
+    pub resource_lock_ttl_secs: u64,
 }
 
 impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            // V29.13: 5 → 25, 同步 config.rs default_config()
-            max_turns_per_request: 1000,
-            max_tool_calls_per_turn: 50,
+            // 与 config.rs default_config() 保持一致（单一来源）
+            max_turns_per_request: 25,
+            max_tool_calls_per_turn: 8,
             default_model: ModelId::auto(), // AUTO = 由注册的第一个 provider 决定
             default_temperature: 0.6,
             // V40: 64000 — 对齐主流 coding agent（Claude Code 20K, OpenCode 32K）
@@ -798,8 +891,8 @@ impl Default for CoreConfig {
             max_escalations: 10,
             palace_sync_interval_turns: None,   // Phase γ-Palace-C：默认关
             default_compress_level: crate::core::context::CompressLevel::Brief, // Z3：默认 Brief 兼容旧行为
-            // W2 (Task #100)：默认关——遵循 default-off 原则；运维显式开启
-            tool_result_dedup_enabled: false,
+            // W2 (Task #100)：与 config.rs default_config() 保持一致
+            tool_result_dedup_enabled: true,
             tool_result_dedup_ttl_secs: 60,
             tool_result_dedup_capacity_kb: 2048,
             // Wrapping-E + 段 K5：默认开——段 K1~K4 多层兜底已根除评分错杀风险
@@ -829,7 +922,146 @@ impl Default for CoreConfig {
             reasoning_config: crate::core::reasoning_integration::ReasoningConfig::default(),
             // ─── 内容生命周期管理 ──
             triage: triage::TriageConfig::default(),
+            // ─── 跨会话资源锁 ──
+            resource_lock_enabled: true,
+            resource_lock_ttl_secs: 60,
         }
+    }
+}
+
+impl CoreConfig {
+    /// 从 ConfigManager 自动绑定所有 cfg-可推导字段（单一来源）
+    ///
+    /// ## 根因
+    /// 之前 `engine_init.rs`（CLI 路径）和 `server.rs`（HTTP 路径）各自手写
+    /// `cfg_mgr.get_number("...").map(|n| n as T).unwrap_or(default)` 30+ 次，
+    /// 且两套默认值不一致（`context_window` / `turn_max_tool_calls` /
+    /// `turn_provider_timeout_secs` / `tool_bash_long_timeout_secs` /
+    /// `core.dedup.enabled` 都有偏移）。`CoreConfig::default()` 又写第三套。
+    /// 任何新加字段都得三处同步改——极易漂移。
+    ///
+    /// ## 修复设计
+    /// 1. 本函数是「ConfigManager → CoreConfig」的唯一入口
+    /// 2. 任何 cfg 驱动的字段都从 cfg 读，缺省沿用 `Self::default()`
+    /// 3. 三个 nested 字段（`thresholds` / `policy` / `triage`）走各自的
+    ///    `*::from_config_manager`——递归统一
+    /// 4. 不可由 cfg 直接推导的字段（`system_prompt` / `model_spec` / `model_catalog` /
+    ///    `thinking_intent`）保持 `default()` 状态，调用方在 init 流程中显式注入
+    ///    （使用 `with_system_prompt` / `with_model_spec` / `with_thinking_intent`）
+    ///
+    /// ## 字段映射表
+    /// | 配置键                          | 字段                              |
+    /// |--------------------------------|----------------------------------|
+    /// | `core.max_turns`               | `max_turns_per_request`          |
+    /// | `core.max_tool_calls`          | `max_tool_calls_per_turn`        |
+    /// | `core.temperature`             | `default_temperature`            |
+    /// | `core.max_tokens`              | `default_max_tokens`             |
+    /// | `core.context_window_ratio`    | `context_window_ratio`           |
+    /// | `core.default_model`           | `default_model`                  |
+    /// | `core.silent_router_enabled`   | `silent_router_enabled`          |
+    /// | `core.task_kind_routing`       | `task_kind_routing_enabled`      |
+    /// | `core.scene_tool_loading`      | `scene_tool_loading_enabled`     |
+    /// | `core.tool_frequency_pruning_turns` | `tool_frequency_pruning_turns` |
+    /// | `palace.sync_interval_turns`   | `palace_sync_interval_turns`     |
+    /// | `core.max_escalations`         | `max_escalations`                |
+    /// | `core.dedup.enabled`           | `tool_result_dedup_enabled`      |
+    /// | `core.dedup.ttl_secs`          | `tool_result_dedup_ttl_secs`     |
+    /// | `core.dedup.capacity_kb`       | `tool_result_dedup_capacity_kb`  |
+    /// | `core.adaptive_d_tier_hide`    | `adaptive_d_tier_hide`           |
+    /// | `core.event_sink_enabled`      | `event_sink_enabled`             |
+    /// | `pipeline.escalation_target_model` | `escalation_model`         |
+    /// | `deduction.observer_contamination` | `deduction_observer_contamination` |
+    /// | `deduction.cross_session`      | `deduction_cross_session`        |
+    /// | `deduction.prompt_impact`      | `deduction_prompt_impact`        |
+    /// | `deduction.context_degradation`| `deduction_context_degradation`  |
+    /// | `epistemic.threshold`          | `epistemic_threshold`            |
+    /// | `palace.enabled`               | `palace_enabled`                 |
+    /// | `lint`                         | `lint_overrides`                 |
+    /// | `triage.*`                     | `triage`                         |
+    /// | `turn.*` / `bash.*` / `tool.*` / `subagent.*` / `core.max_turn_timeout_secs` | `thresholds` |
+    /// | `policy.toml` + `core.confirm_timeout_secs` | `policy`            |
+    pub fn from_config_manager(cfg: &crate::config::ConfigManager) -> Self {
+        let mut c = Self::default();
+
+        // ─── LLM 核心参数 ────────────────────────────────────────
+        cfg_bind!(c, cfg, u32, max_turns_per_request, "core.max_turns");
+        cfg_bind!(c, cfg, u32, max_tool_calls_per_turn, "core.max_tool_calls");
+        cfg_bind!(c, cfg, f64, default_temperature, "core.temperature");
+        cfg_bind!(c, cfg, u32, default_max_tokens, "core.max_tokens");
+        cfg_bind!(c, cfg, f64, context_window_ratio, "core.context_window_ratio");
+        if let Some(model) = cfg.get_str("core.default_model") {
+            c.default_model = ModelId(model.to_string());
+        }
+
+        // ─── 路由 / 工具可见性 ────────────────────────────────
+        cfg_bind!(c, cfg, bool, silent_router_enabled, "core.silent_router_enabled");
+        cfg_bind!(c, cfg, bool, task_kind_routing_enabled, "core.task_kind_routing");
+        cfg_bind!(c, cfg, bool, scene_tool_loading_enabled, "core.scene_tool_loading");
+        c.tool_frequency_pruning_turns = cfg.get_number("core.tool_frequency_pruning_turns")
+            .map(|n| n as u64).or(c.tool_frequency_pruning_turns);
+        c.palace_sync_interval_turns = cfg.get_number("palace.sync_interval_turns")
+            .map(|n| n as u32).filter(|&n| n > 0);
+
+        // ─── 模型升级 / 决策 ────────────────────────────────
+        cfg_bind!(c, cfg, u32, max_escalations, "core.max_escalations");
+        c.escalation_model = cfg.get_str("pipeline.escalation_target_model")
+            .filter(|s| !s.is_empty())
+            .map(|s| ModelId(s.to_string()));
+
+        // ─── Tool result dedup ────────────────────────────────
+        cfg_bind!(c, cfg, bool, tool_result_dedup_enabled, "core.dedup.enabled");
+        cfg_bind!(c, cfg, u64, tool_result_dedup_ttl_secs, "core.dedup.ttl_secs");
+        cfg_bind!(c, cfg, usize, tool_result_dedup_capacity_kb, "core.dedup.capacity_kb");
+
+        // ─── 自适应过滤 / 观测层 ────────────────────────────
+        cfg_bind!(c, cfg, bool, adaptive_d_tier_hide, "core.adaptive_d_tier_hide");
+        cfg_bind!(c, cfg, bool, event_sink_enabled, "core.event_sink_enabled");
+
+        // ─── 推演 / 认识论 / 记忆宫殿 ──────────────────────
+        cfg_bind!(c, cfg, bool, deduction_observer_contamination, "deduction.observer_contamination");
+        cfg_bind!(c, cfg, bool, deduction_cross_session, "deduction.cross_session");
+        cfg_bind!(c, cfg, bool, deduction_prompt_impact, "deduction.prompt_impact");
+        cfg_bind!(c, cfg, bool, deduction_context_degradation, "deduction.context_degradation");
+        cfg_bind!(c, cfg, u32, epistemic_threshold, "epistemic.threshold");
+        cfg_bind!(c, cfg, bool, palace_enabled, "palace.enabled");
+
+        // ─── 跨会话资源锁 ──────────────────────────────────────
+        cfg_bind!(c, cfg, bool, resource_lock_enabled, "resource_lock.enabled");
+        cfg_bind!(c, cfg, u64, resource_lock_ttl_secs, "resource_lock.ttl_secs");
+
+        // ─── 嵌套配置（thresholds / policy / triage）──
+        c.thresholds = ThresholdConfig::from_config_manager(cfg);
+        c.policy = Arc::new(policy::PolicyConfig::from_config_manager(cfg));
+        c.triage = triage::TriageConfig::from_config_manager(cfg);
+
+        // ─── Lint overrides（复杂结构，serde 反序列化）──
+        c.lint_overrides = cfg.get_typed::<crate::tool::schema_lint::LintOverrides>("lint");
+
+        c
+    }
+
+    /// 设置 system_prompt（init 流程中显式注入，因为 prompt 来源是 CLI 参数/默认常量）
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = prompt.into();
+        self
+    }
+
+    /// 设置 model_spec（init 流程中基于 cfg 推导 context_window + max_tokens 构造）
+    pub fn with_model_spec(mut self, spec: ModelSpec) -> Self {
+        self.model_spec = Some(spec);
+        self
+    }
+
+    /// 设置 model_catalog（init 流程中合并 builtin + models.toml + provider entries）
+    pub fn with_model_catalog(mut self, catalog: Arc<crate::llm::ModelCatalog>) -> Self {
+        self.model_catalog = Some(catalog);
+        self
+    }
+
+    /// 设置 thinking_intent（init 流程中处理 CLI 参数 > cfg 优先级）
+    pub fn with_thinking_intent(mut self, intent: Option<abacus_types::ThinkingIntent>) -> Self {
+        self.thinking_intent = intent;
+        self
     }
 }
 
@@ -1031,7 +1263,7 @@ pub struct SessionState {
     /// - 消费：pipeline Phase 4 工具分发前检查，匹配则跳过 MCIP
     /// - 销毁：session 关闭时随之销毁（不持久化）
 
-    pub mcip_grants: std::sync::RwLock<std::collections::HashSet<String>>,
+    pub mcip_grants: tokio::sync::RwLock<std::collections::HashSet<String>>,
 
     /// V28：实时授权 channel——按 nonce 索引的 oneshot sender 集合
     ///
@@ -1214,7 +1446,7 @@ impl SessionState {
             progressive: Arc::new(RwLock::new(progressive)),
             session_focus: Arc::new(RwLock::new(None)),
             mode: abacus_types::AbacusMode::Clarify,
-            mcip_grants: std::sync::RwLock::new(std::collections::HashSet::new()),
+            mcip_grants: tokio::sync::RwLock::new(std::collections::HashSet::new()),
             mcip_confirm_channels: std::sync::Mutex::new(std::collections::HashMap::new()),
             task_kind_locked: Arc::new(RwLock::new(None)),
             thinking_decision: Arc::new(RwLock::new(None)),
@@ -1255,6 +1487,15 @@ pub struct TurnResult {
     /// 非空时：L4 展示授权对话框，用户选择后调用 `CoreLoop::grant_and_rerun()` 重运同一 turn。
     /// 空时：turn 正常完成，无工具需要授权。
     pub pending_confirmations: Vec<crate::mcip::McipConfirmRequest>,
+}
+
+/// 压缩结果 — 包含压缩消息数量和释放的 token 数
+#[derive(Debug, Clone)]
+pub struct CompressionResult {
+    /// 压缩的消息数量
+    pub compressed_count: usize,
+    /// 释放的 token 数（original_tokens - compressed_tokens）
+    pub tokens_freed: usize,
 }
 
 /// 厂商分组 — 一个 base_url 下支持多个模型
@@ -1653,6 +1894,121 @@ impl crate::mag_chain::PipelineHook for PalaceAbsorbHook {
                 "palace_absorb_hook: cold→knowledge promotion"
             );
         }
+        Ok(HookAction::Continue)
+    }
+}
+
+/// V42-B: 文件分类器 Hook — PostToolUse 事件中分类文件并记录访问模式
+///
+/// ## 设计意图
+/// 集成 Toolchain 的 file-classifier 能力到 Abacus PipelineHook 系统。
+/// 在 fs_read/fs_write/fs_edit 完成后，分类文件路径并记录到 DualPalaceMemory 行为宫殿。
+///
+/// ## 文件分类规则
+/// - `config.toml` / `config.yaml` → type=config, heat=protected
+/// - `AGENTS.md` / `README.md` → type=memory-hot, heat=always-load
+/// - `.rs` / `.ts` / `.py` / `.go` 源码 → type=code, heat=on-demand
+/// - `Cargo.toml` / `package.json` → type=manifest, heat=on-demand
+/// - 其他 → 不分类
+///
+/// ## 引用关系
+/// - 上游：`PostToolUse` 事件（工具执行后 emit）
+/// - 下游：`DualPalaceMemory.record_interaction()` 记录文件访问模式
+///
+/// ## 生命周期
+/// - 创建：`with_memory()` 时构造，注册为 PipelineHook
+/// - 销毁：CoreLoop drop 时随 pipeline_hooks 释放
+pub(crate) struct FileClassifierHook {
+    palace: std::sync::Weak<tokio::sync::RwLock<DualPalaceMemory>>,
+}
+
+/// 文件分类结果
+#[derive(Debug)]
+struct FileClassification {
+    file_type: &'static str,
+    heat: &'static str,
+}
+
+/// 分类文件路径（Toolchain file-classifier 的 Rust 移植）
+/// 用于 FileClassifierHook 的 PostToolUse 事件处理
+#[allow(dead_code)]
+fn classify_file(path: &str) -> Option<FileClassification> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    // 配置文件
+    if name == "config.toml" || name == "config.yaml" || name == "config.json" {
+        return Some(FileClassification { file_type: "config", heat: "protected" });
+    }
+    if name == "Cargo.toml" || name == "package.json" || name == "go.mod" {
+        return Some(FileClassification { file_type: "manifest", heat: "on-demand" });
+    }
+
+    // 记忆文件
+    if name == "AGENTS.md" || name == "README.md" || name == "MEMORY.md" {
+        return Some(FileClassification { file_type: "memory-hot", heat: "always-load" });
+    }
+
+    // 源码文件
+    if name.ends_with(".rs") || name.ends_with(".ts") || name.ends_with(".py")
+        || name.ends_with(".go") || name.ends_with(".js") || name.ends_with(".tsx")
+    {
+        return Some(FileClassification { file_type: "code", heat: "on-demand" });
+    }
+
+    None
+}
+
+#[async_trait::async_trait]
+impl crate::mag_chain::PipelineHook for FileClassifierHook {
+    fn name(&self) -> &str { "file_classifier_hook" }
+
+    fn accepts(&self, event: &crate::mag_chain::PipelineEvent) -> bool {
+        matches!(event, crate::mag_chain::PipelineEvent::PostToolUse { .. })
+    }
+
+    async fn on_event(&self, event: &crate::mag_chain::PipelineEvent) -> Result<crate::mag_chain::HookAction, KernelError> {
+        use crate::mag_chain::HookAction;
+
+        let crate::mag_chain::PipelineEvent::PostToolUse { tool_id, params, success, .. } = event else {
+            return Ok(HookAction::Continue);
+        };
+
+        // 只处理文件操作工具
+        if !matches!(tool_id.as_str(), "fs_read" | "fs_write" | "fs_edit") {
+            return Ok(HookAction::Continue);
+        }
+
+        let Some(palace_arc) = self.palace.upgrade() else {
+            return Ok(HookAction::Continue);
+        };
+
+        // 从 tool 参数中提取 path 并分类
+        let tool_params: serde_json::Value = serde_json::from_str(params).unwrap_or(serde_json::Value::Null);
+        let path = tool_params.get("path")
+            .or(tool_params.get("source"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let domain = crate::memory_palace::extract_tool_domain(tool_id);
+        let mut tags = vec![
+            domain.to_string(),
+            "file_access".to_string(),
+            if *success { "success".into() } else { "failure".into() },
+        ];
+
+        // 文件分类（Toolchain file-classifier 核心能力）
+        if let Some(classification) = classify_file(path) {
+            tags.push(classification.file_type.to_string());
+            tags.push(classification.heat.to_string());
+        }
+
+        // 记录到行为宫殿
+        let palace = palace_arc.read().await;
+        palace.record_interaction(&format!("file_op:{}", tool_id), &tags).await;
+
         Ok(HookAction::Continue)
     }
 }
@@ -2587,6 +2943,9 @@ impl CoreLoop {
         if let Some(ref engine_lock) = self.triage_engine {
             let mut engine = engine_lock.write().await;
             engine.set_kb(store);
+            // V42-B 冷层桥接: 将 DualPalaceMemory 注入 TriageEngine
+            // COLD 块同时写入知识宫殿，享受 SM-2 衰减 + MemoryBridge 关系链
+            engine.set_memory_palace(palace.clone());
         }
         // Phase γ-Palace-D：启用 palace 后重注册 result.expand executor，注入 palace 让 expand 反馈
         crate::tool::builtin::result::register_executors(
@@ -2603,6 +2962,14 @@ impl CoreLoop {
             ctx_mgr: Arc::downgrade(&self.context_manager),
         });
         self.add_pipeline_hook(100, absorb_hook).await;
+
+        // V42-B: 注册 FileClassifierHook 监听 PostToolUse 事件
+        // 文件操作完成后分类文件路径并记录到行为宫殿（Toolchain file-classifier 能力集成）
+        let classifier_hook = Arc::new(FileClassifierHook {
+            palace: Arc::downgrade(&palace),
+        });
+        self.add_pipeline_hook(90, classifier_hook).await;
+
         self
     }
 
@@ -3216,7 +3583,7 @@ impl CoreLoop {
         // 写入 Always 授权到 session；收集 Once 授权到临时集合
         {
             let s = session.read().await;
-            let mut grants = s.mcip_grants.write_or_recover();
+            let mut grants = s.mcip_grants.write().await;
             for (tool_id, decision) in decisions {
                 match decision {
                     McipGrantDecision::Always => { grants.insert(tool_id.clone()); }
@@ -3520,6 +3887,105 @@ impl CoreLoop {
         self.llm_budget.reconfigure(new_config);
     }
 
+    /// 热重载运行时配置字段（TUI 监测到 config.toml 变更时调用）
+    ///
+    /// 把 `core.temperature` / `core.max_tokens` 写入 `runtime_overrides`（与 config_set 共享同一 map），
+    /// pipeline 下一轮 `build_request` 自动消费。
+    /// `llm_budget` 走 `reconfigure_llm_budget`（专用 LlmBudget 路径）。
+    ///
+    /// 引用关系：TUI run.rs::config_recheck_ticks → 解析 config.toml 后调用
+    /// 生命周期：TUI 进程内可重复调用；不影响已发出的 LLM 请求
+    /// 从 toml::Value 热重载所有可热更新的配置项
+    ///
+    /// ## 根因设计
+    /// 之前 TUI 侧（run.rs）手写 30 行 toml 解析 + 字段映射，每次新增配置项都要改 4 处。
+    /// 本方法是「toml 内容 → CoreLoop 配置更新」的唯一入口，TUI 只需传入解析后的 toml::Value。
+    ///
+    /// ## 可热更新的配置项
+    /// - `core.context_window` → context_manager 窗口大小
+    /// - `core.temperature` → runtime_overrides["temperature"]
+    /// - `core.max_tokens` → runtime_overrides["max_tokens"]
+    /// - `[llm_budget]` → llm_budget.reconfigure()
+    ///
+    /// ## 返回值
+    /// 返回实际变更的配置项名称列表（用于 TUI toast 提示）
+    pub fn reload_from_toml(&self, toml_val: &toml::Value) -> Vec<String> {
+        let mut changed = Vec::new();
+
+        // core.context_window → context_manager
+        if let Some(cw) = toml_val.get("core")
+            .and_then(|c| c.get("context_window"))
+            .and_then(|v| v.as_integer())
+        {
+            let new_val = cw as usize;
+            // context_manager.window 是 async RwLock，这里只更新 runtime_overrides
+            // 实际的 context_manager 更新由 TUI 侧在 event loop 中处理
+            changed.push(format!("context_window: {}", new_val));
+        }
+
+        // core.temperature → runtime_overrides
+        let new_temperature = toml_val.get("core")
+            .and_then(|c| c.get("temperature"))
+            .and_then(|v| v.as_float());
+
+        // core.max_tokens → runtime_overrides
+        let new_max_tokens = toml_val.get("core")
+            .and_then(|c| c.get("max_tokens"))
+            .and_then(|v| v.as_integer())
+            .map(|n| n as u32);
+
+        // [llm_budget] → llm_budget.reconfigure()
+        let new_llm_budget = toml_val.get("llm_budget").map(|lb| {
+            llm_budget::LlmBudgetConfig {
+                max_cost_usd: lb.get("max_cost_usd")
+                    .and_then(|v| v.as_float()).unwrap_or(0.0),
+                max_total_tokens: lb.get("max_total_tokens")
+                    .and_then(|v| v.as_float()).unwrap_or(0.0).max(0.0) as u64,
+                soft_threshold: lb.get("soft_threshold")
+                    .and_then(|v| v.as_float()).unwrap_or(0.70),
+                hard_threshold: lb.get("hard_threshold")
+                    .and_then(|v| v.as_float()).unwrap_or(0.85),
+                reject_threshold: lb.get("reject_threshold")
+                    .and_then(|v| v.as_float()).unwrap_or(0.95),
+                latency_window: lb.get("latency_window")
+                    .and_then(|v| v.as_float()).unwrap_or(20.0).max(1.0) as usize,
+            }
+        }).filter(|_| toml_val.get("llm_budget").is_some());
+
+        // 应用变更
+        if new_temperature.is_some() || new_max_tokens.is_some() || new_llm_budget.is_some() {
+            self.hot_reload_core_config(new_temperature, new_max_tokens, new_llm_budget);
+            if new_temperature.is_some() { changed.push("temperature".into()); }
+            if new_max_tokens.is_some() { changed.push("max_tokens".into()); }
+            if toml_val.get("llm_budget").is_some() { changed.push("llm_budget".into()); }
+        }
+
+        changed
+    }
+
+    pub fn hot_reload_core_config(
+        &self,
+        new_temperature: Option<f64>,
+        new_max_tokens: Option<u32>,
+        new_llm_budget: Option<llm_budget::LlmBudgetConfig>,
+    ) {
+        {
+            let mut overrides = self
+                .runtime_overrides
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(t) = new_temperature {
+                overrides.insert("temperature".to_string(), t.to_string());
+            }
+            if let Some(m) = new_max_tokens {
+                overrides.insert("max_tokens".to_string(), m.to_string());
+            }
+        }
+        if let Some(b) = new_llm_budget {
+            self.llm_budget.reconfigure(b);
+        }
+    }
+
     /// 上下文窗口使用状态（CLI `context status` / TUI `/context`）
     pub async fn context_status(&self) -> ContextWindowStatus {
         let w = self.context_manager.window.read().await;
@@ -3533,11 +3999,17 @@ impl CoreLoop {
     }
 
     /// 手动压缩会话上下文（CLI `session compress` / TUI `/compress`）
-    pub async fn compress_context(&self, session: &RwLock<SessionState>) -> usize {
+    pub async fn compress_context(&self, session: &RwLock<SessionState>) -> CompressionResult {
         let s = session.read().await;
         let mut msgs = s.messages.write().await;
         let compressed = self.context_manager.auto_compress_messages(&mut msgs).await;
-        compressed.len()
+        let tokens_freed = compressed.iter()
+            .map(|c| c.original_tokens.saturating_sub(c.compressed_tokens))
+            .sum();
+        CompressionResult {
+            compressed_count: compressed.len(),
+            tokens_freed,
+        }
     }
 
     /// 注入临时知识到下一轮 prompt（CLI `context inject` / TUI `/inject`）
@@ -4808,7 +5280,7 @@ Output JSON:
             // 如果已在 always_allow / mcip_grants 中，直接告知 LLM 已授权，无需等待
             "session_request_permission" => {
                 let requested_tool = params.get("tool_id").and_then(|v| v.as_str()).unwrap_or("");
-                let grants = s.mcip_grants.read_or_recover();
+                let grants = s.mcip_grants.read().await;
                 let already_granted = grants.contains(requested_tool);
                 drop(grants);
                 drop(map);
@@ -5206,6 +5678,15 @@ Output JSON:
         };
 
         let cluster_registry = self.cluster_registry.clone();
+        // V42-B Phase 3-1: 预读取经验数据（避免在 map 闭包中 await）
+        let experience_data: std::collections::HashMap<ToolId, (bool, u32)> = {
+            let eff = self.effectiveness.read().await;
+            tools.iter().map(|t| {
+                let trusted = eff.validate_trust(&t.id);
+                let consecutive = eff.consecutive_failures(&t.id);
+                (t.id.clone(), (trusted, consecutive))
+            }).collect()
+        };
 
         // Short-Mode：工具数 > 12 时，对最近 3 轮未使用的工具切换到 short_description
         // 节省 token（典型场景 30+ 工具时减少 ~40% description 字节）
@@ -5254,6 +5735,17 @@ Output JSON:
                         abacus_types::VisibilityTier::D => "\u{25B3}",  // △
                     };
                     t.schema.description.push_str(&format!(" [{}]", label));
+                }
+                // V42-B: 经验注入器（Phase 3-1）
+                // 从 EffectivenessTracker 查询历史经验，注入到 tool description 中
+                // 让 LLM 知道工具的可靠性，避免重复使用失败的工具
+                if let Some(&(trusted, consecutive)) = experience_data.get(&t.id) {
+                    if !trusted {
+                        t.schema.description.push_str(" [unreliable]");
+                    }
+                    if consecutive >= 3 {
+                        t.schema.description.push_str(&format!(" [{} failures]", consecutive));
+                    }
                 }
                 if let Some(hint) = cluster_registry.render_hint_for(&t.schema.name) {
                     t.schema.description.push_str(&hint);
