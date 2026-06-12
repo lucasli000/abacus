@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "abacus-cli"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "abacus-core",
  "abacus-orchestrator",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-core"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "abacus-types",
  "async-trait",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-orchestrator"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "abacus-core",
  "abacus-types",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-server"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "abacus-core",
  "abacus-orchestrator",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-types"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "abacus-ui-kit"
-version = "2.5.1"
+version = "2.5.5"
 dependencies = [
  "ratatui",
  "serde",

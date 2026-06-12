@@ -1,6 +1,6 @@
 [package]
 name = "abacus-cli"
-version = "2.5.1"
+version = "2.5.5"
 edition = "2021"
 authors = ["Abacus Team"]
 description = "CLI + TUI for Abacus (Clarify/Plan/Team/Meeting modes)"
@@ -17,15 +17,15 @@ path = "src/main.rs"
 
 
 [dependencies]
-abacus-core = { path = "../abacus-core", version = "2.5.1" }
-abacus-types = { path = "../abacus-types", version = "2.5.1" }
-abacus-orchestrator = { path = "../abacus-orchestrator", version = "2.5.1" }
+abacus-core = { path = "../abacus-core", version = "2.5.5" }
+abacus-types = { path = "../abacus-types", version = "2.5.5" }
+abacus-orchestrator = { path = "../abacus-orchestrator", version = "2.5.5" }
 # V42: UI 公开契约 crate (Theme + Section + DashboardTab)
 # 引用关系: tui/components/* 全部通过 abacus_ui_kit::Theme 访问主题色
 #          tui/components/panel/sections/ 实现 Section trait
 #          tui/extensions.rs 暴露 SectionRegistry + DashboardRegistry 给 Agent 扩展
 # 设计取舍: 把 Theme + Section trait 抽到本 crate, 让第三方 Agent 应用可注入自定义看板/仪表盘
-abacus-ui-kit = { path = "../abacus-ui-kit", version = "2.5.1" }
+abacus-ui-kit = { path = "../abacus-ui-kit", version = "2.5.5" }
 
 clap = { version = "4.5", features = ["derive", "cargo"] }
 tokio = { version = "1.35", features = ["full"] }

@@ -1,9 +1,9 @@
-name: Release v2.0.0
+name: Release v2.5.5
 
 on:
   push:
     tags:
-      - 'v2.0.0'
+      - 'v2.5.5'
   workflow_dispatch:
 
 env:
@@ -124,33 +124,47 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v2.0.0
-          name: "AbacusCode v2.0.0"
+          tag_name: v2.5.5
+          name: "AbacusCode v2.5.5"
           body: |
-            # AbacusCode v2.0.0
+            # AbacusCode v2.5.5
 
-            ## 🚀 Major Features
+            ## 🔒 安全增强
 
-            ### V42-B Streaming Migration
-            - Deleted 5 V40 fields, migrated to CardStream
-            - 8 new V42-B helper methods
-            - writer.rs: ToolAgentResult handling
+            - 注入检测 Unicode 防护: normalize_for_injection() 去除零宽字符
+            - 注入模式可配置化: SafetyGuard.user_injection_patterns
+            - ActionClassifier 历史感知: classify_with_history()
+            - PathOutsideCwd 路径规范化: 防止遍历绕过
+            - 429 errors 排除 fallback
 
-            ### Config System Overhaul
-            - 17 config sections with validation
-            - Provider.toml unified (deprecated llm.* keys)
-            - 30+ validation rules
+            ## 🧠 自学习循环
 
-            ### Knowledge Base
-            - 14 seed knowledge entries (Abacus architecture)
-            - 12 behavior patterns + 5 knowledge entries
-            - abacusbr.md with 6 sub-specifications
+            - 经验注入器: tool description 注入 [unreliable] / [N failures] 标记
+            - 经验验证器: PostToolUse 事件后更新 EffectivenessTracker
+            - 反模式泛化器: detect_environment_issue() + detect_failure_pattern()
+            - validate_trust / consecutive_failures / should_avoid
 
-            ### Setup Wizard
-            - API validation before saving
-            - Latest models (2026-06-08)
-            - URL variants for providers
-            - OpenCodeZen + VolcengineCoding providers
+            ## 🏗️ 架构改进
+
+            - run.rs 子函数提取: process_engine_response() + process_streaming_chunks()
+            - EventBus 双向订阅: subscribe() 返回 UnboundedReceiver
+            - ConfigManager 变更检测: changed_keys + drain_changes()
+            - CoreConfig::from_config_manager 统一配置绑定
+            - TaskRegistry 多任务并发管理 + Drop impl
+            - reset_session() 增强: 保留 infra 级数据
+
+            ## 🎯 阈值优化
+
+            - tool_calls 50→75, timeout 600→1200, budget 80/90/98
+            - Hot 80-90% → 85-95%, Critical >90% → >95%
+            - confirm_timeout 60→120s
+
+            ## 🔧 其他
+
+            - 5 个内置技能: code_quality_gate, TDD, debugging, verification, review-matrix
+            - payload-guard: 大文件读取警告
+            - ResourceGuard: 跨会话资源锁
+            - CJK display_width 修正
 
             ## 📦 Downloads
 
@@ -173,7 +187,7 @@ jobs:
 
             ## 📊 Stats
 
-            - 1,490 tests pass
+            - 1,814 tests pass
             - 0 warnings
             - 0 errors
           draft: false
