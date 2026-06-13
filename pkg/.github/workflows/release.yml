@@ -24,6 +24,12 @@ jobs:
             artifact_name: abacus-aarch64-apple-darwin
             asset_name: abacus-aarch64-apple-darwin.tar.gz
           
+          # macOS x86_64 (Intel)
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact_name: abacus-x86_64-apple-darwin
+            asset_name: abacus-x86_64-apple-darwin.tar.gz
+          
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
