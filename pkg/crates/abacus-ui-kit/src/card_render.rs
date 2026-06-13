@@ -95,7 +95,8 @@ pub fn render_card(
     };
 
     // Header: 直接靠左，无左侧色条
-    let title_spans = build_title_spans(&header, &color, ctx, shimmer_pos);
+    let header_width = rect.width.saturating_sub(1);
+    let title_spans = build_title_spans(&header, &color, ctx, shimmer_pos, header_width);
     f.render_widget(
         Paragraph::new(title_spans),
         Rect::new(rect.x, rect.y, rect.width.saturating_sub(1), 1),
@@ -235,21 +236,27 @@ fn build_title_spans(
     color: &Color,
     ctx: &dyn SectionContext,
     shimmer_pos: i32,
+    available_width: u16,
 ) -> Line<'static> {
     let title_style = Style::default().fg(*color).add_modifier(Modifier::BOLD);
     let trailing_style = Style::default().fg(ctx.theme().muted);
     let mut spans = vec![Span::styled(header.title.clone(), title_style)];
     let with_shimmer = shimmer_pos != -999;
-    // 显式按 display column 评估 title 宽度, 防 CJK 字符下 `chars().count()` 偏小
-    // 导致 fill_w 算错 (老 path 用 chars().count() 已在 2026-06-11 替换为 display_width)
-    let _title_w = display_width(&header.title);
     if !header.trailing.is_empty() {
-        spans.push(Span::raw(" "));
+        // V42-B: trailing 右对齐 — 用空格填充到可用宽度
+        let title_w = display_width(&header.title);
+        let trailing_w = display_width(&header.trailing);
+        let shimmer_w = if with_shimmer { 2 } else { 0 }; // " ●"
+        let total_w = title_w + trailing_w + shimmer_w;
+        let avail = available_width as usize;
+        let fill = if avail > total_w + 1 { avail - total_w } else { 1 };
+        spans.push(Span::raw(" ".repeat(fill)));
         spans.push(Span::styled(header.trailing.clone(), trailing_style));
+    } else if with_shimmer {
+        spans.push(Span::raw(" "));
     }
     // 流式期间附加 shimmer 字符 (视觉提示, 实际光带在边框上)
     if with_shimmer {
-        spans.push(Span::raw(" "));
         spans.push(Span::styled("●", Style::default().fg(*color)));
     }
     Line::from(spans)

@@ -142,5 +142,20 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
         y = y.saturating_add(actual_h);
     }
 
-    // 5. 状态指示 (V40 顶部右下 "压缩中" 红条 — V42-B 暂不实现, 等 Phase 14 清理时统一)
+    // 5. 更新滚动元数据 — 让 handle_chat_scroll_key 能正确 clamp
+    // last_total_lines: 所有卡片高度之和（含被 scroll 跳过的部分）
+    // last_visible_h: 可见区域能容纳的行数
+    let total_height: usize = skipped as usize + (y.saturating_sub(inner.y)) as usize;
+    state.last_total_lines.set(total_height);
+    state.last_visible_h.set(inner.height as usize);
+    // 缓存每张卡片的高度供 hit-test
+    {
+        let mut rows = state.cached_msg_rows.borrow_mut();
+        rows.clear();
+        for card in state.cards.iter() {
+            let collapse = state.cards.collapse(card.id());
+            let h = card_total_height(card.as_ref(), &ctx, inner.width, collapse) as usize;
+            rows.push(h);
+        }
+    }
 }

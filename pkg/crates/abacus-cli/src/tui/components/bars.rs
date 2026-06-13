@@ -93,7 +93,7 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ── 右侧: model_name ──
     let right = Span::styled(
         format!("{} ", model_name),
-        Style::default().fg(state.theme.muted),
+        Style::default().fg(state.theme.accent),
     );
 
     // 计算左右间距，确保右侧不溢出

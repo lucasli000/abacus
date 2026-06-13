@@ -160,11 +160,55 @@ fn push_tool_event(state: &mut AppState, _name: &str, _args: &str, status: ToolS
 }
 
 /// 推送 ToolOutput 到 active AbacusCard —— 直接绑定到最后一个 ToolCall
-fn push_tool_output(state: &mut AppState, _name: &str, output: &str) {
+/// V42-B: 解析 JSON 输出，存结构化数据
+fn push_tool_output(state: &mut AppState, name: &str, output: &str) {
     let active_id = state.cards.active_id();
     if let Some(id) = active_id {
         if let Some(abacus) = state.cards.card_downcast_mut::<AbacusCard>(id) {
-            abacus.set_last_call_output(output.to_string());
+            let parsed = parse_tool_output_from_str(name, output);
+            abacus.set_last_call_output(parsed.stdout_summary.clone());
+            // 同时存储完整解析结果到扩展字段
+            abacus.set_last_call_parsed(parsed);
+        }
+    }
+}
+
+/// 工具输出解析结果
+#[derive(Debug, Clone)]
+pub struct ToolOutputParsed {
+    pub command: String,
+    pub stdout_summary: String,
+    pub stdout_full: String,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<u64>,
+}
+
+/// 解析工具输出 JSON
+pub fn parse_tool_output_from_str(name: &str, output: &str) -> ToolOutputParsed {
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(output) {
+        let command = json.get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name)
+            .to_string();
+        let stdout = json.get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let exit_code = json.get("exit_code").and_then(|v| v.as_i64());
+        let duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
+        ToolOutputParsed {
+            command,
+            stdout_summary: stdout.lines().next().unwrap_or("").to_string(),
+            stdout_full: stdout.to_string(),
+            exit_code,
+            duration_ms,
+        }
+    } else {
+        ToolOutputParsed {
+            command: name.to_string(),
+            stdout_summary: output.lines().next().unwrap_or("").to_string(),
+            stdout_full: output.to_string(),
+            exit_code: None,
+            duration_ms: None,
         }
     }
 }

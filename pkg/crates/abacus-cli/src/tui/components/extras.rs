@@ -279,18 +279,14 @@ fn render_dashboard_health(f: &mut ratatui::Frame, state: &AppState, area: Rect)
     let muted = Style::default().fg(state.theme.muted);
     let dim = Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM);
     let txt = Style::default().fg(state.theme.text);
-    let ok = Style::default().fg(state.theme.success);
 
-    // 示意数据——实际应从 state.hook_stats 读取
+    // V42-B: Hook 统计为占位示意数据，标记 [开发中]
     lines.push(Line::from(vec![
         Span::styled(" \u{25c7} ", muted),
-        Span::styled(format!("{} 0  {}", t("panel.hook_registered"), t("panel.hook_triggered")), txt),
-        Span::styled(" 0  ", muted),
-        Span::styled(format!("{} 0", t("panel.hook_failed")), ok),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled(" \u{2713} ", muted),
-        Span::styled(format!("{}: --", t("panel.hook_last")), dim),
+        Span::styled(t("panel.hook_stats"), txt),
+        Span::styled(" [", muted),
+        Span::styled(t("panel.development"), Style::default().fg(state.theme.gold).add_modifier(Modifier::DIM)),
+        Span::styled("]", muted),
     ]));
 
     // 滚动

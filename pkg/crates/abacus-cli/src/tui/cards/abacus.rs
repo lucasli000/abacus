@@ -31,6 +31,8 @@ pub struct AbacusCard {
     /// 关联的 trace events (按时间顺序)
     events: Vec<TraceEvent>,
     streaming: CardStreaming,
+    /// V42-B: 解析后的工具输出（用于格式化渲染）
+    parsed_outputs: Vec<Option<crate::tui::cards::writer::ToolOutputParsed>>,
 }
 
 impl AbacusCard {
@@ -40,6 +42,7 @@ impl AbacusCard {
             tool_name: tool_name.into(),
             events: Vec::new(),
             streaming: CardStreaming::Active,
+            parsed_outputs: Vec::new(),
         }
     }
 
@@ -64,6 +67,11 @@ impl AbacusCard {
                 break;
             }
         }
+    }
+
+    /// V42-B: 存储解析后的工具输出
+    pub fn set_last_call_parsed(&mut self, parsed: crate::tui::cards::writer::ToolOutputParsed) {
+        self.parsed_outputs.push(Some(parsed));
     }
 
     /// 供复制功能读取 events 纯文本
@@ -110,7 +118,7 @@ impl MessageCard for AbacusCard {
     fn id(&self) -> u64 { self.id }
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
-        let title = format!("● Abacus · {}", self.tool_name);
+        let title = format!("\u{2699} {}", self.tool_name);
         CardHeader::new(title, "")
             .with_color(ctx.theme().abacus)
     }
@@ -124,26 +132,37 @@ impl MessageCard for AbacusCard {
             CardCollapse::Collapsed => 1,
             CardCollapse::Expanded => {
                 let mut h = 0u16;
-                let avail = max_width.saturating_sub(4).max(20) as usize;
+                let _avail = max_width.saturating_sub(4).max(20) as usize;
                 for event in &self.events {
-                    if let TraceKind::ToolCall { name, args, output, .. } = &event.kind {
+                    if let TraceKind::ToolCall { name, args: _, output, .. } = &event.kind {
                         let lower = name.to_lowercase();
                         if lower == "fs_edit" || lower == "fs_write" {
                             h = h.saturating_add(15); // diff 视图上限
                             continue;
                         }
-                        // 主行：args 在可用宽度内的 wrap 行数（宽松上限）
-                        let args_text = args.lines().next().unwrap_or("").trim();
-                        let args_len = args_text.len();
-                        let args_lines = ((args_len / avail) + 1).min(4) as u16;
-                        h = h.saturating_add(args_lines.max(1));
-                        // output 行：同样在可用宽度内 wrap
+                        // V42-B: 主行（status_icon + command）= 1 行
+                        h = h.saturating_add(1);
+
+                        // 输出区域
                         if let Some(out) = output {
-                            let out_len = out.trim().len();
-                            let out_lines = ((out_len / avail) + 1).min(4) as u16;
-                            h = h.saturating_add(out_lines.max(1));
+                            // 解析 JSON 提取 stdout
+                            let parsed = serde_json::from_str::<serde_json::Value>(out).ok();
+                            let stdout = parsed.as_ref()
+                                .and_then(|j| j.get("stdout").and_then(|v| v.as_str()))
+                                .unwrap_or("");
+                            if !stdout.is_empty() {
+                                // 命令回显行（│ ⤷ command）= 1 行
+                                h = h.saturating_add(1);
+                                // stdout 行（最多 10 行）
+                                let stdout_line_count = stdout.lines().count().min(10) as u16;
+                                h = h.saturating_add(stdout_line_count);
+                                // 截断提示行
+                                if stdout.lines().count() > 10 {
+                                    h = h.saturating_add(1);
+                                }
+                            }
                         }
-                        // 每组之间加 1 行呼吸空行（避免过密）
+                        // 每组之间加 1 行呼吸空行
                         h = h.saturating_add(1);
                     }
                 }
@@ -168,6 +187,11 @@ impl MessageCard for AbacusCard {
             CardCollapse::Expanded => {
                 let mut lines: Vec<Line> = Vec::new();
                 let event_count = self.events.len();
+                let border_style = Style::default().fg(ctx.theme().border);
+                let muted_style = Style::default().fg(ctx.theme().muted);
+                let text_style = Style::default().fg(ctx.theme().text);
+                let text_bold = Style::default().fg(ctx.theme().text).add_modifier(Modifier::BOLD);
+
                 for (idx, event) in self.events.iter().enumerate() {
                     if let TraceKind::ToolCall { name, args, output, status } = &event.kind {
                         // fs_edit / fs_write 走 diff 视图
@@ -177,47 +201,74 @@ impl MessageCard for AbacusCard {
                                 name, args, output.as_deref(), ctx.theme(), 12,
                             ) {
                                 lines.extend(diff_lines);
+                                if idx + 1 < event_count {
+                                    lines.push(Line::raw(""));
+                                }
                                 continue;
                             }
                         }
-                        // 通用工具调用展示：主行（状态+工具名+args）
-                        let (status_icon, color) = status_icon_and_color(*status, ctx);
-                        let mut main_spans = vec![
-                            Span::styled(format!("{} ", status_icon), Style::default().fg(color)),
-                            Span::styled(name.clone(), Style::default().fg(ctx.theme().text).add_modifier(Modifier::BOLD)),
-                        ];
-                        let args_text = args.lines().next().unwrap_or("").trim();
-                        if !args_text.is_empty() {
-                            main_spans.push(Span::styled(
-                                format!(" · {}", args_text),
-                                Style::default().fg(ctx.theme().muted),
-                            ));
-                        }
-                        lines.push(Line::from(main_spans));
 
-                        // output 行：浅缩进 + → 前缀，不再主动截断
-                        if let Some(out) = output {
+                        // V42-B: 格式化渲染 — 提取 command 和 stdout
+                        let (status_icon, color) = status_icon_and_color(*status, ctx);
+                        let parsed = output.as_ref().map(|o| {
+                            crate::tui::cards::writer::parse_tool_output_from_str(name, o)
+                        });
+
+                        // 主行：状态图标 + 命令
+                        let command = parsed.as_ref()
+                            .map(|p| p.command.clone())
+                            .unwrap_or_else(|| {
+                                // 从 args JSON 提取 command 字段
+                                serde_json::from_str::<serde_json::Value>(args)
+                                    .ok()
+                                    .and_then(|j| j.get("command").and_then(|v| v.as_str()).map(String::from))
+                                    .unwrap_or_else(|| name.clone())
+                            });
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{} ", status_icon), Style::default().fg(color)),
+                            Span::styled(command, text_bold),
+                        ]));
+
+                        // 输出行：│ ⤷ command 回显 + │ stdout
+                        if let Some(p) = &parsed {
+                            if !p.stdout_full.is_empty() {
+                                // 命令回显
+                                lines.push(Line::from(vec![
+                                    Span::styled("\u{2502} ", border_style),
+                                    Span::styled("\u{2937} ", muted_style),
+                                    Span::styled(p.command.clone(), muted_style),
+                                ]));
+                                // stdout（最多 10 行）
+                                let stdout_lines: Vec<&str> = p.stdout_full.lines().collect();
+                                let total_lines = stdout_lines.len();
+                                for line in stdout_lines.iter().take(10) {
+                                    lines.push(Line::from(vec![
+                                        Span::styled("\u{2502} ", border_style),
+                                        Span::styled("  ", text_style),
+                                        Span::styled(line.to_string(), text_style),
+                                    ]));
+                                }
+                                // 截断提示
+                                if total_lines > 10 {
+                                    lines.push(Line::from(vec![
+                                        Span::styled("\u{2502} ", border_style),
+                                        Span::styled(
+                                            format!("  \u{2026} +{} lines", total_lines - 10),
+                                            muted_style,
+                                        ),
+                                    ]));
+                                }
+                            }
+                        } else if let Some(out) = output {
+                            // fallback: 未解析的输出
                             let out_trimmed = out.trim();
                             if !out_trimmed.is_empty() {
-                                let mut out_spans = vec![
-                                    Span::styled("  → ", Style::default().fg(ctx.theme().muted)),
-                                ];
-                                // output 如果是多行，拆成多个 Line
-                                let out_lines: Vec<&str> = out_trimmed.lines().collect();
-                                if out_lines.is_empty() {
-                                    out_spans.push(Span::styled(out_trimmed.to_string(), Style::default().fg(ctx.theme().text)));
-                                    lines.push(Line::from(out_spans));
-                                } else {
-                                    // 第一行接在 → 后面
-                                    out_spans.push(Span::styled(out_lines[0].to_string(), Style::default().fg(ctx.theme().text)));
-                                    lines.push(Line::from(out_spans));
-                                    // 后续行对齐到 → 后的起始列（2 空格 + "→ " = 4 字符缩进）
-                                    for line in &out_lines[1..] {
-                                        lines.push(Line::from(vec![
-                                            Span::styled("    ", Style::default().fg(ctx.theme().muted)),
-                                            Span::styled(line.to_string(), Style::default().fg(ctx.theme().text)),
-                                        ]));
-                                    }
+                                for line in out_trimmed.lines().take(5) {
+                                    lines.push(Line::from(vec![
+                                        Span::styled("\u{2502} ", border_style),
+                                        Span::styled("  ", text_style),
+                                        Span::styled(line.to_string(), text_style),
+                                    ]));
                                 }
                             }
                         }
@@ -230,7 +281,7 @@ impl MessageCard for AbacusCard {
                 }
                 if lines.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        "(working…)",
+                        "(working\u{2026})",
                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
                     )));
                 }
@@ -247,9 +298,9 @@ impl MessageCard for AbacusCard {
 
 fn status_icon_and_color(status: ToolStatus, ctx: &dyn SectionContext) -> (&'static str, ratatui::style::Color) {
     match status {
-        ToolStatus::Running => ("●", ctx.theme().muted),
-        ToolStatus::Success => ("✓", ctx.theme().success),
-        ToolStatus::Failed => ("✗", ctx.theme().error),
+        ToolStatus::Running => ("\u{25ce}", ctx.theme().primary),
+        ToolStatus::Success => ("\u{25c9}", ctx.theme().success),
+        ToolStatus::Failed => ("\u{2715}", ctx.theme().error),
     }
 }
 
@@ -259,9 +310,9 @@ fn build_collapsed_summary(events: &[TraceEvent], tool_name: &str) -> String {
     for event in events.iter().rev() {
         if let TraceKind::ToolCall { name, args, status, .. } = &event.kind {
             let icon = match status {
-                ToolStatus::Running => "●",
-                ToolStatus::Success => "✓",
-                ToolStatus::Failed => "✗",
+                ToolStatus::Running => "\u{25ce}",
+                ToolStatus::Success => "\u{25c9}",
+                ToolStatus::Failed => "\u{2715}",
             };
             let param = extract_key_param(args);
             if let Some(p) = param {

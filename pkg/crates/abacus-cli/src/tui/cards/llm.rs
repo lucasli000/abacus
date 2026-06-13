@@ -89,7 +89,7 @@ impl MessageCard for LlmCard {
     }
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
-        CardHeader::new(format!("● LLM · {}", self.model), "")
+        CardHeader::new(format!("\u{25c7} Abacus  {}", self.model), "")
             .with_color(ctx.theme().session)
             .with_preview(self.reply_preview())
     }

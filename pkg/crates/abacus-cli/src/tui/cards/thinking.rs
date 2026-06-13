@@ -69,7 +69,7 @@ impl MessageCard for ThinkingCard {
     }
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
-        CardHeader::new(format!("◐ Think · {}", self.model), "")
+        CardHeader::new(format!("\u{25c8} Think  {}", self.model), "")
             .with_color(ctx.theme().accent)
             .with_preview(self.preview())
     }
@@ -84,16 +84,22 @@ impl MessageCard for ThinkingCard {
 
     fn body_height(
         &self,
-        _ctx: &dyn SectionContext,
-        _max_width: u16,
+        ctx: &dyn SectionContext,
+        max_width: u16,
         collapse: CardCollapse,
     ) -> u16 {
         match collapse {
             CardCollapse::Headless => 0,
             CardCollapse::Collapsed => 1,
             CardCollapse::Expanded => {
-                let lines = self.text.lines().count().max(1) as u16;
-                lines
+                if self.text.is_empty() {
+                    return 1;
+                }
+                // V42-B: 使用与 render_body 相同的 markdown 渲染计算行数
+                let styled = crate::tui::markdown::render_markdown_bounded(
+                    &self.text, ctx.theme(), false, max_width.saturating_sub(3) as usize
+                );
+                styled.len().max(1) as u16
             }
         }
     }
@@ -122,17 +128,22 @@ impl MessageCard for ThinkingCard {
             }
             CardCollapse::Expanded => {
                 let mut lines: Vec<Line> = Vec::new();
+                let border_style = Style::default().fg(ctx.theme().border);
                 if self.text.is_empty() {
                     lines.push(Line::from(Span::styled(
-                        "(thinking…)",
+                        "(thinking\u{2026})",
                         Style::default().fg(ctx.theme().muted).add_modifier(Modifier::DIM),
                     )));
                 } else {
-                    for line in self.text.lines() {
-                        lines.push(Line::from(Span::styled(
-                            format!(" {}", line),
-                            Style::default().fg(ctx.theme().text),
-                        )));
+                    // V42-B: 复用 markdown 渲染，左侧加 │ 缩进线
+                    let styled = crate::tui::markdown::render_markdown_bounded(
+                        &self.text, ctx.theme(), false, inner.width.saturating_sub(3) as usize
+                    );
+                    let md_lines = crate::tui::markdown::styled_lines_to_lines(&styled);
+                    for md_line in md_lines {
+                        let mut spans = vec![Span::styled("\u{2502} ", border_style)];
+                        spans.extend(md_line.spans);
+                        lines.push(Line::from(spans));
                     }
                 }
                 let p = Paragraph::new(lines).wrap(Wrap { trim: false });

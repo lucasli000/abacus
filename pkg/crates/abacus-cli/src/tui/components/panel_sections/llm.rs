@@ -78,6 +78,16 @@ impl Section for LlmSection {
         let mut lines: Vec<Line> = Vec::new();
         render_section_header(&mut lines, crate::tui::i18n::t("panel.llm"), w, theme);
 
+        // ── 无 provider/model 时显示"未连接"，提前返回 ──
+        if state.active_provider_id.is_empty() && state.model_name.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("    \u{25cc} ", Style::default().fg(theme.muted)),
+                Span::styled(crate::tui::i18n::t("panel.not_connected"), Style::default().fg(theme.muted)),
+            ]));
+            f.render_widget(Paragraph::new(lines), area);
+            return;
+        }
+
         // ── 头行: provider + model + thinking ──
         // 从 provider_statuses 查找 display_name（第三字段），fallback 到 raw ID
         let provider_info = state
@@ -121,72 +131,80 @@ impl Section for LlmSection {
         ]));
 
         // ── ctx 进度条 ──
+        // V42-B: context_window == 0 时（模型未确认），不显示进度条
         let raw_used = if state.ctx_live_tokens > 0 {
             state.ctx_live_tokens as usize
         } else {
             state.session_tokens.latest_prompt_tokens as usize
         };
         let max_ctx = state.context_window;
-        let used = if max_ctx > 0 { raw_used.min(max_ctx) } else { raw_used };
-        let pct = if max_ctx > 0 && used > 0 {
-            used * 100 / max_ctx
-        } else {
-            0
-        };
-        let pc = if pct >= 80 {
-            theme.error
-        } else if pct >= 50 {
-            theme.gold
-        } else {
-            theme.success
-        };
-        let bw = w.saturating_sub(14).min(12);
-        let filled = (pct * bw / 100).min(bw);
-        lines.push(Line::from(vec![
-            Span::styled("    ", dim),
-            Span::styled(
-                format!(
-                    "{}{}",
-                    "\u{2593}".repeat(filled),
-                    "\u{2591}".repeat(bw - filled)
+        if max_ctx > 0 {
+            let used = raw_used.min(max_ctx);
+            let pct = if used > 0 { (used as f64 * 100.0 / max_ctx as f64).min(100.0) as usize } else { 0 };
+            let pc = if pct >= 80 {
+                theme.error
+            } else if pct >= 50 {
+                theme.gold
+            } else {
+                theme.success
+            };
+            let bw = w.saturating_sub(14).min(12);
+            let filled = (pct * bw / 100).min(bw);
+            lines.push(Line::from(vec![
+                Span::styled("    ", dim),
+                Span::styled(
+                    format!(
+                        "{}{}",
+                        "\u{2593}".repeat(filled),
+                        "\u{2591}".repeat(bw - filled)
+                    ),
+                    Style::default().fg(pc),
                 ),
-                Style::default().fg(pc),
-            ),
-            Span::styled(format!("  {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
-            Span::styled(
-                format!("  {}/{}", format_ctx(used), format_ctx(max_ctx)),
-                Style::default().fg(theme.muted),
-            ),
-        ]));
+                Span::styled(format!("  {}%", pct), Style::default().fg(pc).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  {}/{}", format_ctx(used), format_ctx(max_ctx)),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
 
         // ── 统计行: 输入 / 输出 / 缓存 / 费用 ──
+        // V42-B: 无 token 消耗时隐藏统计行，避免显示 "输入 0 输出 0 缓存 0%" 噪声
         let inp = state.session_tokens.prompt_tokens;
         let out = state.session_tokens.completion_tokens;
-        let cached = state.session_tokens.cached_tokens;
-        let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
-        let cost = state.session_tokens.cost_cny;
-        let mut tok_parts = vec![
-            Span::styled("    ", dim),
-            Span::styled(
-                format!(
-                    "{} {}  {} {}  {} {}%",
-                    crate::tui::i18n::t("panel.input"),
-                    format_ctx(inp as usize),
-                    crate::tui::i18n::t("panel.output"),
-                    format_ctx(out as usize),
-                    crate::tui::i18n::t("panel.cache"),
-                    cpct
+        if inp > 0 || out > 0 {
+            let cached = state.session_tokens.cached_tokens;
+            let cpct = if inp > 0 { cached * 100 / inp } else { 0 };
+            let cost = state.session_tokens.cost_cny;
+            let mut tok_parts = vec![
+                Span::styled("    ", dim),
+                Span::styled(
+                    format!(
+                        "{} {}  {} {}  {} {}%",
+                        crate::tui::i18n::t("panel.input"),
+                        format_ctx(inp as usize),
+                        crate::tui::i18n::t("panel.output"),
+                        format_ctx(out as usize),
+                        crate::tui::i18n::t("panel.cache"),
+                        cpct
+                    ),
+                    Style::default().fg(theme.muted),
                 ),
-                Style::default().fg(theme.muted),
-            ),
-        ];
-        if cost > 0.001 {
-            tok_parts.push(Span::styled(
-                format!("  {} \u{00a5}{:.2}", crate::tui::i18n::t("panel.cost"), cost),
-                Style::default().fg(theme.gold),
-            ));
+            ];
+            if cost > 0.001 {
+                // V42-B: 模型不在 pricing 表中时，费用不可靠，显示 "—"
+                let cost_display = if model_lookup.id != state.model_name {
+                    "\u{2014}".to_string()  // em-dash
+                } else {
+                    format!("\u{00a5}{:.2}", cost)
+                };
+                tok_parts.push(Span::styled(
+                    format!("  {} {}", crate::tui::i18n::t("panel.cost"), cost_display),
+                    Style::default().fg(theme.gold),
+                ));
+            }
+            lines.push(Line::from(tok_parts));
         }
-        lines.push(Line::from(tok_parts));
 
         f.render_widget(Paragraph::new(lines), area);
     }

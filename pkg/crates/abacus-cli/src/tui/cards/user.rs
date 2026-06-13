@@ -62,7 +62,7 @@ impl MessageCard for UserCard {
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
         CardHeader::new(
-            format!("> You"),
+            format!("\u{25b8} You"),
             self.time.clone(),
         )
         .with_color(ctx.theme().user)
@@ -139,7 +139,7 @@ mod tests {
     fn user_card_header() {
         let card = UserCard::new(1, "hi", "10:00");
         let h = card.header(&ctx());
-        assert_eq!(h.title, "> You");
+        assert_eq!(h.title, "\u{25b8} You");
         assert_eq!(h.trailing, "10:00");
     }
 

@@ -345,6 +345,7 @@ pub fn t(key: &'static str) -> &'static str {
         "panel.cache" => if zh { "缓存" } else { "Cache" },
         "panel.cost" => if zh { "费用" } else { "Cost" },
         "panel.thinking" => if zh { "思考" } else { "Thinking" },
+        "panel.not_connected" => if zh { "未连接" } else { "Not connected" },
         "panel.builtin" => if zh { "内置" } else { "Builtin" },
         "panel.external" => if zh { "外部" } else { "External" },
         "panel.success" => if zh { "可用" } else { "Avail" },
@@ -369,6 +370,8 @@ pub fn t(key: &'static str) -> &'static str {
         "panel.hook_triggered" => if zh { "已触发" } else { "Triggered" },
         "panel.hook_last" => if zh { "上次触发" } else { "Last" },
         "panel.hook_failed" => if zh { "失败" } else { "Failed" },
+        "panel.hook_stats" => if zh { "Hook 统计" } else { "Hook Stats" },
+        "panel.development" => if zh { "开发中" } else { "In Development" },
 
         // ── 记忆宫殿 ──
         "palace.behavior" => if zh { "行为" } else { "Behavior" },

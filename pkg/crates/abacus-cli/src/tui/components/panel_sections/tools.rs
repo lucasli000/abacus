@@ -79,29 +79,33 @@ impl Section for ToolsSection {
             .iter()
             .filter(|r| matches!(r.status, ToolStatus::Success))
             .count();
-        let rate = if tc > 0 { sc * 100 / tc } else { 100 };
+        let rate = if tc > 0 { sc * 100 / tc } else { 0 };
 
         lines.push(Line::from(vec![
             Span::styled("    ", dim),
             Span::styled(
                 format!(
-                    "{} {} {}  {} {}",
+                    "{} {}  {} {}",
                     crate::tui::i18n::t("panel.builtin"),
                     avail.saturating_sub(mcp_count),
                     crate::tui::i18n::t("panel.external"),
                     mcp_count,
-                    crate::tui::i18n::t("panel.success")
                 ),
                 Style::default().fg(theme.text),
             ),
-            Span::styled(
-                format!(" {}%", rate),
-                if rate >= 80 {
-                    Style::default().fg(theme.success)
-                } else {
-                    Style::default().fg(theme.gold)
-                },
-            ),
+            // V42-B: 0 次调用时不显示成功率，避免 "成功 100%" 误导
+            if tc > 0 {
+                Span::styled(
+                    format!("  {} {}%", crate::tui::i18n::t("panel.success"), rate),
+                    if rate >= 80 {
+                        Style::default().fg(theme.success)
+                    } else {
+                        Style::default().fg(theme.gold)
+                    },
+                )
+            } else {
+                Span::raw("")
+            },
         ]));
 
         let mcp_calls = state
