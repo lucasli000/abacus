@@ -35,3 +35,7 @@ lcov.info
 /coverage/
 *.db-shm
 .github/workflows/ci.yml
+
+# AI tools
+.claude/
+.opencode/
