@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <code>v2.0.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
+  <code>v2.5.5</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
 </p>
 
 ---
@@ -143,9 +143,7 @@ Go to [Releases](https://github.com/lucasli000/abacus/releases/latest) and downl
 | Platform | File | Size |
 |----------|------|------|
 | macOS Apple Silicon (M1/M2/M3/M4) | `abacus-aarch64-apple-darwin.tar.gz` | ~19 MB |
-| macOS Intel | `abacus-x86_64-apple-darwin.tar.gz` | ~20 MB |
 | Linux x86_64 | `abacus-x86_64-unknown-linux-gnu.tar.gz` | ~22 MB |
-| Linux ARM64 | `abacus-aarch64-unknown-linux-gnu.tar.gz` | ~21 MB |
 
 Then install:
 
@@ -223,7 +221,7 @@ rm -rf ~/.abacus  # Remove config + data (optional)
 
 ```bash
 # Option A: Use mirror proxy
-curl -fsSL https://gh-proxy.com/https://github.com/lucasli000/abacus/releases/download/v2.0.0/abacus-aarch64-apple-darwin.tar.gz | tar -xz
+curl -fsSL https://gh-proxy.com/https://github.com/lucasli000/abacus/releases/download/v2.5.5/abacus-aarch64-apple-darwin.tar.gz | tar -xz
 sudo mv abacus /usr/local/bin/
 
 # Option B: Use local SOCKS proxy
@@ -249,6 +247,9 @@ curl -x socks5://127.0.0.1:7890 -fsSL https://github.com/lucasli000/abacus/relea
 - **MCIP** — Multi-level permission gate (role → confirm → capability).
 - **ProgressiveGate** — Complexity-aware output strategy.
 - **Dynamic Timeout** — Complexity + tool count + LLM self-extension.
+- **Self-Learning** — EffectivenessTracker records tool outcomes. Experience injector marks unreliable tools. Anti-pattern detector catches environment issues.
+- **Unicode Injection Defense** — Zero-width character normalization prevents prompt injection bypass.
+- **Configurable Safety Rules** — User-defined injection patterns with priority override.
 
 ### TUI
 
@@ -257,6 +258,11 @@ curl -x socks5://127.0.0.1:7890 -fsSL https://github.com/lucasli000/abacus/relea
 - Right panel: dashboard + timeline + focus
 - 12 built-in themes
 - Inline suggestions (Tab)
+- **Honest Data Display** — No fake data when provider/model not connected. Shows "Not connected" instead of placeholders.
+- **Formatted Tool Output** — JSON parsed into structured display: `⚙ command` + `│ ⤷ stdout`
+- **Symbol System** — Consistent visual language: ▸ You / ◈ Think / ⚙ Tool / ◇ Abacus
+- **Markdown in Thinking** — Thinking cards render markdown with syntax highlighting
+- **Right-aligned Metadata** — Model name and timestamps aligned to card header right side
 
 ## Quick Start
 
@@ -324,11 +330,15 @@ abacus/pkg/
 
 ```bash
 cargo check --workspace        # Type check
-cargo test --workspace         # Run tests
-make build                     # Release build
-make package                   # Create .tar.gz
-make universal                 # macOS universal binary
+cargo test --workspace         # Run tests (1814 tests)
+cargo build --release --package abacus-cli  # Release build
 ```
+
+### Test Coverage
+
+- 1814 unit tests across all crates
+- 0 warnings, 0 errors
+- Theme WCAG contrast validation (12 themes × 4 color roles)
 
 ## License
 
