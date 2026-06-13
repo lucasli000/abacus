@@ -78,6 +78,28 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
 
     for card in state.cards.iter() {
         let id = card.id();
+
+        // V42-B FIX: 跳过空 LlmCard / ExpertCard / ThinkingCard
+        // 流式期间可能创建空卡片占位，应避免渲染 header-only 的空卡片
+        if state.cards.active_id() != Some(id) {
+            // 已 finish 的卡片才检查（active 卡正在累积，不应跳过）
+            if let Some(llm) = state.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
+                if llm.reply_text_for_copy().is_empty() {
+                    continue;
+                }
+            }
+            if let Some(expert) = state.cards.card_downcast_ref::<crate::tui::cards::ExpertCard>(id) {
+                if expert.reply_text_for_copy().is_empty() {
+                    continue;
+                }
+            }
+            if let Some(think) = state.cards.card_downcast_ref::<crate::tui::cards::ThinkingCard>(id) {
+                if think.text_for_copy().is_empty() {
+                    continue;
+                }
+            }
+        }
+
         let collapse = state.cards.collapse(id);
         let h = card_total_height(card.as_ref(), &ctx, inner.width, collapse);
         if h == 0 {

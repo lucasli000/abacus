@@ -253,26 +253,28 @@ pub fn push_session_message(
 ) {
     // V42-B FIX: 流式路径已通过 TextDelta 累积内容到 LlmCard，
     // 此时 EngineResponse 抵达再调 add_message 会重复创建 LlmCard。
-    // 检测：最后一张静态卡片是否已是 LlmCard/ExpertCard 且 reply 已包含 text（或 text 包含 reply）。
+    // 检测：最近 5 张已 finish 的 LlmCard/ExpertCard 中是否有匹配 text 的，有则跳过。
     if !text.is_empty() {
-        if let Some(last_id) = state.cards.last_id() {
-            // 仅当最后一张卡是非 active（已 finish）时才考虑去重
-            // active 卡正在流式累积，不应跳过
-            if state.cards.active_id() != Some(last_id) {
-                if expert_name.is_some() {
-                    if let Some(expert) = state.cards.card_downcast_ref::<ExpertCard>(last_id) {
-                        let existing = expert.reply_text_for_copy();
-                        if !existing.is_empty() && (existing.contains(text) || text.contains(&existing)) {
-                            // 流式已落档，跳过非流式重复
-                            return;
-                        }
-                    }
-                } else if let Some(llm) = state.cards.card_downcast_ref::<LlmCard>(last_id) {
-                    let existing = llm.reply_text_for_copy();
-                    if !existing.is_empty() && (existing.contains(text) || text.contains(&existing)) {
+        let active = state.cards.active_id();
+        let mut card_ids: Vec<u64> = state.cards.iter()
+            .map(|c| c.id())
+            .filter(|id| Some(*id) != active)
+            .collect();
+        card_ids.reverse();
+        for cid in card_ids.into_iter().take(5) {
+            if expert_name.is_some() {
+                if let Some(expert) = state.cards.card_downcast_ref::<ExpertCard>(cid) {
+                    let existing = expert.reply_text_for_copy();
+                    if !existing.is_empty() && (existing == text || existing.contains(text) || text.contains(&existing)) {
                         // 流式已落档，跳过非流式重复
                         return;
                     }
+                }
+            } else if let Some(llm) = state.cards.card_downcast_ref::<LlmCard>(cid) {
+                let existing = llm.reply_text_for_copy();
+                if !existing.is_empty() && (existing == text || existing.contains(text) || text.contains(&existing)) {
+                    // 流式已落档，跳过非流式重复
+                    return;
                 }
             }
         }
