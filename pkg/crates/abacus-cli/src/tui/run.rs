@@ -356,6 +356,23 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
     };
     state.engine_handle = Some(engine.clone());
 
+    // V42-B FIX: 启动时初始化所有注册工具的 health 快照
+    // 引用关系：state.tool_health 由 ToolsSection 读取，原仅在工具调用时填充导致
+    // 新会话面板显示 "Builtin 0 External 0"（误导用户工具未注册）
+    {
+        let tools = engine.core.tool_registry_ref().all_tools().await;
+        let tool_ids: Vec<abacus_types::ToolId> = tools.iter()
+            .filter(|t| matches!(t.state, abacus_types::ToolState::Loaded | abacus_types::ToolState::Active))
+            .map(|t| t.id.clone())
+            .collect();
+        if !tool_ids.is_empty() {
+            let health = engine.core.tool_health_snapshot(&tool_ids).await;
+            for entry in health {
+                state.tool_health.insert(entry.tool_id.clone(), entry);
+            }
+        }
+    }
+
     // 启动 AutoEngine Runner——将 AutoHealth 快照推送到自动化 Tab
     // 生命周期：_auto_runner_handle drop 后 runner task 退出；与 TUI 同生命周期
     // 引用关系：health_rx 在 interval tick 分支被 try_recv；state.auto_health 消费

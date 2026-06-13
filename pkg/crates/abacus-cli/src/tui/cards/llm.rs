@@ -107,11 +107,14 @@ impl MessageCard for LlmCard {
             CardCollapse::Headless => 0,
             CardCollapse::Collapsed => {
                 let preview = self.reply_preview();
-                if preview.is_empty() { 1 } else { 1 }
+                if preview.is_empty() { 0 } else { 1 }
             }
             CardCollapse::Expanded => {
-                let reply_lines = self.reply_text.lines().count().max(1) as u16;
-                reply_lines
+                if self.reply_text.is_empty() {
+                    0  // V42-B: 空 reply 不占 body 行（避免显示空卡片）
+                } else {
+                    self.reply_text.lines().count().max(1) as u16
+                }
             }
         }
     }

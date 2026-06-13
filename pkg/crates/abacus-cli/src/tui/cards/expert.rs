@@ -43,6 +43,11 @@ impl ExpertCard {
         self.streaming = s;
     }
 
+    /// 供去重检测读取已累积的 reply 文本
+    pub fn reply_text_for_copy(&self) -> String {
+        self.reply_text.clone()
+    }
+
     fn reply_preview(&self) -> String {
         self.reply_text.lines().next().unwrap_or("").to_string()
     }

@@ -27,11 +27,17 @@ use crate::tui::state::{AppState, EventLevel, TraceEvent, TraceKind, ToolStatus}
 /// 处理单个 chunk, 写入 CardStream
 pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
     match chunk {
-        StreamChunk::Thinking(_) => {
-            ensure_thinking_card_active(state);
+        StreamChunk::Thinking(t) => {
+            // V42-B FIX: 仅在内容非空时创建 ThinkingCard，避免空头卡
+            if !t.is_empty() {
+                ensure_thinking_card_active(state);
+            }
         }
-        StreamChunk::TextDelta(_) => {
-            ensure_reply_card_active(state);
+        StreamChunk::TextDelta(t) => {
+            // V42-B FIX: 仅在内容非空时创建 LlmCard，避免空头卡
+            if !t.is_empty() {
+                ensure_reply_card_active(state);
+            }
         }
         StreamChunk::ToolStart { .. } => {
             ensure_no_active(state);
@@ -245,6 +251,33 @@ pub fn push_session_message(
     time: &str,
     expert_name: Option<&str>,
 ) {
+    // V42-B FIX: 流式路径已通过 TextDelta 累积内容到 LlmCard，
+    // 此时 EngineResponse 抵达再调 add_message 会重复创建 LlmCard。
+    // 检测：最后一张静态卡片是否已是 LlmCard/ExpertCard 且 reply 已包含 text（或 text 包含 reply）。
+    if !text.is_empty() {
+        if let Some(last_id) = state.cards.last_id() {
+            // 仅当最后一张卡是非 active（已 finish）时才考虑去重
+            // active 卡正在流式累积，不应跳过
+            if state.cards.active_id() != Some(last_id) {
+                if expert_name.is_some() {
+                    if let Some(expert) = state.cards.card_downcast_ref::<ExpertCard>(last_id) {
+                        let existing = expert.reply_text_for_copy();
+                        if !existing.is_empty() && (existing.contains(text) || text.contains(&existing)) {
+                            // 流式已落档，跳过非流式重复
+                            return;
+                        }
+                    }
+                } else if let Some(llm) = state.cards.card_downcast_ref::<LlmCard>(last_id) {
+                    let existing = llm.reply_text_for_copy();
+                    if !existing.is_empty() && (existing.contains(text) || text.contains(&existing)) {
+                        // 流式已落档，跳过非流式重复
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // 兜底: 上游残留 active 先 finish 掉
     state.cards.finish_active();
     let id = state.cards.alloc_id();

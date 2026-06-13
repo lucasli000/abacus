@@ -107,12 +107,15 @@ impl Section for LlmSection {
             None => ("\u{00b7}", theme.muted),
         };
         // model: 优先用原始 model_name，若 lookup 成功则用 display_name
+        // V42-B FIX: 逻辑反转——lookup_model_or_default 命中时 id == model_name，
+        // 此时使用 display_name；不匹配时（fallback 到 V4-Flash）显示原始 model_name
         let model_lookup = abacus_types::lookup_model_or_default(&state.model_name);
         let model_display = if model_lookup.id == state.model_name {
-            // lookup 未命中（返回了 fallback），直接显示原始 model_name
-            state.model_name.as_str()
-        } else {
+            // lookup 命中：显示官方 display_name
             model_lookup.display_name
+        } else {
+            // lookup 未命中（返回了 fallback），显示用户配置的原始 model_name
+            state.model_name.as_str()
         };
         lines.push(Line::from(vec![
             Span::styled(format!(" {} ", status_icon), Style::default().fg(status_color)),
