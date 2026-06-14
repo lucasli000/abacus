@@ -56,7 +56,8 @@ pub struct CardStream {
 }
 
 /// 最大保留卡片数——超出时 FIFO 裁剪最旧卡片，防止长会话滚动卡顿
-const MAX_CARDS: usize = 100;
+/// 压力测试修复5：与 state::MAX_MESSAGES=200 同步，防止 messages > cards 导致 desync
+const MAX_CARDS: usize = 200;
 
 impl Default for CardStream {
     fn default() -> Self {

@@ -2661,15 +2661,30 @@ impl AppState {
         cursor_col: &mut usize,
     ) {
         let ta = textarea.borrow();
+        let (row, col) = ta.cursor();
+        // 压力测试修复4：光标移动不改文本时，跳过 O(n) 字符串比较和分配
+        // 只在 cursor_pos 可能变化时更新 cursor（不需要比较文本）
+        let new_cursor_pos = row_col_to_byte_pos(input, row, col);
+        if *cursor_pos != new_cursor_pos {
+            *cursor_pos = new_cursor_pos;
+        }
+        *cursor_line = row;
+        *cursor_col = col;
+        // 光标移动不改文本，直接返回（文本变化由 textarea.input() 触发，已在调用处同步）
+    }
+
+    /// 压力测试修复4b：文本变化专用 sync（比 sync_from_textarea 更高效，跳过 cursor 重算）
+    /// 仅在 textarea 文本实际变化时调用（如 textarea.input() 返回 true 后）
+    pub(crate) fn sync_text_from_textarea(
+        textarea: &RefCell<TuiTextArea<'static>>,
+        input: &mut String,
+    ) {
+        let ta = textarea.borrow();
         let new_input: String = ta.lines().join("\n");
         if *input != new_input {
             input.clear();
             input.push_str(&new_input);
         }
-        let (row, col) = ta.cursor();
-        *cursor_pos = row_col_to_byte_pos(input, row, col);
-        *cursor_line = row;
-        *cursor_col = col;
     }
 
     /// V42-B+: 从 state.input 同步到 tui-textarea
@@ -3868,6 +3883,8 @@ impl AppState {
         self.streaming_trace_ids.clear();
         // 流式 Markdown 增量引擎：drop 释放 mdstream 状态
         *self.streaming_md.borrow_mut() = None;
+        // 压力测试修复2：流式结束清除 dirty 标记，防止"永远 dirty"
+        self.streaming_content_dirty.set(false);
         // V42-B: cached_base_lines + cached_base_msg_count 已删除
         self.streaming_content_dirty.set(false);
         // Phase 2: 流式结束后恢复自动跟随
@@ -4401,7 +4418,7 @@ fn byte_pos_to_row_col(input: &str, byte_pos: usize) -> (usize, usize) {
 /// (row, col) → 字节偏移 转换
 ///
 /// 用于将 tui-textarea 的光标位置 (row, col) 转换为 state.cursor_pos（字节偏移）。
-fn row_col_to_byte_pos(input: &str, row: usize, col: usize) -> usize {
+pub(crate) fn row_col_to_byte_pos(input: &str, row: usize, col: usize) -> usize {
     let mut current_row = 0usize;
     let mut current_col = 0usize;
     let mut byte_offset = 0usize;

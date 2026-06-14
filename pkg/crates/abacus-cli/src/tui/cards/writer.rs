@@ -55,7 +55,9 @@ pub fn handle_chunk(state: &mut AppState, chunk: &StreamChunk) {
         }
         StreamChunk::ToolAgentResult { icon, name, call_count, summary, .. } => {
             ensure_reply_card_active(state);
-            let display = format!("\n{} {} · {} calls", icon, name, call_count);
+            // 压力测试修复3：截断过长的 tool name，防止溢出屏幕宽度
+            let name_short: String = name.chars().take(20).collect();
+            let display = format!("\n{} {} · {} calls", icon, name_short, call_count);
             if let Some(id) = state.cards.active_id() {
                 if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(id) {
                     llm.append_reply(&display);

@@ -95,8 +95,9 @@ pub fn apply_picker_selection(state: &mut AppState) {
     state.cursor_pos = 0;
     state.cursor_line = 0;
     state.cursor_col = 0;
-    state.input_state = crate::tui::state::InputState::Ready;
-    state.mark_render_dirty();
+            state.input_state = crate::tui::state::InputState::Ready;
+            state.sync_to_textarea(); // 压力测试修复1
+            state.mark_render_dirty();
 }
 
 /// 解析并执行斜杠命令。返回 true 表示命令已消费（不发给引擎）。
@@ -1480,24 +1481,30 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
     // 字符输入 — Phase 2: 委托 tui-textarea 处理，替代手写 cursor 状态机
     // textarea.input() 处理：char 插入、cursor 移动、unicode-width 计算
     // 保留：inline suggestion、slash auto-complete、input_state 更新
+    // 字符输入 — Phase 2+4: 委托 tui-textarea，优化 sync（区分文本变化 vs 光标移动）
     if let KeyCode::Char(c) = code {
         if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) {
-            // 转换为 tui-textarea Input 并委托
             let ti = tui_textarea::Input {
                 key: tui_textarea::Key::Char(c),
-                ctrl: false,
-                alt: false,
-                shift: false,
+                ctrl: false, alt: false, shift: false,
             };
-            state.textarea.borrow_mut().input(ti);
-            // 同步 textarea → state
-            crate::tui::state::AppState::sync_from_textarea(
-                &state.textarea,
-                &mut state.input,
-                &mut state.cursor_pos,
-                &mut state.cursor_line,
-                &mut state.cursor_col,
-            );
+            let text_changed = state.textarea.borrow_mut().input(ti);
+            if text_changed {
+                // 文本变化：只比较文本（跳过 cursor 重算），再用 textarea.cursor()
+                crate::tui::state::AppState::sync_text_from_textarea(
+                    &state.textarea, &mut state.input,
+                );
+                let (row, col) = state.textarea.borrow().cursor();
+                state.cursor_pos = crate::tui::state::row_col_to_byte_pos(&state.input, row, col);
+                state.cursor_line = row;
+                state.cursor_col = col;
+            } else {
+                // 光标移动：直接同步 cursor（不做 O(n) 字符串比较）
+                crate::tui::state::AppState::sync_from_textarea(
+                    &state.textarea, &mut state.input,
+                    &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
+                );
+            }
             state.input_state = InputState::Typing;
 
             // 更新内联补全候选（保留原有逻辑）
@@ -2279,6 +2286,7 @@ pub fn submit_message(state: &mut AppState) {
                 state.cursor_pos = 0;
                 state.cursor_line = 0;
                 state.cursor_col = 0;
+                state.sync_to_textarea();
                 state.input_state = InputState::Thinking;
                 return;
             } else if input_lower == "n" || input_lower == "no" {
@@ -2289,6 +2297,7 @@ pub fn submit_message(state: &mut AppState) {
                 state.cursor_pos = 0;
                 state.cursor_line = 0;
                 state.cursor_col = 0;
+                state.sync_to_textarea();
                 state.input_state = InputState::Ready;
                 return;
             }
@@ -2431,6 +2440,7 @@ pub fn submit_message(state: &mut AppState) {
     state.cursor_pos = 0;
     state.cursor_line = 0;
     state.cursor_col = 0;
+    state.sync_to_textarea(); // 压力测试修复1：清空 input 后立即同步 textarea，防止闪烁
     state.input_state = InputState::Thinking;
     state.op_started_at = Some(std::time::Instant::now());
     state.accumulated_elapsed = std::time::Duration::ZERO;
