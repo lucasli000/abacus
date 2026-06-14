@@ -436,8 +436,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     };
     let bar_color = state.input_bar_color();
 
-    // ── 同步 textarea 内容 ──
-    state.sync_to_textarea();
+    // Phase 2: textarea 是 SSoT，input() 后已同步到 state.input，无需额外 sync
 
     // ── 状态指示行文本 ──
     let spinner = || {

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use tracing::info;
 
-use crate::tui::state::{AppState, Focus, InputState, Message, MsgContent, ScrollAction, AbacusMode, TextSelection};
+use crate::tui::state::{AppState, Focus, InputState, ScrollAction, AbacusMode, TextSelection};
 
 /// Phase 3 去重：base64_encode_inner 已统一到 util::base64_encode
 /// 保留 pub 别名防止外部依赖（如有）break，下一 PR 可删此 wrapper
@@ -1422,26 +1422,22 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // Backspace — 使用 char boundary 安全删除
+    // Backspace — Phase 2: 委托 tui-textarea 处理（CJK 安全 + char boundary）
     if code == KeyCode::Backspace {
-        if state.cursor_pos > 0 {
-            if let Some((idx, _)) = state.input[..state.cursor_pos].char_indices().next_back() {
-                state.input.remove(idx);
-                state.cursor_pos = idx;
-            }
-            state.recalculate_cursor();
-        } else if !state.input.is_empty() {
-            // cursor_pos == 0 但 input 非空：cursor 与 input 不同步（防御性修复）
-            // 强制删除第一个字符
-            if state.input.len() > 0 {
-                let first_char_len = state.input.chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-                if first_char_len > 0 {
-                    state.input.drain(..first_char_len);
-                    state.cursor_pos = 0;
-                    state.recalculate_cursor();
-                }
-            }
-        }
+        let ti = tui_textarea::Input {
+            key: tui_textarea::Key::Backspace,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+        state.textarea.borrow_mut().input(ti);
+        crate::tui::state::AppState::sync_from_textarea(
+            &state.textarea,
+            &mut state.input,
+            &mut state.cursor_pos,
+            &mut state.cursor_line,
+            &mut state.cursor_col,
+        );
         // 更新内联补全候选
         state.inline_suggestion = if state.input.is_empty() {
             None
@@ -1493,52 +1489,56 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // 字符输入 — 使用 char boundary 更新 cursor_pos + unicode-width
+    // 字符输入 — Phase 2: 委托 tui-textarea 处理，替代手写 cursor 状态机
+    // textarea.input() 处理：char 插入、cursor 移动、unicode-width 计算
+    // 保留：inline suggestion、slash auto-complete、input_state 更新
     if let KeyCode::Char(c) = code {
-        let char_len = c.len_utf8();
-        state.input.insert(state.cursor_pos, c);
-        state.cursor_pos += char_len;
-        state.input_state = InputState::Typing;
-        if c == '\n' {
-            state.recalculate_cursor();
-        } else {
-            state.cursor_col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
-        }
-
-        // 更新内联补全候选（不阻塞输入）+ 清空 Tab 循环状态
-        // IME/中文输入法下拼音组合会产生高频 Char 事件；普通文本不做历史补全扫描，
-        // 只对 `/` 开头的命令即时补全，Tab 仍可触发完整候选。
-        state.inline_suggestion = if state.input.trim_start().starts_with('/') {
-            state.compute_inline_suggestion()
-        } else {
-            None
-        };
-        state.inline_candidates.clear();
-        state.inline_candidate_idx = 0;
-
-        // V32 · Slash 自动补全：用户在输入栏首位敲 `/` 起头的命令时自动弹候选
-        //
-        // 特殊路径：Picker 命令直接执行，跳过补全弹窗中间步骤
-        // - /model / /m → 直接打开模型选择器（用户不需要再按一次 Enter）
-        // - /theme       → 直接打开主题选择器
-        // - /thinking /think → 直接打开思考深度选择器
-        // 以上命令输入完成后即可开起 picker，无需经过补全候选列表确认。
-        if state.input.starts_with('/') && state.cursor_pos == state.input.len() {
-            let trimmed = state.input.trim().to_string(); // to_string() 释放借用，避免后续可变借用冲突
-            let is_direct_picker = matches!(trimmed.as_str(),
-                "/model" | "/m" | "/mode" | "/theme" | "/thinking" | "/think"
+        if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) {
+            // 转换为 tui-textarea Input 并委托
+            let ti = tui_textarea::Input {
+                key: tui_textarea::Key::Char(c),
+                ctrl: false,
+                alt: false,
+                shift: false,
+            };
+            state.textarea.borrow_mut().input(ti);
+            // 同步 textarea → state
+            crate::tui::state::AppState::sync_from_textarea(
+                &state.textarea,
+                &mut state.input,
+                &mut state.cursor_pos,
+                &mut state.cursor_line,
+                &mut state.cursor_col,
             );
-            if is_direct_picker {
-                if handle_slash_command(state, &trimmed) {
-                    state.input.clear();
-                    state.cursor_pos = 0;
-                    state.cursor_line = 0;
-                    state.cursor_col = 0;
-                    state.input_state = InputState::Ready;
+            state.input_state = InputState::Typing;
+
+            // 更新内联补全候选（保留原有逻辑）
+            state.inline_suggestion = if state.input.trim_start().starts_with('/') {
+                state.compute_inline_suggestion()
+            } else {
+                None
+            };
+            state.inline_candidates.clear();
+            state.inline_candidate_idx = 0;
+
+            // Slash 自动补全（保留原有逻辑）
+            if state.input.starts_with('/') && state.cursor_pos == state.input.len() {
+                let trimmed = state.input.trim().to_string();
+                let is_direct_picker = matches!(trimmed.as_str(),
+                    "/model" | "/m" | "/mode" | "/theme" | "/thinking" | "/think"
+                );
+                if is_direct_picker {
+                    if handle_slash_command(state, &trimmed) {
+                        state.input.clear();
+                        state.cursor_pos = 0;
+                        state.cursor_line = 0;
+                        state.cursor_col = 0;
+                        state.input_state = InputState::Ready;
+                    }
+                    return;
                 }
-                return;
+                let _ = trigger_completion(state);
             }
-            let _ = trigger_completion(state);
         }
     }
 }

@@ -1191,7 +1191,7 @@ pub struct AppState {
     ///
     /// ## 同步策略
     /// - `state.input` 是 SSoT（单真相源）
-    /// - 每帧渲染前 sync_to_textarea() 将 input 同步到 textarea
+    /// - Phase 2: textarea.input() 后 sync_from_textarea() 将 textarea 同步回 state.input
     /// - textarea 负责：光标渲染、行号、软换行、选区高亮
     /// - `state.input` 负责：slash 命令拦截、submit 逻辑、completion、历史
     ///
@@ -2649,51 +2649,27 @@ impl AppState {
         self.rendered_lines_dirty.set(false);
     }
 
-    /// V42-B+: 同步 state.input 到 tui-textarea
+    /// V42-B+: 从 tui-textarea 同步内容和光标到 state 字段
     ///
-    /// 每帧渲染前调用，确保 textarea 内容与 input 一致。
-    /// 同时同步光标位置（从 cursor_pos 字节偏移 → textarea 的 (row, col)）。
-    ///
-    /// ## 性能
-    /// O(n) 单次扫描，n = input.len()。每帧最多调一次。
-    pub(crate) fn sync_to_textarea(&self) {
-        let mut ta = self.textarea.borrow_mut();
-
-        // 1. 同步文本内容
-        let current = ta.lines().join("\n");
-        if current != self.input {
-            // 清空并重设
-            let lines: Vec<String> = if self.input.is_empty() {
-                vec![String::new()]
-            } else {
-                self.input.lines().map(|s| s.to_string()).collect()
-            };
-            // tui-textarea 没有 set_lines，用 select_all + delete + insert
-            ta.select_all();
-            ta.cut();
-            for (i, line) in lines.iter().enumerate() {
-                if i > 0 {
-                    ta.insert_newline();
-                }
-                ta.insert_str(line);
-            }
+    /// 独立函数避免 &self vs &mut self 冲突（textarea 在 RefCell 中）。
+    /// 调用方需持有 &mut AppState，传入各字段的可变引用。
+    pub(crate) fn sync_from_textarea(
+        textarea: &RefCell<TuiTextArea<'static>>,
+        input: &mut String,
+        cursor_pos: &mut usize,
+        cursor_line: &mut usize,
+        cursor_col: &mut usize,
+    ) {
+        let ta = textarea.borrow();
+        let new_input: String = ta.lines().join("\n");
+        if *input != new_input {
+            input.clear();
+            input.push_str(&new_input);
         }
-
-        // 2. 同步光标位置（cursor_pos 是字节偏移，转为 (row, col)）
-        let (target_row, target_col) = byte_pos_to_row_col(&self.input, self.cursor_pos);
-        let (cur_row, cur_col) = ta.cursor();
-        if (cur_row, cur_col) != (target_row, target_col) {
-            use tui_textarea::CursorMove;
-            // 先移到行首，再移到目标行
-            ta.move_cursor(CursorMove::Top);
-            for _ in 0..target_row {
-                ta.move_cursor(CursorMove::Down);
-            }
-            ta.move_cursor(CursorMove::Head);
-            for _ in 0..target_col {
-                ta.move_cursor(CursorMove::Forward);
-            }
-        }
+        let (row, col) = ta.cursor();
+        *cursor_pos = row_col_to_byte_pos(input, row, col);
+        *cursor_line = row;
+        *cursor_col = col;
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -4376,6 +4352,33 @@ fn byte_pos_to_row_col(input: &str, byte_pos: usize) -> (usize, usize) {
         byte_offset += ch.len_utf8();
     }
     (row, col)
+}
+
+/// (row, col) → 字节偏移 转换
+///
+/// 用于将 tui-textarea 的光标位置 (row, col) 转换为 state.cursor_pos（字节偏移）。
+fn row_col_to_byte_pos(input: &str, row: usize, col: usize) -> usize {
+    let mut current_row = 0usize;
+    let mut current_col = 0usize;
+    let mut byte_offset = 0usize;
+    for ch in input.chars() {
+        if current_row == row && current_col == col {
+            return byte_offset;
+        }
+        if ch == '\n' {
+            if current_row == row {
+                // 目标在本行末尾（col 超出实际列数）
+                return byte_offset;
+            }
+            current_row += 1;
+            current_col = 0;
+        } else {
+            current_col += 1;
+        }
+        byte_offset += ch.len_utf8();
+    }
+    // 到达文本末尾
+    byte_offset
 }
 
 #[cfg(test)]

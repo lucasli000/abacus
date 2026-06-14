@@ -261,7 +261,7 @@ pub(crate) fn screen_pos_to_card_char(
     terminal_rows: u16,
     scroll: usize,
     cards: &abacus_ui_kit::CardStream,
-    chat_width: u16,
+    _chat_width: u16,
     cached_msg_rows: &[usize],
 ) -> Option<(usize, usize)> {
     let msg_area_start = 1u16;
