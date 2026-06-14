@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.5.6 (2026-06-14) — UX 质量 + 架构重构（参考 OpenCode TUI）
+
+### UX / 美观
+
+- **跨角色呼吸感** — 相邻卡片 kind 不同时插入 1 行空白（User→LLM、LLM→Tool 等），同类紧贴
+- **焦点感知输入框** — Focus::Input 时 bg 从 theme.bg 升级到 theme.surface，强化"我现在在这"
+- **Placeholder 视觉强化** — 加 `▎` accent bold cursor 提示，用户感知可输入区域
+- **Dynamic 快捷键提示栏** — 底行显示上下文相关快捷键（`/` 命令 / Tab 补全 / Ctrl+B 等），替代原静态 `⏎ Enter`
+- **TopBar 紧凑指标** — 任务头右侧新增 tokens + context% + cost 一行汇总（参考 OpenCode 截图）
+- **工具调用语义符号** — Running→⠇ / Success→→ / Failed→✗，替代原装饰性 ●
+- **tui-textarea 集成（Phase 1）** — 引入 ratatui 生态最成熟的多行编辑器，替换手写 Paragraph 渲染
+
+### 稳定
+
+- **dedup 强化** — normalize_for_dedup（trim + collapse 空白）+ suffix 匹配，消除 ToolAgent prefix 注入导致的重复
+- **set_scroll 安全上限** — total==0 时 max 从 usize::MAX 改为 10_000，防首帧前 scroll 溢出
+- **scroll 字段改 pub(crate)** — 强制所有修改走 set_scroll()，绕过 clamp 不再可能
+- **RefCell 合并** — 4 个 RefCell<u16>（last_msg_area_x/y/width/height）→ 1 个 RefCell<Rect>，减少 75% borrow 操作
+
+### 高性能
+
+- **cached_msg_rows 消除重复遍历** — 渲染循环中收集高度，末尾直接赋值，消除每帧 ~100 次冗余 card_total_height 调用
+- **dedup O(1)** — CardStream 新增 iter_rev()，push_session_message dedup 从 O(n) 全量遍历 → 逆序 take(5)
+
+### 可维护
+
+- **MessageCard trait 加 is_empty()** — 消除 render_cards 中 3 种类型硬编码 downcast，新增 Card 类型无需改 render.rs
+- **Space 折叠迁移到 cards** — handle_chat_scroll_key 从读 state.messages (V40) 改为读 state.cards (V42-B)，消除双数据源不一致
+- **学习笔记** — docs/opencode-tui-design-study.md，OpenCode TUI 架构分析 + 可借鉴设计点
+
+### 测试
+
+- 新增 12 个 dedup 测试 + 9 个 metrics 测试 + 3 个 abacus card 测试
+- 全量 300/300 测试通过
+
 ## v2.0.0 (2026-06-10) — 配置系统重构 + 知识库 + 全平台 CI
 
 ### Architecture
