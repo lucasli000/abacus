@@ -44,6 +44,7 @@ pub mod card;
 pub mod card_render;
 pub mod card_stream;
 pub mod hooks;
+pub mod scrollable;
 pub mod scrollable_stack;
 pub mod section;
 pub mod theme;
@@ -55,6 +56,7 @@ pub use util::{char_width, display_width, pad_to_width};
 pub use card::kinds;
 pub use card_render::{card_total_height, hit_test_card, paint_card_top_shimmer, render_card};
 pub use card_stream::CardStream;
+pub use scrollable::{Scrollable, SimpleScrollOffset};
 pub use scrollable_stack::{ScrollLayout, ScrollPosition, ScrollableStack};
 pub use hooks::{PulseGate, ShimmerPhase, SpinnerFrame, SPINNER_FRAMES};
 pub use section::{
@@ -77,6 +79,7 @@ pub mod prelude {
     pub use crate::card::kinds;
     pub use crate::card_render::{card_total_height, hit_test_card, paint_card_top_shimmer, render_card};
     pub use crate::card_stream::CardStream;
+    pub use crate::scrollable::{Scrollable, SimpleScrollOffset};
     pub use crate::scrollable_stack::{ScrollLayout, ScrollPosition, ScrollableStack};
     pub use crate::hooks::{PulseGate, ShimmerPhase, SpinnerFrame};
     pub use crate::section::{

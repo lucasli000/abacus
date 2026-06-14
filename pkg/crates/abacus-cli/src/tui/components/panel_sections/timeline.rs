@@ -124,19 +124,22 @@ impl Section for TimelineSection {
                     ]));
                 }
             }
-            // 滚动裁剪
+            // 滚动裁剪（SimpleScrollOffset: offset from top）
             let vis = area.height as usize;
             if lines.len() > vis {
-                let end = lines.len().saturating_sub(state.timeline_scroll_offset);
-                let start = end.saturating_sub(vis);
+                use abacus_ui_kit::Scrollable;
+                let raw_off = state.timeline_scroll.offset();
+                let max_off = lines.len().saturating_sub(vis);
+                let start = raw_off.min(max_off);
+                let end = (start + vis).min(lines.len());
                 lines = lines[start..end].to_vec();
-                if state.timeline_scroll_offset > 0 && !lines.is_empty() {
+                if start > 0 && !lines.is_empty() {
                     lines[0] = Line::from(vec![
                         Span::styled("    ", dim),
                         Span::styled(
                             format!(
                                 "\u{2191} {} \u{66f4}\u{591a}",
-                                state.timeline_scroll_offset
+                                start
                             ),
                             dim,
                         ),

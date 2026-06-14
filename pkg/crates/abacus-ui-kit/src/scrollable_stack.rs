@@ -247,6 +247,48 @@ impl ScrollableStack {
     }
 }
 
+use crate::scrollable::Scrollable;
+
+impl Scrollable for ScrollableStack {
+    fn scroll_up(&mut self, n: usize) {
+        ScrollableStack::scroll_up(self, n as u16);
+    }
+
+    fn scroll_down(&mut self, n: usize, content_len: usize) {
+        let layout = ScrollLayout {
+            items: Vec::new(),
+            total_height: content_len as u16,
+            viewport_height: self.viewport_height,
+        };
+        ScrollableStack::scroll_down(self, n as u16, &layout);
+    }
+
+    fn scroll_to_top(&mut self) {
+        ScrollableStack::scroll_to_top(self);
+    }
+
+    fn scroll_to_bottom(&mut self, _content_len: usize) {
+        ScrollableStack::scroll_to_bottom(self);
+    }
+
+    fn offset(&self) -> usize {
+        self.position.offset() as usize
+    }
+
+    fn is_at_bottom(&self) -> bool {
+        ScrollableStack::is_at_bottom(self)
+    }
+
+    fn clamp(&mut self, content_len: usize, viewport_height: usize) {
+        let layout = ScrollLayout {
+            items: Vec::new(),
+            total_height: content_len as u16,
+            viewport_height: viewport_height as u16,
+        };
+        ScrollableStack::rebuild(self, &layout);
+    }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // 测试
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

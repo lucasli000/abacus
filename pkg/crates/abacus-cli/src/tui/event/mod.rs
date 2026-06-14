@@ -648,28 +648,26 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
         use crate::tui::state::PanelSection;
         match code {
             KeyCode::Up => {
+                use abacus_ui_kit::Scrollable;
                 match state.panel_scroll_section {
                     PanelSection::Timeline => {
-                        // V30 timeline 边界修复：以 last_timeline_visible 为 max_events 推导上限
-                        // max_offset = total.saturating_sub(max_events)
-                        let max_off = state.trace_events.len()
-                            .saturating_sub(state.last_timeline_visible.get());
-                        state.timeline_scroll_offset = (state.timeline_scroll_offset + 1).min(max_off);
+                        state.timeline_scroll.scroll_up(1);
                     }
                     PanelSection::Knowledge => {
-                        state.knowledge_scroll_offset += 1;
+                        state.knowledge_scroll.scroll_up(1);
                     }
                 }
                 state.mark_render_dirty(); // 触发完整重绘
                 return true;
             }
             KeyCode::Down => {
+                use abacus_ui_kit::Scrollable;
                 match state.panel_scroll_section {
                     PanelSection::Timeline => {
-                        state.timeline_scroll_offset = state.timeline_scroll_offset.saturating_sub(1);
+                        state.timeline_scroll.scroll_down(1, state.trace_events.len());
                     }
                     PanelSection::Knowledge => {
-                        state.knowledge_scroll_offset = state.knowledge_scroll_offset.saturating_sub(1);
+                        state.knowledge_scroll.scroll_down(1, 1000);
                     }
                 }
                 state.mark_render_dirty(); // 触发完整重绘
@@ -1629,14 +1627,14 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                 if in_panel {
                     // 看板 timeline / knowledge: 鼠标显式在 panel 列内
                     use crate::tui::state::PanelSection;
+                    use abacus_ui_kit::Scrollable;
                     match state.panel_scroll_section {
                         PanelSection::Timeline => {
-                            // V30 timeline 边界修复：同键盘 ↑ 以 last_timeline_visible 推导上限
-                            let max_off = state.trace_events.len()
-                                .saturating_sub(state.last_timeline_visible.get());
-                            state.timeline_scroll_offset = (state.timeline_scroll_offset + 2).min(max_off);
+                            state.timeline_scroll.scroll_up(2);
                         }
-                        PanelSection::Knowledge => state.knowledge_scroll_offset += 2,
+                        PanelSection::Knowledge => {
+                            state.knowledge_scroll.scroll_up(2);
+                        }
                     }
                     state.mark_render_dirty();
                 } else {
@@ -1654,9 +1652,10 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
 
                 if in_panel {
                     use crate::tui::state::PanelSection;
+                    use abacus_ui_kit::Scrollable;
                     match state.panel_scroll_section {
-                        PanelSection::Timeline => state.timeline_scroll_offset = state.timeline_scroll_offset.saturating_sub(2),
-                        PanelSection::Knowledge => state.knowledge_scroll_offset = state.knowledge_scroll_offset.saturating_sub(2),
+                        PanelSection::Timeline => state.timeline_scroll.scroll_down(2, state.trace_events.len()),
+                        PanelSection::Knowledge => state.knowledge_scroll.scroll_down(2, 1000),
                     }
                     state.mark_render_dirty();
                 } else {

@@ -625,8 +625,11 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     let vis = area.height as usize;
     if lines.len() > vis {
-        let end = lines.len().saturating_sub(state.knowledge_scroll_offset);
-        let start = end.saturating_sub(vis);
+        use abacus_ui_kit::Scrollable;
+        let raw_off = state.knowledge_scroll.offset();
+        let max_off = lines.len().saturating_sub(vis);
+        let start = raw_off.min(max_off);
+        let end = (start + vis).min(lines.len());
         lines = lines[start..end].to_vec();
     }
     f.render_widget(Paragraph::new(lines), area);

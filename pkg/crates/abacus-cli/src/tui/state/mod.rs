@@ -27,7 +27,7 @@ pub mod session_export;
 pub mod session_migrate;
 
 use crate::tui::api::EngineHandle;
-use abacus_ui_kit::{CardStream, Theme};
+use abacus_ui_kit::{CardStream, Theme, SimpleScrollOffset};
 use tui_textarea::TextArea as TuiTextArea;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1564,15 +1564,15 @@ pub struct AppState {
     pub pending_mcip_confirmations: Vec<abacus_core::mcip::McipConfirmRequest>,
 
     // ─── V0.5 Panel Scroll ──────────────────────────────────────────
-    /// 时间线滚动偏移（0 = auto-scroll to bottom，>0 = 手动向上偏移行数）
-    pub timeline_scroll_offset: usize,
+    /// 时间线滚动（offset-from-top，0 = 顶部，follow_tail = auto-scroll to bottom）
+    pub timeline_scroll: SimpleScrollOffset,
     /// V35: Timeline 分组缓存 — 防止每帧重分组（trace_events.len() 变化时失效重建）
     /// 生命周期: render_tab_scene 按需重建，进程内有效
     pub timeline_groups_cache: Vec<TimelineGroup>,
     /// 上次缓存时 trace_events.len()，用于失效检测
     pub timeline_cache_len: usize,
-    /// 知识宫殿滚动偏移（0 = auto-scroll to bottom，>0 = 手动向上偏移行数）
-    pub knowledge_scroll_offset: usize,
+    /// 知识宫殿滚动（offset-from-top，0 = 顶部，follow_tail = auto-scroll to bottom）
+    pub knowledge_scroll: SimpleScrollOffset,
     /// 面板当前滚动焦点区块（用于 ↑↓ 操作哪个区块）
     pub panel_scroll_section: PanelSection,
 
@@ -2971,10 +2971,10 @@ impl AppState {
             pending_confirmation_response: None,
             always_allow: std::collections::HashSet::new(),
             pending_mcip_confirmations: Vec::new(),
-            timeline_scroll_offset: 0,
+            timeline_scroll: SimpleScrollOffset::with_follow_tail(true),
             timeline_groups_cache: Vec::new(),
             timeline_cache_len: 0,
-            knowledge_scroll_offset: 0,
+            knowledge_scroll: SimpleScrollOffset::with_follow_tail(true),
             panel_scroll_section: PanelSection::Timeline,
             knowledge_calls: Vec::new(),
             focus_changed_at: None,
