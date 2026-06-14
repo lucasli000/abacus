@@ -28,7 +28,15 @@
 
 - **MessageCard trait 加 is_empty()** — 消除 render_cards 中 3 种类型硬编码 downcast，新增 Card 类型无需改 render.rs
 - **Space 折叠迁移到 cards** — handle_chat_scroll_key 从读 state.messages (V40) 改为读 state.cards (V42-B)，消除双数据源不一致
+- **鼠标 hit-test 迁移到 cards** — screen_pos_to_msg_char → screen_pos_to_card_char，extract_selection_text → extract_card_selection_text，scroll_to_message 改用 cached_msg_rows
+- **MessageCard trait 加 text_content()** — 各 Card 类型覆写返回对应文本，支持鼠标选择复制等场景
+- **/new 命令同步清空 cards** — 修复只清 messages 不清 cards 导致旧会话卡片残留的 bug
 - **学习笔记** — docs/opencode-tui-design-study.md，OpenCode TUI 架构分析 + 可借鉴设计点
+
+### 待做（下次 session）
+
+- **tui-textarea Phase 2** — 键盘处理迁移到 textarea.input()，替换 handle_input_key 中的手写 cursor 状态机
+- **Scrollback trait 抽象** — 架构级重构，需 C3/C4 完成后才有干净基础
 
 ### 测试
 
