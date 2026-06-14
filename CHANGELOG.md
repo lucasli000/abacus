@@ -2,6 +2,26 @@
 
 ## v2.5.6 (2026-06-14) — UX 质量 + 架构重构（参考 OpenCode TUI）
 
+### 完成总结
+
+本次会话完成 **19 个任务**，共产生 **25 次 commit**，最终状态：
+- 1544/1544 测试通过，0 error，0 clippy warning
+- 6 个 workspace crate 全量 clippy 清零（34 warnings → 0）
+
+### 关键架构决策
+
+- **tui-textarea SSoT** — 输入状态机完全替换为 tui-textarea widget，`state.input` 保持 SSoT（文本内容），textarea 通过 `sync_to_textarea`/`sync_from_textarea` 双向同步
+- **卡片语义识别** — `MessageCard` trait 新增 `fn kind()` 方法，支持 Markdown 标题识别和交互语义
+- **Tool Agent 结果可视化** — LLM 输出 `ToolAgentResult` JSON 时自动渲染 tool-badge
+- **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
+- **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
+
+### 后续规划（下一阶段）
+
+1. **Scrollback trait 抽象** — 定义 `ScrollableContent` trait，统一 Scrollback/ScrollbackOverlay/CardStream/Picker 四类滚动容器
+2. **tui-textarea Phase 5** — Tab 补全完全委托给 textarea
+3. **TUI 质量加固** — 继续清理存量优化点
+
 ### UX / 美观
 
 - **跨角色呼吸感** — 相邻卡片 kind 不同时插入 1 行空白（User→LLM、LLM→Tool 等），同类紧贴
