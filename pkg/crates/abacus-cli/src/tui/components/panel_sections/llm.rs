@@ -53,6 +53,9 @@ impl Section for LlmSection {
     fn id(&self) -> &str {
         "llm"
     }
+    fn order(&self) -> u32 {
+        10
+    }
 
     fn title(&self) -> &str {
         // i18n key, 由实现侧自行翻译

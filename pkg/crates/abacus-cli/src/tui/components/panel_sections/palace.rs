@@ -36,6 +36,9 @@ impl Section for PalaceSection {
     fn id(&self) -> &str {
         "palace"
     }
+    fn order(&self) -> u32 {
+        40
+    }
 
     fn title(&self) -> &str {
         "panel.palace"

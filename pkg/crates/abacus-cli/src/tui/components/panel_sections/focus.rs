@@ -48,6 +48,9 @@ impl Section for FocusSection {
     fn id(&self) -> &str {
         "focus"
     }
+    fn order(&self) -> u32 {
+        60
+    }
 
     fn title(&self) -> &str {
         "panel.focus"

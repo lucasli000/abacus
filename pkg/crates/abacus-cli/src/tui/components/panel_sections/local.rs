@@ -38,6 +38,9 @@ impl Section for LocalSection {
     fn id(&self) -> &str {
         "local"
     }
+    fn order(&self) -> u32 {
+        30
+    }
 
     fn title(&self) -> &str {
         "panel.local"

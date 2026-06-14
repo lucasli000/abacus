@@ -119,8 +119,14 @@ pub trait Section {
     fn id(&self) -> &str;
 
     /// 显示标题 —— 渲染到 section header 行
-    /// 内置 Section 可返回 i18n key，由实现侧自行翻译
     fn title(&self) -> &str;
+
+    /// 排序优先级 —— 数值越小越靠前（100 = 未指定，50 = 中间，0 = 最前）
+    /// 插件 section 可指定 order 值控制在内置 section 之间的位置。
+    /// 默认 100。内置 section 的 order 值见 extensions.rs。
+    fn order(&self) -> u32 {
+        100
+    }
 
     /// 最小高度 —— 区块至少需要多少行才有意义
     /// SectionStack 按 min_height 总和判断是否截断
@@ -334,6 +340,21 @@ impl SectionRegistry {
             if let Some(s) = self.sections.get(*id) {
                 stack = stack.add(s.as_ref());
             }
+        }
+        stack
+    }
+
+    /// 按 Section::order() 排序组装 SectionStack
+    ///
+    /// 用于 config.toml 未指定 sections 时的默认行为：
+    /// 所有已注册 section 按 order() 升序排列。
+    /// 插件 section（order=100）自动排在内置 section（order=10~60）之后。
+    pub fn build_sorted_stack<'a>(&'a self) -> SectionStack<'a> {
+        let mut sections: Vec<&dyn Section> = self.sections.values().map(|s| s.as_ref()).collect();
+        sections.sort_by_key(|s| s.order());
+        let mut stack = SectionStack::new();
+        for s in sections {
+            stack = stack.add(s);
         }
         stack
     }

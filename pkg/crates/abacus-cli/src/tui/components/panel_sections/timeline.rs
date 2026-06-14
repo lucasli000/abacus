@@ -53,6 +53,9 @@ impl Section for TimelineSection {
     fn id(&self) -> &str {
         "timeline"
     }
+    fn order(&self) -> u32 {
+        50
+    }
 
     fn title(&self) -> &str {
         "panel.timeline"

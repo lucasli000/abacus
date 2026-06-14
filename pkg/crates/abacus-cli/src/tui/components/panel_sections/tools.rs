@@ -39,6 +39,9 @@ impl Section for ToolsSection {
     fn id(&self) -> &str {
         "tools"
     }
+    fn order(&self) -> u32 {
+        20
+    }
 
     fn title(&self) -> &str {
         "panel.tools"
