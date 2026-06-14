@@ -87,6 +87,72 @@ pub struct Theme {
     pub mode_meeting: Color,
     /// 模型品牌色（仅染 TopBar 模型 chip，不污染全局 accent）
     pub model_chip: Color,
+    // ── V42-B+ 语义色：Markdown ──
+    pub markdown_heading: Color,
+    pub markdown_link: Color,
+    pub markdown_code: Color,
+    pub markdown_blockquote: Color,
+    pub markdown_emph: Color,
+    pub markdown_strong: Color,
+    pub markdown_hr: Color,
+    pub markdown_list: Color,
+    // ── V42-B+ 语义色：Syntax ──
+    pub syntax_comment: Color,
+    pub syntax_keyword: Color,
+    pub syntax_function: Color,
+    pub syntax_variable: Color,
+    pub syntax_string: Color,
+    pub syntax_number: Color,
+    pub syntax_type: Color,
+    pub syntax_operator: Color,
+    // ── V42-B+ 语义色：Diff ──
+    pub diff_added: Color,
+    pub diff_removed: Color,
+    pub diff_context: Color,
+    pub diff_added_bg: Color,
+    pub diff_removed_bg: Color,
+    pub diff_context_bg: Color,
+    // ── V42-B+ 语义色：Thinking ──
+    pub thinking_bg: Color,
+    pub thinking_border: Color,
+}
+
+impl Theme {
+    /// 从 13 个基础色派生出所有语义色（markdown / syntax / diff / thinking）
+    ///
+    /// 每个主题构造函数末尾调用 `.with_semantic_colors()`，新主题自动继承。
+    /// 特定主题可覆盖个别语义色后再调 `with_semantic_colors()`。
+    pub fn with_semantic_colors(mut self) -> Self {
+        // Markdown（参考 OpenTUI smoke-theme.json）
+        self.markdown_heading = self.accent;
+        self.markdown_link = self.accent;
+        self.markdown_code = self.gold;
+        self.markdown_blockquote = self.muted;
+        self.markdown_emph = self.error;
+        self.markdown_strong = self.gold;
+        self.markdown_hr = self.muted;
+        self.markdown_list = self.accent;
+        // Syntax
+        self.syntax_comment = self.muted;
+        self.syntax_keyword = self.primary;
+        self.syntax_function = self.accent;
+        self.syntax_variable = self.user;
+        self.syntax_string = self.success;
+        self.syntax_number = self.gold;
+        self.syntax_type = self.primary;
+        self.syntax_operator = self.accent;
+        // Diff
+        self.diff_added = self.success;
+        self.diff_removed = self.error;
+        self.diff_context = self.muted;
+        self.diff_added_bg = blend(self.success, self.bg, 0.15);
+        self.diff_removed_bg = blend(self.error, self.bg, 0.15);
+        self.diff_context_bg = self.surface;
+        // Thinking
+        self.thinking_bg = self.elevated;
+        self.thinking_border = self.accent;
+        self
+    }
 }
 
 impl Theme {
@@ -130,6 +196,31 @@ impl Theme {
         self.mode_team = map(&self.mode_team);
         self.mode_meeting = map(&self.mode_meeting);
         self.model_chip = map(&self.model_chip);
+        // V42-B+ 语义色
+        self.markdown_heading = map(&self.markdown_heading);
+        self.markdown_link = map(&self.markdown_link);
+        self.markdown_code = map(&self.markdown_code);
+        self.markdown_blockquote = map(&self.markdown_blockquote);
+        self.markdown_emph = map(&self.markdown_emph);
+        self.markdown_strong = map(&self.markdown_strong);
+        self.markdown_hr = map(&self.markdown_hr);
+        self.markdown_list = map(&self.markdown_list);
+        self.syntax_comment = map(&self.syntax_comment);
+        self.syntax_keyword = map(&self.syntax_keyword);
+        self.syntax_function = map(&self.syntax_function);
+        self.syntax_variable = map(&self.syntax_variable);
+        self.syntax_string = map(&self.syntax_string);
+        self.syntax_number = map(&self.syntax_number);
+        self.syntax_type = map(&self.syntax_type);
+        self.syntax_operator = map(&self.syntax_operator);
+        self.diff_added = map(&self.diff_added);
+        self.diff_removed = map(&self.diff_removed);
+        self.diff_context = map(&self.diff_context);
+        self.diff_added_bg = map(&self.diff_added_bg);
+        self.diff_removed_bg = map(&self.diff_removed_bg);
+        self.diff_context_bg = map(&self.diff_context_bg);
+        self.thinking_bg = map(&self.thinking_bg);
+        self.thinking_border = map(&self.thinking_border);
     }
 
     fn strip_all_color(&mut self) {
@@ -155,6 +246,31 @@ impl Theme {
         self.mode_team = Color::Yellow;
         self.mode_meeting = Color::Red;
         self.model_chip = Color::Cyan;
+        // V42-B+ 语义色（16 色终端降级）
+        self.markdown_heading = Color::Cyan;
+        self.markdown_link = Color::Cyan;
+        self.markdown_code = Color::Yellow;
+        self.markdown_blockquote = Color::DarkGray;
+        self.markdown_emph = Color::Red;
+        self.markdown_strong = Color::Yellow;
+        self.markdown_hr = Color::DarkGray;
+        self.markdown_list = Color::Cyan;
+        self.syntax_comment = Color::DarkGray;
+        self.syntax_keyword = Color::Blue;
+        self.syntax_function = Color::Cyan;
+        self.syntax_variable = Color::Blue;
+        self.syntax_string = Color::Green;
+        self.syntax_number = Color::Yellow;
+        self.syntax_type = Color::Blue;
+        self.syntax_operator = Color::Cyan;
+        self.diff_added = Color::Green;
+        self.diff_removed = Color::Red;
+        self.diff_context = Color::DarkGray;
+        self.diff_added_bg = Color::Reset;
+        self.diff_removed_bg = Color::Reset;
+        self.diff_context_bg = Color::Reset;
+        self.thinking_bg = Color::Reset;
+        self.thinking_border = Color::Cyan;
     }
 
     /// 按当前模式更新 mode 专属色
@@ -270,7 +386,31 @@ impl Theme {
             mode_team: Color::Rgb(215, 175, 130),
             mode_meeting: Color::Rgb(215, 130, 145),
             model_chip: Color::Rgb(180, 190, 210),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn catppuccin_mocha() -> Self {
@@ -296,7 +436,31 @@ impl Theme {
             mode_team: Color::Rgb(250, 179, 135),
             mode_meeting: Color::Rgb(243, 139, 168),
             model_chip: Color::Rgb(203, 166, 247),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn light() -> Self {
@@ -328,7 +492,31 @@ impl Theme {
             mode_team: Color::Rgb(0xC2, 0x41, 0x0C),    // Light Orange 加深
             mode_meeting: Color::Rgb(0xC7, 0x25, 0x2C),
             model_chip: Color::Rgb(0x00, 0x7A, 0xFF),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn monokai() -> Self {
@@ -355,7 +543,31 @@ impl Theme {
             mode_team: Color::Rgb(253, 151, 31),
             mode_meeting: Color::Rgb(249, 38, 114),
             model_chip: Color::Rgb(174, 129, 255),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn dracula() -> Self {
@@ -381,7 +593,31 @@ impl Theme {
             mode_team: Color::Rgb(255, 184, 108),
             mode_meeting: Color::Rgb(255, 85, 85),
             model_chip: Color::Rgb(189, 147, 249),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn nord() -> Self {
@@ -408,7 +644,31 @@ impl Theme {
             mode_team: Color::Rgb(208, 135, 112),
             mode_meeting: Color::Rgb(191, 97, 106),
             model_chip: Color::Rgb(180, 142, 173),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn gruvbox() -> Self {
@@ -434,7 +694,31 @@ impl Theme {
             mode_team: Color::Rgb(254, 128, 25),
             mode_meeting: Color::Rgb(251, 73, 52),
             model_chip: Color::Rgb(211, 134, 155),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn tokyo_night() -> Self {
@@ -460,7 +744,31 @@ impl Theme {
             mode_team: Color::Rgb(255, 158, 100),
             mode_meeting: Color::Rgb(247, 118, 142),
             model_chip: Color::Rgb(187, 154, 247),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn solarized_dark() -> Self {
@@ -487,7 +795,31 @@ impl Theme {
             mode_team: Color::Rgb(203, 75, 22),
             mode_meeting: Color::Rgb(220, 50, 47),
             model_chip: Color::Rgb(108, 113, 196),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     fn one_dark() -> Self {
@@ -513,7 +845,31 @@ impl Theme {
             mode_team: Color::Rgb(209, 154, 102),
             mode_meeting: Color::Rgb(224, 108, 117),
             model_chip: Color::Rgb(198, 120, 221),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     /// Apple Dark 主题 — macOS Sonoma 系统色彩（systemBlue / systemPurple / systemGreen）
@@ -542,7 +898,20 @@ impl Theme {
             mode_team: Color::Rgb(0xFF, 0x9F, 0x0A),   // systemOrange
             mode_meeting: Color::Rgb(0xFF, 0x45, 0x3A),
             model_chip: Color::Rgb(0xBF, 0x5A, 0xF2),  // systemPurple
-        }
+            // V42-B+ 语义色（由 with_semantic_colors() 覆盖）
+            markdown_heading: Color::Rgb(0, 0, 0), markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0), markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0), markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0), markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0), syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0), syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0), syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0), syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0), diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0), diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0), diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0), thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 
     /// Google Material Design 3 主题 — 深蓝灰底 + Google 品牌四色
@@ -571,7 +940,31 @@ impl Theme {
             mode_team: Color::Rgb(0xFB, 0xBC, 0x04),
             mode_meeting: Color::Rgb(0xEA, 0x43, 0x35),
             model_chip: Color::Rgb(0xC5, 0x8A, 0xF9),
-        }
+            markdown_heading: Color::Rgb(0, 0, 0),
+            markdown_link: Color::Rgb(0, 0, 0),
+            markdown_code: Color::Rgb(0, 0, 0),
+            markdown_blockquote: Color::Rgb(0, 0, 0),
+            markdown_emph: Color::Rgb(0, 0, 0),
+            markdown_strong: Color::Rgb(0, 0, 0),
+            markdown_hr: Color::Rgb(0, 0, 0),
+            markdown_list: Color::Rgb(0, 0, 0),
+            syntax_comment: Color::Rgb(0, 0, 0),
+            syntax_keyword: Color::Rgb(0, 0, 0),
+            syntax_function: Color::Rgb(0, 0, 0),
+            syntax_variable: Color::Rgb(0, 0, 0),
+            syntax_string: Color::Rgb(0, 0, 0),
+            syntax_number: Color::Rgb(0, 0, 0),
+            syntax_type: Color::Rgb(0, 0, 0),
+            syntax_operator: Color::Rgb(0, 0, 0),
+            diff_added: Color::Rgb(0, 0, 0),
+            diff_removed: Color::Rgb(0, 0, 0),
+            diff_context: Color::Rgb(0, 0, 0),
+            diff_added_bg: Color::Rgb(0, 0, 0),
+            diff_removed_bg: Color::Rgb(0, 0, 0),
+            diff_context_bg: Color::Rgb(0, 0, 0),
+            thinking_bg: Color::Rgb(0, 0, 0),
+            thinking_border: Color::Rgb(0, 0, 0),
+        }.with_semantic_colors()
     }
 }
 
@@ -581,6 +974,18 @@ pub fn ansi256_fallback(r: u8, g: u8, b: u8) -> u8 {
     let gi = (g as u32 * 5 / 255).min(5);
     let bi = (b as u32 * 5 / 255).min(5);
     (16 + 36 * ri + 6 * gi + bi) as u8
+}
+
+/// 颜色混合：`blend(fg, bg, alpha)` → fg 与 bg 按 alpha 混合（0.0=纯bg，1.0=纯fg）
+pub fn blend(fg: Color, bg: Color, alpha: f64) -> Color {
+    if let (Color::Rgb(fr, fg_c, fb), Color::Rgb(br, bg_c, bb)) = (fg, bg) {
+        let r = (fr as f64 * alpha + br as f64 * (1.0 - alpha)) as u8;
+        let g = (fg_c as f64 * alpha + bg_c as f64 * (1.0 - alpha)) as u8;
+        let b = (fb as f64 * alpha + bb as f64 * (1.0 - alpha)) as u8;
+        Color::Rgb(r, g, b)
+    } else {
+        fg // fallback: 非 RGB 色直接返回前景
+    }
 }
 
 /// 终端能力检测 — 主题降级用
