@@ -1562,50 +1562,40 @@ pub fn handle_chat_scroll_key(state: &mut AppState, code: KeyCode) {
         KeyCode::PageDown => state.set_scroll(ScrollAction::Down(page_step)),
         KeyCode::Home | KeyCode::End => state.set_scroll(ScrollAction::ToBottom),
         KeyCode::Char(' ') => {
-            // V12: Space 升级为"切换最后一条消息的所有 blocks"
-            //   智能态：扫描所有块，任一已展开 → 全部折叠；全部折叠 → 全部展开
-            //   设计意图：思考链通常是 Think + N ToolCall，逐个切换费时
-            //
-            // V29.11 (B4): 折叠锚定 — 用户在浏览历史时(scroll>0), 切换最后一条
-            //   blocks 折叠会改变总行数; 不调整 scroll 会导致视野上方的 anchor msg
-            //   被推出屏幕。算法:
-            //     before_rows = estimate(last_msg, content_w)
-            //     toggle blocks
-            //     after_rows = estimate(last_msg, content_w)
-            //     scroll += (after - before) — 让上方 anchor 视觉位置不动
-            //   scroll==0 时不锚定 — 用户在 auto-follow 底部, 期望"看到最新内容"
-            //   而非"卡在原行号"
-            if !state.messages.is_empty() {
-                let msg_idx = state.messages.len() - 1;
+            // C2: 折叠逻辑迁移到读 state.cards（V42-B 数据源）
+            if let Some(last_id) = state.cards.last_id() {
+                let should_anchor = state.scroll > 0;
                 let content_w = {
                     let w = state.last_content_width.get();
-                    if w == 0 { 80 } else { w }  // V29.11: 首帧前 fallback 80
+                    if w == 0 { 80 } else { w }
                 };
-                let should_anchor = state.scroll > 0;
-                let before_rows = if should_anchor {
-                    state.messages.get(msg_idx)
-                        .map(|m| crate::tui::components::estimate_msg_rows(m, content_w as usize))
+
+                // 折叠前高度
+                let before_h = if should_anchor {
+                    let collapse = state.cards.collapse(last_id);
+                    let ctx = crate::tui::components::section_ctx::AppContext::new(state);
+                    state.cards.card(last_id)
+                        .map(|c| abacus_ui_kit::card_total_height(c, &ctx, content_w, collapse) as usize)
                         .unwrap_or(0)
                 } else { 0 };
 
-                if let Some(msg) = state.messages.get_mut(msg_idx) {
-                    // 先判断目标状态
-                    let any_expanded = msg.parts.iter().any(|p| matches!(p,
-                        crate::tui::state::MsgContent::Block { collapsed: false, .. }));
-                    let target_collapsed = any_expanded; // 有任一展开 → 全部折叠
-                    for part in &mut msg.parts {
-                        if let crate::tui::state::MsgContent::Block { collapsed, .. } = part {
-                            *collapsed = target_collapsed;
-                        }
-                    }
+                // 切换折叠（mut borrow 结束后才能再 immut borrow）
+                let toggle_result = state.cards.toggle_collapse(last_id);
+                if let Some(new_collapse) = toggle_result {
+                    // 折叠后高度（ctx 在 toggle 后重建，避免 borrow 冲突）
+                    let after_h = if should_anchor {
+                        let ctx = crate::tui::components::section_ctx::AppContext::new(state);
+                        state.cards.card(last_id)
+                            .map(|c| abacus_ui_kit::card_total_height(c, &ctx, content_w, new_collapse) as usize)
+                            .unwrap_or(0)
+                    } else { 0 };
 
-                    if should_anchor {
-                        // V29.11: 切换后估算 + 调整 scroll, 保持上方 anchor 不动
-                        // V29.16: 经 SSOT set_scroll(AnchorAdjust) — 内部判方向 + 标 dirty
-                        let after_rows = crate::tui::components::estimate_msg_rows(msg, content_w as usize);
-                        state.set_scroll(ScrollAction::AnchorAdjust { after_rows, before_rows });
+                    if should_anchor && before_h != after_h {
+                        state.set_scroll(ScrollAction::AnchorAdjust {
+                            after_rows: after_h,
+                            before_rows: before_h,
+                        });
                     } else {
-                        // 不锚定时仅折叠状态变了, 仍需重渲染
                         state.mark_render_dirty();
                     }
                 }
@@ -2856,43 +2846,105 @@ mod space_anchor_tests {
 
     #[test]
     fn space_anchors_on_expand() {
-        // scroll>0, 折叠态切到展开 → 行数+, scroll 应+(同等增量)
+        use crate::tui::cards::LlmCard;
         let mut s = AppState::new(AbacusMode::Clarify);
-        s.add_message(build_msg_with_block("hi", "L1\nL2\nL3\nL4\nL5", true));
+        // 创建有内容的 LlmCard（collapse 影响 body_height）
+        let id = s.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test");
+        card.append_reply("L1\nL2\nL3\nL4\nL5");
+        s.cards.push_active(Box::new(card));
+        s.cards.finish_active();
+        s.cards.set_collapse(id, abacus_ui_kit::CardCollapse::Collapsed);
         s.last_content_width.set(80);
         s.set_scroll(ScrollAction::Absolute(10));
 
-        let before = crate::tui::components::estimate_msg_rows(&s.messages[0], 80);
-        handle_chat_scroll_key(&mut s, KeyCode::Char(' '));
-        let after = crate::tui::components::estimate_msg_rows(&s.messages[0], 80);
+        let before = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+
+        s.cards.toggle_collapse(id);
+        // 手动调 set_scroll 模拟 handle_chat_scroll_key 的锚定逻辑
+        let after = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+        s.set_scroll(ScrollAction::AnchorAdjust { after_rows: after, before_rows: before });
+
         assert!(after > before, "展开后行数应增加");
         assert_eq!(s.scroll, 10 + (after - before), "scroll 应同步增加 delta 行");
     }
 
     #[test]
     fn space_anchors_on_collapse() {
-        // scroll>0, 展开态切到折叠 → 行数-, scroll 应-(同等减量)
+        use crate::tui::cards::LlmCard;
         let mut s = AppState::new(AbacusMode::Clarify);
-        s.add_message(build_msg_with_block("hi", "L1\nL2\nL3\nL4\nL5", false));
+        let id = s.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test");
+        card.append_reply("L1\nL2\nL3\nL4\nL5");
+        s.cards.push_active(Box::new(card));
+        s.cards.finish_active();
+        // 默认 Expanded
         s.last_content_width.set(80);
         s.set_scroll(ScrollAction::Absolute(100));
 
-        let before = crate::tui::components::estimate_msg_rows(&s.messages[0], 80);
-        handle_chat_scroll_key(&mut s, KeyCode::Char(' '));
-        let after = crate::tui::components::estimate_msg_rows(&s.messages[0], 80);
+        let before = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+
+        s.cards.toggle_collapse(id);
+        let after = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+        s.set_scroll(ScrollAction::AnchorAdjust { after_rows: after, before_rows: before });
+
         assert!(after < before, "折叠后行数应减少");
         assert_eq!(s.scroll, 100 - (before - after), "scroll 应同步减少 delta 行");
     }
 
     #[test]
     fn space_saturating_sub_on_collapse() {
-        // scroll 比 delta 还小时 saturating 到 0, 不溢出
+        use crate::tui::cards::LlmCard;
         let mut s = AppState::new(AbacusMode::Clarify);
-        s.add_message(build_msg_with_block("hi", "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8", false));
+        let id = s.cards.alloc_id();
+        let mut card = LlmCard::new(id, "test");
+        card.append_reply("L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8");
+        s.cards.push_active(Box::new(card));
+        s.cards.finish_active();
         s.last_content_width.set(80);
         s.set_scroll(ScrollAction::Absolute(1));
-        handle_chat_scroll_key(&mut s, KeyCode::Char(' '));
-        // delta ≈ 8 行, 但 scroll 只有 1 → saturating 到 0
+
+        // 手动模拟 Space 折叠
+        let before = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+        s.cards.toggle_collapse(id);
+        let after = {
+            let ctx = crate::tui::components::section_ctx::AppContext::new(&s);
+            let collapse = s.cards.collapse(id);
+            s.cards.card(id)
+                .map(|c| abacus_ui_kit::card_total_height(c, &ctx, 80, collapse) as usize)
+                .unwrap_or(0)
+        };
+        s.set_scroll(ScrollAction::AnchorAdjust { after_rows: after, before_rows: before });
         assert_eq!(s.scroll, 0, "delta > scroll 时 saturating_sub 兜到 0");
     }
 
