@@ -456,7 +456,7 @@ impl<'a> MdRenderer<'a> {
                                 style: Style::default().fg(self.theme.muted).add_modifier(Modifier::DIM),
                             });
                             self.current_spans.push(StyledSpan {
-                                text: if line.starts_with(' ') { line[1..].to_string() } else { line.to_string() },
+                                text: line.strip_prefix(' ').unwrap_or(line).to_string(),
                                 style: Style::default().fg(self.theme.muted).add_modifier(Modifier::DIM),
                             });
                         }
@@ -557,7 +557,7 @@ impl<'a> MdRenderer<'a> {
             let used: usize = allocated.iter().sum();
             // 剩余空间按原始比例分配给还有富余的列
             let mut surplus: Vec<usize> = col_widths.iter().enumerate()
-                .map(|(i, &w)| if w > allocated[i] { w - allocated[i] } else { 0 })
+                .map(|(i, &w)| w.saturating_sub(allocated[i]))
                 .collect();
             let total_surplus: usize = surplus.iter().sum();
             if total_surplus > 0 && used < avail {

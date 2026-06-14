@@ -1366,7 +1366,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             };
             state.textarea.borrow_mut().input(ti);
             crate::tui::state::AppState::sync_from_textarea(
-                &state.textarea, &mut state.input,
+                &state.textarea, state.input.as_str(),
                 &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
             );
         } else if !has_newline {
@@ -1393,7 +1393,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             };
             state.textarea.borrow_mut().input(ti);
             crate::tui::state::AppState::sync_from_textarea(
-                &state.textarea, &mut state.input,
+                &state.textarea, state.input.as_str(),
                 &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
             );
         } else if !has_newline {
@@ -1418,7 +1418,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         state.textarea.borrow_mut().input(ti);
         crate::tui::state::AppState::sync_from_textarea(
             &state.textarea,
-            &mut state.input,
+            state.input.as_str(),
             &mut state.cursor_pos,
             &mut state.cursor_line,
             &mut state.cursor_col,
@@ -1444,7 +1444,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         };
         state.textarea.borrow_mut().input(ti);
         crate::tui::state::AppState::sync_from_textarea(
-            &state.textarea, &mut state.input,
+            &state.textarea, state.input.as_str(),
             &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
         );
         return;
@@ -1472,7 +1472,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         };
         state.textarea.borrow_mut().input(ti);
         crate::tui::state::AppState::sync_from_textarea(
-            &state.textarea, &mut state.input,
+            &state.textarea, state.input.as_str(),
             &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
         );
         return;
@@ -1501,7 +1501,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             } else {
                 // 光标移动：直接同步 cursor（不做 O(n) 字符串比较）
                 crate::tui::state::AppState::sync_from_textarea(
-                    &state.textarea, &mut state.input,
+                    &state.textarea, state.input.as_str(),
                     &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
                 );
             }

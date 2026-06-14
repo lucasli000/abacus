@@ -80,12 +80,12 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // 引用关系: run.rs 设置 state.processing_phase → 此处读取
     if state.processing_phase.starts_with("planning") {
         left.push(Span::styled(
-            format!(" [PLAN]"),
+            " [PLAN]".to_string(),
             Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD),
         ));
     } else if state.processing_phase.starts_with("team") {
         left.push(Span::styled(
-            format!(" [TEAM]"),
+            " [TEAM]".to_string(),
             Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD),
         ));
     }

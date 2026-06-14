@@ -493,7 +493,7 @@ fn render_tab_data(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
             Span::styled("  in    ", label),
             Span::styled(format!("{:<8}", format_ctx(inp as usize)), val),
             Span::styled("  out ", label),
-            Span::styled(format!("{}", format_ctx(out as usize)), val),
+            Span::styled(format_ctx(out as usize).to_string(), val),
         ]));
         lns.push(Line::from(vec![
             Span::styled("  cache ", label),
@@ -540,7 +540,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     // ════════════════════════════════════════════════════════════
     // 记忆宫殿 — palace 本体结构 + 本轮调用记录
     // ════════════════════════════════════════════════════════════
-    lines.push(Line::from(Span::styled(format!("{}", t("panel.knowledge")), ab)));
+    lines.push(Line::from(Span::styled(t("panel.knowledge").to_string(), ab)));
     if let Some(ref snap) = state.palace_data {
         if snap.behavior_count > 0 {
             lines.push(Line::from(vec![Span::styled(format!("  {}", t("palace.behavior")), Style::default().fg(state.theme.gold).add_modifier(Modifier::BOLD)), Span::styled(format!("  {}", snap.behavior_count), txt)]));
@@ -589,7 +589,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
     if !blocked.is_empty() {
         lines.push(Line::from(Span::styled(format!("  阻断 {}", blocked.len()), Style::default().fg(state.theme.error))));
         for (nm, _) in blocked.iter().take(2) {
-            let t: String = nm.rsplitn(2, "__").next().unwrap_or(nm).chars().take(18).collect();
+            let t: String = nm.rsplit("__").next().unwrap_or(nm).chars().take(18).collect();
             lines.push(Line::styled(format!("    {}", t), muted));
         }
     }
@@ -600,7 +600,7 @@ fn render_tab_stockroom(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         let mut freq: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
         for r in &state.tool_records { *freq.entry(r.name.as_str()).or_insert(0) += 1; }
         if let Some((tn, cnt)) = freq.iter().max_by_key(|(_, c)| *c) {
-            let t: String = tn.rsplitn(2, "__").next().unwrap_or(tn).chars().take(14).collect();
+            let t: String = tn.rsplit("__").next().unwrap_or(tn).chars().take(14).collect();
             lines.push(Line::from(vec![Span::styled("  最 ", muted), Span::styled(format!("{} · {}次", t, cnt), txt)]));
         }
     }

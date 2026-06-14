@@ -252,7 +252,7 @@ pub fn list_records(cwd_filter: Option<&str>) -> Vec<MeetingRecord> {
         })
         .filter(|r| cwd_filter.map(|f| r.cwd.contains(f)).unwrap_or(true))
         .collect();
-    records.sort_by(|a, b| b.date.cmp(&a.date));
+    records.sort_by_key(|r| std::cmp::Reverse(r.date));
     records
 }
 

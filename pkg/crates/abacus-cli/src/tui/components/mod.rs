@@ -292,8 +292,7 @@ pub(crate) fn screen_pos_to_card_char(
     // 用 card.text_content() 提取文本，按行反查 char_idx
     let text = cards.iter().nth(card_idx)?.text_content();
     let mut char_idx = 0usize;
-    let mut visual_row = 0usize;
-    for line in text.split('\n') {
+    for (visual_row, line) in text.split('\n').enumerate() {
         if visual_row == row_in_card {
             let line_chars: Vec<char> = line.chars().collect();
             let mut col_acc = 0usize;
@@ -307,7 +306,6 @@ pub(crate) fn screen_pos_to_card_char(
             }
             return Some((card_idx, char_idx));
         }
-        visual_row += 1;
         char_idx += line.chars().count() + 1; // +1 for '\n'
     }
     Some((card_idx, char_idx))

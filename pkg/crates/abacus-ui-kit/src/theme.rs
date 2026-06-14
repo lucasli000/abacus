@@ -314,7 +314,7 @@ impl Theme {
 
     /// 切换主题（返回 true 表示成功；未知主题名返回 false 不修改）
     pub fn switch_theme(&mut self, name: &str) -> bool {
-        if !Self::all_names().iter().any(|n| *n == name) {
+        if !Self::all_names().contains(&name) {
             return false;
         }
         *self = from_name(name);

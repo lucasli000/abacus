@@ -36,6 +36,12 @@ pub struct StreamingMd {
     pending_cache: Vec<StyledLine>,
 }
 
+impl Default for StreamingMd {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingMd {
     pub fn new() -> Self {
         Self {

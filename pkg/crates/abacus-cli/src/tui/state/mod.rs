@@ -53,6 +53,12 @@ pub struct TaskRegistry {
     active: Vec<(TaskId, tokio::task::JoinHandle<()>)>,
 }
 
+impl Default for TaskRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TaskRegistry {
     pub fn new() -> Self {
         Self { next_id: 0, active: Vec::new() }
@@ -2585,7 +2591,7 @@ impl AppState {
         }
         if let Some(id) = last_id {
             if let Some(llm) = self.cards.card_downcast_mut::<crate::tui::cards::LlmCard>(id) {
-                return std::mem::take(&mut llm.reply_text_field());
+                return std::mem::take(llm.reply_text_field());
             }
         }
         String::new()
@@ -2655,7 +2661,7 @@ impl AppState {
     /// 调用方需持有 &mut AppState，传入各字段的可变引用。
     pub(crate) fn sync_from_textarea(
         textarea: &RefCell<TuiTextArea<'static>>,
-        input: &mut String,
+        input: &str,
         cursor_pos: &mut usize,
         cursor_line: &mut usize,
         cursor_col: &mut usize,

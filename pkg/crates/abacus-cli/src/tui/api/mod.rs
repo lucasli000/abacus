@@ -2087,6 +2087,7 @@ pub async fn ai_complete(
 
 /// 引擎完整响应，承载 TurnResult 的全部结构化数据
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct EngineResponse {
     pub text: String,
     pub thinking: Option<String>,
@@ -2135,24 +2136,6 @@ pub struct EngineResponse {
     pub tokens_freed: Option<usize>,
 }
 
-impl Default for EngineResponse {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            thinking: None,
-            tool_records: vec![],
-            stats: None,
-            progressive_state: None,
-            inertia_warning: None,
-            pending_confirmations: vec![],
-            meeting_experts: None,
-            auto_fallback_chat: None,
-            turnkey_plan: None,
-            needs_clarify: None,
-            tokens_freed: None,
-        }
-    }
-}
 
 impl EngineResponse {
     pub fn from_turn_result(result: TurnResult, thinking: Option<String>) -> Self {

@@ -65,7 +65,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     let is_streaming = state.cards.active_id().is_some();
     if is_streaming {
         let tick = state.anim_tick.get();
-        let shimmer_pos = ShimmerPhase::compute(tick, 50, 3500, 8, inner.width as u16);
+        let shimmer_pos = ShimmerPhase::compute(tick, 50, 3500, 8, inner.width);
         // 用 active 卡的主色 (如有), 否则 border 色
         let color = state
             .cards
@@ -149,7 +149,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
                 // 计算 shimmer 位置 (仅 active 卡)
                 let shimmer_pos = if state.cards.active_id() == Some(id) {
                     let tick = state.anim_tick.get();
-                    ShimmerPhase::compute(tick, 50, 3500, 8, inner.width as u16)
+                    ShimmerPhase::compute(tick, 50, 3500, 8, inner.width)
                 } else {
                     -999 // sentinel: 关闭 shimmer
                 };
@@ -176,7 +176,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
         // 计算 shimmer 位置 (仅 active 卡)
         let shimmer_pos = if state.cards.active_id() == Some(id) {
             let tick = state.anim_tick.get();
-            ShimmerPhase::compute(tick, 50, 3500, 8, inner.width as u16)
+            ShimmerPhase::compute(tick, 50, 3500, 8, inner.width)
         } else {
             -999 // sentinel: 关闭 shimmer
         };

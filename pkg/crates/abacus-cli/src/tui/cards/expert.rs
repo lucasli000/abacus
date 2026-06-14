@@ -88,7 +88,7 @@ impl MessageCard for ExpertCard {
 
     fn render_body(&self, f: &mut Frame, ctx: &dyn SectionContext, inner: Rect, collapse: CardCollapse) {
         match collapse {
-            CardCollapse::Headless => return,
+            CardCollapse::Headless => (),
             CardCollapse::Collapsed => {
                 let preview = self.reply_preview();
                 let (text, style) = if preview.is_empty() {

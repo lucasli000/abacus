@@ -62,7 +62,7 @@ impl MessageCard for UserCard {
 
     fn header(&self, ctx: &dyn SectionContext) -> CardHeader {
         CardHeader::new(
-            format!("\u{25b8} You"),
+            "\u{25b8} You".to_string(),
             self.time.clone(),
         )
         .with_color(ctx.theme().user)

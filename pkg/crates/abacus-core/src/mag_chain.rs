@@ -144,14 +144,12 @@ impl Middleware for ResourceGuard {
 
         // 检查锁
         if let Some((owner, acquired)) = locks.get(&path) {
-            if owner != &self.session_id {
-                if acquired.elapsed() < self.ttl {
-                    return Err(KernelError::Other(format!(
-                        "resource locked: {} is being edited by another session (TTL {}s remaining)",
-                        path,
-                        self.ttl.as_secs().saturating_sub(acquired.elapsed().as_secs())
-                    )));
-                }
+            if owner != &self.session_id && acquired.elapsed() < self.ttl {
+                return Err(KernelError::Other(format!(
+                    "resource locked: {} is being edited by another session (TTL {}s remaining)",
+                    path,
+                    self.ttl.as_secs().saturating_sub(acquired.elapsed().as_secs())
+                )));
             }
         }
 

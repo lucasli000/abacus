@@ -547,7 +547,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                         }
                     }).await.ok().flatten();
                     if let Some(mtime) = mtime_result {
-                        if state.config_mtime.map_or(true, |t| mtime != t) {
+                        if state.config_mtime != Some(mtime) {
                             // mtime 变化，再读取文件内容
                             let check_result = tokio::task::spawn_blocking(move || {
                                 let content = std::fs::read_to_string(&config_path).ok()?;
@@ -1604,8 +1604,8 @@ fn format_undo_result(r: &abacus_core::undo::UndoResult) -> String {
         let detail = match c {
             abacus_core::undo::UndoConflict::ExternalModification { observed_sha256, expected_sha256 } =>
                 format!("File externally modified\n  expected sha256: {}\n  observed sha256: {}",
-                    expected_sha256.get(..16).unwrap_or(&expected_sha256),
-                    observed_sha256.get(..16).unwrap_or(&observed_sha256)),
+                    expected_sha256.get(..16).unwrap_or(expected_sha256),
+                    observed_sha256.get(..16).unwrap_or(observed_sha256)),
             abacus_core::undo::UndoConflict::FileGone =>
                 "File externally deleted".to_string(),
             abacus_core::undo::UndoConflict::DirectoryNotEmpty { entries } =>
@@ -1890,7 +1890,6 @@ mod undo_timeline_render_tests {
 /// sections = ["llm", "tools", "local", "palace", "timeline", "focus"]
 /// ```
 /// 未配置时返回 `None`（使用默认布局）。
-
 /// Process engine responses from the response channel.
 /// Extracted from `run_tui()` to reduce main loop complexity.
 /// Returns `true` if the main loop should break (currently always returns `false`).

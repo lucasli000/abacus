@@ -540,7 +540,7 @@ fn save_config(state: &SetupState) -> Result<(), String> {
     {
         let core = ensure_table(&mut root, "core");
         // core.skill_workflow_enabled
-        let skill_enabled = state.feature_toggles.get(0).copied().unwrap_or(false);
+        let skill_enabled = state.feature_toggles.first().copied().unwrap_or(false);
         core.insert("skill_workflow_enabled".into(), toml::Value::Boolean(skill_enabled));
         // 其它三个 feature 走空 section 占位（用户可后续手工编辑）
     }
@@ -1670,7 +1670,7 @@ fn render_features_page(f: &mut Frame, state: &SetupState) {
 /// 生命周期：一次性执行，无副作用
 fn handle_paste(state: &mut SetupState, text: &str) {
     // 清理粘贴文本：移除换行、首尾空白
-    let cleaned = text.trim().replace('\n', "").replace('\r', "");
+    let cleaned = text.trim().replace(['\n', '\r'], "");
     if cleaned.is_empty() {
         return;
     }
@@ -1882,7 +1882,7 @@ pub fn run_setup(
                         f.render_widget(
                             Paragraph::new(vec![
                                 Line::from(Span::styled(
-                                    format!(" ✗ API 验证失败"),
+                                    " ✗ API 验证失败".to_string(),
                                     theme.semantic_style(abacus_ui_kit::SemanticIntent::Danger, abacus_ui_kit::Strength::Strong),
                                 )),
                                 Line::raw(""),

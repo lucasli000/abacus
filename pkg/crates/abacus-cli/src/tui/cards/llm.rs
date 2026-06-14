@@ -135,7 +135,7 @@ impl MessageCard for LlmCard {
         collapse: CardCollapse,
     ) {
         match collapse {
-            CardCollapse::Headless => return,
+            CardCollapse::Headless => (),
             CardCollapse::Collapsed => {
                 let preview = self.reply_preview();
                 let (text, style) = if preview.is_empty() {

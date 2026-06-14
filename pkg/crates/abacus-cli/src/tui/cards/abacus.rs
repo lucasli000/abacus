@@ -179,7 +179,7 @@ impl MessageCard for AbacusCard {
 
     fn render_body(&self, f: &mut Frame, ctx: &dyn SectionContext, inner: Rect, collapse: CardCollapse) {
         match collapse {
-            CardCollapse::Headless => return,
+            CardCollapse::Headless => (),
             CardCollapse::Collapsed => {
                 let summary = build_collapsed_summary(&self.events, &self.tool_name);
                 let p = Paragraph::new(Line::from(Span::styled(
