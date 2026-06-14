@@ -82,6 +82,7 @@ pub fn apply_picker_selection(state: &mut AppState) {
             state.cursor_line = 0;
             state.cursor_col = state.input.len();
             state.input_state = crate::tui::state::InputState::Ready;
+            state.sync_to_textarea();
             state.mark_render_dirty();
             submit_message(state);
             return;
@@ -722,6 +723,7 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
                     state.input.push(' ');
                     state.cursor_pos = state.input.len();
                     state.recalculate_cursor();
+                    state.sync_to_textarea();
                     // 切回输入焦点让用户立即可输参数
                     state.focus = crate::tui::state::Focus::Panel;
                     state.input_state = crate::tui::state::InputState::Typing;
@@ -1315,8 +1317,9 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             state.input = next;
             state.cursor_pos = state.input.len();
             state.recalculate_cursor();
-            state.inline_suggestion = None; // 循环中不显示 ghost text
+            state.inline_suggestion = None;
             state.input_state = InputState::Typing;
+            state.sync_to_textarea();
             return;
         }
 
@@ -1324,28 +1327,28 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         if let Some(suggestion) = state.inline_suggestion.take() {
             let current_input = state.input.trim().to_string();
             if suggestion.len() > current_input.len() {
-                // 构建全部候选列表（供连续 Tab 循环）
                 let candidates = state.compute_all_inline_candidates();
                 state.input = suggestion.clone();
                 state.cursor_pos = state.input.len();
                 state.recalculate_cursor();
                 state.input_state = InputState::Typing;
-                // 设置循环列表（包含当前已接受的作为第 0 项）
                 if candidates.len() > 1 {
                     state.inline_candidates = candidates;
                     state.inline_candidate_idx = 0;
                 }
+                state.sync_to_textarea();
                 return;
             }
         }
 
-        // 路径 C: 尝试触发补全（可能产生新 inline_suggestion）
+        // 路径 C: 尝试触发补全
         if trigger_completion(state) { return; }
 
         // 路径 D: 无任何候选 → Tab 插入缩进
         state.input.insert(state.cursor_pos, '\t');
         state.cursor_pos += 1;
         state.input_state = InputState::Typing;
+        state.sync_to_textarea();
         return;
     }
 
@@ -1456,6 +1459,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 state.cursor_pos = state.input.len();
                 state.recalculate_cursor();
                 state.inline_candidates.clear();
+                state.sync_to_textarea();
                 state.mark_render_dirty();
                 return;
             }
