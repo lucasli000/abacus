@@ -1781,7 +1781,7 @@ pub async fn send_plan_and_execute_streaming(
         let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
             format!("\n📋 计划已生成（{} 个任务）。选择执行方式：\n  [A] 自动  [S] 逐步确认  [T] Team\n", tasks.len()),
         ));
-        return ApiResult::Ok(EngineResponse {
+        ApiResult::Ok(EngineResponse {
             text: format!("{}\n\n---\n{}", plan_text, task_summary),
             thinking: None,
             tool_records: vec![],
@@ -1801,136 +1801,6 @@ pub async fn send_plan_and_execute_streaming(
             }),
             needs_clarify: None,
             tokens_freed: None,
-        });
-
-        #[allow(unreachable_code)]
-        // Phase 2: 自动执行（复用 Team 执行逻辑）
-        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-            format!("\n执行阶段 — {} 个任务开始执行\n\n", tasks.len()),
-        ));
-
-        // 确保 Team session 存在并添加任务
-        let team = handle.ensure_team_session(message).await;
-        // 重置已有任务（如果是新的 plan 执行）
-        let initial_status = team.status().await;
-        let team = if matches!(initial_status, TeamStatus::Completed { .. } | TeamStatus::Failed { .. }) {
-            handle.reset_team().await;
-            handle.ensure_team_session(message).await
-        } else {
-            team
-        };
-
-        if let Err(e) = team.transition_to(TeamStatus::Planning).await {
-            tracing::warn!("Plan→Team status transition failed: {}", e);
-        }
-
-        for task in &tasks {
-            team.add_task(task.clone()).await;
-        }
-
-        // 展示任务分配
-        {
-            let mut assign_text = String::from("已规划任务：\n");
-            for (i, task) in tasks.iter().enumerate() {
-                assign_text.push_str(&format!(" → task_{}: {}\n", i + 1, task.description));
-            }
-            assign_text.push('\n');
-            let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(assign_text));
-        }
-
-        // 执行
-        let _ = team.transition_to(TeamStatus::Executing {
-            active_tasks: 0, completed_tasks: 0,
-        }).await;
-
-        let ready_by_role = team.ready_tasks_by_role().await;
-        let mut results: Vec<(String, String)> = Vec::new();
-
-        for (role, role_tasks) in &ready_by_role {
-            for (idx, task) in role_tasks.iter().enumerate() {
-                let agent_label = format!("task_{}", idx + 1);
-                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-                    format!("⚙ {} 开始执行...\n", agent_label),
-                ));
-
-                let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-                    format!("\n── {} ({:?}) ─────────────────────────\n", agent_label, role),
-                ));
-
-                match team.execute_task_with_core_streaming(
-                    &handle.core, task, role, stream_tx.clone(), None
-                ).await {
-                    Ok(r) => {
-                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-                            format!("\n── {} 完成 ──────────────────────────\n", agent_label),
-                        ));
-                        results.push((task.id.clone(), r));
-                    }
-                    Err(e) => {
-                        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-                            format!("\n── {} 失败: {} ──────────────────\n", agent_label, e),
-                        ));
-                        tracing::warn!("Plan task {} failed: {}", task.id, e);
-                    }
-                }
-            }
-        }
-
-        // 状态转换
-        if team.all_tasks_done().await {
-            let (total, completed, failed) = team.stats().await;
-            let summary = format!("{}/{} 完成, {} 失败", completed, total, failed);
-            let _ = team.transition_to(TeamStatus::Reviewing).await;
-            let _ = team.transition_to(TeamStatus::Completed { summary }).await;
-        }
-
-        // Phase 3: Leader 综合结果
-        let _ = stream_tx.send(abacus_core::llm::stream::StreamChunk::TextDelta(
-            "\n═══ 汇总 ══════════════════════════════\n".into(),
-        ));
-
-        let final_text = if results.is_empty() {
-            "所有任务执行失败，请检查上方错误信息。".to_string()
-        } else {
-            let mut agent_outputs = String::new();
-            for (task_id, output) in &results {
-                agent_outputs.push_str(&format!("## Task '{}':\n{}\n\n", task_id, output));
-            }
-            let summary_prompt = format!(
-                "You are the team Leader. Tasks have been planned and executed.\n\
-                 Original user request: {}\n\n\
-                 Task results:\n{}\n\
-                 Synthesize all results into a cohesive final answer. Be concise and actionable.",
-                message, agent_outputs
-            );
-
-            let summary_session = abacus_core::core::SessionState::new("_plan_summary");
-            let summary_session = tokio::sync::RwLock::new(summary_session);
-            match handle.core.process_turn_streaming(
-                &summary_prompt, &summary_session, stream_tx.clone()
-            ).await {
-                Ok(result) => result.response,
-                Err(e) => {
-                    tracing::warn!("Plan summary failed: {}", e);
-                    results.iter()
-                        .map(|(id, out)| format!("### {}\n{}", id, out))
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                }
-            }
-        };
-
-        ApiResult::Ok(EngineResponse {
-            text: final_text,
-            thinking: None,
-            tool_records: vec![],
-            stats: None,
-            progressive_state: None,
-            inertia_warning: None,
-            pending_confirmations: vec![],
-            meeting_experts: None,
-            auto_fallback_chat: None,
-            turnkey_plan: None, needs_clarify: None, tokens_freed: None,
         })
     };
 

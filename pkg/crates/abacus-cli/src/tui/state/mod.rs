@@ -661,16 +661,6 @@ impl Focus {
     }
 }
 
-/// 面板焦点（仅在看板 tab 间切换）
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // V42-B: 预留，当前未使用
-pub enum PanelFocus {
-    Timeline,
-    Memory,
-    Components,
-    Tasks,
-}
-
 /// Toast 通知
 #[derive(Clone)]
 pub struct Toast {
@@ -1218,8 +1208,6 @@ pub struct AppState {
     pub dashboard_scroll: usize,
     /// V40: 自动化模块健康快照（由 JobRunner 推送更新）
     pub auto_health: abacus_core::auto::AutoHealth,
-    /// 面板 tab 键盘焦点（None = 焦点不在面板）
-    pub panel_focus: Option<PanelFocus>,
     /// 打字机光标——最新消息已展示的字符数
     pub stream_cursor: usize,
 
@@ -2870,7 +2858,6 @@ impl AppState {
             dashboard_tab: DashboardTab::Health,
             dashboard_scroll: 0,
             auto_health: abacus_core::auto::AutoHealth::default(),
-            panel_focus: None,
             stream_cursor: 0,
             cmd_scroll: 0,
             cmd_selected: 0,
@@ -4275,6 +4262,15 @@ impl AppState {
             .chars()
             .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
             .sum();
+    }
+
+    /// 清空输入框 + 重置光标 + 同步 textarea
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor_pos = 0;
+        self.cursor_line = 0;
+        self.cursor_col = 0;
+        self.sync_to_textarea();
     }
 
     pub fn expert_count(&self) -> usize {

@@ -946,10 +946,7 @@ fn navigate_history_down(state: &mut AppState) {
     match state.history_index {
         None | Some(0) => {
             state.history_index = None;
-            state.input.clear();
-            state.cursor_pos = 0;
-            state.cursor_line = 0;
-            state.cursor_col = 0;
+            state.clear_input();
         }
         Some(idx) => {
             let new_idx = idx - 1;
@@ -2214,10 +2211,7 @@ pub fn submit_message(state: &mut AppState) {
 
     // 斜杠命令拦截：本地消费，不发给引擎
     if handle_slash_command(state, &text) {
-        state.input.clear();
-        state.cursor_pos = 0;
-        state.cursor_line = 0;
-        state.cursor_col = 0;
+        state.clear_input();
         state.input_state = InputState::Ready;
         return;
     }
@@ -2248,10 +2242,7 @@ pub fn submit_message(state: &mut AppState) {
                 state.add_toast("✗ 已拒绝", Duration::from_secs(2));
                 state.pending_confirmation_response = Some(false);
             }
-            state.input.clear();
-            state.cursor_pos = 0;
-            state.cursor_line = 0;
-            state.cursor_col = 0;
+            state.clear_input();
             state.mark_render_dirty();
             return;
         }

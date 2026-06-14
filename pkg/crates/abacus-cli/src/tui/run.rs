@@ -752,12 +752,9 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                 // 生命周期：单次消费，下一帧的 pending_text.take() 分支会实际发送
                 if state.pending_send {
                     state.pending_send = false;
-                    if !state.input.is_empty() {
+                     if !state.input.is_empty() {
                         state.pending_text = Some(state.input.clone());
-                        state.input.clear();
-                        state.cursor_pos = 0;
-                        state.cursor_line = 0;
-                        state.cursor_col = 0;
+                        state.clear_input();
                     }
                 }
 
@@ -1682,11 +1679,19 @@ fn format_timeline(
 }
 
 fn short_path(p: &str) -> String {
-    let chars: Vec<char> = p.chars().collect();
-    if chars.len() <= 60 { return p.to_string(); }
-    let head: String = chars.iter().take(30).collect();
-    let tail: String = chars.iter().rev().take(27).collect::<Vec<_>>().into_iter().rev().collect();
-    format!("{head}…{tail}")
+    let char_count = p.chars().count();
+    if char_count <= 60 { return p.to_string(); }
+    let mut result = String::with_capacity(62);
+    for c in p.chars().take(30) {
+        result.push(c);
+    }
+    result.push('…');
+    // 取最后 27 个字符
+    let skip = char_count.saturating_sub(27);
+    for c in p.chars().skip(skip) {
+        result.push(c);
+    }
+    result
 }
 
 // V33 注：`save_session_snapshot` doc 已迁移至实际定义处（项目层 sessions/{uuid}.json，
