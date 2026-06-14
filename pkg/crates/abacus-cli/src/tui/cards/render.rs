@@ -11,13 +11,19 @@
 //!    - 调 `card_total_height` 算高度
 //!    - 按 scroll offset 决定是否在可见区
 //!    - 调 `render_card` 画单卡
+//!    - **跨角色时插入 1 行呼吸感空白**（V42-B+ UX 改进，参考 OpenCode TUI）
 //! 4. 缓存 item_areas 到 `state.scroll_layout` 供 hit-test 使用
+//!
+//! ## 跨角色呼吸感
+//!
+//! 相邻卡片 kind 不同时，插入 1 行空白（用 muted bg 渲染）。同类相邻（如连续
+//! 多轮 LLM 回复）紧贴不 gap，避免破坏连续流视觉一致性。
 //!
 //! ## 与 V40 的对照
 //!
 //! | V40 | V42-B |
 //! |-----|-------|
-//! | `messages.rs` 1439 行 | `render.rs` ~150 行 |
+//! | `messages.rs` 1439 行 | `render.rs` ~200 行 |
 //! | `build_message_lines` 缓存 L0/L1/L2 三级 | 每次直接 render, 缓存 item_areas |
 //! | `cached_msg_rows` + `estimate_msg_rows` | `card_total_height` 精确返回 |
 //! | `message_trace_row_map` | `ScrollLayout.item_areas` |
@@ -26,13 +32,17 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::widgets::{Block, Widget};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Paragraph, Widget};
 
 use abacus_ui_kit::hooks::ShimmerPhase;
 use abacus_ui_kit::prelude::*;
 
 use crate::tui::components::section_ctx::AppContext;
 use crate::tui::state::AppState;
+
+/// 跨角色呼吸感空白行数
+const INTER_CARD_GAP_ROWS: u16 = 1;
 
 /// V42-B 消息流渲染入口 —— 替代 `render_messages_in_card`
 ///
@@ -75,9 +85,13 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     let scroll_offset = state.scroll;
     let mut y = inner.y;
     let mut skipped = 0u16;
+    // V42-B+: 跟踪上一张可见卡的 kind，用于跨角色呼吸感判定
+    // 跨角色 = 不同 kind 的相邻卡，需要插入 1 行空白
+    let mut prev_visible_kind: Option<&'static str> = None;
 
     for card in state.cards.iter() {
         let id = card.id();
+        let card_kind = card.kind();
 
         // V42-B FIX: 跳过空 LlmCard / ExpertCard / ThinkingCard
         // 流式期间可能创建空卡片占位，应避免渲染 header-only 的空卡片
@@ -104,6 +118,27 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
         let h = card_total_height(card.as_ref(), &ctx, inner.width, collapse);
         if h == 0 {
             continue;
+        }
+
+        // V42-B+: 跨角色呼吸感 — 在画卡前判断是否需要 gap
+        // 注意：gap 占用 inner 区域空间；如果 y + gap 已超出 inner.y + inner.height
+        // 则跳过 gap（不画），避免视觉断裂
+        if prev_visible_kind.is_some_and(|prev| prev != card_kind) {
+            if y < inner.y + inner.height {
+                let available_gap = inner.y + inner.height - y;
+                let gap_to_render = INTER_CARD_GAP_ROWS.min(available_gap);
+                if gap_to_render > 0 {
+                    // 画 1 行 muted bg 空白（不做 scroll skip 计数 — gap 算在
+                    // last_total_lines 但不计入 cached_msg_rows，避免 hit-test 错位）
+                    let gap_rect = Rect::new(inner.x, y, inner.width, gap_to_render);
+                    let gap_p = Paragraph::new(Line::raw(""))
+                        .style(Style::default().bg(state.theme.bg));
+                    gap_p.render(gap_rect, f.buffer_mut());
+                    y = y.saturating_add(gap_to_render);
+                    // gap 不计入 skipped（避免 scroll 偏移计算时算两遍）
+                    // 但 last_total_lines 应当算 gap —— 由末尾 total_height 累加保证
+                }
+            }
         }
 
         // scroll: 跳过 scroll_offset 行
@@ -135,6 +170,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
                 render_card(f, card.as_ref(), &ctx, rect, collapse, shimmer_pos);
                 y = y.saturating_add(actual_h);
                 skipped = skipped.saturating_add(h);
+                prev_visible_kind = Some(card_kind);
                 continue;
             }
         }
@@ -162,6 +198,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
         render_card(f, card.as_ref(), &ctx, rect, collapse, shimmer_pos);
 
         y = y.saturating_add(actual_h);
+        prev_visible_kind = Some(card_kind);
     }
 
     // 5. 更新滚动元数据 — 让 handle_chat_scroll_key 能正确 clamp
