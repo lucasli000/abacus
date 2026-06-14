@@ -114,6 +114,19 @@ pub fn t(key: &'static str) -> &'static str {
         "hint.esc_cancel" => if zh { "Esc取消" } else { "Esc cancel" },
         "hint.panel_hidden" => if zh { "Ctrl+I 显示看板 · Ctrl+B 切焦点" } else { "Ctrl+I panel · Ctrl+B focus" },
         "hint.panel_visible" => if zh { "Ctrl+B切焦点 · / 命令 · Tab补全" } else { "Ctrl+B focus · / cmd · Tab complete" },
+        // V42-B+: keyboard_hint_bar 新增的快捷键提示
+        "hint.slash_command" => if zh { "命令" } else { "command" },
+        "hint.focus_panel" => if zh { "切焦点" } else { "focus panel" },
+        "hint.cmd_palette" => if zh { "命令面板" } else { "command palette" },
+        "hint.cancel" => if zh { "取消" } else { "cancel" },
+        "hint.send" => if zh { "发送" } else { "send" },
+        "hint.tab_switch" => if zh { "切tab" } else { "switch tab" },
+        "hint.scroll" => if zh { "滚动" } else { "scroll" },
+        "hint.back_to_input" => if zh { "回输入" } else { "back to input" },
+        "hint.cmd_select" => if zh { "选命令" } else { "select command" },
+        "hint.cmd_fill" => if zh { "填充" } else { "fill to input" },
+        "hint.panel_hidden_short" => if zh { "显示看板" } else { "show panel" },
+        "hint.focus_input" => if zh { "回输入" } else { "back to input" },
 
         // ── 确认弹窗 ──
         "confirm.allow" => if zh { "允许" } else { "Allow" },

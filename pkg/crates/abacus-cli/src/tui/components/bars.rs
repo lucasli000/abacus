@@ -245,14 +245,23 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     //   - 200ms 脉冲叠 BOLD 提示刚切换
     let bar_color = state.input_bar_color();
 
+    // V42-B+: 焦点 bg 使用 surface（比 bg 亮一级）— 让用户视觉上感知"我现在在这"
+    // 非焦点（命令面板等）用 bg（保持视觉层次）
+    // 这是 OpenCode TextareaRenderable `focusedBackgroundColor` 的对应实现
+    let focused_bg = if state.focus == Focus::Input {
+        state.theme.surface
+    } else {
+        state.theme.bg
+    };
+
     let input_block = Block::default()
         .border_type(BorderType::Rounded)
         .borders(Borders::ALL)
         // V42-B FIX: border_style 必须含 bg，否则 ratatui 渲染边框时将边框 cell 的
         // bg 重置为终端默认色（Reset），与全局 theme.bg 不一致。
-        .border_style(Style::default().fg(bar_color).bg(state.theme.bg))
+        .border_style(Style::default().fg(bar_color).bg(focused_bg))
         .padding(Padding::horizontal(1))
-        .style(Style::default().bg(state.theme.bg)); // 填充背景色，防止旧内容穿透
+        .style(Style::default().bg(focused_bg)); // 填充背景色，防止旧内容穿透
 
     let inner = input_block.inner(area);
     f.render_widget(input_block, area);
@@ -412,7 +421,15 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         } else {
             state.theme.muted
         };
+        // V42-B+: placeholder 视觉强化 — 加 cursor 提示 "▎" 前缀 + accent 色块
+        // 用户能看到"这里有输入位置但还没输入"，强化可输入区域感知
+        // 不闪烁（cursor 闪烁由系统 cursor 控制），只展示静态 accent 视觉锚
+        let cursor_color = state.theme.accent;
         input_lines.push(Line::from(vec![
+            Span::styled(
+                "▎ ",
+                Style::default().fg(cursor_color).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 placeholder_text,
                 Style::default().fg(placeholder_color).add_modifier(Modifier::ITALIC),
@@ -462,14 +479,51 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
     };
 
-    // 底行：右侧操作提示（mode 标签仅在 StatusBar 显示，不重复）
-    let right_w = display_width(right_hint_text);
-    let fill = inner.width.saturating_sub(right_w as u16).max(1);
+    // 底行：V42-B+ dynamic keyboard hint bar（参考 OpenCode TUI）
+    // 左侧：上下文相关的快捷键提示
+    // 右侧：当前焦点下的 Enter 行为（send / cancel）
+    let bottom_hints: Vec<(&str, &str)> = if is_busy {
+        vec![]
+    } else {
+        match state.input_state {
+            InputState::Ready => vec![
+                ("/", t("hint.slash_command")),
+                ("Tab", t("hint.completing")),
+                ("Ctrl+B", t("hint.focus_panel")),
+            ],
+            InputState::Completing => vec![
+                ("Tab", t("hint.completing")),
+                ("Esc", t("hint.cancel")),
+            ],
+            _ => vec![],
+        }
+    };
 
-    let bottom_spans = vec![
-        Span::raw(" ".repeat(fill as usize)),
-        Span::styled(right_hint_text, right_style),
-    ];
+    let mut bottom_spans: Vec<Span> = Vec::new();
+    let hint_key_style = Style::default().fg(state.theme.accent);
+    let hint_sep_style = Style::default().fg(state.theme.muted);
+    let hint_desc_style = state.theme.text_style(TextRole::Caption);
+    let mut first_hint = true;
+    for (key, desc) in bottom_hints {
+        if !first_hint {
+            bottom_spans.push(Span::styled("  ·  ", hint_sep_style));
+        }
+        first_hint = false;
+        bottom_spans.push(Span::styled(key, hint_key_style));
+        bottom_spans.push(Span::styled(format!(" {}", desc), hint_desc_style));
+    }
+
+    // 右侧 hint（send/cancel）始终在最右
+    let right_w = display_width(right_hint_text);
+    let left_w: usize = bottom_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let fill = inner.width.saturating_sub((left_w + right_w + 1) as u16).max(1);
+
+    if !bottom_spans.is_empty() {
+        bottom_spans.push(Span::raw(" ".repeat(fill as usize)));
+    } else {
+        bottom_spans.push(Span::raw(" ".repeat(inner.width.saturating_sub(right_w as u16).max(1) as usize)));
+    }
+    bottom_spans.push(Span::styled(right_hint_text, right_style));
     input_lines.push(Line::from(bottom_spans));
 
     // 清空 inner 区域防残影（text_area_h 变化时旧行内容残留）
@@ -478,8 +532,15 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     // V42-B FIX: Paragraph 必须显式设置 bg，否则 Clear widget 已将 inner 区域
     // 所有 cell 的 bg 重置为终端默认色（Reset），而 Paragraph 空白区域不会
     // 自动继承全局 theme.bg，导致输入框内部背景与全局不一致。
+    //
+    // V42-B+: 焦点态用 surface（亮一级）让用户视觉感知当前焦点位置
+    let inner_bg = if state.focus == Focus::Input {
+        state.theme.surface
+    } else {
+        state.theme.bg
+    };
     let input_widget = Paragraph::new(input_lines)
-        .style(Style::default().bg(state.theme.bg));
+        .style(Style::default().bg(inner_bg));
     f.render_widget(input_widget, inner);
 
     // 光标定位：考虑 soft-wrap——visual line 可能不是逻辑行起点
