@@ -897,33 +897,26 @@ pub fn trigger_completion(state: &mut AppState) -> bool {
 ///     多候选时只填充输入框，用户再按 Enter 确认（V32-2：防误选）
 /// - 其他候选（文件路径、带参数的命令）→ 仅填充输入框，用户继续编辑
 fn accept_completion(state: &mut AppState) {
-    if state.completion_index >= state.completion_candidates.len() {
+    let Some(chosen) = state.completion.popup_selected().map(|s| s.to_string()) else {
         cancel_completion(state);
         return;
-    }
-    let chosen = state.completion_candidates[state.completion_index].clone();
-    // L3-17: 仅斜杠命令后加空格，文件路径不加
+    };
     let suffix = if chosen.starts_with('/') { " " } else { "" };
-    // V32-2: 在 cancel_completion 清空列表前捕获候选数
-    let unambiguous = state.completion_candidates.len() == 1;
-    let is_slash_root_cmd = chosen.starts_with('/') && state.completion_prefix.is_empty();
-    state.input = format!("{}{}{}", state.completion_prefix, chosen, suffix);
+    let unambiguous = state.completion.popup_candidates.len() == 1;
+    let is_slash_root_cmd = chosen.starts_with('/') && state.completion.popup_prefix.is_empty();
+    state.input = format!("{}{}{}", state.completion.popup_prefix, chosen, suffix);
     state.cursor_pos = state.input.len();
     state.recalculate_cursor();
     cancel_completion(state);
     state.input_state = InputState::Typing;
     state.sync_to_textarea();
-    // V32-2: 仅单一候选时自动提交，避免多个候选时误选（如 /mode 选中 /model）
     if is_slash_root_cmd && unambiguous {
         submit_message(state);
     }
 }
 /// 取消补全，清除候选列表。
 fn cancel_completion(state: &mut AppState) {
-    state.completion_candidates.clear();
-    state.completion_index = 0;
-    state.completion_prefix.clear();
-    state.completion.reset();
+    state.completion.reset_all();
     if state.input_state == InputState::Completing {
         state.input_state = InputState::Typing;
     }
@@ -1170,50 +1163,36 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
     if state.input_state == InputState::Completing {
         match code {
             KeyCode::Tab => {
-                // Tab 循环选中下一候选
-                if !state.completion_candidates.is_empty() {
-                    state.completion_index = (state.completion_index + 1) % state.completion_candidates.len();
+                if state.completion.has_popup() {
+                    state.completion.popup_next();
+                    state.completion.popup_next();
                 }
                 return;
             }
             KeyCode::BackTab => {
-                // E5 修复：Shift+Tab 循环选中上一候选
-                // 之前：wrapping_sub(1) % len 在 index=0 时退化为 usize::MAX % len，
-                // 结果取决于 len（len=5 时 → 0 卡住；len=4 时 → 3）—— 不可预测
-                // 用与 Up 键一致的显式 wrap-around 逻辑
-                if !state.completion_candidates.is_empty() {
-                    state.completion_index = if state.completion_index == 0 {
-                        state.completion_candidates.len() - 1
-                    } else {
-                        state.completion_index - 1
-                    };
+                if state.completion.has_popup() {
+                    state.completion.popup_prev();
                 }
                 return;
             }
             KeyCode::Up => {
-                if !state.completion_candidates.is_empty() {
-                    state.completion_index = if state.completion_index == 0 {
-                        state.completion_candidates.len() - 1
-                    } else {
-                        state.completion_index - 1
-                    };
+                if state.completion.has_popup() {
+                    state.completion.popup_prev();
                 }
                 return;
             }
             KeyCode::Down => {
-                if !state.completion_candidates.is_empty() {
-                    state.completion_index = (state.completion_index + 1) % state.completion_candidates.len();
+                if state.completion.has_popup() {
+                    state.completion.popup_next();
                 }
                 return;
             }
-            // L4-19: PageUp/PageDown 快速跳转补全候选
             KeyCode::PageUp => {
-                state.completion_index = state.completion_index.saturating_sub(5);
+                state.completion.popup_page_up();
                 return;
             }
             KeyCode::PageDown => {
-                let max = state.completion_candidates.len().saturating_sub(1);
-                state.completion_index = (state.completion_index + 5).min(max);
+                state.completion.popup_page_down();
                 return;
             }
             KeyCode::Enter => {
@@ -1227,9 +1206,9 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             // V32 · Alt+1..9 直选：用户视觉上看到候选 1..N，按 Alt+数字直接确认
             // 比 ↓↓↓ Enter 快得多；Alt 修饰键避免与正常字符输入冲突
             KeyCode::Char(d) if mods.contains(KeyModifiers::ALT) && d.is_ascii_digit() && d != '0' => {
-                let target = (d as u8 - b'1') as usize; // '1' → 0, '9' → 8
-                if target < state.completion_candidates.len() {
-                    state.completion_index = target;
+                let target = (d as u8 - b'1') as usize;
+                state.completion.popup_select(target);
+                if state.completion.popup_selected().is_some() {
                     accept_completion(state);
                 }
                 return;

@@ -1355,13 +1355,7 @@ pub struct AppState {
     /// 引用关系: run.rs 各 LLM spawn 点调用 register()；event/mod.rs::EscAction::CancelOperation 调用 cancel_all()
     /// 生命周期: 每次 spawn 注册；正常完成由 reap_finished 清理；Esc 中断时 cancel_all
     pub task_registry: TaskRegistry,
-    /// 补全候选列表（Tab 触发）
-    pub completion_candidates: Vec<String>,
-    /// 补全选中下标（usize::MAX = 未选中）
-    pub completion_index: usize,
-    /// 补全触发时的前缀（用于替换）
-    pub completion_prefix: String,
-    /// 内联补全引擎 — ghost text + Tab 循环
+    /// 统一补全引擎 — 内联（Tab）+ 弹窗（Ctrl+Space / Ctrl+Tab）
     pub completion: completion::CompletionEngine,
     /// 已提交输入的历史（FIFO，上限 100）
     pub input_history: Vec<String>,
@@ -2898,9 +2892,6 @@ impl AppState {
             engine_tx: None,
             task_registry: TaskRegistry::new(),
             pending_text: None,
-            completion_candidates: Vec::new(),
-            completion_index: 0,
-            completion_prefix: String::new(),
             completion: completion::CompletionEngine::new(),
             input_history: Vec::new(),
             pending_inputs: VecDeque::new(),

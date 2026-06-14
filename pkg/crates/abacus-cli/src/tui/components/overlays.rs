@@ -330,7 +330,7 @@ pub fn render_min_terminal_warning(f: &mut ratatui::Frame) -> bool {
 ///
 /// ## 引用关系
 /// - 调用方：`render_overlays`（chat/team/meeting 三模式入口）
-/// - 输入：`state.completion_candidates`（候选列表）+ `state.completion_index`（选中索引）
+/// - 输入：`state.completion.popup_candidates`（候选列表）+ `state.completion.popup_index`（选中索引）
 /// - 生命周期：`input_state == Completing && !candidates.is_empty()` 时每帧重绘
 pub fn render_completion_popup(
     f: &mut ratatui::Frame,
@@ -341,7 +341,7 @@ pub fn render_completion_popup(
     use ratatui::widgets::{Block, Borders, Clear, Paragraph};
     use crate::tui::util::{display_width, truncate_to_width, pad_to_width};
 
-    let candidates = &state.completion_candidates;
+    let candidates = &state.completion.popup_candidates;
     if candidates.is_empty() { return; }
 
     let is_slash = candidates.first().map(|c| c.starts_with('/')).unwrap_or(false);
@@ -394,7 +394,7 @@ pub fn render_completion_popup(
 
     let visible_rows: usize = inner.height as usize;
     // 选中项所在行（grid row）
-    let selected_row = state.completion_index / ncols;
+    let selected_row = state.completion.popup_index / ncols;
     let scroll_start_row: usize = if nrows_total <= visible_rows {
         0
     } else {
@@ -425,7 +425,7 @@ pub fn render_completion_popup(
             }
 
             let candidate = &candidates[idx];
-            let is_selected = idx == state.completion_index;
+            let is_selected = idx == state.completion.popup_index;
 
             // 描述（仅斜杠命令有）
             let desc: String = if is_slash {
@@ -511,7 +511,7 @@ pub fn render_overlays(
     // P1 z-order 修复：confirm_dialog 存在时不渲染其他弹窗，避免遇策弹窗被遗漏覆盖
     if state.confirm_dialog.is_none() {
         if state.input_state == crate::tui::state::InputState::Completing
-            && !state.completion_candidates.is_empty()
+            && !state.completion.popup_candidates.is_empty()
         {
             render_completion_popup(f, state, input_area, messages_area);
         }

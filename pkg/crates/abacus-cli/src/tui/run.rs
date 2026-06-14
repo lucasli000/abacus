@@ -764,9 +764,7 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     if candidates.is_empty() {
                         state.input_state = InputState::Typing;
                     } else {
-                        state.completion_candidates = candidates;
-                        state.completion_index = 0;
-                        state.completion_prefix = prefix;
+                        state.completion.set_popup(candidates, prefix);
                         state.input_state = InputState::Completing;
                     }
                 }
