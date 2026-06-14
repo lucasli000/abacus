@@ -872,23 +872,20 @@ pub fn handle_global_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers
 // 补全候选从 slash_commands::all_command_names() 动态获取（registry SSoT）
 
 /// 触发补全：分析当前输入，生成候选列表。
-/// 返回 true 表示有候选（进入 Completing 状态），false 表示无匹配。
-/// 2026-05-28: 补全统一走 inline suggestion（不再弹窗）
-///
-/// 旧行为：设置 InputState::Completing + 弹窗候选列表
-/// 新行为：计算最佳候选 → 写入 state.inline_suggestion → ghost text 渲染
-///        用户 Tab 接受 / 继续输入覆盖 / Esc 清除
+/// CompletionEngine.set_suggestion() 写入 ghost text。
 ///
 /// 返回 true 表示有候选（Tab 不应插入缩进）
 pub fn trigger_completion(state: &mut AppState) -> bool {
-    // 重算 inline suggestion（统一入口已涵盖斜杠命令 + 历史）
     let suggestion = state.compute_inline_suggestion();
-    if suggestion.is_some() {
-        state.inline_suggestion = suggestion;
-        true
-    } else {
-        state.inline_suggestion = None;
-        false
+    match suggestion {
+        Some(s) => {
+            state.completion.set_suggestion(s);
+            true
+        }
+        None => {
+            state.completion.suggestion = None;
+            false
+        }
     }
 }
 
@@ -924,9 +921,9 @@ fn accept_completion(state: &mut AppState) {
 /// 取消补全，清除候选列表。
 fn cancel_completion(state: &mut AppState) {
     state.completion_candidates.clear();
-    state.completion_index = 0; // V42-B: 改为 0（usize::MAX 哨兵值改为 0，由 candidates 为空判断）
+    state.completion_index = 0;
     state.completion_prefix.clear();
-    state.inline_suggestion = None;
+    state.completion.reset();
     if state.input_state == InputState::Completing {
         state.input_state = InputState::Typing;
     }
@@ -1262,7 +1259,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                     state.recalculate_cursor();
                 }
                 // 更新内联补全候选
-                state.inline_suggestion = if state.input.is_empty() {
+                state.completion.suggestion = if state.input.is_empty() {
                     None
                 } else {
                     state.compute_inline_suggestion()
@@ -1300,30 +1297,28 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
     }
 
     // Tab: 触发补全 — 优先接受内联建议（不阻塞输入），否则走原有的补全弹窗
-    // 2026-05-28: Tab = inline 补全接受 + 连续 Tab 循环候选（fish shell 模式）
+    // CompletionEngine 封装 suggestion/candidates/candidate_idx 三状态
     //
     // 流程:
-    //   首次 Tab: 接受 inline_suggestion → 填入 input
-    //   连续 Tab: 从 inline_candidates 取下一个覆盖 input
-    //   无候选时: 插入缩进
-    //
-    // 任何非 Tab 输入会在字符处理路径清空 inline_candidates（见 Char 分支）
+    //   路径 A: 已有候选 → engine.next_candidate() 循环
+    //   路径 B: 有 ghost text → 接受 + 构建候选列表
+    //   路径 C: 无建议 → trigger_completion() 计算
+    //   路径 D: 全无 → 插入缩进
     if code == KeyCode::Tab && !mods.contains(KeyModifiers::CONTROL) {
-        // 路径 A: 已有 inline_candidates（连续 Tab 循环）
-        if !state.inline_candidates.is_empty() {
-            state.inline_candidate_idx = (state.inline_candidate_idx + 1) % state.inline_candidates.len();
-            let next = state.inline_candidates[state.inline_candidate_idx].clone();
+        // 路径 A: 已有候选（连续 Tab 循环）
+        if state.completion.is_cycling() {
+            let next = state.completion.next_candidate();
             state.input = next;
             state.cursor_pos = state.input.len();
             state.recalculate_cursor();
-            state.inline_suggestion = None;
+            state.completion.suggestion = None;
             state.input_state = InputState::Typing;
             state.sync_to_textarea();
             return;
         }
 
-        // 路径 B: 首次 Tab — 接受 inline_suggestion 并构建候选列表
-        if let Some(suggestion) = state.inline_suggestion.take() {
+        // 路径 B: 首次 Tab — 接受 ghost text 并构建候选列表
+        if let Some(suggestion) = state.completion.suggestion.take() {
             let current_input = state.input.trim().to_string();
             if suggestion.len() > current_input.len() {
                 let candidates = state.compute_all_inline_candidates();
@@ -1331,10 +1326,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
                 state.cursor_pos = state.input.len();
                 state.recalculate_cursor();
                 state.input_state = InputState::Typing;
-                if candidates.len() > 1 {
-                    state.inline_candidates = candidates;
-                    state.inline_candidate_idx = 0;
-                }
+                state.completion.set_candidates(candidates);
                 state.sync_to_textarea();
                 return;
             }
@@ -1422,7 +1414,7 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             &mut state.cursor_col,
         );
         // 更新内联补全候选
-        state.inline_suggestion = if state.input.is_empty() {
+        state.completion.suggestion = if state.input.is_empty() {
             None
         } else {
             state.compute_inline_suggestion()
@@ -1453,11 +1445,11 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         let at_end = state.cursor_pos >= state.input.len();
         if at_end {
             // 光标在末尾 + 有 inline suggestion → 采纳（fish shell 风格）
-            if let Some(suggestion) = state.inline_suggestion.take() {
+            if let Some(suggestion) = state.completion.suggestion.take() {
                 state.input = suggestion;
                 state.cursor_pos = state.input.len();
                 state.recalculate_cursor();
-                state.inline_candidates.clear();
+                state.completion.candidates.clear();
                 state.sync_to_textarea();
                 state.mark_render_dirty();
                 return;
@@ -1506,13 +1498,13 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
             state.input_state = InputState::Typing;
 
             // 更新内联补全候选（保留原有逻辑）
-            state.inline_suggestion = if state.input.trim_start().starts_with('/') {
+            state.completion.suggestion = if state.input.trim_start().starts_with('/') {
                 state.compute_inline_suggestion()
             } else {
                 None
             };
-            state.inline_candidates.clear();
-            state.inline_candidate_idx = 0;
+            state.completion.candidates.clear();
+            state.completion.candidate_idx = 0;
 
             // Slash 自动补全（保留原有逻辑）
             if state.input.starts_with('/') && state.cursor_pos == state.input.len() {

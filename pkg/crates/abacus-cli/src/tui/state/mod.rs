@@ -22,6 +22,7 @@ use std::time::{Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+pub mod completion;
 pub mod session_export;
 /// V42-B Phase 13: session v3 → v4 透明升级
 pub mod session_migrate;
@@ -1372,16 +1373,8 @@ pub struct AppState {
     pub completion_index: usize,
     /// 补全触发时的前缀（用于替换）
     pub completion_prefix: String,
-    /// 静默内联补全 — ghost text 显示在光标后。
-    /// Tab 首次接受当前候选，连续 Tab 循环切换下一个候选。
-    pub inline_suggestion: Option<String>,
-    /// 2026-05-28: Tab 循环候选列表（连续 Tab 在多候选间切换）
-    /// 首次 Tab 接受 inline_suggestion → 写入 input；
-    /// 连续 Tab → 从 inline_candidates 取下一个覆盖 input。
-    /// 任何非 Tab 输入清空此列表。
-    pub inline_candidates: Vec<String>,
-    /// 当前 Tab 循环索引
-    pub inline_candidate_idx: usize,
+    /// 内联补全引擎 — ghost text + Tab 循环
+    pub completion: completion::CompletionEngine,
     /// 已提交输入的历史（FIFO，上限 100）
     pub input_history: Vec<String>,
     /// 排队的输入（忙碌态下用户 Enter 提交的消息，当前请求完成后自动发送）
@@ -2921,9 +2914,7 @@ impl AppState {
             completion_candidates: Vec::new(),
             completion_index: 0,
             completion_prefix: String::new(),
-            inline_suggestion: None,
-            inline_candidates: Vec::new(),
-            inline_candidate_idx: 0,
+            completion: completion::CompletionEngine::new(),
             input_history: Vec::new(),
             pending_inputs: VecDeque::new(),
             pending_send: false,

@@ -463,7 +463,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         InputState::Executing => (format!("{} {}{}{}", spinner(), t("event.working"), phase, elapsed), state.theme.gold),
         InputState::Outputting => (format!("{} {}{}", spinner(), t("event.outputting"), elapsed), state.theme.success),
         InputState::Paused => (format!("⏸ {}", t("hint.paused")), state.theme.semantic_fg(SemanticIntent::Warning)),
-        _ if state.engine_handle.is_some() && state.inline_suggestion.is_some() => {
+        _ if state.engine_handle.is_some() && state.completion.suggestion.is_some() => {
             (format!("● {} · Tab ↵", t("event.ready")), state.theme.success)
         }
         _ if state.engine_handle.is_some() => (format!("● {}", t("event.ready")), state.theme.success),
