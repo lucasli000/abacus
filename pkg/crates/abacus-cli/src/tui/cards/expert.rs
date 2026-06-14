@@ -66,6 +66,7 @@ impl MessageCard for ExpertCard {
 
     fn streaming(&self) -> CardStreaming { self.streaming }
     fn is_empty(&self) -> bool { self.reply_text.is_empty() }
+    fn text_content(&self) -> String { self.reply_text.clone() }
     fn default_collapse(&self) -> CardCollapse { CardCollapse::Expanded }
 
     fn body_height(&self, ctx: &dyn SectionContext, max_width: u16, collapse: CardCollapse) -> u16 {

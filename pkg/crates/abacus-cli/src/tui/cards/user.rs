@@ -72,6 +72,10 @@ impl MessageCard for UserCard {
         self.streaming
     }
 
+    fn text_content(&self) -> String {
+        self.text.clone()
+    }
+
     fn default_collapse(&self) -> CardCollapse {
         CardCollapse::Expanded
     }

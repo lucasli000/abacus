@@ -82,6 +82,10 @@ impl MessageCard for ThinkingCard {
         self.text.is_empty()
     }
 
+    fn text_content(&self) -> String {
+        self.text.clone()
+    }
+
     fn default_collapse(&self) -> CardCollapse {
         CardCollapse::Collapsed
     }

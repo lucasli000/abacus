@@ -102,6 +102,10 @@ impl MessageCard for LlmCard {
         self.reply_text.is_empty()
     }
 
+    fn text_content(&self) -> String {
+        self.reply_text.clone()
+    }
+
     fn default_collapse(&self) -> CardCollapse {
         CardCollapse::Expanded
     }

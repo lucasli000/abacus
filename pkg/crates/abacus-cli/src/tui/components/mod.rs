@@ -248,6 +248,71 @@ pub(crate) fn screen_pos_to_msg_char(
     Some((msg_idx, char_idx))
 }
 
+/// C3: 鼠标坐标 → (card_idx, char_idx) 反查
+///
+/// 替代 `screen_pos_to_msg_char`，直接读 `state.cards` 而非 `state.messages`。
+/// 逻辑与原函数一致，区别：
+/// - 用 cards.len() 替代 messages.len()
+/// - 用 card.text_content() 替代 messages[idx].parts 提取文本
+/// - cached_msg_rows 来源不变（render_cards 已同步）
+pub(crate) fn screen_pos_to_card_char(
+    row: u16,
+    col: u16,
+    terminal_rows: u16,
+    scroll: usize,
+    cards: &abacus_ui_kit::CardStream,
+    chat_width: u16,
+    cached_msg_rows: &[usize],
+) -> Option<(usize, usize)> {
+    let msg_area_start = 1u16;
+    let msg_area_end = terminal_rows.saturating_sub(7);
+    if row < msg_area_start || row >= msg_area_end {
+        return None;
+    }
+    let screen_row = (row - msg_area_start) as usize;
+    let card_count = cards.len();
+    let use_cache = !cached_msg_rows.is_empty() && cached_msg_rows.len() == card_count;
+    if !use_cache {
+        return None; // 无缓存时无法定位（render_cards 每帧更新缓存）
+    }
+    // 找 card_idx
+    let mut card_idx: Option<usize> = None;
+    let mut acc = 0usize;
+    for (idx, _card) in cards.iter().enumerate().skip(scroll) {
+        let h = cached_msg_rows[idx];
+        if h == 0 { continue; }
+        if screen_row < acc + h {
+            card_idx = Some(idx);
+            break;
+        }
+        acc += h;
+    }
+    let card_idx = card_idx?;
+    let row_in_card = screen_row.saturating_sub(acc);
+    // 用 card.text_content() 提取文本，按行反查 char_idx
+    let text = cards.iter().nth(card_idx)?.text_content();
+    let mut char_idx = 0usize;
+    let mut visual_row = 0usize;
+    for line in text.split('\n') {
+        if visual_row == row_in_card {
+            let line_chars: Vec<char> = line.chars().collect();
+            let mut col_acc = 0usize;
+            for c in &line_chars {
+                let w = unicode_width::UnicodeWidthChar::width(*c).unwrap_or(1);
+                if col_acc + w > (col.saturating_sub(6) as usize) {
+                    return Some((card_idx, char_idx));
+                }
+                col_acc += w;
+                char_idx += 1;
+            }
+            return Some((card_idx, char_idx));
+        }
+        visual_row += 1;
+        char_idx += line.chars().count() + 1; // +1 for '\n'
+    }
+    Some((card_idx, char_idx))
+}
+
 // ════════════════════════════════════════════════════════════════
 // Card — 圆角卡片容器 (含阴影)
 // ════════════════════════════════════════════════════════════════

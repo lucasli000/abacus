@@ -1679,14 +1679,14 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
             // 生命周期：selection 状态清除走 Up 分支（复制后 take()）或 Esc 取消
             if event.modifiers.contains(KeyModifiers::SHIFT) {
                 let cached_rows = state.cached_msg_rows.borrow();
-                if let Some((msg_idx, char_idx)) = crate::tui::components::screen_pos_to_msg_char(
-                    event.row, event.column, terminal_rows, state.scroll, &state.messages, chat_cols,
+                if let Some((card_idx, char_idx)) = crate::tui::components::screen_pos_to_card_char(
+                    event.row, event.column, terminal_rows, state.scroll, &state.cards, chat_cols,
                     cached_rows.as_slice(),
                 ) {
                     state.text_selection = Some(TextSelection {
-                        start_msg_idx: msg_idx,
+                        start_msg_idx: card_idx,
                         start_char_idx: char_idx,
-                        end_msg_idx: msg_idx,
+                        end_msg_idx: card_idx,
                         end_char_idx: char_idx,
                     });
                     state.mark_render_dirty();
@@ -1861,12 +1861,12 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                     let pw = if state.panel_visible { terminal_cols * crate::tui::layout::panel_pct_for_width(terminal_cols) / 100 } else { 0 };
                     let chat_cols = terminal_cols.saturating_sub(pw).max(40);
                     let cached_rows = state.cached_msg_rows.borrow();
-                    if let Some((msg_idx, char_idx)) = crate::tui::components::screen_pos_to_msg_char(
-                        event.row, event.column, terminal_rows, state.scroll, &state.messages, chat_cols,
+                    if let Some((card_idx, char_idx)) = crate::tui::components::screen_pos_to_card_char(
+                        event.row, event.column, terminal_rows, state.scroll, &state.cards, chat_cols,
                         cached_rows.as_slice(),
                     ) {
                         if let Some(ref mut sel) = state.text_selection {
-                            sel.end_msg_idx = msg_idx;
+                            sel.end_msg_idx = card_idx;
                             sel.end_char_idx = char_idx;
                         }
                         state.mark_render_dirty();
@@ -1884,7 +1884,7 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
                 let is_empty_range = sel.start_msg_idx == sel.end_msg_idx
                     && sel.start_char_idx == sel.end_char_idx;
                 if !is_empty_range {
-                    let text = extract_selection_text(&sel, &state.messages, &state.trace_events);
+                    let text = extract_card_selection_text(&sel, &state.cards);
                     if !text.is_empty() {
                         match crate::tui::clipboard::set_text(&text) {
                             Ok(backend) => {
@@ -1915,20 +1915,30 @@ pub fn handle_mouse(state: &mut AppState, event: MouseEvent, terminal_cols: u16,
 ///
 /// 引用关系: 被 timeline 点击 hit-test 调用(event 所属 msg → 跳转)
 /// 副作用: 设 state.scroll + mark_dirty;is_streaming_active 时不动(自动跟随底部)
-pub fn scroll_to_message(state: &mut AppState, target_idx: usize, content_width: usize) {
-    if state.is_streaming_active() || target_idx >= state.messages.len() { return; }
-    let last_idx = state.messages.len().saturating_sub(1);
+/// C3: 滚动到指定卡片（替代原 scroll_to_message）
+///
+/// state.scroll 语义: 从底部往上偏移的"渲染行数"(非 card 索引)。
+/// 算法: 累加 target_idx 之后所有 card 的缓存高度,设为 scroll 值,
+/// 这样 target_idx 的最后一行落到屏幕底部(用户滚轮可微调)。
+///
+/// 引用关系: 被 timeline 点击 hit-test 调用(card 所属 → 跳转)
+/// 副作用: 设 state.scroll + mark_dirty;is_streaming_active 时不动(自动跟随底部)
+pub fn scroll_to_message(state: &mut AppState, target_idx: usize, _content_width: usize) {
+    if state.is_streaming_active() || target_idx >= state.cards.len() { return; }
+    let last_idx = state.cards.len().saturating_sub(1);
     if target_idx >= last_idx {
-        // 目标已在最底,scroll = 0(自动跟随)
         state.set_scroll(ScrollAction::ToBottom);
     } else {
-        // 累加 target_idx+1 之后所有消息的估算行数 = 该位置距底部的行偏移
-        // V29.10: estimate_msg_rows 已搬到 components 模块, 与 build_message_lines 同模块强约束
-        // V29.16: 走 SSOT — clamp/dirty 内部统一
-        let lines_below: usize = state.messages.iter()
-            .skip(target_idx + 1)
-            .map(|m| crate::tui::components::estimate_msg_rows(m, content_width))
-            .sum();
+        // 用 cached_msg_rows 累加 target_idx+1 之后所有卡片的高度
+        let cached = state.cached_msg_rows.borrow();
+        let valid_cache = !cached.is_empty() && cached.len() == state.cards.len();
+        let lines_below: usize = if valid_cache {
+            cached.iter().skip(target_idx + 1).sum()
+        } else {
+            // 缓存无效时 fallback：每张卡估算 3 行（header + 1 行 body + 空行）
+            state.cards.len().saturating_sub(target_idx + 1) * 3
+        };
+        drop(cached);
         state.set_scroll(ScrollAction::Absolute(lines_below));
     }
 }
@@ -1937,90 +1947,39 @@ pub fn scroll_to_message(state: &mut AppState, target_idx: usize, content_width:
 //   路径: crate::tui::components::estimate_msg_rows / screen_row_to_msg_idx
 //   动机: 与 build_message_lines 同模块让「估算 vs 实际渲染」三处不一致问题在一个文件内可检轮
 
-/// 从选择区域提取文本（含 stream + block detail）
-/// V30 复制修复：提取选中文本，支持 char-级边界 + Trace 详情拼入。
+/// C3: 从选择区域提取文本（card 版本）
 ///
-/// ## 语义不变量
-/// - char_idx 是 msg “Stream parts 拼接后”的字符偏移，与 screen_pos_to_msg_char 同语义
-/// - 跨 msg 选中时：首 msg 从 start_char_idx 取到末；中间 msg 全部；末 msg 从 0 取到 end_char_idx
-/// - Trace 详情：在 sel 跨过 Trace part 时拼入 events 的实际内容而非“[trace · N events]”占位符
-///
-/// ## 引用关系
-/// - 调用方：handle_mouse Up 分支（selection 释放）
-/// - 依赖：state.trace_events （SSOT）、state.messages
-fn extract_selection_text(
+/// 使用 card.text_content() 替代 messages[idx].parts 拼接。
+/// 各 Card 类型覆写 text_content() 返回对应文本：
+/// - UserCard → 用户输入文本
+/// - LlmCard → reply 文本
+/// - ExpertCard → reply 文本
+/// - ThinkingCard → thinking 文本
+/// - AbacusCard → 事件文本
+fn extract_card_selection_text(
     sel: &TextSelection,
-    messages: &std::collections::VecDeque<Message>,
-    trace_events: &[crate::tui::state::TraceEvent],
+    cards: &abacus_ui_kit::CardStream,
 ) -> String {
-    use crate::tui::state::TraceKind;
-    // 规范化 sel：按 (msg_idx, char_idx) 字典序计算起止
-    let (s_msg, s_char, e_msg, e_char) =
+    // 规范化 sel
+    let (s_idx, s_char, e_idx, e_char) =
         if (sel.start_msg_idx, sel.start_char_idx) <= (sel.end_msg_idx, sel.end_char_idx) {
             (sel.start_msg_idx, sel.start_char_idx, sel.end_msg_idx, sel.end_char_idx)
         } else {
             (sel.end_msg_idx, sel.end_char_idx, sel.start_msg_idx, sel.start_char_idx)
         };
     let mut text = String::new();
-    let last = messages.len().saturating_sub(1);
-    let e_msg = e_msg.min(last);
-    for idx in s_msg..=e_msg {
-        let Some(msg) = messages.get(idx) else { continue; };
-        // Stream 拼接 + Block detail + Trace details
-        let mut parts_flat = String::new();
-        for part in &msg.parts {
-            match part {
-                MsgContent::Stream(s) => parts_flat.push_str(s),
-                MsgContent::Block { summary, detail, .. } => {
-                    if !parts_flat.is_empty() && !parts_flat.ends_with('\n') { parts_flat.push('\n'); }
-                    parts_flat.push_str(&format!("[{}]\n", summary));
-                    parts_flat.push_str(detail);
-                    if !detail.ends_with('\n') { parts_flat.push('\n'); }
-                }
-                MsgContent::Trace { event_ids, .. } => {
-                    if !parts_flat.is_empty() && !parts_flat.ends_with('\n') { parts_flat.push('\n'); }
-                    for eid in event_ids {
-                        if let Some(ev) = trace_events.iter().find(|e| e.id == *eid) {
-                            match &ev.kind {
-                                TraceKind::Generic { content } => {
-                                    parts_flat.push_str(content);
-                                    parts_flat.push('\n');
-                                }
-                                TraceKind::Thinking { text: t, .. } => {
-                                    parts_flat.push_str("[thinking]\n");
-                                    parts_flat.push_str(t);
-                                    if !t.ends_with('\n') { parts_flat.push('\n'); }
-                                }
-                                TraceKind::ToolCall { name, args, output, .. } => {
-                                    parts_flat.push_str(&format!("[tool: {}]\n", name));
-                                    if !args.is_empty() {
-                                        parts_flat.push_str("args: ");
-                                        parts_flat.push_str(args);
-                                        parts_flat.push('\n');
-                                    }
-                                    if let Some(o) = output {
-                                        parts_flat.push_str("output: ");
-                                        parts_flat.push_str(o);
-                                        if !o.ends_with('\n') { parts_flat.push('\n'); }
-                                    }
-                                }
-                                TraceKind::Reply { tokens } => {
-                                    parts_flat.push_str(&format!("[reply · {} tokens]\n", tokens));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        // 切片：首/末 msg 按 char_idx，中间 msg 全量
-        let chars: Vec<char> = parts_flat.chars().collect();
-        let start_in_msg = if idx == s_msg { s_char.min(chars.len()) } else { 0 };
-        let end_in_msg = if idx == e_msg { e_char.min(chars.len()) } else { chars.len() };
-        if start_in_msg < end_in_msg {
-            let slice: String = chars[start_in_msg..end_in_msg].iter().collect();
+    let last = cards.len().saturating_sub(1);
+    let e_idx = e_idx.min(last);
+    for (idx, card) in cards.iter().enumerate() {
+        if idx < s_idx || idx > e_idx { continue; }
+        let card_text = card.text_content();
+        let chars: Vec<char> = card_text.chars().collect();
+        let start_in = if idx == s_idx { s_char.min(chars.len()) } else { 0 };
+        let end_in = if idx == e_idx { e_char.min(chars.len()) } else { chars.len() };
+        if start_in < end_in {
+            let slice: String = chars[start_in..end_in].iter().collect();
             text.push_str(&slice);
-            if idx < e_msg && !text.ends_with('\n') {
+            if idx < e_idx && !text.ends_with('\n') {
                 text.push('\n');
             }
         }
@@ -2571,38 +2530,16 @@ pub fn switch_mode(state: &mut AppState, mode: AbacusMode) {
 // 消息块折叠/展开
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// V28 (T7): toggle_block 支持任意可折叠 part(Block 或 Trace),
-/// part_idx 在 Block 与 Trace 之间共用计数空间,方便 hit-test 直接定位。
-pub fn toggle_block(state: &mut AppState, msg_idx: usize, part_idx: usize) {
-    let mut toggled = false;
-    if let Some(msg) = state.messages.get_mut(msg_idx) {
-        let mut bi = 0;
-        for part in &mut msg.parts {
-            match part {
-                crate::tui::state::MsgContent::Block { collapsed, .. } => {
-                    if bi == part_idx {
-                        *collapsed = !*collapsed;
-                        toggled = true;
-                        break;
-                    }
-                    bi += 1;
-                }
-                crate::tui::state::MsgContent::Trace { collapsed, .. } => {
-                    if bi == part_idx {
-                        *collapsed = !*collapsed;
-                        toggled = true;
-                        break;
-                    }
-                    bi += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    // S3 修复：collapsed 翻转改变渲染行数，必须失效缓存——否则画面要等下次其他事件
-    // 触发 dirty 才更新，用户感觉折叠"按了不响应"
-    if toggled {
-        state.mark_dirty();
+/// C3: toggle 卡片折叠（替代原 toggle_block）
+///
+/// 原 toggle_block 操作 messages[msg_idx].parts[part_idx] 的 Block/Trace collapsed 字段。
+/// 新版直接调 cards.toggle_collapse(card_id)，CardStream 管理 collapse_overrides。
+pub fn toggle_block(state: &mut AppState, card_idx: usize, _part_idx: usize) {
+    // card_idx → card_id（先收集 id，再 mutate，避免 borrow 冲突）
+    let card_id = state.cards.iter().nth(card_idx).map(|c| c.id());
+    if let Some(card_id) = card_id {
+        state.cards.toggle_collapse(card_id);
+        state.mark_render_dirty();
     }
 }
 

@@ -241,6 +241,18 @@ pub trait MessageCard: 'static + std::any::Any {
         false
     }
 
+    /// 卡片的纯文本内容（用于鼠标选择复制、hit-test 文本定位等）
+    ///
+    /// 默认返回空字符串。各 Card 类型覆写返回实际内容：
+    /// - UserCard: 用户输入文本
+    /// - LlmCard: reply 文本
+    /// - ExpertCard: reply 文本
+    /// - ThinkingCard: thinking 文本
+    /// - AbacusCard: 事件文本
+    fn text_content(&self) -> String {
+        String::new()
+    }
+
     /// 默认折叠策略 —— turn 结束后 CardStream 自动应用
     /// User → Expanded（默认 expand, 短文本）
     /// Abacus → Collapsed（折叠总结视图）
