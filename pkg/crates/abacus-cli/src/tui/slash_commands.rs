@@ -316,6 +316,7 @@ fn cmd_clear(s: &mut AppState, _: &str, _: &[&str]) -> CmdResult {
         s.reset_streaming();
     }
     s.messages.clear();
+    s.cards.clear();
     s.expert_names_cache.clear();
     s.events.clear();
     // V28: 同步清 trace_events 与 id 分配器(messages 已清,无悬挂引用风险)
