@@ -297,10 +297,16 @@ impl MessageCard for AbacusCard {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 fn status_icon_and_color(status: ToolStatus, ctx: &dyn SectionContext) -> (&'static str, ratatui::style::Color) {
+    // V42-B+: 状态语义符号参考 OpenCode TUI 工具列表
+    //   * tool_call  → tool_result  ✗ tool_failed  ⠋ tool_running
+    // 设计意图：
+    //   - Running 用旋转箭头，提示正在执行
+    //   - Success 用 → 强调"产出了结果"，配合 muted 颜色弱化（OpenCode 风格）
+    //   - Failed 用 ✗ 醒目颜色让用户快速定位失败
     match status {
-        ToolStatus::Running => ("\u{25ce}", ctx.theme().primary),
-        ToolStatus::Success => ("\u{25c9}", ctx.theme().success),
-        ToolStatus::Failed => ("\u{2715}", ctx.theme().error),
+        ToolStatus::Running => ("\u{2807}", ctx.theme().accent),     // ⠇ 旋转箭头
+        ToolStatus::Success => ("\u{2192}", ctx.theme().muted),     // → 结果（弱化）
+        ToolStatus::Failed  => ("\u{2717}", ctx.theme().error),     // ✗ 失败（醒目）
     }
 }
 
@@ -309,10 +315,11 @@ fn build_collapsed_summary(events: &[TraceEvent], tool_name: &str) -> String {
     // 找最后一个 ToolCall
     for event in events.iter().rev() {
         if let TraceKind::ToolCall { name, args, status, .. } = &event.kind {
+            // V42-B+: 与 status_icon_and_color 保持一致的语义符号
             let icon = match status {
-                ToolStatus::Running => "\u{25ce}",
-                ToolStatus::Success => "\u{25c9}",
-                ToolStatus::Failed => "\u{2715}",
+                ToolStatus::Running => "\u{2807}",     // ⠇
+                ToolStatus::Success => "\u{2192}",     // →
+                ToolStatus::Failed  => "\u{2717}",     // ✗
             };
             let param = extract_key_param(args);
             if let Some(p) = param {
@@ -368,4 +375,91 @@ fn truncate_display(s: &str, max_w: usize) -> String {
         end = i + ch.len_utf8();
     }
     format!("{}…", &s[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V42-B+: 验证 status_icon 语义符号映射（OpenCode 风格）
+    /// Running → ⠇ (旋转箭头)
+    /// Success → → (结果箭头，弱化)
+    /// Failed → ✗ (失败醒目)
+    #[test]
+    fn status_icon_matches_semantic_symbols() {
+        // 验证字符常量（不依赖 theme，颜色参数被忽略）
+        let (running_icon, _) = status_icon_and_color(ToolStatus::Running, &TestCtx);
+        let (success_icon, _) = status_icon_and_color(ToolStatus::Success, &TestCtx);
+        let (failed_icon, _) = status_icon_and_color(ToolStatus::Failed, &TestCtx);
+
+        assert_eq!(running_icon, "\u{2807}", "running should use spinner ⠇");
+        assert_eq!(success_icon, "\u{2192}", "success should use arrow →");
+        assert_eq!(failed_icon, "\u{2717}", "failed should use cross ✗");
+    }
+
+    /// V42-B+: collapsed summary 也使用相同的语义符号
+    #[test]
+    fn collapsed_summary_uses_same_icons() {
+        use crate::tui::state::{EventLevel, TraceKind, TraceEvent};
+        let events = vec![
+            TraceEvent {
+                id: 1,
+                time: "12:00".into(),
+                category: "tool".into(),
+                level: EventLevel::Info,
+                kind: TraceKind::ToolCall {
+                    name: "fs_read".into(),
+                    args: "{\"path\":\"/foo/bar.rs\"}".into(),
+                    output: Some("...".into()),
+                    status: ToolStatus::Success,
+                },
+                duration_ms: Some(50),
+            },
+        ];
+        let summary = build_collapsed_summary(&events, "fs_read");
+        assert!(summary.starts_with('\u{2192}'), "collapsed summary should start with → for success");
+        assert!(summary.contains("fs_read"));
+        assert!(summary.contains("/foo/bar.rs"));
+    }
+
+    /// 失败的 collapsed summary 应以 ✗ 开头
+    #[test]
+    fn collapsed_summary_failed_uses_cross() {
+        use crate::tui::state::{EventLevel, TraceKind, TraceEvent};
+        let events = vec![
+            TraceEvent {
+                id: 1,
+                time: "12:00".into(),
+                category: "tool".into(),
+                level: EventLevel::Warning,
+                kind: TraceKind::ToolCall {
+                    name: "bash".into(),
+                    args: "{}".into(),
+                    output: Some("error".into()),
+                    status: ToolStatus::Failed,
+                },
+                duration_ms: Some(100),
+            },
+        ];
+        let summary = build_collapsed_summary(&events, "bash");
+        assert!(summary.starts_with('\u{2717}'), "failed summary should start with ✗");
+    }
+
+    // 测试用 ctx（避免引入完整 Theme）
+    use abacus_ui_kit::Theme;
+    use abacus_ui_kit::section::SectionContext;
+    struct TestTheme(Theme);
+    impl SectionContext for TestTheme {
+        fn theme(&self) -> &Theme { &self.0 }
+    }
+    static TEST_THEME: std::sync::OnceLock<Theme> = std::sync::OnceLock::new();
+    fn test_theme() -> &'static Theme {
+        TEST_THEME.get_or_init(Theme::brand)
+    }
+    struct TestCtxWrap;
+    impl SectionContext for TestCtxWrap {
+        fn theme(&self) -> &Theme { test_theme() }
+    }
+    // TestCtx 是一个零大小类型别名
+    use TestCtxWrap as TestCtx;
 }
