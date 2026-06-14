@@ -41,9 +41,10 @@ use crate::tui::state::AppState;
 /// 本函数不校验 area 边界, 由调用方负责。
 pub fn card_hit_test(state: &AppState, x: u16, y: i32) -> Option<u64> {
     let ctx = AppContext::new(state);
-    let inner_width = *state.last_msg_area_width.borrow();
-    let mut current_y = *state.last_msg_area_y.borrow() as i32;
-    let y_end = current_y + *state.last_msg_area_height.borrow() as i32;
+    let area = *state.last_msg_area.borrow();
+    let inner_width = area.width;
+    let mut current_y = area.y as i32;
+    let y_end = current_y + area.height as i32;
 
     for card in state.cards.iter() {
         let id = card.id();
@@ -54,8 +55,8 @@ pub fn card_hit_test(state: &AppState, x: u16, y: i32) -> Option<u64> {
         }
         if y >= current_y && y < current_y + h {
             // 命中 — 进一步校验 x 范围
-            let x_start = *state.last_msg_area_x.borrow() as i32;
-            let x_end = x_start + *state.last_msg_area_width.borrow() as i32;
+            let x_start = area.x as i32;
+            let x_end = x_start + area.width as i32;
             if (x as i32) >= x_start && (x as i32) < x_end {
                 return Some(id);
             }

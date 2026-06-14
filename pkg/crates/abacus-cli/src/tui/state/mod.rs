@@ -1131,7 +1131,7 @@ pub struct AppState {
     /// 缓存有效性: `cached_msg_rows.len() == messages.len()` 时直接用, 否则回退 `estimate_msg_rows`
     /// V42-B: 保留 (RefCell 让 hit-test 路径在 streaming 期间动态更新)
     pub cached_msg_rows: RefCell<Vec<usize>>,
-    pub scroll: usize,
+    pub(crate) scroll: usize,
     /// Phase 2: 用户是否主动离开底部浏览历史（streaming 期间不强制拉回）
     /// - set_scroll(Up/Down) → true
     /// - set_scroll(ToBottom) → false
@@ -1325,10 +1325,10 @@ pub struct AppState {
     /// 4 字段记录 inner Rect (border 内), hit_test 用 (x, y) 反查 Card id
     /// 用 `RefCell` 包装: render 路径 (`&AppState`) 也需要写, 普通字段无法
     /// 在 immutable 借用下写入; 借用范围仅 4 行赋值, 无并发风险
-    pub last_msg_area_x: RefCell<u16>,
-    pub last_msg_area_y: RefCell<u16>,
-    pub last_msg_area_width: RefCell<u16>,
-    pub last_msg_area_height: RefCell<u16>,
+    /// V42-B+: 消息区 Rect 缓存（合并原 4 个 RefCell<u16>）
+    /// 引用关系：render_cards 写入，hit_test 读取
+    /// 生命周期：每帧渲染时更新，hit_test 时读取
+    pub(crate) last_msg_area: RefCell<ratatui::layout::Rect>,
     /// V40 字段 — 消息区最近一次的内容宽度, 供 hit-test (event/mod.rs) 使用
     /// Cell 让 immutable render 路径可写
     pub last_content_width: Cell<u16>,
@@ -2862,10 +2862,7 @@ impl AppState {
             toasts: Vec::new(),
             cards: CardStream::new(),
             message_scroll_y: 0,
-            last_msg_area_x: RefCell::new(0),
-            last_msg_area_y: RefCell::new(0),
-            last_msg_area_width: RefCell::new(0),
-            last_msg_area_height: RefCell::new(0),
+            last_msg_area: RefCell::new(ratatui::layout::Rect::new(0, 0, 0, 0)),
             last_content_width: Cell::new(80),
             running: true,
             paused: false,
@@ -3163,7 +3160,9 @@ impl AppState {
         }
         let total = self.last_total_lines.get();
         let vis = self.last_visible_h.get();
-        let max = if total == 0 { usize::MAX } else { total.saturating_sub(vis) };
+        // A1 fix: total==0 时用安全上限（pre-render 场景需要允许滚动，
+        // 但 usize::MAX 会导致溢出。10000 行 = ~500 屏，足够任何预渲染场景）
+        let max = if total == 0 { 10_000 } else { total.saturating_sub(vis) };
         let new = match action {
             ScrollAction::ToBottom => 0,
             ScrollAction::Up(n) => (self.scroll + n).min(max),
@@ -3177,7 +3176,7 @@ impl AppState {
                     self.scroll.saturating_sub(before_rows - after_rows)
                 }
             }
-            ScrollAction::Restore(n) => n,
+            ScrollAction::Restore(n) => n.min(max),
         };
         self.scroll = new;
         self.mark_render_dirty();

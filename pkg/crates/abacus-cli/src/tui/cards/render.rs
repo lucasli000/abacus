@@ -59,10 +59,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     msg_block.render(area, f.buffer_mut());
 
     // V42-B: 缓存 inner Rect 供 hit_test 使用 (通过 RefCell 内部写)
-    *state.last_msg_area_x.borrow_mut() = inner.x;
-    *state.last_msg_area_y.borrow_mut() = inner.y;
-    *state.last_msg_area_width.borrow_mut() = inner.width;
-    *state.last_msg_area_height.borrow_mut() = inner.height;
+    *state.last_msg_area.borrow_mut() = inner;
 
     // 2. 流式 shimmer 顶部光带
     let is_streaming = state.cards.active_id().is_some();
