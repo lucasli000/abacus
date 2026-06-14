@@ -85,6 +85,8 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     // V42-B+: 跟踪上一张可见卡的 kind，用于跨角色呼吸感判定
     // 跨角色 = 不同 kind 的相邻卡，需要插入 1 行空白
     let mut prev_visible_kind: Option<&'static str> = None;
+    // B1: 收集每张卡的高度（复用渲染循环的计算，避免末尾重复 O(n) 遍历）
+    let mut collected_heights: Vec<usize> = Vec::with_capacity(state.cards.len());
 
     for card in state.cards.iter() {
         let id = card.id();
@@ -96,16 +98,19 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
             // 已 finish 的卡片才检查（active 卡正在累积，不应跳过）
             if let Some(llm) = state.cards.card_downcast_ref::<crate::tui::cards::LlmCard>(id) {
                 if llm.reply_text_for_copy().is_empty() {
+                    collected_heights.push(0);
                     continue;
                 }
             }
             if let Some(expert) = state.cards.card_downcast_ref::<crate::tui::cards::ExpertCard>(id) {
                 if expert.reply_text_for_copy().is_empty() {
+                    collected_heights.push(0);
                     continue;
                 }
             }
             if let Some(think) = state.cards.card_downcast_ref::<crate::tui::cards::ThinkingCard>(id) {
                 if think.text_for_copy().is_empty() {
+                    collected_heights.push(0);
                     continue;
                 }
             }
@@ -113,6 +118,7 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
 
         let collapse = state.cards.collapse(id);
         let h = card_total_height(card.as_ref(), &ctx, inner.width, collapse);
+        collected_heights.push(h as usize);
         if h == 0 {
             continue;
         }
@@ -204,14 +210,9 @@ pub fn render_cards(f: &mut Frame, state: &AppState, area: Rect, _focus: crate::
     let total_height: usize = skipped as usize + (y.saturating_sub(inner.y)) as usize;
     state.last_total_lines.set(total_height);
     state.last_visible_h.set(inner.height as usize);
-    // 缓存每张卡片的高度供 hit-test
+    // B1: 复用渲染循环收集的高度（避免重复 O(n) 遍历 + card_total_height 调用）
     {
         let mut rows = state.cached_msg_rows.borrow_mut();
-        rows.clear();
-        for card in state.cards.iter() {
-            let collapse = state.cards.collapse(card.id());
-            let h = card_total_height(card.as_ref(), &ctx, inner.width, collapse) as usize;
-            rows.push(h);
-        }
+        *rows = collected_heights;
     }
 }

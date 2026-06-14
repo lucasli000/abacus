@@ -269,20 +269,20 @@ pub fn push_session_message(
         // 先把 active finish 掉（让 LlmCard #N 不再被 filter 排除）
         let _ = state.cards.finish_active();
 
-        for card in state.cards.iter() {
+        // B3: 逆序遍历（最新卡片优先），限制 5 张，命中即 return。
+        // 通常第一张就命中（流式累积的 LlmCard），O(1) 替代原 O(n)。
+        for card in state.cards.iter_rev().take(5) {
             let cid = card.id();
             if expert_name.is_some() {
                 if let Some(expert) = state.cards.card_downcast_ref::<ExpertCard>(cid) {
                     let existing = expert.reply_text_for_copy();
                     if dedup_match(&existing, text) {
-                        // 流式已落档，跳过非流式重复
                         return;
                     }
                 }
             } else if let Some(llm) = state.cards.card_downcast_ref::<LlmCard>(cid) {
                 let existing = llm.reply_text_for_copy();
                 if dedup_match(&existing, text) {
-                    // 流式已落档，跳过非流式重复
                     return;
                 }
             }

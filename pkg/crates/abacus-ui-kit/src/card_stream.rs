@@ -220,6 +220,11 @@ impl CardStream {
         self.cards.iter()
     }
 
+    /// 全部卡片（逆序 — 最新在前，用于 dedup 等"只关心最近几张"的场景）
+    pub fn iter_rev(&self) -> impl Iterator<Item = &Box<dyn MessageCard>> {
+        self.cards.iter().rev()
+    }
+
     /// 卡片总数
     pub fn len(&self) -> usize {
         self.cards.len()
