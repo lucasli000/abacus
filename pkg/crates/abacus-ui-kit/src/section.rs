@@ -271,15 +271,13 @@ fn compute_heights(sections: &[&dyn Section], total: u16) -> Vec<u16> {
             .map(|(i, s)| s.preferred_height(total).saturating_sub(out[i]))
             .collect();
         let extras_sum: u32 = extras.iter().map(|&h| h as u32).sum();
-        // clippy::manual_checked_div: 这里 guard + 除是为了配合下面的 for 循环复用 extras_sum,
-        // 改 checked_div 后需要每次循环里再 .unwrap() 不必要复杂
-        #[allow(clippy::manual_div_ceil, clippy::manual_checked_div)]
-        if extras_sum > 0 {
+        // 用 NonZeroU32 避免 clippy manual_checked_div
+        if let Some(divisor) = std::num::NonZeroU32::new(extras_sum) {
             for (i, &extra) in extras.iter().enumerate() {
                 if extra == 0 {
                     continue;
                 }
-                let bonus = ((extra as u32) * (remaining as u32) / extras_sum) as u16;
+                let bonus = ((extra as u32) * (remaining as u32) / divisor) as u16;
                 out[i] = out[i].saturating_add(bonus);
             }
         }
