@@ -78,6 +78,10 @@ impl MessageCard for ThinkingCard {
         self.streaming
     }
 
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     fn default_collapse(&self) -> CardCollapse {
         CardCollapse::Collapsed
     }

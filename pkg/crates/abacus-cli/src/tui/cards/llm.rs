@@ -98,6 +98,10 @@ impl MessageCard for LlmCard {
         self.streaming
     }
 
+    fn is_empty(&self) -> bool {
+        self.reply_text.is_empty()
+    }
+
     fn default_collapse(&self) -> CardCollapse {
         CardCollapse::Expanded
     }

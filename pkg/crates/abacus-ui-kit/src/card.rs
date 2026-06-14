@@ -232,6 +232,15 @@ pub trait MessageCard: 'static + std::any::Any {
     /// 当前流式生命周期状态
     fn streaming(&self) -> CardStreaming;
 
+    /// 卡片内容是否为空（应跳过渲染）
+    ///
+    /// 流式期间可能创建空卡片占位，此方法用于 render_cards 跳过空卡。
+    /// 默认返回 false（大多数卡片不为空）。
+    /// LlmCard/ExpertCard/ThinkingCard 覆写检查 reply_text/thinking_text。
+    fn is_empty(&self) -> bool {
+        false
+    }
+
     /// 默认折叠策略 —— turn 结束后 CardStream 自动应用
     /// User → Expanded（默认 expand, 短文本）
     /// Abacus → Collapsed（折叠总结视图）
