@@ -90,6 +90,11 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
         ));
     }
 
+    // ── 中间: tokens + context% + cost (V42-B+ UX 改进)
+    //   参考 OpenCode 截图: "39,413  20% ($0.29)"
+    //   紧凑单行汇总，不与 title 抢空间（窄终端时自动截断）
+    let metrics_mid: Vec<Span> = build_metrics_spans(state);
+
     // ── 右侧: model_name ──
     let right = Span::styled(
         format!("{} ", model_name),
@@ -98,16 +103,200 @@ pub fn render_top_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 
     // 计算左右间距，确保右侧不溢出
     let left_len: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let mid_len: usize = metrics_mid.iter().map(|s| display_width(s.content.as_ref())).sum();
     let right_len = display_width(right.content.as_ref());
-    let gap = width.saturating_sub(left_len + right_len);
+    let gap = width.saturating_sub(left_len + mid_len + right_len);
 
     let mut spans = left;
-    if gap > 0 {
+    // 只有 metrics 非空且有空间时才插入
+    if !metrics_mid.is_empty() && gap > 0 {
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.extend(metrics_mid);
+    } else if gap > 0 {
         spans.push(Span::raw(" ".repeat(gap)));
     }
     spans.push(right);
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// V42-B+: 构建 TopBar 中间的紧凑指标 spans（tokens + context% + cost）
+///
+/// 视觉格式（参考 OpenCode 截图）：
+///   "39,413  20% ($0.29)"    (完整)
+///   "39,413  20%"             (cost=0 时省略 cost)
+///   "39,413"                  (context_window=0 时省略 percentage)
+///
+/// 颜色：
+///   - tokens: text（主色）
+///   - context%: muted（次要）
+///   - cost: gold（强调但不大声）
+fn build_metrics_spans(state: &AppState) -> Vec<Span<'_>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let tokens = state.session_tokens.total_tokens;
+    if tokens == 0 {
+        return spans;
+    }
+    let sep_style = Style::default().fg(state.theme.muted);
+
+    // tokens with thousands separator
+    let tokens_str = format_tokens(tokens);
+    spans.push(Span::styled(tokens_str, Style::default().fg(state.theme.text)));
+
+    // context% if context_window > 0
+    let ctx_window = state.context_window;
+    if ctx_window > 0 {
+        let ctx_used = state.ctx_live_tokens.max(state.session_tokens.latest_prompt_tokens);
+        let pct = ((ctx_used as f64 / ctx_window as f64) * 100.0).round() as u32;
+        // 超过 90% 显示警告色
+        let pct_color = if pct >= 90 {
+            state.theme.error
+        } else if pct >= 70 {
+            state.theme.gold
+        } else {
+            state.theme.muted
+        };
+        spans.push(Span::styled("  ", sep_style));
+        spans.push(Span::styled(format!("{}%", pct), Style::default().fg(pct_color)));
+    }
+
+    // cost if > 0
+    let cost = state.session_tokens.cost_cny;
+    if cost > 0.0 {
+        spans.push(Span::styled("  ", sep_style));
+        let cost_str = format_cost(cost);
+        spans.push(Span::styled(
+            format!("({})", cost_str),
+            Style::default().fg(state.theme.gold),
+        ));
+    }
+
+    spans
+}
+
+/// 格式化 token 数为带千分位的紧凑形式：1234 → "1,234", 12345 → "12K"
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        if n % 1_000_000 == 0 {
+            format!("{}M", n / 1_000_000)
+        } else {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        }
+    } else if n >= 10_000 {
+        // 4 位以上用 K 简化（节省 TopBar 空间）
+        format!("{}K", n / 1_000)
+    } else {
+        // 4 位以下完整显示
+        n.to_string()
+    }
+}
+
+/// 格式化费用：< 0.01 显示 "<0.01"；>= 0.01 显示 "X.XX"（保留 2 位）
+fn format_cost(c: f64) -> String {
+    if c < 0.01 {
+        "<0.01".to_string()
+    } else {
+        format!("¥{:.2}", c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_tokens_small() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(1), "1");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1234), "1234");
+        assert_eq!(format_tokens(9999), "9999");
+    }
+
+    #[test]
+    fn format_tokens_large_compact() {
+        assert_eq!(format_tokens(10_000), "10K");
+        assert_eq!(format_tokens(39_413), "39K");
+        assert_eq!(format_tokens(100_000), "100K");
+        assert_eq!(format_tokens(999_999), "999K");
+    }
+
+    #[test]
+    fn format_tokens_million() {
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(2_500_000), "2.5M");
+        assert_eq!(format_tokens(10_000_000), "10M");
+    }
+
+    #[test]
+    fn format_cost_small() {
+        assert_eq!(format_cost(0.0), "<0.01");
+        assert_eq!(format_cost(0.005), "<0.01");
+        assert_eq!(format_cost(0.29), "¥0.29");
+        assert_eq!(format_cost(1.5), "¥1.50");
+        assert_eq!(format_cost(100.0), "¥100.00");
+    }
+
+    #[test]
+    fn build_metrics_spans_empty_when_no_tokens() {
+        use crate::tui::state::{AbacusMode, AppState};
+        let state = AppState::new(AbacusMode::Clarify);
+        let spans = build_metrics_spans(&state);
+        assert!(spans.is_empty(), "no tokens → empty metrics");
+    }
+
+    #[test]
+    fn build_metrics_spans_tokens_only() {
+        use crate::tui::state::{AbacusMode, AppState};
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.session_tokens.total_tokens = 1234;
+        state.context_window = 0; // 关闭 context%
+        state.session_tokens.latest_prompt_tokens = 0;
+        let spans = build_metrics_spans(&state);
+        assert_eq!(spans.len(), 1, "tokens-only (no context%, no cost): 1 span");
+    }
+
+    #[test]
+    fn build_metrics_spans_with_context_pct() {
+        use crate::tui::state::{AbacusMode, AppState};
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.session_tokens.total_tokens = 5000;
+        state.context_window = 10000;
+        state.session_tokens.latest_prompt_tokens = 2000;
+        let spans = build_metrics_spans(&state);
+        // 5000 + "  " + "20%"
+        assert!(spans.len() >= 3, "with context% should have ≥3 spans");
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(combined.contains("5000"), "should contain token count");
+        assert!(combined.contains("20%"), "should contain context%");
+    }
+
+    #[test]
+    fn build_metrics_spans_high_pct_uses_warning_color() {
+        use crate::tui::state::{AbacusMode, AppState};
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.session_tokens.total_tokens = 1000;
+        state.context_window = 1000;
+        state.session_tokens.latest_prompt_tokens = 950;
+        let spans = build_metrics_spans(&state);
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(combined.contains("95%"), "should show 95%");
+    }
+
+    #[test]
+    fn build_metrics_spans_full() {
+        use crate::tui::state::{AbacusMode, AppState};
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.session_tokens.total_tokens = 39_413;
+        state.session_tokens.latest_prompt_tokens = 8000;
+        state.context_window = 40_000;
+        state.session_tokens.cost_cny = 0.29;
+        let spans = build_metrics_spans(&state);
+        let combined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(combined.contains("39K"), "should contain token count");
+        assert!(combined.contains("20%"), "should contain context%");
+        assert!(combined.contains("¥0.29"), "should contain cost");
+    }
 }
 
 
