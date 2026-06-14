@@ -4,15 +4,21 @@
 
 ### 完成总结
 
-本次会话完成 **19 个任务**，共产生 **25 次 commit**，最终状态：
-- 1544/1544 测试通过，0 error，0 clippy warning
-- 6 个 workspace crate 全量 clippy 清零（34 warnings → 0）
+本次会话完成 **22 个任务**，共产生 **28 次 commit**，最终状态：
+- 1552/1552 测试通过，0 error，0 clippy warning
+- 6 个 workspace crate 全量 clippy 清零
 
 ### 关键架构决策
 
+- **Scrollback trait** — `Scrollable` trait 统一 4 类滚动容器（SimpleScrollOffset + ScrollableStack），面板滚动迁移至 trait 方法调用
+- **CompletionEngine** — 内联补全状态机封装（suggestion + candidates + candidate_idx），Tab handler 简化为 4 条路径
 - **tui-textarea SSoT** — 输入状态机完全替换为 tui-textarea widget，`state.input` 保持 SSoT（文本内容），textarea 通过 `sync_to_textarea`/`sync_from_textarea` 双向同步
 - **卡片语义识别** — `MessageCard` trait 新增 `fn kind()` 方法，支持 Markdown 标题识别和交互语义
 - **Tool Agent 结果可视化** — LLM 输出 `ToolAgentResult` JSON 时自动渲染 tool-badge
+- **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
+- **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
+- **死代码清理** — 删除 ~130 行不可达代码 + PanelFocus 死枚举
+- **方法提取** — `clear_input()` 消除 4 处重复；`short_path()` 6→1 次分配
 - **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
 - **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
 
