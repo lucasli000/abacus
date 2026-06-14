@@ -2672,6 +2672,50 @@ impl AppState {
         *cursor_col = col;
     }
 
+    /// V42-B+: 从 state.input 同步到 tui-textarea
+    ///
+    /// 外部代码直接修改 state.input 后调用（如 navigate_history、accept_completion、
+    /// 测试代码直接设置 s.input），确保 textarea 内容与 state.input 一致。
+    ///
+    /// ## 调用时机
+    /// - navigate_history_up/down 修改 state.input 后
+    /// - accept_completion 修改 state.input 后
+    /// - slash 命令修改 state.input 后
+    /// - 测试代码直接设置 s.input 后
+    pub(crate) fn sync_to_textarea(&self) {
+        let mut ta = self.textarea.borrow_mut();
+        let current = ta.lines().join("\n");
+        if current != self.input {
+            let lines: Vec<String> = if self.input.is_empty() {
+                vec![String::new()]
+            } else {
+                self.input.lines().map(|s| s.to_string()).collect()
+            };
+            ta.select_all();
+            ta.cut();
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    ta.insert_newline();
+                }
+                ta.insert_str(line);
+            }
+        }
+        // 同步光标
+        let (target_row, target_col) = byte_pos_to_row_col(&self.input, self.cursor_pos);
+        let (cur_row, cur_col) = ta.cursor();
+        if (cur_row, cur_col) != (target_row, target_col) {
+            use tui_textarea::CursorMove;
+            ta.move_cursor(CursorMove::Top);
+            for _ in 0..target_row {
+                ta.move_cursor(CursorMove::Down);
+            }
+            ta.move_cursor(CursorMove::Head);
+            for _ in 0..target_col {
+                ta.move_cursor(CursorMove::Forward);
+            }
+        }
+    }
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // V42-B messages 升级路径
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

@@ -914,6 +914,7 @@ fn accept_completion(state: &mut AppState) {
     state.recalculate_cursor();
     cancel_completion(state);
     state.input_state = InputState::Typing;
+    state.sync_to_textarea();
     // V32-2: 仅单一候选时自动提交，避免多个候选时误选（如 /mode 选中 /model）
     if is_slash_root_cmd && unambiguous {
         submit_message(state);
@@ -939,6 +940,7 @@ fn navigate_history_up(state: &mut AppState) {
     state.input = state.input_history[state.input_history.len() - 1 - idx].clone();
     state.cursor_pos = state.input.len();
     state.recalculate_cursor();
+    state.sync_to_textarea();
 }
 
 /// 历史导航：下箭头回到更新的历史。
@@ -959,6 +961,7 @@ fn navigate_history_down(state: &mut AppState) {
             state.recalculate_cursor();
         }
     }
+    state.sync_to_textarea();
 }
 
 /// 将当前输入加入历史（提交时调用）。
@@ -1346,37 +1349,26 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // Up: 多行模式行间移光标 / 单行 history / 多行首行 no-op (V25 保护)
-    // V25: 多行首行 Up 不再触发 navigate_history_up——避免误把整个多行 input 替换为历史命令
-    //      单行场景下 Up = history 仍然合理(用户习惯)
-    //      引用关系: navigate_history_up 会改 state.input,多行首行触发 = 整段被替换 = 数据丢失风险
+    // Up: 多行模式委托 textarea 移光标 / 单行 history
+    // V25: 多行首行 Up 不再触发 navigate_history_up（保护多行内容不被 history 替换）
     if code == KeyCode::Up {
         let has_newline = state.input.contains('\n');
         let on_first_line = state.cursor_line == 0;
         if has_newline && !on_first_line {
-            // 多行非首行: 移光标到上一行同列
-            // EV10 修复：按 char index 计算同列位置（不按 byte），
-            // 避免 CJK 行 + ASCII 行混排时新 cursor_pos 落在多字节 char 中间
-            // 触发 recalculate_cursor 的 slice panic
-            let before = &state.input[..state.cursor_pos];
-            let current_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let col_chars = state.input[current_line_start..state.cursor_pos].chars().count();
-            let prev_line_end = current_line_start.saturating_sub(1); // '\n' position
-            let prev_before = &state.input[..prev_line_end];
-            let prev_line_start = prev_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let prev_line = &state.input[prev_line_start..prev_line_end];
-            // 找到 char index col_chars 对应的 byte offset；超出则停在行末
-            let target_byte = prev_line.char_indices()
-                .nth(col_chars)
-                .map(|(b, _)| b)
-                .unwrap_or(prev_line.len());
-            state.cursor_pos = prev_line_start + target_byte;
-            state.recalculate_cursor();
+            // Phase 3: 委托 textarea 处理多行 Up（CJK 安全 + 行列精确）
+            let ti = tui_textarea::Input {
+                key: tui_textarea::Key::Up,
+                ctrl: false, alt: false, shift: false,
+            };
+            state.textarea.borrow_mut().input(ti);
+            crate::tui::state::AppState::sync_from_textarea(
+                &state.textarea, &mut state.input,
+                &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
+            );
         } else if !has_newline {
-            // 单行: history navigate (用户习惯)
             navigate_history_up(state);
         }
-        // V25: else 多行首行 → no-op,保护多行内容不被 history 替换
+        // V25: 多行首行 → no-op
         if state.input.is_empty() {
             state.input_state = InputState::Ready;
         } else {
@@ -1385,35 +1377,24 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // Down: 多行模式行间移光标 / 单行 history / 多行末行 no-op (V25 保护,与 Up 对称)
+    // Down: 多行模式委托 textarea 移光标 / 单行 history
     if code == KeyCode::Down {
         let has_newline = state.input.contains('\n');
         let total_lines = state.input.matches('\n').count();
         let on_last_line = state.cursor_line >= total_lines;
         if has_newline && !on_last_line {
-            // 多行非末行: 移光标到下一行同列
-            // EV10 修复：与 Up 对称——按 char index 同列移动避免落入 char 中间字节
-            let before = &state.input[..state.cursor_pos];
-            let current_line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let col_chars = state.input[current_line_start..state.cursor_pos].chars().count();
-            let after_cursor = &state.input[state.cursor_pos..];
-            if let Some(next_newline) = after_cursor.find('\n') {
-                let next_line_start = state.cursor_pos + next_newline + 1;
-                let next_after = &state.input[next_line_start..];
-                let next_line_end_in_after = next_after.find('\n').unwrap_or(next_after.len());
-                let next_line = &next_after[..next_line_end_in_after];
-                let target_byte = next_line.char_indices()
-                    .nth(col_chars)
-                    .map(|(b, _)| b)
-                    .unwrap_or(next_line.len());
-                state.cursor_pos = next_line_start + target_byte;
-            }
-            state.recalculate_cursor();
+            let ti = tui_textarea::Input {
+                key: tui_textarea::Key::Down,
+                ctrl: false, alt: false, shift: false,
+            };
+            state.textarea.borrow_mut().input(ti);
+            crate::tui::state::AppState::sync_from_textarea(
+                &state.textarea, &mut state.input,
+                &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
+            );
         } else if !has_newline {
-            // 单行: history navigate
             navigate_history_down(state);
         }
-        // V25: else 多行末行 → no-op,保护多行内容不被 history 替换
         if state.input.is_empty() {
             state.input_state = InputState::Ready;
         } else {
@@ -1451,41 +1432,44 @@ pub fn handle_input_key(state: &mut AppState, code: KeyCode, mods: KeyModifiers)
         return;
     }
 
-    // Left 光标移动（字符边界安全 + unicode-width 计算 display column）
+    // Left — Phase 3: 委托 textarea（CJK 安全 + unicode-width）
     if code == KeyCode::Left {
-        if state.cursor_pos > 0 {
-            if let Some((idx, ch)) = state.input[..state.cursor_pos].char_indices().next_back() {
-                state.cursor_pos = idx;
-                if ch == '\n' {
-                    state.recalculate_cursor();
-                } else {
-                    state.cursor_col = state.cursor_col.saturating_sub(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1));
-                }
-            }
-        }
+        let ti = tui_textarea::Input {
+            key: tui_textarea::Key::Left,
+            ctrl: false, alt: false, shift: false,
+        };
+        state.textarea.borrow_mut().input(ti);
+        crate::tui::state::AppState::sync_from_textarea(
+            &state.textarea, &mut state.input,
+            &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
+        );
         return;
     }
-    // Right 光标移动（unicode-width 计算 display column）
+
+    // Right — Phase 3: 委托 textarea + 末尾 inline suggestion 采纳
     if code == KeyCode::Right {
-        if state.cursor_pos < state.input.len() {
-            // 光标不在末尾：正常右移一字符
-            let rest = &state.input[state.cursor_pos..];
-            if let Some(ch) = rest.chars().next() {
-                state.cursor_pos += ch.len_utf8();
-                if ch == '\n' {
-                    state.recalculate_cursor();
-                } else {
-                    state.cursor_col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
-                }
+        let at_end = state.cursor_pos >= state.input.len();
+        if at_end {
+            // 光标在末尾 + 有 inline suggestion → 采纳（fish shell 风格）
+            if let Some(suggestion) = state.inline_suggestion.take() {
+                state.input = suggestion;
+                state.cursor_pos = state.input.len();
+                state.recalculate_cursor();
+                state.inline_candidates.clear();
+                state.mark_render_dirty();
+                return;
             }
-        } else if let Some(suggestion) = state.inline_suggestion.take() {
-            // 2026-05-28: 光标在末尾 + 有 inline suggestion → 采纳（fish shell 风格）
-            state.input = suggestion;
-            state.cursor_pos = state.input.len();
-            state.recalculate_cursor();
-            state.inline_candidates.clear();
-            state.mark_render_dirty();
         }
+        // 光标不在末尾：委托 textarea 右移
+        let ti = tui_textarea::Input {
+            key: tui_textarea::Key::Right,
+            ctrl: false, alt: false, shift: false,
+        };
+        state.textarea.borrow_mut().input(ti);
+        crate::tui::state::AppState::sync_from_textarea(
+            &state.textarea, &mut state.input,
+            &mut state.cursor_pos, &mut state.cursor_line, &mut state.cursor_col,
+        );
         return;
     }
 
@@ -2550,17 +2534,14 @@ mod ev10_panic_tests {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     /// EV10 回归：构造 CJK + ASCII 混合多行场景，证明 Up/Down 不再 panic 在 char boundary
-    /// 修复前路径：cursor_pos = prev_line_start + col(byte) → 落在 '中' 中间字节 → recalculate_cursor 切片 panic
     #[test]
     fn up_does_not_panic_at_char_boundary() {
         let mut s = AppState::new(AbacusMode::Clarify);
-        // 第一行 CJK "中"(3 bytes), 第二行 ASCII "ab"
         s.input = "中\nab".to_string();
-        s.cursor_pos = 6; // 'b' 之后（byte 6 = 'a'(4) + 'b'(5) end）
+        s.cursor_pos = 6;
         s.recalculate_cursor();
+        s.sync_to_textarea(); // Phase 3: 外部修改 state.input 后同步到 textarea
         assert_eq!(s.cursor_line, 1);
-        // 触发 Up：col_chars=2（"ab" 两个 char），上一行 "中" 只有 1 char
-        // 预期：target_byte = 行末 = 3，new cursor_pos = 0+3 = 3 → '\n' 位置
         handle_input_key(&mut s, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(s.cursor_pos, 3, "应停在 '中' 之后即 \\n 位置");
         assert_eq!(s.cursor_line, 0);
@@ -2569,13 +2550,11 @@ mod ev10_panic_tests {
     #[test]
     fn down_does_not_panic_at_char_boundary() {
         let mut s = AppState::new(AbacusMode::Clarify);
-        // 第一行 ASCII "ab", 第二行 CJK "中文"
         s.input = "ab\n中文".to_string();
-        s.cursor_pos = 1; // 'a' 之后
+        s.cursor_pos = 1;
         s.recalculate_cursor();
+        s.sync_to_textarea();
         assert_eq!(s.cursor_line, 0);
-        // 触发 Down：col_chars=1，下一行 "中文" char index 1 → '文' 起始 byte=3
-        // new cursor_pos = next_line_start(3) + 3 = 6 → '文' 起始（valid char boundary）
         handle_input_key(&mut s, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(s.cursor_pos, 6, "应落在 '文' char boundary");
         assert_eq!(s.cursor_line, 1);
@@ -2583,13 +2562,12 @@ mod ev10_panic_tests {
 
     #[test]
     fn up_from_ascii_to_cjk_overflow() {
-        // 当前行 col_chars 超出上一行 char count 时停在行末
         let mut s = AppState::new(AbacusMode::Clarify);
         s.input = "中\nabcde".to_string();
-        s.cursor_pos = 9; // 末尾 'e' 之后（3+1+5）
+        s.cursor_pos = 9;
         s.recalculate_cursor();
+        s.sync_to_textarea();
         handle_input_key(&mut s, KeyCode::Up, KeyModifiers::NONE);
-        // col_chars=5 但上一行只有 1 char → 停在行末 = 3
         assert_eq!(s.cursor_pos, 3);
     }
 }
