@@ -4913,4 +4913,217 @@ mod tests {
         let taken = state.take_last_llm_text();
         assert_eq!(taken, "");
     }
+
+    // ─── V42-B 重复响应回归测试（user reported scenario）───
+    //
+    // 用户报告：发送"你好"，LLM 回复"你好。准备开始什么任务？"在聊天区出现两次。
+    // 模拟用户实际场景：UserCard → 流式 LlmCard（累积完整文本）→ EngineResponse 落档。
+    // 期望：add_message(Session) 应触发 dedup，跳过新建 LlmCard，仅保留流式累积的卡。
+    //
+    // 根因假设：3c26b8a 修复在以下边界场景可能仍 miss：
+    //   - LlmCard.reply_text 与 response.text 内容不完全相等
+    //   - finish_active 时机问题
+    //   - 别的路径也调 add_message
+
+    #[test]
+    fn dedup_skips_when_llm_card_already_has_full_text() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+
+        // 1. 用户输入 → UserCard
+        state.add_message(Message::new_user("你好", "03:30"));
+
+        // 2. begin_streaming_session 创建空 LlmCard (active)
+        state.begin_streaming_session();
+
+        // 3. 流式累积（模拟 LLM 完整回复）
+        let reply = "你好。准备开始什么任务？";
+        let active_id = state.cards.active_id().expect("active after begin_streaming");
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply(reply);
+        }
+
+        // 4. Complete 抵达 → finish_active（直接调，避免依赖 StreamChunk::Default）
+        state.cards.finish_active();
+        assert!(state.cards.active_id().is_none(), "active should be finished");
+
+        // 5. 关键：此时 state.cards 里 LlmCard 的 reply_text 应 == reply
+        let pre_count = state.cards.len();
+        let pre_last_text = state.last_llm_text();
+        assert_eq!(pre_last_text, reply, "LlmCard should have full text");
+
+        // 6. 模拟 process_engine_response 调用 add_message(Session{Stream(reply)})
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(reply.to_string())],
+            "03:30",
+        ));
+
+        // 7. 期望：dedup 命中，cards 数量不变 (UserCard + 1 LlmCard)
+        let post_count = state.cards.len();
+        assert_eq!(
+            post_count, pre_count,
+            "dedup should skip: pre={} post={}", pre_count, post_count
+        );
+    }
+
+    #[test]
+    fn dedup_with_exact_match_still_dedups() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.begin_streaming_session();
+
+        let reply = "你好。准备开始什么任务？";
+        let active_id = state.cards.active_id().unwrap();
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply(reply);
+        }
+        state.cards.finish_active();
+
+        let count_before = state.cards.len();
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(reply.to_string())],
+            "03:30",
+        ));
+        assert_eq!(
+            state.cards.len(),
+            count_before,
+            "exact match should dedup"
+        );
+    }
+
+    #[test]
+    fn dedup_when_response_text_differs_by_trailing_newline() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.begin_streaming_session();
+
+        // 流式累积末尾带换行
+        let streamed = "你好。准备开始什么任务？\n";
+        let active_id = state.cards.active_id().unwrap();
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply(streamed);
+        }
+        state.cards.finish_active();
+
+        let count_before = state.cards.len();
+        // response.text 无末尾换行（典型 case：API 端 trim 过）
+        let response_text = "你好。准备开始什么任务？";
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(response_text.to_string())],
+            "03:30",
+        ));
+        // 期望：streamed.contains(response_text) → dedup 命中
+        assert_eq!(
+            state.cards.len(),
+            count_before,
+            "trailing-newline diff should still dedup via contains()"
+        );
+    }
+
+    /// Bug repro: 流式累积被 ToolAgentResult 注入了 prefix，response.text 只包含正文
+    /// 这是用户实际可能遇到的 duplication 场景之一
+    #[test]
+    fn dedup_when_streaming_has_tool_agent_prefix() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.begin_streaming_session();
+
+        // 模拟 ToolAgentResult 先注入 prefix（format!("\n{} {} · {} calls", icon, name, call_count)）
+        let active_id = state.cards.active_id().unwrap();
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply("\n🔍 code · 1 calls");
+        }
+        // 然后 LLM 回复正文
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply("\n你好。准备开始什么任务？");
+        }
+        state.cards.finish_active();
+
+        // LlmCard.reply_text = "\n🔍 code · 1 calls\n\n你好。准备开始什么任务？"
+
+        let count_before = state.cards.len();
+        // response.text 只包含正文（不含 ToolAgent prefix）
+        let response_text = "你好。准备开始什么任务？";
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(response_text.to_string())],
+            "03:30",
+        ));
+        // 期望：text 包含在 existing 中 → dedup 命中（条件三：text.contains(&existing)...）
+        // 实际：existing 是超集，text 是子集 → existing.contains(text) 命中
+        assert_eq!(
+            state.cards.len(),
+            count_before,
+            "tool_agent_prefix scenario should dedup"
+        );
+    }
+
+    /// Bug repro: 流式累积包含 markdown formatting，response.text 可能是 stripped 版本
+    #[test]
+    fn dedup_when_streaming_has_markdown_formatting() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.begin_streaming_session();
+
+        let active_id = state.cards.active_id().unwrap();
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            // 流式累积包含 **bold** 标记
+            llm.append_reply("**你好。准备开始什么任务？**");
+        }
+        state.cards.finish_active();
+
+        let count_before = state.cards.len();
+        // response.text 不含 markdown 标记
+        let response_text = "你好。准备开始什么任务？";
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(response_text.to_string())],
+            "03:30",
+        ));
+        // 此场景下不应该 dedup（因为内容确实不同）
+        // 这是正确的行为 — 测试记录这个不 dedup 的边界
+        assert_eq!(
+            state.cards.len(),
+            count_before + 1,
+            "markdown stripping is content change, should create new card"
+        );
+    }
+
+    /// Bug repro: 同一 turn 多次调 add_message（重复 EngineResponse 抵达）
+    #[test]
+    fn dedup_against_double_add_message() {
+        use crate::tui::cards::LlmCard;
+
+        let mut state = AppState::new(AbacusMode::Clarify);
+        state.begin_streaming_session();
+
+        let reply = "你好。准备开始什么任务？";
+        let active_id = state.cards.active_id().unwrap();
+        if let Some(llm) = state.cards.card_downcast_mut::<LlmCard>(active_id) {
+            llm.append_reply(reply);
+        }
+        state.cards.finish_active();
+
+        let count_before = state.cards.len();
+        // 第一次 add_message: 应该 dedup（流式已累积完整文本）
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(reply.to_string())],
+            "03:30",
+        ));
+        assert_eq!(state.cards.len(), count_before, "first add_message should dedup");
+
+        // 第二次 add_message（同响应重发）: 也应该 dedup
+        state.add_message(Message::new_session(
+            vec![MsgContent::Stream(reply.to_string())],
+            "03:30",
+        ));
+        assert_eq!(
+            state.cards.len(),
+            count_before,
+            "second add_message should also dedup"
+        );
+    }
 }

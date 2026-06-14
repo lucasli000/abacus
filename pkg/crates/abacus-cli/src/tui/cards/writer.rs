@@ -253,35 +253,41 @@ pub fn push_session_message(
 ) {
     // V42-B FIX: 流式路径已通过 TextDelta 累积内容到 LlmCard，
     // 此时 EngineResponse 抵达再调 add_message 会重复创建 LlmCard。
-    // 检测：最近 5 张已 finish 的 LlmCard/ExpertCard 中是否有匹配 text 的，有则跳过。
+    //
+    // 关键时序：
+    //   1. 流式累积阶段：handle_chunk → ensure_reply_card_active → push_active LlmCard #N
+    //   2. StreamChunk::Complete 抵达 → writer::handle_chunk → cards.finish_active()
+    //   3. EngineResponse 抵达 → process_engine_response → add_message → push_session_message
+    //
+    // 关键修复点：
+    //   - 必须在 finish_active 之后再做 dedup 检查（否则 active LlmCard 被 filter 掉，dedup miss）
+    //   - 不依赖 active 状态，遍历所有 LlmCard/ExpertCard 检查
+    //   - 匹配条件：text 已在 existing 里，或 existing 包含 text，或反向包含
+    //   - 文本规范化：trim 空白/换行 + collapse 多空白，再做相等/包含比较
+    //     （应对：流式末尾换行 vs response.text trim 后的差异、ToolAgentResult 注入前缀等）
     if !text.is_empty() {
-        let active = state.cards.active_id();
-        let mut card_ids: Vec<u64> = state.cards.iter()
-            .map(|c| c.id())
-            .filter(|id| Some(*id) != active)
-            .collect();
-        card_ids.reverse();
-        for cid in card_ids.into_iter().take(5) {
+        // 先把 active finish 掉（让 LlmCard #N 不再被 filter 排除）
+        let _ = state.cards.finish_active();
+
+        for card in state.cards.iter() {
+            let cid = card.id();
             if expert_name.is_some() {
                 if let Some(expert) = state.cards.card_downcast_ref::<ExpertCard>(cid) {
                     let existing = expert.reply_text_for_copy();
-                    if !existing.is_empty() && (existing == text || existing.contains(text) || text.contains(&existing)) {
+                    if dedup_match(&existing, text) {
                         // 流式已落档，跳过非流式重复
                         return;
                     }
                 }
             } else if let Some(llm) = state.cards.card_downcast_ref::<LlmCard>(cid) {
                 let existing = llm.reply_text_for_copy();
-                if !existing.is_empty() && (existing == text || existing.contains(text) || text.contains(&existing)) {
+                if dedup_match(&existing, text) {
                     // 流式已落档，跳过非流式重复
                     return;
                 }
             }
         }
     }
-
-    // 兜底: 上游残留 active 先 finish 掉
-    state.cards.finish_active();
     let id = state.cards.alloc_id();
     let model = if state.model_name.is_empty() {
         "llm".into()
@@ -308,4 +314,129 @@ pub fn push_session_message(
     // time 当前未挂到 Card header(渲染层从 self.messages 读 time);
     // 保留参数供未来扩展, 避免破坏现有 API 签名
     let _ = time;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Dedup 辅助
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 规范化文本用于 dedup 比较：trim 前后空白 + collapse 连续空白为单空格
+///
+/// 目的：消除流式累积末尾换行、API response.text trim、ToolAgentResult 注入前缀
+/// 等场景导致的 dedup miss。
+///
+/// 复杂度：O(n) 单次扫描，无堆分配（除返回 String 外）。
+fn normalize_for_dedup(s: &str) -> String {
+    let trimmed = s.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut prev_was_space = false;
+    for ch in trimmed.chars() {
+        if ch.is_whitespace() {
+            if !prev_was_space && !out.is_empty() {
+                out.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_was_space = false;
+        }
+    }
+    out
+}
+
+/// Dedup 匹配：existing 与 text 在规范化后是否相等或 existing 是 text 的前缀扩展
+///
+/// 返回 true 表示可视为同一消息（流式累积内容已覆盖 response.text），跳过新建。
+///
+/// 设计原则：
+///   - 流式累积总是包含 response.text 的全部内容（LLM 不会先 emit 一部分然后
+///     改变主意输出不同内容），所以匹配只需考虑 existing 是 text 的超集的情况
+///   - 命中条件：
+///     1. normalized 后完全相等（处理 trailing whitespace、换行差异）
+///     2. existing 规范化后以 text 规范化后结尾（处理 ToolAgent prefix 注入场景）
+///   - **不**做 substring contains：避免 markdown stripping 场景的误合并
+///     （流式带 **，response.text 不带 → 误判为子集 → 错误 dedup）
+///
+/// 反例（不应 dedup）：
+///   - existing="**你好。**", text="你好。"（markdown 标记不同，语义不同）
+///   - existing="你好。世界", text="你好。"（前缀相同但尾部不同）
+///
+/// 输入参数：均接受未规范化文本（函数内部统一 normalize）
+fn dedup_match(existing: &str, text: &str) -> bool {
+    if existing.is_empty() || text.is_empty() {
+        return false;
+    }
+    let normalized_existing = normalize_for_dedup(existing);
+    let normalized_text = normalize_for_dedup(text);
+    if normalized_existing.is_empty() || normalized_text.is_empty() {
+        return false;
+    }
+    // 条件 1: 规范化后完全相等
+    if normalized_existing == normalized_text {
+        return true;
+    }
+    // 条件 2: existing 以 text 结尾（处理 ToolAgent prefix 注入）
+    // 使用 ends_with 而非 contains，避免中间子串误判
+    if normalized_existing.len() > normalized_text.len()
+        && normalized_existing.ends_with(&normalized_text)
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_strips_whitespace() {
+        assert_eq!(normalize_for_dedup("  你好。  \n"), "你好。");
+        assert_eq!(normalize_for_dedup("\n\nhello\n\nworld\n"), "hello world");
+        assert_eq!(normalize_for_dedup("a\t\tb  c"), "a b c");
+        assert_eq!(normalize_for_dedup(""), "");
+        assert_eq!(normalize_for_dedup("   "), "");
+    }
+
+    #[test]
+    fn dedup_match_exact() {
+        assert!(dedup_match("你好。准备开始什么任务？", "你好。准备开始什么任务？"));
+    }
+
+    #[test]
+    fn dedup_match_trailing_newline_diff() {
+        // 流式末尾带换行，response.text trim 后
+        assert!(dedup_match("你好。准备开始什么任务？\n", "你好。准备开始什么任务？"));
+        assert!(dedup_match("你好。准备开始什么任务？", "你好。准备开始什么任务？\n"));
+    }
+
+    #[test]
+    fn dedup_match_internal_whitespace_diff() {
+        // normalize 语义：trim + collapse 连续空白为单空格
+        // 所以 "你好。\n\n准备" 和 "你好。 准备" 是等价的（normalize 后都成 "你好。 准备"）
+        assert!(dedup_match("你好。\n\n准备开始", "你好。 准备开始"));
+        assert!(dedup_match("你好。\t准备开始", "你好。 准备开始"));
+        assert!(dedup_match("你好。  准备开始", "你好。 准备开始"));
+    }
+
+    #[test]
+    fn dedup_match_suffix() {
+        // existing 以 text 结尾 → dedup（ToolAgent prefix 场景）
+        assert!(dedup_match("🔍 code · 1 calls\n\n你好。准备开始？", "你好。准备开始？"));
+        assert!(dedup_match("\n[thinking]\n\n你好。", "你好。"));
+    }
+
+    #[test]
+    fn dedup_no_match_for_middle_substring() {
+        // existing 在中间包含 text（但前后不同）→ 不应 dedup
+        assert!(!dedup_match("前缀。中间内容。你好。后缀。", "中间内容。你好。"));
+        assert!(!dedup_match("前后\n中间\n你好\n剩余", "中间\n你好"));
+    }
+
+    #[test]
+    fn dedup_no_match_for_different_content() {
+        assert!(!dedup_match("你好", "再见"));
+        assert!(!dedup_match("", "任何文本"));
+        assert!(!dedup_match("任何文本", ""));
+    }
 }
