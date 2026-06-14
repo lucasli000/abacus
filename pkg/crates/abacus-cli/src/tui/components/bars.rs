@@ -8,7 +8,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use crate::tui::i18n::t;
 use crate::tui::state::{AppState, Focus, InputState};
@@ -428,58 +428,18 @@ pub fn render_status_bar(f: &mut ratatui::Frame, state: &AppState, area: Rect) {
 pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: Rect, _focus: Focus) {
     use ratatui::widgets::block::Padding;
 
-    // V32 · 三焦点视觉对称：
-    //   - 输入框边框跟随状态变化（Ready=user, Typing=text, Thinking=accent 等）
-    //   - Focus::Input 时叠加 thick 上边框（与 Panel/CommandHint 同款锚点）
-    //   - 200ms 脉冲叠 BOLD 提示刚切换
-    let bar_color = state.input_bar_color();
-
     // V42-B+: 焦点 bg 使用 surface（比 bg 亮一级）— 让用户视觉上感知"我现在在这"
-    // 非焦点（命令面板等）用 bg（保持视觉层次）
-    // 这是 OpenCode TextareaRenderable `focusedBackgroundColor` 的对应实现
     let focused_bg = if state.focus == Focus::Input {
         state.theme.surface
     } else {
         state.theme.bg
     };
+    let bar_color = state.input_bar_color();
 
-    let input_block = Block::default()
-        .border_type(BorderType::Rounded)
-        .borders(Borders::ALL)
-        // V42-B FIX: border_style 必须含 bg，否则 ratatui 渲染边框时将边框 cell 的
-        // bg 重置为终端默认色（Reset），与全局 theme.bg 不一致。
-        .border_style(Style::default().fg(bar_color).bg(focused_bg))
-        .padding(Padding::horizontal(1))
-        .style(Style::default().bg(focused_bg)); // 填充背景色，防止旧内容穿透
+    // ── 同步 textarea 内容 ──
+    state.sync_to_textarea();
 
-    let inner = input_block.inner(area);
-    f.render_widget(input_block, area);
-
-    // V32 · 焦点视觉强调：focus=Input 时叠加上边框 thick primary
-    // 与 render_panel/render_shortcuts_hints 的视觉锚一致，三档焦点反馈对称
-    let input_focused = state.focus == Focus::Input;
-    if input_focused && area.width >= 3 {
-        let mut top_style = Style::default().fg(state.theme.primary);
-        if state.focus_pulsing() {
-            top_style = top_style.add_modifier(Modifier::BOLD);
-        }
-        let top_segment = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y,
-            width: area.width.saturating_sub(2),
-            height: 1,
-        };
-        let top_overlay = Block::default()
-            .borders(Borders::TOP)
-            .border_type(BorderType::Thick)
-            .border_style(top_style);
-        f.render_widget(top_overlay, top_segment);
-    }
-
-    let _cursor_color = state.input_bar_color(); // 保留调用以备后续光标颜色定制
-    let mut input_lines: Vec<Line> = Vec::new();
-
-    // ── 顶行：状态指示（spinner + phase + elapsed）──
+    // ── 状态指示行文本 ──
     let spinner = || {
         let tick = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -499,8 +459,7 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
     } else { String::new() };
     let phase = if state.processing_phase.is_empty() { String::new() }
         else { format!(" {}", state.processing_phase) };
-    // Mode 标签不在 InputBar 重复显示（StatusBar 已有唯一模式指示）
-    let (status_text, status_color) = match state.input_state {
+    let (status_text, _status_color) = match state.input_state {
         InputState::Thinking => (format!("{} {}{}{}", spinner(), t("event.thinking"), phase, elapsed), state.theme.accent),
         InputState::Executing => (format!("{} {}{}{}", spinner(), t("event.working"), phase, elapsed), state.theme.gold),
         InputState::Outputting => (format!("{} {}{}", spinner(), t("event.outputting"), elapsed), state.theme.success),
@@ -511,97 +470,37 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         _ if state.engine_handle.is_some() => (format!("● {}", t("event.ready")), state.theme.success),
         _ => (format!("● {}", t("event.ready")), state.theme.muted),
     };
-    input_lines.push(Line::from(vec![
-        Span::styled(status_text, Style::default().fg(status_color)),
-    ]));
 
-    // ── 中间：输入文本区（自适应高度 + soft-wrap）──
-    // V40: 支持 soft-wrap——超出框宽的行自动视觉折行
-    let text_area_h = inner.height.saturating_sub(2).max(1) as usize;
-    let wrap_width = inner.width.saturating_sub(0) as usize; // 可用渲染宽度
+    // ── 构建 textarea 的 Block（边框 + 状态指示 title）──
+    let input_block = Block::default()
+        .border_type(BorderType::Rounded)
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            format!(" {} ", status_text),
+            Style::default().fg(_status_color),
+        ))
+        .border_style(Style::default().fg(bar_color).bg(focused_bg))
+        .padding(Padding::horizontal(1))
+        .style(Style::default().bg(focused_bg));
 
-    // Soft-wrap：将每个逻辑行按 wrap_width 拆分为多个视觉行
-    // WrappedLine 用指针差值直接计算在 state.input 中的字节范围（零误差）
-    struct WrappedLine<'a> {
-        text: &'a str,
-        logical_line: usize,
-        byte_start: usize,
-        byte_end: usize,
-    }
-    let input_ptr = state.input.as_ptr() as usize;
-    let logical_lines: Vec<&str> = state.input.lines().collect();
-    let mut wrapped: Vec<WrappedLine> = Vec::new();
-    for (li, line) in logical_lines.iter().enumerate() {
-        if line.is_empty() {
-            let byte_off = line.as_ptr() as usize - input_ptr;
-            wrapped.push(WrappedLine { text: "", logical_line: li, byte_start: byte_off, byte_end: byte_off });
-        } else {
-            let chars: Vec<char> = line.chars().collect();
-            let widths: Vec<usize> = chars.iter().map(|c| crate::tui::util::char_width(*c)).collect();
-            let mut pos = 0;
-            while pos < chars.len() {
-                let mut w = 0usize;
-                let mut end = pos;
-                while end < chars.len() {
-                    let cw = widths[end];
-                    if cw == 0 { end += 1; continue; }
-                    if w + cw > wrap_width && end > pos { break; }
-                    w += cw;
-                    end += 1;
-                }
-                let start_byte: usize = chars[..pos].iter().map(|c| c.len_utf8()).sum();
-                let end_byte: usize = chars[..end].iter().map(|c| c.len_utf8()).sum();
-                let seg = &line[start_byte..end_byte];
-                let byte_off = seg.as_ptr() as usize - input_ptr;
-                wrapped.push(WrappedLine {
-                    text: seg,
-                    logical_line: li,
-                    byte_start: byte_off,
-                    byte_end: byte_off + seg.len(),
-                });
-                pos = end;
-            }
-        }
-    }
-
-    // 滚动：用字节范围定位光标所在的 visual line
-    let cursor_wrapped_idx = {
-        let mut idx = wrapped.len().saturating_sub(1);
-        for (wi, wl) in wrapped.iter().enumerate() {
-            // 光标在 [byte_start, byte_end) 范围内，或在行尾（byte_start == byte_end 且光标在该位置）
-            if state.cursor_pos >= wl.byte_start && state.cursor_pos < wl.byte_end {
-                idx = wi;
-                break;
-            } else if wl.byte_start == wl.byte_end && state.cursor_pos == wl.byte_start {
-                // 空行或行尾，光标在该位置
-                idx = wi;
-                break;
-            }
-        }
-        idx
-    };
-    let start = if wrapped.len() <= text_area_h {
-        0
-    } else if cursor_wrapped_idx >= text_area_h {
-        cursor_wrapped_idx + 1 - text_area_h
-    } else {
-        0
-    };
-    let end = (start + text_area_h).min(wrapped.len());
-
-    let show_placeholder = state.input.is_empty() && matches!(state.input_state, InputState::Ready);
-    let cursor_visible_line = cursor_wrapped_idx.saturating_sub(start);
-
-    if show_placeholder {
-        // V41: AwaitingApproval 时 placeholder 变为策略选择提示
+    // ── 配置 textarea 样式 ──
+    {
+        let mut ta = state.textarea.borrow_mut();
+        ta.set_block(input_block);
+        ta.set_style(Style::default().fg(state.theme.text).bg(focused_bg));
+        // 隐藏 tui-textarea 的 REVERSED cursor（我们用真实终端 cursor）
+        ta.set_cursor_style(Style::default().fg(focused_bg).bg(focused_bg));
+        ta.set_cursor_line_style(Style::default());
+        // placeholder
         let placeholder_text = if matches!(
             state.plan_phase,
             Some(crate::tui::state::PlanPhase::AwaitingApproval { .. })
         ) {
-            t("status.plan_strategy")
+            t("status.plan_strategy").to_string()
         } else {
-            "Ask anything..."
+            "Ask anything...".to_string()
         };
+        ta.set_placeholder_text(&placeholder_text);
         let placeholder_color = if matches!(
             state.plan_phase,
             Some(crate::tui::state::PlanPhase::AwaitingApproval { .. })
@@ -610,54 +509,43 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         } else {
             state.theme.muted
         };
-        // V42-B+: placeholder 视觉强化 — 加 cursor 提示 "▎" 前缀 + accent 色块
-        // 用户能看到"这里有输入位置但还没输入"，强化可输入区域感知
-        // 不闪烁（cursor 闪烁由系统 cursor 控制），只展示静态 accent 视觉锚
-        let cursor_color = state.theme.accent;
-        input_lines.push(Line::from(vec![
-            Span::styled(
-                "▎ ",
-                Style::default().fg(cursor_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                placeholder_text,
-                Style::default().fg(placeholder_color).add_modifier(Modifier::ITALIC),
-            ),
-        ]));
-        for _ in 1..text_area_h {
-            input_lines.push(Line::raw(""));
-        }
-    } else {
-        for vi in start..end {
-            let wl = &wrapped[vi];
-            let mut spans: Vec<Span> = vec![
-                Span::styled(wl.text.to_string(), Style::default().fg(state.theme.text)),
-            ];
-            // 内联建议：仅在最后一个视觉行 + 光标在末尾时
-            let is_last_wrapped = vi == wrapped.len().saturating_sub(1);
-            if is_last_wrapped && state.cursor_pos == state.input.len() {
-                if let Some(sugg) = &state.inline_suggestion {
-                    let full_input = state.input.trim();
-                    if let Some(r) = sugg.strip_prefix(full_input).filter(|r| !r.is_empty()) {
-                        spans.push(Span::styled(
-                            r,
-                            Style::default().fg(state.theme.muted).add_modifier(Modifier::DIM),
-                        ));
-                    }
-                }
-            }
-            input_lines.push(Line::from(spans));
-        }
-        // 填充剩余空行
-        let rendered_lines = end.saturating_sub(start);
-        if rendered_lines < text_area_h {
-            for _ in rendered_lines..text_area_h {
-                input_lines.push(Line::raw(""));
-            }
-        }
+        ta.set_placeholder_style(
+            Style::default().fg(placeholder_color).add_modifier(Modifier::ITALIC),
+        );
     }
-    // ── 底行：左侧模式标识 + 右侧操作提示 ──
-    // 注：token 统计已迁移到健康仪表盘（extras.rs render_dashboard_health）
+
+    // ── 渲染 textarea widget ──
+    {
+        let ta = state.textarea.borrow();
+        f.render_widget(&*ta, area);
+    }
+
+    // ── 焦点 thick 上边框叠加 ──
+    let input_focused = state.focus == Focus::Input;
+    if input_focused && area.width >= 3 {
+        let mut top_style = Style::default().fg(state.theme.primary);
+        if state.focus_pulsing() {
+            top_style = top_style.add_modifier(Modifier::BOLD);
+        }
+        let top_segment = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        let top_overlay = Block::default()
+            .borders(Borders::TOP)
+            .border_type(BorderType::Thick)
+            .border_style(top_style);
+        f.render_widget(top_overlay, top_segment);
+    }
+
+    // ── 底行：dynamic keyboard hint bar ──
+    let inner = Block::default()
+        .border_type(BorderType::Rounded)
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(1))
+        .inner(area);
 
     let is_busy = matches!(state.input_state,
         InputState::Thinking | InputState::Executing | InputState::Outputting);
@@ -668,9 +556,6 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         Style::default().fg(state.theme.accent).add_modifier(Modifier::BOLD)
     };
 
-    // 底行：V42-B+ dynamic keyboard hint bar（参考 OpenCode TUI）
-    // 左侧：上下文相关的快捷键提示
-    // 右侧：当前焦点下的 Enter 行为（send / cancel）
     let bottom_hints: Vec<(&str, &str)> = if is_busy {
         vec![]
     } else {
@@ -702,7 +587,6 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         bottom_spans.push(Span::styled(format!(" {}", desc), hint_desc_style));
     }
 
-    // 右侧 hint（send/cancel）始终在最右
     let right_w = display_width(right_hint_text);
     let left_w: usize = bottom_spans.iter().map(|s| display_width(s.content.as_ref())).sum();
     let fill = inner.width.saturating_sub((left_w + right_w + 1) as u16).max(1);
@@ -713,50 +597,30 @@ pub fn render_input_bar_focused(f: &mut ratatui::Frame, state: &AppState, area: 
         bottom_spans.push(Span::raw(" ".repeat(inner.width.saturating_sub(right_w as u16).max(1) as usize)));
     }
     bottom_spans.push(Span::styled(right_hint_text, right_style));
-    input_lines.push(Line::from(bottom_spans));
 
-    // 清空 inner 区域防残影（text_area_h 变化时旧行内容残留）
-    f.render_widget(Clear, inner);
+    // hint bar 渲染在 block 底部（inner 最后一行）
+    if inner.height >= 1 {
+        let hint_y = inner.y + inner.height - 1;
+        let hint_area = Rect::new(inner.x, hint_y, inner.width, 1);
+        f.render_widget(Paragraph::new(Line::from(bottom_spans)).style(Style::default().bg(focused_bg)), hint_area);
+    }
 
-    // V42-B FIX: Paragraph 必须显式设置 bg，否则 Clear widget 已将 inner 区域
-    // 所有 cell 的 bg 重置为终端默认色（Reset），而 Paragraph 空白区域不会
-    // 自动继承全局 theme.bg，导致输入框内部背景与全局不一致。
-    //
-    // V42-B+: 焦点态用 surface（亮一级）让用户视觉感知当前焦点位置
-    let inner_bg = if state.focus == Focus::Input {
-        state.theme.surface
-    } else {
-        state.theme.bg
-    };
-    let input_widget = Paragraph::new(input_lines)
-        .style(Style::default().bg(inner_bg));
-    f.render_widget(input_widget, inner);
-
-    // 光标定位：考虑 soft-wrap——visual line 可能不是逻辑行起点
+    // ── 真实终端光标定位 ──
+    // tui-textarea 的 cursor 位置是相对于 widget area 的 (row, col)
+    // 需要转换为绝对终端坐标
     {
-        let cursor_visual_line = cursor_visible_line;
-        // 计算光标所在 WrappedLine 在其逻辑行内的起始 display width
-        let visual_col_offset = if cursor_wrapped_idx < wrapped.len() {
-            let wl = &wrapped[cursor_wrapped_idx];
-            // 指针差值得到段在逻辑行内的字节偏移
-            let line_ptr = logical_lines[wl.logical_line].as_ptr() as usize;
-            let seg_offset_bytes = wl.byte_start.saturating_sub(line_ptr.saturating_sub(input_ptr));
-            // 逐字符累加 display width，不超过 seg 的字节边界
-            let mut bw = 0usize;
-            let mut dw = 0usize;
-            for c in logical_lines[wl.logical_line].chars() {
-                let cw = crate::tui::util::char_width(c);
-                let new_bw = bw + c.len_utf8();
-                if new_bw > seg_offset_bytes { break; }
-                bw = new_bw;
-                dw += cw;
-            }
-            dw
-        } else { 0 };
-        let col_in_visual = state.cursor_col.saturating_sub(visual_col_offset);
-        let cursor_x = inner.x + col_in_visual as u16;
-        let cursor_y = inner.y + 1 + cursor_visual_line as u16;
-        f.set_cursor_position((cursor_x, cursor_y));
+        let ta = state.textarea.borrow();
+        let (cursor_row, cursor_col) = ta.cursor();
+        // inner 区域的起始位置 + cursor 在 inner 中的偏移
+        // 但 tui-textarea 渲染在 area（含 border），所以 cursor 是相对于 area 的
+        // Block border 占 1 行（上）+ 1 列（左右），padding 1 列
+        // 实际 cursor 绝对位置 = area.y + 1(border top) + cursor_row, area.x + 1(border left) + 1(padding) + cursor_col
+        let abs_x = area.x.saturating_add(2).saturating_add(cursor_col as u16);
+        let abs_y = area.y.saturating_add(1).saturating_add(cursor_row as u16);
+        // 确保 cursor 在可见区域内
+        if abs_y < area.y + area.height && abs_x < area.x + area.width {
+            f.set_cursor_position((abs_x, abs_y));
+        }
     }
 }
 

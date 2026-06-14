@@ -65,6 +65,13 @@ similar = "2.7"
 # 引用关系：tui/md_stream.rs 唯一消费方
 # 生命周期：streaming 期间活跃，reset_streaming 时 drop
 mdstream = { version = "0.2", default-features = false }
+# V42-B+: 多行文本编辑器（参考 OpenCode TextareaRenderable）
+# - 真实多行编辑（Enter = newline, Shift+Enter 可配置 submit）
+# - 内置 cursor 闪烁、placeholder、selection、keybindings
+# - 替代 V40 时代手写的 cursor_pos/cursor_line/cursor_col 状态机
+# 引用关系：components/bars.rs::render_input_bar_focused（计划接入）
+# 生命周期：会话内常驻，随 input_state 切换显示/隐藏
+tui-textarea = "0.6"
 # Phase1-1.1: 同步 HTTP 替代 curl 子进程（setup.rs fetch_model_list_sync）
 # 引用关系：tui/setup.rs::fetch_model_list_sync 唯一消费方
 # 生命周期：每次 fetch 调用创建临时 Agent，无长连接

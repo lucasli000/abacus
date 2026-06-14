@@ -28,6 +28,7 @@ pub mod session_migrate;
 
 use crate::tui::api::EngineHandle;
 use abacus_ui_kit::{CardStream, Theme};
+use tui_textarea::TextArea as TuiTextArea;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // TaskRegistry — 后台任务生命周期管理
@@ -1183,6 +1184,22 @@ pub struct AppState {
     pub(crate) cursor_line: usize,
     /// 缓存光标在行内的字符偏移
     pub(crate) cursor_col: usize,
+
+    /// V42-B+: tui-textarea 多行编辑器（参考 OpenCode TextareaRenderable）
+    /// 用 RefCell 包装：TextArea 内部用 Rc（!Send），AppState 需要 Send，
+    /// RefCell 提供运行时借用检查 + 单线程安全保证。
+    ///
+    /// ## 同步策略
+    /// - `state.input` 是 SSoT（单真相源）
+    /// - 每帧渲染前 sync_to_textarea() 将 input 同步到 textarea
+    /// - textarea 负责：光标渲染、行号、软换行、选区高亮
+    /// - `state.input` 负责：slash 命令拦截、submit 逻辑、completion、历史
+    ///
+    /// ## 后续迁移路径
+    /// Phase 1（当前）: 仅用 textarea 渲染，input handler 不变
+    /// Phase 2: 用 textarea.input() 处理键盘，移除手写 cursor 状态机
+    /// Phase 3: 用 textarea.lines() 替代 state.input（需重构 submit/completion）
+    pub(crate) textarea: std::cell::RefCell<TuiTextArea<'static>>,
 
     /// 全局焦点区域
     pub focus: Focus,
@@ -2632,6 +2649,53 @@ impl AppState {
         self.rendered_lines_dirty.set(false);
     }
 
+    /// V42-B+: 同步 state.input 到 tui-textarea
+    ///
+    /// 每帧渲染前调用，确保 textarea 内容与 input 一致。
+    /// 同时同步光标位置（从 cursor_pos 字节偏移 → textarea 的 (row, col)）。
+    ///
+    /// ## 性能
+    /// O(n) 单次扫描，n = input.len()。每帧最多调一次。
+    pub(crate) fn sync_to_textarea(&self) {
+        let mut ta = self.textarea.borrow_mut();
+
+        // 1. 同步文本内容
+        let current = ta.lines().join("\n");
+        if current != self.input {
+            // 清空并重设
+            let lines: Vec<String> = if self.input.is_empty() {
+                vec![String::new()]
+            } else {
+                self.input.lines().map(|s| s.to_string()).collect()
+            };
+            // tui-textarea 没有 set_lines，用 select_all + delete + insert
+            ta.select_all();
+            ta.cut();
+            for (i, line) in lines.iter().enumerate() {
+                if i > 0 {
+                    ta.insert_newline();
+                }
+                ta.insert_str(line);
+            }
+        }
+
+        // 2. 同步光标位置（cursor_pos 是字节偏移，转为 (row, col)）
+        let (target_row, target_col) = byte_pos_to_row_col(&self.input, self.cursor_pos);
+        let (cur_row, cur_col) = ta.cursor();
+        if (cur_row, cur_col) != (target_row, target_col) {
+            use tui_textarea::CursorMove;
+            // 先移到行首，再移到目标行
+            ta.move_cursor(CursorMove::Top);
+            for _ in 0..target_row {
+                ta.move_cursor(CursorMove::Down);
+            }
+            ta.move_cursor(CursorMove::Head);
+            for _ in 0..target_col {
+                ta.move_cursor(CursorMove::Forward);
+            }
+        }
+    }
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // V42-B messages 升级路径
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -2753,6 +2817,19 @@ impl AppState {
             cursor_pos: 0,
             cursor_line: 0,
             cursor_col: 0,
+            textarea: {
+                let mut ta = TuiTextArea::default();
+                ta.set_placeholder_text("Ask anything...");
+                ta.set_placeholder_style(
+                    ratatui::style::Style::default()
+                        .fg(ratatui::style::Color::DarkGray)
+                        .add_modifier(ratatui::style::Modifier::ITALIC),
+                );
+                ta.set_cursor_style(
+                    ratatui::style::Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
+                );
+                std::cell::RefCell::new(ta)
+            },
             focus: Focus::Input,
             panel_visible: true,
             panel_tab: PanelTab::Timeline,
@@ -4277,6 +4354,29 @@ impl AppState {
 
         candidates
     }
+}
+
+/// 字节偏移 → (row, col) 转换
+///
+/// 用于将 state.cursor_pos（字节偏移）转换为 tui-textarea 需要的 (row, col) 光标位置。
+/// row 和 col 都是 0-indexed，col 是字符偏移（非字节偏移）。
+fn byte_pos_to_row_col(input: &str, byte_pos: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let mut byte_offset = 0usize;
+    for ch in input.chars() {
+        if byte_offset >= byte_pos {
+            break;
+        }
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+        byte_offset += ch.len_utf8();
+    }
+    (row, col)
 }
 
 #[cfg(test)]
