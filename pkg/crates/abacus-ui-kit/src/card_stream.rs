@@ -280,10 +280,8 @@ impl CardStream {
     ///
     /// 与 [`Self::card_downcast_mut`] 平行, 用于只读访问 (如文本提取)
     pub fn card_downcast_ref<T: 'static + MessageCard>(&self, id: u64) -> Option<&T> {
-        // 通过 id_to_idx 直接拿 Box 引用 (避免借用 self.card 的复杂链)
         let idx = *self.id_to_idx.get(&id)?;
-        let boxed: &Box<dyn MessageCard> = self.cards.get(idx)?;
-        let card: &(dyn std::any::Any + 'static) = boxed.as_ref();
+        let card: &(dyn std::any::Any + 'static) = self.cards.get(idx)?.as_ref();
         card.downcast_ref::<T>()
     }
 

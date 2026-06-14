@@ -205,29 +205,26 @@ impl LocalProviderDetector {
     /// - 优先选含 "embed" 的模型名
     /// - 其次选列表第一个
     pub fn guess_embedding_config(endpoints: &[LocalEndpoint]) -> Option<(String, String, usize)> {
-        for ep in endpoints {
+        endpoints.first().and_then(|ep| {
             let model = ep
                 .models
                 .iter()
                 .find(|m| m.to_lowercase().contains("embed"))
                 .or(ep.models.first())?;
-            // 维度默认 1024（常见值），用户可通过 config 覆盖
-            return Some((ep.base_url.clone(), model.clone(), 1024));
-        }
-        None
+            Some((ep.base_url.clone(), model.clone(), 1024))
+        })
     }
 
     /// 从发现结果中推断 reranker 配置
     pub fn guess_reranker_config(endpoints: &[LocalEndpoint]) -> Option<(String, String)> {
-        for ep in endpoints {
+        endpoints.first().and_then(|ep| {
             let model = ep
                 .models
                 .iter()
                 .find(|m| m.to_lowercase().contains("rank"))
                 .or(ep.models.first())?;
-            return Some((ep.base_url.clone(), model.clone()));
-        }
-        None
+            Some((ep.base_url.clone(), model.clone()))
+        })
     }
 }
 
