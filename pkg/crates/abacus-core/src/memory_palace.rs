@@ -290,10 +290,73 @@ impl KnowledgePalace {
         }
         let similar = find_similar_cross_domain(&entry, &entries);
         entries.insert(entry.id.clone(), entry);
+        self.evict_if_needed(&mut entries);
+        (true, similar)
+    }
 
-        // M-4 fix: 容量淘汰: 移除 SM-2 interval 最短（最不稳固/反复遗忘）的条目
-        // 原 max_by(最长) 是错误的：interval 长 = 被成功记忆最多次，最稳固，不应淘汰
-        // interval 短 = 频繁遗忘/初存，这才是应淘汰的弱质知识
+    /// 智能合并写入 — 支持多种合并策略
+    ///
+    /// 当存在相似条目时，按策略决定如何合并：
+    /// - `KeepExisting`: 保留旧数据，忽略新数据
+    /// - `KeepIncoming`: 新数据覆盖旧数据
+    /// - `MergeField`: 非空字段覆盖，列表追加（实体/关系/标签去重合并）
+    ///
+    /// 返回 (是否写入, 相似条目ID列表)
+    pub async fn store_with_strategy(
+        &self,
+        entry: KnowledgeEntry,
+        strategy: MergeStrategy,
+    ) -> (bool, Vec<String>) {
+        let mut entries = self.entries.write().await;
+
+        // 1. 精确匹配（content 完全相同）→ 拒绝
+        if entries.values().any(|e| e.content == entry.content) {
+            return (false, vec![]);
+        }
+
+        // 2. 同域标题重复 → 按策略处理
+        let same_domain_id = find_same_domain_match(&entry, &entries);
+        if let Some(ref existing_id) = same_domain_id {
+            match strategy {
+                MergeStrategy::KeepExisting => {
+                    return (false, vec![]);
+                }
+                MergeStrategy::KeepIncoming => {
+                    entries.insert(existing_id.clone(), entry);
+                    self.evict_if_needed(&mut entries);
+                    return (true, vec![existing_id.clone()]);
+                }
+                MergeStrategy::MergeField => {
+                    if let Some(existing) = entries.get_mut(existing_id) {
+                        merge_fields(existing, &entry);
+                    }
+                    return (true, vec![existing_id.clone()]);
+                }
+            }
+        }
+
+        // 3. 跨域相似 → 按策略处理
+        let similar = find_similar_cross_domain(&entry, &entries);
+        if !similar.is_empty() {
+            match strategy {
+                MergeStrategy::KeepExisting => {
+                    return (false, vec![]);
+                }
+                MergeStrategy::KeepIncoming | MergeStrategy::MergeField => {
+                    // 跨域相似不合并（不同域的知识应该独立存在）
+                    // 只插入新条目，由调用方建立 Similar 关系链
+                }
+            }
+        }
+
+        // 4. 无匹配 → 直接插入
+        entries.insert(entry.id.clone(), entry);
+        self.evict_if_needed(&mut entries);
+        (true, similar)
+    }
+
+    /// 容量淘汰：移除 SM-2 interval 最短的条目
+    fn evict_if_needed(&self, entries: &mut HashMap<String, KnowledgeEntry>) {
         if entries.len() > MAX_KNOWLEDGE_ENTRIES {
             let weakest = entries.values()
                 .min_by(|a, b| a.sm2_interval_days.partial_cmp(&b.sm2_interval_days).unwrap_or(std::cmp::Ordering::Equal))
@@ -302,8 +365,6 @@ impl KnowledgePalace {
                 entries.remove(&id);
             }
         }
-
-        (true, similar)
     }
 
     /// 获取 memory 中已有条目的 `(domain, id)` 供 bridge 使用
@@ -350,6 +411,77 @@ fn find_similar_cross_domain(entry: &KnowledgeEntry, entries: &HashMap<String, K
             }
         })
         .collect()
+}
+
+/// 知识合并策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeStrategy {
+    /// 保留已有数据，忽略新数据
+    KeepExisting,
+    /// 新数据覆盖旧数据
+    KeepIncoming,
+    /// 非空字段覆盖，列表追加（实体/关系/标签去重合并）
+    MergeField,
+}
+
+/// 同域精确标题匹配（返回匹配的条目 ID）
+fn find_same_domain_match(
+    entry: &KnowledgeEntry,
+    entries: &HashMap<String, KnowledgeEntry>,
+) -> Option<String> {
+    let title_words: std::collections::HashSet<&str> = entry.title
+        .split_whitespace().filter(|w| w.len() > 1).collect();
+    if title_words.is_empty() { return None; }
+
+    entries.values()
+        .filter(|e| e.domain == entry.domain)
+        .find(|e| {
+            let other: std::collections::HashSet<&str> = e.title
+                .split_whitespace().filter(|w| w.len() > 1).collect();
+            if other.is_empty() { return false; }
+            let intersection = title_words.intersection(&other).count();
+            intersection as f64 / title_words.len().max(other.len()) as f64 > 0.5
+        })
+        .map(|e| e.id.clone())
+}
+
+/// 字段级合并：非空字段覆盖，列表去重追加
+fn merge_fields(existing: &mut KnowledgeEntry, incoming: &KnowledgeEntry) {
+    // 标量字段：非空则覆盖
+    if !incoming.title.is_empty() {
+        existing.title = incoming.title.clone();
+    }
+    if !incoming.content.is_empty() {
+        existing.content = incoming.content.clone();
+    }
+    if !incoming.domain.is_empty() {
+        existing.domain = incoming.domain.clone();
+    }
+    // 时序信息：incoming 有则覆盖
+    if incoming.temporal.is_some() {
+        existing.temporal = incoming.temporal.clone();
+    }
+    // 实体去重合并（按 name 去重）
+    for entity in &incoming.entities {
+        if !existing.entities.iter().any(|e| e.name == entity.name) {
+            existing.entities.push(entity.clone());
+        }
+    }
+    // 关系去重合并（按 source+type+target 去重）
+    for rel in &incoming.relations {
+        let key = format!("{}|{}|{}", rel.source, rel.relation_type, rel.target);
+        if !existing.relations.iter().any(|r| {
+            format!("{}|{}|{}", r.source, r.relation_type, r.target) == key
+        }) {
+            existing.relations.push(rel.clone());
+        }
+    }
+    // 标签去重合并
+    for tag in &incoming.tags {
+        if !existing.tags.contains(tag) {
+            existing.tags.push(tag.clone());
+        }
+    }
 }
 
 impl KnowledgePalace {
