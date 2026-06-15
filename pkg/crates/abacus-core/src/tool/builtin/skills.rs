@@ -699,7 +699,9 @@ Blocker: ...
 Next: ...
 [/assess]
 ".into(),
-        knowledge_refs: vec![],
+        knowledge_refs: vec![
+            "builtin:knowledge/assess-me-guide.md".into(),
+        ],
         palace_tags: vec!["meta".into(), "audit".into(), "cognition".into(), "self_check".into()],
         compound: true,
         template_params: Vec::new(),
@@ -787,7 +789,9 @@ fn skill_reframe() -> SkillDef {
 - debug-root-cause：排查外部因果链（error/bug）
 - reframe：改变问题框架（打转/噪声/复杂化）
 ".into(),
-        knowledge_refs: vec![],
+        knowledge_refs: vec![
+            "builtin:knowledge/assess-me-guide.md".into(),
+        ],
         palace_tags: vec!["reframe".into(), "simplify".into(), "meta".into(), "perspective".into()],
         compound: true,
         template_params: Vec::new(),
@@ -906,7 +910,9 @@ fn skill_debug_root_cause() -> SkillDef {
 - 症状不是原因（\"null pointer\" 是症状不是根因）
 - 2 种方法后仍卡住 → 问题定义可能有误 → 重做 Phase 1
 ".into(),
-        knowledge_refs: vec![],
+        knowledge_refs: vec![
+            "builtin:knowledge/rca-methods.md".into(),
+        ],
         palace_tags: vec!["debug".into(), "rca".into(), "root_cause".into(), "systematic".into()],
         compound: true,
         template_params: Vec::new(),

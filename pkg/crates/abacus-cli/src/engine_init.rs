@@ -319,6 +319,9 @@ pub async fn create_engine(
     let palace_clone = palace.clone();
     core = core.with_memory(kb_store.clone(), palace).await;
 
+    // 加载内置技能到 SkillEngine（注册 trigger + 注册 ToolHandle）
+    core.load_builtin_skills().await;
+
     // 6. 创建 reranker + health check + 注入 triage_engine
     // V42-B: 之前此处仅打印日志，未实际注入。reranker 注入必须在 with_memory 之后
     //（triage_engine 在 with_memory 中才被完整初始化）。
