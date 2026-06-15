@@ -249,6 +249,26 @@ impl KnowledgeEntry {
     }
 }
 
+/// 图遍历结果
+#[derive(Debug, Clone)]
+pub struct GraphTraversalResult {
+    /// 匹配的知识条目
+    pub entry: KnowledgeEntry,
+    /// 从起始实体到此条目的跳数
+    pub depth: usize,
+}
+
+/// 关系匹配结果
+#[derive(Debug, Clone)]
+pub struct RelationMatch {
+    /// 匹配的关系
+    pub relation: KnowledgeRelation,
+    /// 包含此关系的知识条目 ID
+    pub source_entry_id: String,
+    /// 包含此关系的知识条目标题
+    pub source_entry_title: String,
+}
+
 /// 知识宫殿（最大 5000 条目，超出时按 SM-2 interval 最长的淘汰）
 pub struct KnowledgePalace {
     entries: RwLock<HashMap<String, KnowledgeEntry>>,
@@ -996,6 +1016,137 @@ impl DualPalaceMemory {
             }
         }
         knowledge
+    }
+
+    // ─── 图谱查询 ──────────────────────────────────────────────────
+
+    /// 图遍历查询：从指定实体出发，沿关系链找到相关知识
+    ///
+    /// - `start_entity`: 起始实体名（模糊匹配）
+    /// - `max_depth`: 最大遍历深度
+    /// - `relation_types`: 可选的关系类型过滤（None = 不过滤）
+    ///
+    /// 返回按深度排序的 `GraphTraversalResult` 列表
+    pub async fn graph_traverse(
+        &self,
+        start_entity: &str,
+        max_depth: usize,
+        relation_types: Option<&[&str]>,
+    ) -> Vec<GraphTraversalResult> {
+        let entries = self.knowledge.entries.read().await;
+        let bridge = self.bridge.relations.read().await;
+        let lower = start_entity.to_lowercase();
+
+        let mut visited = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+
+        // 找到包含 start_entity 的所有条目
+        for entry in entries.values() {
+            let matches_entity = entry.entities.iter().any(|e|
+                e.name.to_lowercase().contains(&lower)
+            );
+            let matches_title = entry.title.to_lowercase().contains(&lower);
+            let matches_content = entry.content.to_lowercase().contains(&lower);
+
+            if matches_entity || matches_title || matches_content {
+                queue.push_back((entry.id.clone(), 0usize));
+                visited.insert(entry.id.clone());
+            }
+        }
+
+        while let Some((entry_id, depth)) = queue.pop_front() {
+            if depth > max_depth { continue; }
+
+            if let Some(entry) = entries.get(&entry_id) {
+                results.push(GraphTraversalResult {
+                    entry: entry.clone(),
+                    depth,
+                });
+
+                // 沿关系链遍历
+                for rel in bridge.iter() {
+                    let next_id = if rel.from_id == entry_id {
+                        Some(&rel.to_id)
+                    } else if rel.to_id == entry_id {
+                        Some(&rel.from_id)
+                    } else {
+                        None
+                    };
+
+                    if let Some(next_id) = next_id {
+                        // 过滤关系类型
+                        if let Some(types) = relation_types {
+                            let rel_type_str = format!("{:?}", rel.relation_type).to_lowercase();
+                            if !types.iter().any(|t| rel_type_str.contains(t)) {
+                                continue;
+                            }
+                        }
+
+                        if !visited.contains(next_id) {
+                            visited.insert(next_id.clone());
+                            queue.push_back((next_id.clone(), depth + 1));
+                        }
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// 实体搜索：找到包含指定实体的所有知识条目
+    pub async fn search_by_entity(
+        &self,
+        entity_name: &str,
+        entity_type: Option<&str>,
+    ) -> Vec<KnowledgeEntry> {
+        let entries = self.knowledge.entries.read().await;
+        let lower = entity_name.to_lowercase();
+
+        entries.values()
+            .filter(|e| {
+                e.entities.iter().any(|ent| {
+                    ent.name.to_lowercase().contains(&lower)
+                        && entity_type.map_or(true, |t| ent.entity_type == t)
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 关系查询：找到两个实体之间的关系
+    pub async fn find_relations(
+        &self,
+        source: &str,
+        target: &str,
+    ) -> Vec<RelationMatch> {
+        let entries = self.knowledge.entries.read().await;
+        let source_lower = source.to_lowercase();
+        let target_lower = target.to_lowercase();
+        let mut matches = Vec::new();
+
+        for entry in entries.values() {
+            for rel in &entry.relations {
+                let rel_source_lower = rel.source.to_lowercase();
+                let rel_target_lower = rel.target.to_lowercase();
+
+                let forward_match = rel_source_lower.contains(&source_lower)
+                    && rel_target_lower.contains(&target_lower);
+                let reverse_match = rel_source_lower.contains(&target_lower)
+                    && rel_target_lower.contains(&source_lower);
+
+                if forward_match || reverse_match {
+                    matches.push(RelationMatch {
+                        relation: rel.clone(),
+                        source_entry_id: entry.id.clone(),
+                        source_entry_title: entry.title.clone(),
+                    });
+                }
+            }
+        }
+
+        matches
     }
 
     // ─── 自动维护机制 ────────────────────────────────────────────────
