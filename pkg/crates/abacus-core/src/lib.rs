@@ -30,6 +30,7 @@ pub mod mag_chain;
 pub mod script_hook;
 pub mod memory_palace;
 pub mod knowledge_store;
+pub mod knowledge_extractor;
 pub mod vllm_embedder;
 pub mod local_provider;
 pub mod paths;
