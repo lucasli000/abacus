@@ -26,36 +26,35 @@ use std::sync::Arc;
 
 use crate::core::prompt_assembly::{HookContext, PromptHook};
 use crate::knowledge_store::KnowledgeStore;
+use crate::memory_palace::DualPalaceMemory;
 
 /// Generated Knowledge PromptHook（Priority = 180，位于 Knowledge 层）
 ///
 /// ## 字段
 /// - `store`: KnowledgeStore 引用（只读，FTS5 查询）
+/// - `palace`: 可选 DualPalaceMemory 引用（实体感知注入）
 /// - `top_k`: 返回最多 top_k 条背景知识（默认 3）
 ///
 /// ## 并发安全
 /// KnowledgeStore 内部已用 Arc<Mutex<Connection>>，hook 只读无竞争。
 pub struct GeneratedKnowledgeHook {
     /// 知识库引用（Arc 共享，只读操作）
-    ///
-    /// ## 引用关系
-    /// - 设置方：CoreLoop::new() 在 knowledge_store 初始化后注入
-    /// - 消费方：inject() 中的 query() 调用
-    /// - 生命周期：随 CoreLoop 生死
     store: Arc<KnowledgeStore>,
-
+    /// 可选的记忆宫殿引用（用于实体感知注入）
+    palace: Option<Arc<tokio::sync::RwLock<DualPalaceMemory>>>,
     /// 注入的最大背景知识条数（默认 3，避免 token 膨胀）
     top_k: usize,
 }
 
 impl GeneratedKnowledgeHook {
-    /// 创建 GeneratedKnowledgeHook
-    ///
-    /// ## 参数
-    /// - `store`: KnowledgeStore Arc 引用
-    /// - `top_k`: 最多注入多少条背景知识（建议 2-5）
     pub fn new(store: Arc<KnowledgeStore>, top_k: usize) -> Self {
-        Self { store, top_k }
+        Self { store, palace: None, top_k }
+    }
+
+    /// 注入记忆宫殿引用（启用实体感知注入）
+    pub fn with_palace(mut self, palace: Arc<tokio::sync::RwLock<DualPalaceMemory>>) -> Self {
+        self.palace = Some(palace);
+        self
     }
 }
 
@@ -83,30 +82,61 @@ impl PromptHook for GeneratedKnowledgeHook {
     }
 
     fn inject(&self, ctx: &HookContext) -> String {
-        // 同步调用 KnowledgeStore 查询（hook 是同步接口）
-        // 使用 tokio::task::block_in_place 安全地在 async 上下文中做同步等待
-        // 注意：hook 从 assemble() 调用，assemble() 在 async 上下文运行
-        let query = ctx.input.chars().take(200).collect::<String>();
+        let query: String = ctx.input.chars().take(200).collect();
+        let query_for_entity = query.clone();
         let store = Arc::clone(&self.store);
         let top_k = self.top_k;
 
-        // block_in_place 允许在 tokio 多线程运行时中进行同步阻塞操作
+        // FTS5 全文检索
         let results = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 store.query(&query, top_k, None).await
             })
         });
 
+        let mut lines = Vec::new();
+
+        // FTS5 结果
         match results {
             Ok(refs) if !refs.is_empty() => {
-                let mut lines = vec!["**背景参考（来自知识库）**".to_string()];
+                lines.push("**背景参考（来自知识库）**".to_string());
                 for (i, r) in refs.iter().take(self.top_k).enumerate() {
                     let preview: String = r.content.chars().take(300).collect();
                     lines.push(format!("{}. {}", i + 1, preview));
                 }
-                lines.join("\n")
             }
-            _ => String::new(), // ZeroHit 或错误时不注入
+            _ => {}
+        }
+
+        // 实体感知检索（如果有 palace）
+        if let Some(ref palace) = self.palace {
+            let entity_results = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async move {
+                    let palace = palace.read().await;
+                    palace.search_by_entity(&query_for_entity, None).await
+                })
+            });
+
+            if !entity_results.is_empty() {
+                lines.push("\n**相关实体**".to_string());
+                let mut entity_count = 0;
+                for entry in entity_results.iter().take(3) {
+                    for entity in entry.entities.iter().take(3) {
+                        if entity_count >= 5 { break; }
+                        lines.push(format!("- [{}] {} — {}", entity.entity_type, entity.name, entity.description));
+                        entity_count += 1;
+                    }
+                    for rel in entry.relations.iter().take(2) {
+                        lines.push(format!("- {} → {} → {}", rel.source, rel.relation_type, rel.target));
+                    }
+                }
+            }
+        }
+
+        if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n")
         }
     }
 

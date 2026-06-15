@@ -589,9 +589,35 @@ pub fn palace_register_async(
     ];
 
     tokio::spawn(async move {
-        let entry = KnowledgeEntry::new(&id, &title, &content, &domain_str);
-        let mut entry = entry;
+        let mut entry = KnowledgeEntry::new(&id, &title, &content, &domain_str);
         entry.tags = tags;
+
+        // 自动创建工具实体
+        entry.entities.push(abacus_core::memory_palace::KnowledgeEntity {
+            name: title.clone(),
+            entity_type: "tool".into(),
+            description: ingested.entry.description.clone(),
+        });
+
+        // 创建工具→领域关系
+        entry.relations.push(abacus_core::memory_palace::KnowledgeRelation {
+            source: title.clone(),
+            target: domain_str.clone(),
+            relation_type: "belongs_to".into(),
+            time: None,
+        });
+
+        // 为每个 action 创建实体
+        if let Some(ref actions) = ingested.entry.actions {
+            for action in actions {
+                entry.entities.push(abacus_core::memory_palace::KnowledgeEntity {
+                    name: format!("{}::{}", title, action),
+                    entity_type: "action".into(),
+                    description: format!("{} 的 {} 操作", title, action),
+                });
+            }
+        }
+
         let p = palace.read().await;
         let _ = p.store_knowledge(entry).await;
     })

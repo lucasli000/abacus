@@ -1108,7 +1108,7 @@ impl DualPalaceMemory {
             .filter(|e| {
                 e.entities.iter().any(|ent| {
                     ent.name.to_lowercase().contains(&lower)
-                        && entity_type.map_or(true, |t| ent.entity_type == t)
+                        && entity_type.is_none_or(|t| ent.entity_type == t)
                 })
             })
             .cloned()
@@ -1193,6 +1193,16 @@ impl DualPalaceMemory {
             "session".into(),
             format!("turn:{turn}"),
         ];
+
+        // 从决策文本中启发式提取实体
+        for decision in key_decisions {
+            extract_entities_heuristic(decision, &mut entry.entities);
+        }
+        // 从 summary 中也提取
+        extract_entities_heuristic(summary, &mut entry.entities);
+        // 去重
+        entry.entities.dedup_by(|a, b| a.name == b.name && a.entity_type == b.entity_type);
+
         self.store_knowledge(entry).await
     }
 
@@ -1227,6 +1237,22 @@ impl DualPalaceMemory {
             self.bridge.add_relation(rel).await;
         }
 
+        // 实体注入：将工具使用记录注入相关知识条目的 entities
+        // 使用 search_by_entity 查找已包含该工具的条目
+        let existing = self.search_by_entity(tool_id, Some("tool")).await;
+        if existing.is_empty() {
+            // 无已有条目包含此工具实体 → 在 domain 匹配的条目中注入
+            for entry in candidates.iter().take(1) {
+                let mut updated = entry.clone();
+                updated.entities.push(KnowledgeEntity {
+                    name: tool_id.to_string(),
+                    entity_type: "tool".into(),
+                    description: format!("工具调用记录: {}", tool_id),
+                });
+                let _ = self.knowledge.store_with_strategy(updated, MergeStrategy::MergeField).await;
+            }
+        }
+
         // Write-through
         if let Some(ref store) = self.store {
             let memories = self.behavior.memories.read().await;
@@ -1237,7 +1263,6 @@ impl DualPalaceMemory {
 
         // Lazy prune: 每 100 次 tool interaction 执行一次清理
         let count = self.write_quota.fetch_add(0, std::sync::atomic::Ordering::Relaxed);
-        // 借用 write_quota 作为 interaction counter（非精确，仅触发条件）
         let behavior_count = self.behavior.memories.read().await.len();
         if behavior_count > MAX_BEHAVIOR_ENTRIES / 2 && count.is_multiple_of(100) {
             self.prune().await;
@@ -1363,6 +1388,19 @@ impl DualPalaceMemory {
             }
         }
 
+        // 实体共现：找到包含当前工具的知识条目中的其他工具实体
+        let entity_entries = self.search_by_entity(current_tool, Some("tool")).await;
+        for entry in &entity_entries {
+            for entity in &entry.entities {
+                if entity.entity_type == "tool" && entity.name != current_tool {
+                    // 避免重复
+                    if !recommendations.iter().any(|(name, _)| name == &entity.name) {
+                        recommendations.push((entity.name.clone(), 0.3));
+                    }
+                }
+            }
+        }
+
         // 按 strength 降序
         recommendations.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         recommendations
@@ -1387,19 +1425,33 @@ impl DualPalaceMemory {
         query: &str,
         domain: &str,
     ) -> SmartRetrieveResult {
-        // Phase 1: 知识宫殿 cache probe
+        // Phase 1: 知识宫殿 keyword 搜索
         let cached = self.knowledge.search(query).await;
-        // 过滤 confidence 足够高的条目（>= 0.65）：SM-2 衰减未过期且 ease 足够高
         let now = chrono::Utc::now().timestamp();
         let hot: Vec<_> = cached.iter().filter(|e| {
             e.next_review > now && e.sm2_ease >= 1.8
         }).cloned().collect();
 
         if !hot.is_empty() {
-            // cache hit：记录命中行为
             let tags = vec!["palace_hit".to_string(), domain.to_string(), "retrieval".to_string()];
             self.behavior.record_interaction(&format!("cache_hit:{}", query), &tags).await;
             return SmartRetrieveResult::CacheHit { entries: hot };
+        }
+
+        // Phase 1.5: 实体搜索 + 图遍历扩展
+        let entity_entries = self.search_by_entity(query, None).await;
+        if !entity_entries.is_empty() {
+            // 从实体匹配出发，沿关系链扩展
+            let graph_results = self.graph_traverse(query, 2, None).await;
+            let expanded: Vec<KnowledgeEntry> = graph_results.into_iter()
+                .map(|r| r.entry)
+                .filter(|e| e.sm2_ease >= 1.5) // 图发现的条目用更宽松的阈值
+                .collect();
+            if !expanded.is_empty() {
+                let tags = vec!["entity_hit".to_string(), domain.to_string(), "retrieval".to_string()];
+                self.behavior.record_interaction(&format!("entity_hit:{}", query), &tags).await;
+                return SmartRetrieveResult::CacheHit { entries: expanded };
+            }
         }
 
         // Phase 2: 行为宫殿 → 推荐最优 Skill
@@ -1409,7 +1461,6 @@ impl DualPalaceMemory {
             domain.to_string(),
         ]).await;
 
-        // 取置信度最高的成功 Skill
         let best_skill = skill_memories.iter()
             .filter(|m| m.pattern.starts_with("skill:") && m.confidence > 0.3)
             .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
@@ -1953,6 +2004,65 @@ pub(crate) fn blob_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
             f32::from_le_bytes(arr)
         })
         .collect()
+}
+
+/// 启发式实体提取 — 从文本中提取工具名、文件路径、概念
+///
+/// 不依赖 LLM，使用正则匹配：
+/// - 工具名：snake_case 标识符（如 fs_read, code_execute）
+/// - 文件路径：含 / 或 . 的路径模式
+/// - 概念：连续中文字符（2字以上）
+fn extract_entities_heuristic(text: &str, entities: &mut Vec<KnowledgeEntity>) {
+    // 工具名：snake_case（至少含一个下划线）
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        if clean.contains('_') && clean.chars().all(|c| c.is_alphanumeric() || c == '_') && clean.len() > 3 {
+            entities.push(KnowledgeEntity {
+                name: clean.to_string(),
+                entity_type: "tool".into(),
+                description: format!("工具: {}", clean),
+            });
+        }
+    }
+
+    // 文件路径：含 / 或 . 后缀
+    for word in text.split_whitespace() {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
+        if (clean.contains('/') || clean.ends_with(".rs") || clean.ends_with(".py") || clean.ends_with(".ts")
+            || clean.ends_with(".toml") || clean.ends_with(".json") || clean.ends_with(".md"))
+            && clean.len() > 3
+        {
+            entities.push(KnowledgeEntity {
+                name: clean.to_string(),
+                entity_type: "file".into(),
+                description: format!("文件: {}", clean),
+            });
+        }
+    }
+
+    // 概念：连续中文字符（2字以上）
+    let mut chars_iter = text.char_indices().peekable();
+    while let Some((start, ch)) = chars_iter.next() {
+        if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+            let mut end = start + ch.len_utf8();
+            while let Some(&(next_pos, next_ch)) = chars_iter.peek() {
+                if ('\u{4e00}'..='\u{9fff}').contains(&next_ch) {
+                    end = next_pos + next_ch.len_utf8();
+                    chars_iter.next();
+                } else {
+                    break;
+                }
+            }
+            let concept = &text[start..end];
+            if concept.chars().count() >= 2 {
+                entities.push(KnowledgeEntity {
+                    name: concept.to_string(),
+                    entity_type: "concept".into(),
+                    description: format!("概念: {}", concept),
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]

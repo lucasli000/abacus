@@ -2935,7 +2935,7 @@ impl CoreLoop {
         // 生命周期：随 prompt_assembly 存活；KnowledgeStore 只读，无写锁竞争
         let gen_knowledge_hook = crate::core::knowledge_hook::GeneratedKnowledgeHook::new(
             store.clone(), 3
-        );
+        ).with_palace(palace.clone());
         self.prompt_assembly.register_hook(Box::new(gen_knowledge_hook));
         self.knowledge_store = Some(store.clone());
         self.memory_palace = Some(palace.clone());
