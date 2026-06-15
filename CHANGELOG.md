@@ -1,15 +1,16 @@
 # Changelog
 
-## v2.5.6 (2026-06-14) — UX 质量 + 架构重构（参考 OpenCode TUI）
+## v2.5.6 (2026-06-14) — UX 质量 + 架构重构 + 记忆系统升级
 
 ### 完成总结
 
-本次会话完成 **20 个任务**，共产生 **38 次 commit**，修改 **51 个文件**（+6029/-4345 行）。
-- 1549/1549 测试通过，0 error，0 clippy warning
+本次会话完成 **26 个任务**，共产生 **47 次 commit**，修改 **60+ 个文件**。
+- 1554/1554 测试通过，0 error，0 clippy warning
 - state/mod.rs: 5277 → 1755 行（**-67%**）
 
 ### 关键架构决策
 
+**TUI 层：**
 - **Scrollback trait** — `Scrollable` trait 统一滚动容器（SimpleScrollOffset + ScrollableStack），面板滚动迁移至 trait 方法
 - **CompletionEngine** — 统一内联+弹窗补全（suggestion + popup_candidates），Tab/Ctrl+Space/Ctrl+Tab 全部通过引擎 API
 - **tui-textarea SSoT** — 输入状态机完全替换为 tui-textarea widget，`state.input` 保持 SSoT，textarea 双向同步
@@ -18,6 +19,14 @@
 - **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
 - **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
 - **死代码清理** — 删除 ~130 行不可达代码 + PanelFocus 死枚举 + ~600 行 ConfirmDialog 提取
+
+**记忆系统层（参考 Hyper-Extract）：**
+- **KnowledgeEntry 结构化** — 新增 `entities: Vec<KnowledgeEntity>` + `relations: Vec<KnowledgeRelation>` + `temporal: Option<TemporalInfo>`
+- **MergeStrategy 智能合并** — 3 种策略（KeepExisting / KeepIncoming / MergeField），实体+关系+标签去重合并
+- **图谱查询** — `graph_traverse()` BFS 遍历 + `search_by_entity()` 实体搜索 + `find_relations()` 关系查询
+- **LLM 提取引擎** — `knowledge_extractor.rs`：实体/关系/完整提取 prompt + JSON 解析（支持 markdown 代码块）
+- **化学反应集成** — 7 个集成点：smart_retrieve 图遍历 / absorb_snapshot 实体提取 / GeneratedKnowledgeHook 实体注入 / record_tool_behavior 实体创建 / ingest 实体提取 / recommend_next_tools 实体共现 / knowledge_refs 运行时加载
+- **内置技能激活** — `load_builtin_skills()` 在启动时调用，think-skills 预装（assess-me / reframe / debug-root-cause）
 
 ### state/ 目录最终结构
 
