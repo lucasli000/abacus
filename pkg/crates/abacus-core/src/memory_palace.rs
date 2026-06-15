@@ -124,6 +124,46 @@ impl Default for BehaviorPalace {
 
 // ─── 知识宫殿 ───────────────────────────────────────────────────────────
 
+/// 知识实体（从文本中提取的结构化实体）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KnowledgeEntity {
+    /// 实体名称（唯一标识）
+    pub name: String,
+    /// 实体类型：tool, file, function, concept, person, organization, etc.
+    pub entity_type: String,
+    /// 简短描述
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 知识关系（实体之间的结构化关系）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KnowledgeRelation {
+    /// 源实体名
+    pub source: String,
+    /// 目标实体名
+    pub target: String,
+    /// 关系类型：uses, depends_on, calls, contains, implements, etc.
+    pub relation_type: String,
+    /// 可选时序信息
+    #[serde(default)]
+    pub time: Option<String>,
+}
+
+/// 时序信息
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TemporalInfo {
+    /// 创建时间（ISO 8601）
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// 观察时间（ISO 8601）
+    #[serde(default)]
+    pub observed_at: Option<String>,
+    /// 有效期描述
+    #[serde(default)]
+    pub validity: Option<String>,
+}
+
 /// 知识条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeEntry {
@@ -131,6 +171,17 @@ pub struct KnowledgeEntry {
     pub title: String,
     pub content: String,
     pub domain: String,
+    // ── 结构化知识字段 ──
+    /// 从文本中提取的实体列表
+    #[serde(default)]
+    pub entities: Vec<KnowledgeEntity>,
+    /// 实体之间的关系
+    #[serde(default)]
+    pub relations: Vec<KnowledgeRelation>,
+    /// 时序信息（可选）
+    #[serde(default)]
+    pub temporal: Option<TemporalInfo>,
+    // ── SM-2 间隔重复 ──
     pub sm2_ease: f64,
     pub sm2_interval_days: f64,
     pub sm2_repetitions: u32,
@@ -147,6 +198,9 @@ impl KnowledgeEntry {
             title: title.into(),
             content: content.into(),
             domain: domain.into(),
+            entities: Vec::new(),
+            relations: Vec::new(),
+            temporal: None,
             sm2_ease: 2.5,
             sm2_interval_days: 1.0,
             sm2_repetitions: 0,
@@ -154,6 +208,22 @@ impl KnowledgeEntry {
             next_review: now + 86400,
             tags: vec![],
         }
+    }
+
+    /// 是否包含结构化知识（实体或关系）
+    pub fn has_structured_knowledge(&self) -> bool {
+        !self.entities.is_empty() || !self.relations.is_empty()
+    }
+
+    /// 按实体名搜索
+    pub fn find_entity(&self, name: &str) -> Option<&KnowledgeEntity> {
+        let lower = name.to_lowercase();
+        self.entities.iter().find(|e| e.name.to_lowercase().contains(&lower))
+    }
+
+    /// 获取指定类型的所有关系
+    pub fn relations_of_type(&self, rel_type: &str) -> Vec<&KnowledgeRelation> {
+        self.relations.iter().filter(|r| r.relation_type == rel_type).collect()
     }
 
     /// SM-2 算法更新
@@ -1289,6 +1359,27 @@ impl SqlitePalaceStore {
             ).map_err(|e| format!("migrate embedding column: {e}"))?;
         }
 
+        // Migration: add structured knowledge columns (idempotent)
+        for (col, col_type) in &[
+            ("entities", "TEXT NOT NULL DEFAULT '[]'"),
+            ("relations", "TEXT NOT NULL DEFAULT '[]'"),
+            ("temporal", "TEXT DEFAULT NULL"),
+        ] {
+            let has_col: bool = conn.prepare("PRAGMA table_info(knowledge_entries)")
+                .and_then(|mut stmt| {
+                    let found = stmt.query_map([], |row| row.get::<_, String>(1))?
+                        .filter_map(|r| r.ok())
+                        .any(|c| c == *col);
+                    Ok(found)
+                })
+                .unwrap_or(false);
+            if !has_col {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE knowledge_entries ADD COLUMN {col} {col_type};"
+                )).map_err(|e| format!("migrate {col} column: {e}"))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1302,7 +1393,8 @@ impl SqlitePalaceStore {
         {
             let mut stmt = conn.prepare(
                 "SELECT id, title, content, domain, sm2_ease, sm2_interval_days,
-                        sm2_repetitions, last_reviewed, next_review, tags
+                        sm2_repetitions, last_reviewed, next_review, tags,
+                        entities, relations, temporal
                  FROM knowledge_entries
                  ORDER BY last_reviewed DESC
                  LIMIT 5000"
@@ -1311,14 +1403,23 @@ impl SqlitePalaceStore {
             let entries: Vec<KnowledgeEntry> = stmt.query_map([], |row| {
                 let tags_json: String = row.get(9)?;
                 let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_else(|e| {
-                    tracing::warn!("failed to parse tags JSON: {e}, raw: {}", &tags_json[..tags_json.len().min(200)]);
+                    tracing::warn!("failed to parse tags JSON: {e}");
                     Vec::new()
                 });
+                let entities_json: String = row.get(10)?;
+                let entities: Vec<KnowledgeEntity> = serde_json::from_str(&entities_json).unwrap_or_default();
+                let relations_json: String = row.get(11)?;
+                let relations: Vec<KnowledgeRelation> = serde_json::from_str(&relations_json).unwrap_or_default();
+                let temporal_json: Option<String> = row.get(12)?;
+                let temporal: Option<TemporalInfo> = temporal_json.and_then(|s| serde_json::from_str(&s).ok());
                 Ok(KnowledgeEntry {
                     id: row.get(0)?,
                     title: row.get(1)?,
                     content: row.get(2)?,
                     domain: row.get(3)?,
+                    entities,
+                    relations,
+                    temporal,
                     sm2_ease: row.get(4)?,
                     sm2_interval_days: row.get(5)?,
                     sm2_repetitions: row.get(6)?,
@@ -1425,15 +1526,21 @@ impl SqlitePalaceStore {
     pub async fn persist_knowledge(&self, entry: &KnowledgeEntry) -> Result<(), String> {
         let conn = self.conn.lock().await;
         let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
+        let entities_json = serde_json::to_string(&entry.entities).unwrap_or_else(|_| "[]".into());
+        let relations_json = serde_json::to_string(&entry.relations).unwrap_or_else(|_| "[]".into());
+        let temporal_json: Option<String> = entry.temporal.as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "{}".into()));
         conn.execute(
             "INSERT OR REPLACE INTO knowledge_entries
              (id, title, content, domain, sm2_ease, sm2_interval_days,
-              sm2_repetitions, last_reviewed, next_review, tags, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, unixepoch())",
+              sm2_repetitions, last_reviewed, next_review, tags,
+              entities, relations, temporal, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch())",
             rusqlite::params![
                 entry.id, entry.title, entry.content, entry.domain,
                 entry.sm2_ease, entry.sm2_interval_days, entry.sm2_repetitions,
                 entry.last_reviewed, entry.next_review, tags_json,
+                entities_json, relations_json, temporal_json,
             ],
         ).map_err(|e| format!("persist knowledge: {e}"))?;
         Ok(())
