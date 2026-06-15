@@ -4,29 +4,38 @@
 
 ### 完成总结
 
-本次会话完成 **24 个任务**，共产生 **31 次 commit**，最终状态：
-- 1552/1552 测试通过，0 error，0 clippy warning
-- state/mod.rs: 5277 → 4585 行（-13%）
+本次会话完成 **20 个任务**，共产生 **38 次 commit**，修改 **51 个文件**（+6029/-4345 行）。
+- 1549/1549 测试通过，0 error，0 clippy warning
+- state/mod.rs: 5277 → 1755 行（**-67%**）
 
 ### 关键架构决策
 
-- **Scrollback trait** — `Scrollable` trait 统一 4 类滚动容器（SimpleScrollOffset + ScrollableStack），面板滚动迁移至 trait 方法调用
-- **CompletionEngine** — 统一内联+弹窗补全（suggestion + candidates + popup_candidates），Tab/Ctrl+Space/Ctrl+Tab 全部通过引擎 API 操作
-- **tui-textarea SSoT** — 输入状态机完全替换为 tui-textarea widget，`state.input` 保持 SSoT（文本内容），textarea 通过 `sync_to_textarea`/`sync_from_textarea` 双向同步
+- **Scrollback trait** — `Scrollable` trait 统一滚动容器（SimpleScrollOffset + ScrollableStack），面板滚动迁移至 trait 方法
+- **CompletionEngine** — 统一内联+弹窗补全（suggestion + popup_candidates），Tab/Ctrl+Space/Ctrl+Tab 全部通过引擎 API
+- **tui-textarea SSoT** — 输入状态机完全替换为 tui-textarea widget，`state.input` 保持 SSoT，textarea 双向同步
+- **AppState 拆分** — 10 个子模块：types/confirm/init_ext/session_ext/picker_ext/message_ext/streaming_ext/input_ext/completion
 - **卡片语义识别** — `MessageCard` trait 新增 `fn kind()` 方法，支持 Markdown 标题识别和交互语义
-- **Tool Agent 结果可视化** — LLM 输出 `ToolAgentResult` JSON 时自动渲染 tool-badge
 - **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
 - **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
-- **死代码清理** — 删除 ~130 行不可达代码 + PanelFocus 死枚举
-- **方法提取** — `clear_input()` 消除 4 处重复；`short_path()` 6→1 次分配
-- **27 色主题系统** — 8 markdown + 8 syntax + 6 diff + 2 thinking + 1 blend，所有主题通过 `with_semantic_colors()` 自动派生
-- **双数据源重构** — `add_message` 同步写入 `state.messages` 和 `state.cards`，`iter_rev().take(5)` 优化去重
+- **死代码清理** — 删除 ~130 行不可达代码 + PanelFocus 死枚举 + ~600 行 ConfirmDialog 提取
 
-### 后续规划（下一阶段）
+### state/ 目录最终结构
 
-1. **Scrollback trait 抽象** — 定义 `ScrollableContent` trait，统一 Scrollback/ScrollbackOverlay/CardStream/Picker 四类滚动容器
-2. **tui-textarea Phase 5** — Tab 补全完全委托给 textarea
-3. **TUI 质量加固** — 继续清理存量优化点
+```
+state/
+├── mod.rs          (1755行) AppState 定义 + V42-B compat + 测试
+├── types.rs        (1048行) 38 个类型定义（19 struct + 19 enum）
+├── confirm.rs      (600行)  ConfirmDialog + Risk Engine
+├── picker_ext.rs   (397行)  9 种 Picker + Editor 方法
+├── init_ext.rs     (219行)  构造函数
+├── session_ext.rs  (289行)  会话/焦点/滚动/模式方法
+├── input_ext.rs    (247行)  光标/textarea/内联补全方法
+├── message_ext.rs  (213行)  消息/事件/trace 方法
+├── streaming_ext.rs(199行)  V42-B streaming 方法
+├── completion.rs   (150行)  CompletionEngine 统一补全引擎
+├── session_export.rs        会话导出
+└── session_migrate.rs       会话迁移
+```
 
 ### UX / 美观
 
