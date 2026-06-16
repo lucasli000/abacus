@@ -39,3 +39,4 @@ lcov.info
 # AI tools
 .claude/
 .opencode/
+docs/opencode-tui-design-study.md
