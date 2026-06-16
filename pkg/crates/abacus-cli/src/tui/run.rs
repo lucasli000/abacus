@@ -586,11 +586,12 @@ pub async fn run_tui(chat: bool, team: bool) -> io::Result<()> {
                     }
                 }
 
+                // 先处理流式 chunks（填充 LlmCard），再处理 EngineResponse（dedup 检查需要 LlmCard 有内容）
+                let had_streaming_update = process_streaming_chunks(&mut state, &mut stream_rx).await;
                 // Paused 时暂停引擎响应消费（但继续渲染和接收事件）
                 if !state.paused {
                     let _ = process_engine_response(&mut state, &mut res_rx).await;
                 }
-                let had_streaming_update = process_streaming_chunks(&mut state, &mut stream_rx).await;
                 // V40: 全量 drain 后统一设一次 dirty（替代每 chunk 重复设置）
                 // had_streaming_update 同时作为分区渲染信号：true = 仅 streaming 尾部需重建
                 if had_streaming_update {
