@@ -153,8 +153,8 @@ jobs:
 
             | Platform | Architecture | File |
             |----------|-------------|------|
-| macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
-| Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
+            | macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
+            | Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
 
             ## Installation
 
