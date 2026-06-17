@@ -42,9 +42,6 @@ pub mod output;
 pub mod pipe;
 pub mod engine_init;
 
-// TUI module
-pub mod tui;
-
 // Main entry point
 pub use crate::commands::*;
 pub use crate::output::*;

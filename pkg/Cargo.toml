@@ -4,7 +4,6 @@ members = [
     "crates/abacus-types",
     "crates/abacus-core",
     "crates/abacus-orchestrator",
-    "crates/abacus-ui-kit",
     "crates/abacus-cli",
     "crates/abacus-server",
     "crates/abacus-bridge",

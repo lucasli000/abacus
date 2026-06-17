@@ -20,7 +20,15 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::{HistoryArgs, RedoArgs, UndoArgs};
-use crate::tui::util::safe_prefix;
+
+/// Truncate string to max_len characters, appending "…" if truncated
+fn safe_prefix(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_len])
+    }
+}
 
 /// `abacus undo` 入口
 pub async fn handle_undo(args: &UndoArgs) -> Result<(), String> {

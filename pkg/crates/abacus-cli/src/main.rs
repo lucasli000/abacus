@@ -38,7 +38,6 @@ mod commands;
 mod output;
 mod pipe;
 mod engine_init;
-mod tui;
 
 use commands::*;
 use output::*;
@@ -116,9 +115,6 @@ enum Commands {
     /// Turnkey — fully-managed task execution
     Turnkey(TurnkeyArgs),
 
-    /// TUI — terminal user interface (interactive modes)
-    Tui(TuiArgs),
-
     /// Generate shell completions for bash/zsh/fish
     Completions {
         /// Shell type
@@ -141,51 +137,40 @@ enum Commands {
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    // i18n: 检测系统语言（ABACUS_LANG > LC_ALL > LANG，默认 En）
-    crate::tui::i18n::init_lang();
-
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[FATAL] Abacus panicked: {}", info);
     }));
 
     // Initialize logging
-    // TUI 模式下跳过 stderr subscriber——由 run_tui() 初始化文件 writer，
-    // 否则日志输出到 stderr 会穿透 TUI alternate screen 渲染。
-    let is_tui_mode = {
-        let pre_cli = Cli::parse();
-        matches!(
-            pre_cli.command.as_ref().unwrap_or(&Commands::Tui(TuiArgs { chat: true, team: false, meeting: false })),
-            Commands::Tui(_)
-        )
+    // Initialize logging
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(val) => val,
+        Err(_) => match Cli::parse().verbose {
+            0 => "abacus_cli=info,abacus_core=info,abacus_engine=warn".to_string(),
+            1 => "abacus_cli=debug,abacus_core=debug,abacus_engine=info".to_string(),
+            2 => "abacus_cli=trace,abacus_core=trace,abacus_engine=debug".to_string(),
+            3 => "trace".to_string(),
+            _ => "trace".to_string(),
+        },
     };
-
-    if !is_tui_mode {
-        let filter = match std::env::var("RUST_LOG") {
-            Ok(val) => val,
-            Err(_) => match Cli::parse().verbose {
-                0 => "abacus_cli=info,abacus_core=info,abacus_engine=warn".to_string(),
-                1 => "abacus_cli=debug,abacus_core=debug,abacus_engine=info".to_string(),
-                2 => "abacus_cli=trace,abacus_core=trace,abacus_engine=debug".to_string(),
-                3 => "trace".to_string(),
-                _ => "trace".to_string(),
-            },
-        };
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .init();
-    }
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(filter))
+        .init();
 
     let cli = Cli::parse();
     let mut formatter = get_formatter(cli.format);
 
     tracing::debug!("CLI parsed: {:?}", cli);
 
-    // 无子命令 → 默认进入 TUI Chat 模式
-    let command = cli.command.as_ref().unwrap_or(&Commands::Tui(TuiArgs {
-        chat: true,
-        team: false,
-        meeting: false,
-    }));
+    // 无子命令 → 默认进入 Chat 模式（TUI 已迁移到 TypeScript）
+    let default_cmd = Commands::Chat(ChatArgs {
+        model: "auto".into(),
+        system_prompt: None,
+        message: None,
+        session_id: None,
+        thinking: "off".into(),
+    });
+    let command = cli.command.as_ref().unwrap_or(&default_cmd);
 
     match command {
         Commands::Chat(args) => {
@@ -211,7 +196,6 @@ async fn main() -> Result<()> {
         Commands::Agent(args) => commands::agent::handle_agent(&args.action, &mut formatter).await?,
         Commands::Team(args) => commands::team::handle_team(args, &mut formatter).await?,
         Commands::Turnkey(args) => commands::turnkey::handle_turnkey(args, &mut formatter).await?,
-        Commands::Tui(args) => commands::tui::handle_tui(args).await?,
         Commands::Completions { shell } => {
             let mut cmd = Cli::command();
             generate(*shell, &mut cmd, "abacus", &mut std::io::stdout());

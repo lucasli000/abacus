@@ -20,12 +20,6 @@ path = "src/main.rs"
 abacus-core = { path = "../abacus-core", version = "3.0.0" }
 abacus-types = { path = "../abacus-types", version = "3.0.0" }
 abacus-orchestrator = { path = "../abacus-orchestrator", version = "3.0.0" }
-# V42: UI 公开契约 crate (Theme + Section + DashboardTab)
-# 引用关系: tui/components/* 全部通过 abacus_ui_kit::Theme 访问主题色
-#          tui/components/panel/sections/ 实现 Section trait
-#          tui/extensions.rs 暴露 SectionRegistry + DashboardRegistry 给 Agent 扩展
-# 设计取舍: 把 Theme + Section trait 抽到本 crate, 让第三方 Agent 应用可注入自定义看板/仪表盘
-abacus-ui-kit = { path = "../abacus-ui-kit", version = "3.0.0" }
 
 clap = { version = "4.5", features = ["derive", "cargo"] }
 tokio = { version = "1.35", features = ["full"] }
@@ -39,8 +33,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 rustyline = { version = "13.0", features = ["with-file-history"] }
-ratatui = "0.28"
-crossterm = "0.28"
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { workspace = true }
@@ -48,9 +40,6 @@ async-trait = "0.1"
 serde_yaml = "0.9"
 toml = { workspace = true }
 unicode-width = "0.1"
-pulldown-cmark = "0.10"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
-once_cell = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 clap_complete = "4.6.5"
 shlex = "1.3"

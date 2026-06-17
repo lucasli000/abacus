@@ -8,7 +8,6 @@ pub mod model;
 pub mod session;
 pub mod skill;
 pub mod team;
-pub mod tui;
 pub mod turnkey;
 pub mod undo;
 pub mod agent;
@@ -364,18 +363,3 @@ pub struct HistoryArgs {
     pub format: String,
 }
 
-/// Launch the TUI (terminal user interface)
-#[derive(Parser, Debug)]
-pub struct TuiArgs {
-    /// Start in Chat mode
-    #[arg(long)]
-    pub chat: bool,
-
-    /// Start in Team mode
-    #[arg(long)]
-    pub team: bool,
-
-    /// Start in Meeting mode (default)
-    #[arg(long)]
-    pub meeting: bool,
-}

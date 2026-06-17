@@ -1,6 +1,7 @@
 // bridge/native.ts — Load the native .node file
 
-import { join } from 'path'
+import { join, dirname } from 'path'
+import { existsSync } from 'fs'
 import type { NativeBridge } from './types'
 
 const PLATFORM_SUFFIX: Record<string, string> = {
@@ -19,10 +20,42 @@ function getPlatformSuffix(): string {
   return suffix
 }
 
+function findNativePath(suffix: string): string {
+  const fileName = `abacus-bridge.${suffix}.node`
+
+  // 1. Next to the executable (compiled binary: bun build --compile)
+  const execDir = dirname(process.execPath)
+  const execPath = join(execDir, fileName)
+  if (existsSync(execPath)) return execPath
+
+  // 2. Next to the script (development: bun run src/index.ts)
+  const scriptDir = dirname(import.meta.dir)
+  const scriptPath = join(scriptDir, '..', fileName)
+  if (existsSync(scriptPath)) return scriptPath
+
+  // 3. In project root (fallback)
+  const projectRoot = join(import.meta.dir, '..', '..')
+  const projectPath = join(projectRoot, fileName)
+  if (existsSync(projectPath)) return projectPath
+
+  // 4. Current working directory
+  const cwdPath = join(process.cwd(), fileName)
+  if (existsSync(cwdPath)) return cwdPath
+
+  throw new Error(
+    `Cannot find ${fileName}.\n` +
+    `Searched:\n` +
+    `  - ${execPath}\n` +
+    `  - ${scriptPath}\n` +
+    `  - ${projectPath}\n` +
+    `  - ${cwdPath}\n` +
+    `Run 'cargo build -p abacus-bridge --release' and copy the .node file.`
+  )
+}
+
 export function loadNativeBridge(): NativeBridge {
   const suffix = getPlatformSuffix()
-  const projectRoot = join(import.meta.dir, '..', '..')
-  const nativePath = join(projectRoot, `abacus-bridge.${suffix}.node`)
+  const nativePath = findNativePath(suffix)
 
   try {
     const native = require(nativePath)
