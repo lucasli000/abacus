@@ -1,5 +1,72 @@
 # Changelog
 
+## v2.7.0 (2026-06-17) — TypeScript TUI 迁移 + 外部 Agent 系统
+
+### 架构重构
+
+**TUI 层（Rust → TypeScript 迁移）：**
+- **OpenTUI + XState + Zustand** — 替代 ratatui + crossterm，使用 OpenTUI (Zig 原生渲染) + XState 状态机 + Zustand 数据管理
+- **NAPI-RS Bridge** — 通过 polling 模型 (50ms) 连接 Rust 核心引擎，避免 Bun 的 ThreadsafeFunction 兼容问题
+- **OKLCH 色彩系统** — 11 个主题，基于感知均匀色彩空间，WCAG 对比度验证
+- **响应式布局** — 4 档断点 (<90/90-120/120-160/160+)，消息区 ≥70 列
+- **场景化 UI** — Trading/Coding/Editing 三种场景自动检测，TopBar/快捷键/确认策略适配
+
+**外部 Agent 系统：**
+- **AgentManifest** — 外部 Agent 清单定义（身份/能力/工具/技能/信任级别）
+- **AgentRegistry** — 生命周期管理（install/uninstall/list/health）
+- **ExternalAgentToolExecutor** — 通过 MCP 协议调用外部 Agent 工具
+- **AgentSkillExecutor** — LLM 直接调用 Agent 技能
+- **AgentSkillDiscovery** — 从 Agent 发现并注册技能
+- **AgentLearner** — BehaviorPalace 集成，跨 session 学习
+- **AgentHealthChecker** — 定期 ping + 状态追踪
+- **CLI 命令** — `abacus agent install/list/remove/info/health/enable/disable`
+
+**聚类系统重构：**
+- **21 个 Cluster** — 覆盖全部 72 个工具（原 8 个 cluster 只覆盖 31 个）
+- **ToolAgent 引用 Cluster** — 通过 `cluster_refs` 引用，不再重复维护工具列表
+- **Token 优化** — 新格式 `[g:{cluster} | vs: {siblings} | this: {differentiator}]`，~30 tokens/tool
+
+### 新增文件
+
+```
+pkg/crates/abacus-types/src/agent.rs           # AgentManifest + TrustLevel
+pkg/crates/abacus-core/src/agent/              # 9 个模块
+pkg/crates/abacus-bridge/                      # NAPI-RS bridge crate
+pkg/abacus-tui/                                # TypeScript TUI 项目
+  ├── src/bridge/                              # NAPI 桥接层
+  ├── src/state/                               # XState + Zustand
+  │   ├── machines/                            # 4 个状态机
+│   │   └── store.ts                         # Zustand store
+│   ├── src/components/                        # OpenTUI 组件
+│   │   ├── App.ts                           # 根组件
+│   │   ├── Dashboard.ts                     # 看板
+│   │   ├── cards/                           # 卡片系统
+│   │   ├── overlays/                        # 覆盖层
+│   │   ├── panel/                           # 面板 Section
+│   │   └── modes/                           # 多模式视图
+│   ├── src/theme/                             # OKLCH 主题系统
+│   ├── src/commands/                          # 斜杠命令框架
+│   └── src/utils/                             # 工具函数
+```
+
+### 修改文件
+
+- `abacus-types/src/engine.rs` — ToolProvider +ExternalAgent
+- `abacus-core/src/tool/ingest.rs` — ExternalSource +Agent
+- `abacus-core/src/tool/cluster.rs` — 21 个 cluster 重构
+- `abacus-core/src/core/subagent.rs` — cluster_refs 扩展
+- `abacus-orchestrator/src/team/mod.rs` — AgentRole +ExternalAgent + Agent 消息
+- `abacus-orchestrator/src/meeting/manager.rs` — SpecialistConfig + AgentTransport
+- `abacus-cli/src/commands/agent.rs` — Agent CLI 命令
+
+### 测试
+
+- cluster 测试: 12/12 通过
+- subagent 测试: 9/9 通过
+- agent 测试: 8/8 通过
+- TS typecheck: 通过
+- bun build --compile: 通过
+
 ## v2.5.6 (2026-06-14) — UX 质量 + 架构重构 + 记忆系统升级
 
 ### 完成总结

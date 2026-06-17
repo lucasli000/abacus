@@ -798,13 +798,8 @@ impl LlmProvider for DeepSeekProvider {
         // V30：thinking 模式下 reasoning_tokens（completion 子集）
         let mut thinking_tokens_stream = 0u64;
         let mut completion_tokens = 0u64;
-        // OpenAI/DeepSeek SSE tool call ID 映射：index → id
-        // 根因：SSE 只在第一个 chunk 携带 id，后续 chunk 仅有 index
-        // 修复：建立 index→id 映射，后续 chunk 通过 index 查找 id，避免 arguments 丢失
-        let mut tc_index_to_id: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
-        // ToolCallStart 去重守卫：避免少数代理/模型在多个 chunk 中重复下发 function.name
-        // 导致 TUI 出现重复的 Running 条目
-        let mut tc_index_started: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // 统一流式 tool_calls 组装器
+        let mut tc_collector = crate::llm::stream::StreamingToolCallCollector::new();
 
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
         // 🟡#7 治本：stream_alive 标志 + per-token send 失败时跳出循环
@@ -880,44 +875,17 @@ impl LlmProvider for DeepSeekProvider {
                                     }
                                 }
 
-                                // Tool calls (start/delta)
-                                // OpenAI/DeepSeek SSE 协议：id 只在 index 首次出现的 chunk 携带；
-                                // 后续 argument delta chunk 仅有 index，需通过映射表还原 id。
+                                // Tool calls (start/delta) — 统一 collector
                                 if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                                     for tc in tool_calls {
-                                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
-                                        // 首次出现时（携带 id）存入映射表
-                                        if let Some(id_str) = tc.get("id").and_then(|i| i.as_str()) {
-                                            if !id_str.is_empty() {
-                                                tc_index_to_id.insert(index, id_str.to_string());
-                                            }
-                                        }
-                                        // 从映射表获取 id（后续 chunk 无 id 时通过 index 查找）
-                                        let id = tc_index_to_id.get(&index)
-                                            .cloned()
-                                            .unwrap_or_else(|| {
-                                                tc.get("id").and_then(|i| i.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string()
-                                            });
-                                        if let Some(func) = tc.get("function") {
-                                            if let Some(name) = func.get("name").and_then(|n| n.as_str()) {
-                                                // 展示并且每个 index 只发一次 ToolCallStart
-                                                if tc_index_started.insert(index) {
-                                                    let _ = tx.send(StreamEvent::ToolCallStart {
-                                                        id: id.clone(),
-                                                        name: name.to_string(),
-                                                    });
-                                                }
-                                            }
-                                            if let Some(args) = func.get("arguments").and_then(|a| a.as_str()) {
-                                                if !args.is_empty() {
-                                                    let _ = tx.send(StreamEvent::ToolCallArgDelta {
-                                                        id,
-                                                        delta: args.to_string(),
-                                                    });
-                                                }
-                                            }
+                                        let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                                        let id = tc.get("id").and_then(|i| i.as_str());
+                                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str());
+                                        let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str());
+
+                                        tc_collector.on_tool_call_start(index, id, name, &tx);
+                                        if let Some(a) = args {
+                                            tc_collector.on_tool_call_args(index, a, &tx);
                                         }
                                     }
                                 }
@@ -969,7 +937,7 @@ impl LlmProvider for DeepSeekProvider {
             message: Message {
                 role: MessageRole::Assistant,
                 content: Some(MessageContent::Text(full_text)),
-                tool_calls: None, // Tool calls in streaming mode need separate assembly
+                tool_calls: tc_collector.finish(),
                 name: None,
                 tool_call_id: None,
                 reasoning_content: reasoning_for_message,

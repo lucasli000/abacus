@@ -748,6 +748,9 @@ impl LlmProvider for OpenAICompatibleProvider {
         // V30：流式末 chunk 解析的 reasoning_tokens（completion 子集）
         let mut thinking_tokens_stream = 0u64;
 
+        // 统一流式 tool_calls 组装器
+        let mut tc_collector = crate::llm::stream::StreamingToolCallCollector::new();
+
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
         // 🟡#7 治本：stream_alive 标志 + per-token send 失败时跳出循环
         // 之前 `let _ = tx.send(...)` 把 consumer 断开当成"正常完成"——
@@ -822,6 +825,20 @@ impl LlmProvider for OpenAICompatibleProvider {
                                             }
                                         }
                                     }
+                                    // 流式 tool_calls 组装（统一 collector）
+                                    if let Some(tool_calls) = delta.get("tool_calls").and_then(|tc| tc.as_array()) {
+                                        for tc in tool_calls {
+                                            let index = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                                            let id = tc.get("id").and_then(|i| i.as_str());
+                                            let name = tc.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str());
+                                            let args = tc.get("function").and_then(|f| f.get("arguments")).and_then(|a| a.as_str());
+
+                                            tc_collector.on_tool_call_start(index, id, name, &tx);
+                                            if let Some(a) = args {
+                                                tc_collector.on_tool_call_args(index, a, &tx);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -857,13 +874,16 @@ impl LlmProvider for OpenAICompatibleProvider {
             tracing::debug!("stream consumer gone before final Done");
         }
 
+        // 组装流式收集的 tool_calls（统一 collector）
+        let assembled_tool_calls = tc_collector.finish();
+
         Ok(LlmResponse {
             model: ModelId(body.model),
             message: Message {
                 role: MessageRole::Assistant,
                 content: Some(MessageContent::Text(full_text)),
                 name: None,
-                tool_calls: None,
+                tool_calls: assembled_tool_calls,
                 tool_call_id: None,
                 // 2026-05-28: 透传流式收集的 reasoning_content
                 reasoning_content: if reasoning_buf.is_empty() { None } else { Some(reasoning_buf) },

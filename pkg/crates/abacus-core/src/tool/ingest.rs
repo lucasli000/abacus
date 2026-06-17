@@ -73,6 +73,8 @@ pub enum ExternalSource {
     Plugin,
     /// 用户自定义脚本 (Rhai / Python sandbox)
     Custom,
+    /// 外部 Agent
+    Agent,
 }
 
 impl ExternalSource {
@@ -82,6 +84,7 @@ impl ExternalSource {
             ExternalSource::Mcp => "mcp",
             ExternalSource::Plugin => "plugin",
             ExternalSource::Custom => "custom",
+            ExternalSource::Agent => "agent",
         }
     }
 }

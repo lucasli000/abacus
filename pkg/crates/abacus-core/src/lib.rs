@@ -37,6 +37,7 @@ pub mod paths;
 pub mod process_registry;
 pub mod deduction;
 pub mod auto;
+pub mod agent;
 pub mod sandbox;
 pub mod lsp;
 pub mod code_graph;

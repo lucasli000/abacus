@@ -11,6 +11,7 @@ pub mod team;
 pub mod tui;
 pub mod turnkey;
 pub mod undo;
+pub mod agent;
 
 use clap::Parser;
 

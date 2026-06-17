@@ -71,6 +71,7 @@ impl MeetingPromptAssembler {
             crate::team::AgentRole::PM => "项目经理",
             crate::team::AgentRole::Advisor => "顾问",
             crate::team::AgentRole::Member => "成员",
+            crate::team::AgentRole::ExternalAgent { .. } => "外部专家",
         };
         prompt.push_str(&format!("\n## 你的身份\n- 名称: {}\n- 领域: {}\n- 角色: {}\n\n",
             specialist.name, specialist.specialty.domain, role_str));

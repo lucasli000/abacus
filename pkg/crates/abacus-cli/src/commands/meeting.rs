@@ -181,13 +181,13 @@ async fn handle_live_meeting(
     }
 
     for sp_id in &args.specialists {
-        manager.add_specialist(SpecialistConfig {
-            id: sp_id.clone(),
-            name: sp_id.clone(),
-            model: args.model.clone(),
-            system_prompt: format!("You are a domain expert in {}.", sp_id),
-            role: abacus_orchestrator::team::AgentRole::Member,
-        });
+        manager.add_specialist(SpecialistConfig::local(
+            sp_id,
+            sp_id,
+            &args.model,
+            &format!("You are a domain expert in {}.", sp_id),
+            abacus_orchestrator::team::AgentRole::Member,
+        ));
     }
 
     manager.build().await

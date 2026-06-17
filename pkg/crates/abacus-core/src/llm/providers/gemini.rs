@@ -63,6 +63,9 @@ pub(crate) struct GeminiRequest {
     pub system_instruction: Option<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
     pub generation_config: Option<GenerationConfig>,
+    /// Tool definitions for function calling
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiTool>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -78,6 +81,9 @@ pub(crate) struct GeminiContent {
 pub(crate) struct GeminiPart {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Tool result (request-side): function response from a previous tool call
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionResponse")]
+    pub function_response: Option<GeminiFunctionResponse>,
 }
 
 #[derive(Serialize, Debug)]
@@ -130,7 +136,45 @@ pub(crate) struct GeminiResponseContent {
     pub role: Option<String>,
 }
 
+/// Gemini `functionResponse` part (request-side: tool results sent back to model)
+#[derive(Serialize, Debug)]
+pub(crate) struct GeminiFunctionResponse {
+    pub name: String,
+    pub response: GeminiFunctionResponseContent,
+}
+
+#[derive(Serialize, Debug)]
+pub(crate) struct GeminiFunctionResponseContent {
+    pub name: String,
+    pub content: String,
+}
+
+/// Gemini `functionCall` part (response-side: tool calls from model)
 #[derive(Deserialize, Debug)]
+pub(crate) struct GeminiFunctionCall {
+    pub name: String,
+    #[serde(default)]
+    pub args: Option<serde_json::Value>,
+}
+
+/// Gemini tool definition (request-side)
+#[derive(Serialize, Debug)]
+pub(crate) struct GeminiTool {
+    #[serde(rename = "functionDeclarations")]
+    pub function_declarations: Vec<GeminiFunctionDeclaration>,
+}
+
+/// Gemini function declaration (request-side)
+#[derive(Serialize, Debug)]
+pub(crate) struct GeminiFunctionDeclaration {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug, Default)]
 
 pub(crate) struct GeminiResponsePart {
     #[serde(default)]
@@ -138,6 +182,9 @@ pub(crate) struct GeminiResponsePart {
     /// 仅 thinking part 携带此字段（true）
     #[serde(default)]
     pub thought: Option<bool>,
+    /// Tool call from model (response-side)
+    #[serde(default, rename = "functionCall")]
+    pub function_call: Option<GeminiFunctionCall>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -235,17 +282,24 @@ impl GeminiProvider {
                 crate::llm::provider::MessageRole::User => "user",
                 crate::llm::provider::MessageRole::Assistant => "model",
                 crate::llm::provider::MessageRole::Tool => {
-                    // 2026-05-28: Tool results 包装为 user message（Gemini 不支持 tool role）
-                    // 格式：[Tool Result: tool_name] content
+                    // Tool results: use native functionResponse part
                     let tool_name = msg.name.as_deref().unwrap_or("tool");
-                    let text = match &msg.content {
+                    let content = match &msg.content {
                         Some(crate::llm::provider::MessageContent::Text(t)) => t.clone(),
                         _ => "{}".to_string(),
                     };
-                    let wrapped = format!("[Tool Result: {}] {}", tool_name, text);
                     contents.push(GeminiContent {
                         role: "user".into(),
-                        parts: vec![GeminiPart { text: Some(wrapped) }],
+                        parts: vec![GeminiPart {
+                            text: None,
+                            function_response: Some(GeminiFunctionResponse {
+                                name: tool_name.to_string(),
+                                response: GeminiFunctionResponseContent {
+                                    name: tool_name.to_string(),
+                                    content,
+                                },
+                            }),
+                        }],
                     });
                     continue;
                 }
@@ -279,7 +333,7 @@ impl GeminiProvider {
             }
             contents.push(GeminiContent {
                 role: role.into(),
-                parts: vec![GeminiPart { text: Some(text) }],
+                parts: vec![GeminiPart { text: Some(text), function_response: None }],
             });
         }
 
@@ -295,7 +349,7 @@ impl GeminiProvider {
             } else {
                 Some(GeminiContent {
                     role: "system".into(),
-                    parts: vec![GeminiPart { text: Some(sys_text) }],
+                    parts: vec![GeminiPart { text: Some(sys_text), function_response: None }],
                 })
             }
         };
@@ -312,10 +366,26 @@ impl GeminiProvider {
             thinking_config,
         });
 
+        // Tool definitions for function calling
+        let tools = if req.tools.is_empty() {
+            None
+        } else {
+            Some(vec![GeminiTool {
+                function_declarations: req.tools.iter().map(|t| {
+                    GeminiFunctionDeclaration {
+                        name: t.function.name.clone(),
+                        description: t.function.description.clone(),
+                        parameters: Some(t.function.parameters.clone()),
+                    }
+                }).collect(),
+            }])
+        };
+
         GeminiRequest {
             contents,
             system_instruction,
             generation_config,
+            tools,
         }
     }
 
@@ -333,14 +403,37 @@ impl GeminiProvider {
     /// 把 GeminiResponse 解析为通用 LlmResponse。
     /// **关键差异**：Gemini 把 thinking 与 text 混在 `parts[]` 数组里，
     /// `thought:true` 标记的 part 是思考内容，其余为最终回答。
+    /// `functionCall` 标记的 part 是工具调用请求。
     fn parse_response(&self, raw: GeminiResponse) -> Result<LlmResponse> {
         let candidate = raw.candidates.into_iter().next()
             .ok_or_else(|| KernelError::Provider("empty candidates in Gemini response".into()))?;
 
-        // 把 parts 按 thought 标志拆成两段拼接
+        // 把 parts 按类型拆分
         let mut text = String::new();
         let mut thinking = String::new();
+        let mut tool_calls: Vec<crate::llm::provider::ToolCall> = Vec::new();
+        let mut tool_call_index: u32 = 0;
+
         for part in &candidate.content.parts {
+            // Tool call
+            if let Some(fc) = &part.function_call {
+                let args_json = match &fc.args {
+                    Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                    None => "{}".to_string(),
+                };
+                tool_calls.push(crate::llm::provider::ToolCall {
+                    id: format!("call_{}", tool_call_index),
+                    type_: "function".to_string(),
+                    function: crate::llm::provider::ToolFunction {
+                        name: fc.name.clone(),
+                        arguments: args_json,
+                    },
+                });
+                tool_call_index += 1;
+                continue;
+            }
+
+            // Text / Thinking
             if let Some(t) = &part.text {
                 if part.thought.unwrap_or(false) {
                     thinking.push_str(t);
@@ -357,7 +450,7 @@ impl GeminiProvider {
             role: MessageRole::Assistant,
             content: Some(MessageContent::Text(text)),
             name: None,
-            tool_calls: None,
+            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
             tool_call_id: None,
             reasoning_content: thinking_opt.clone(),
             prefix: false,
@@ -369,17 +462,13 @@ impl GeminiProvider {
             finish_reason: candidate.finish_reason.unwrap_or_else(|| "STOP".into()),
             usage: TokenUsage {
                 prompt_tokens: usage.prompt_token_count,
-                // V30：thoughts 已合并到 completion_tokens 作为子集（文档化于 TokenUsage 注释）
                 completion_tokens: usage.candidates_token_count + usage.thoughts_token_count,
-                // V30 不变量：total = prompt + completion（与 API total_token_count 等价：
-                // prompt + candidates + thoughts；不再直信 API 字段，统一由 prompt+completion 算）
                 total_tokens: usage.prompt_token_count + usage.candidates_token_count + usage.thoughts_token_count,
                 cached_tokens: 0,
                 cache_creation_tokens: 0,
                 thinking_tokens: usage.thoughts_token_count,
             },
             thinking: thinking_opt,
-            // Gemini implicit cache 信息暂不暴露——v1beta 上不稳定
             cache_stats: Some(CacheStats { cache_creation_tokens: 0, cache_read_tokens: 0 }),
         })
     }
@@ -541,6 +630,10 @@ impl LlmProvider for GeminiProvider {
         let mut completion_tokens = 0u64;
         let mut thoughts_tokens = 0u64;
 
+        // 统一流式 tool_calls 组装器
+        let mut tc_collector = crate::llm::stream::StreamingToolCallCollector::new();
+        let mut tool_call_counter: u32 = 0;
+
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
         loop {
             let chunk = match tokio::time::timeout(std::time::Duration::from_secs(45), byte_stream.next()).await {
@@ -577,11 +670,31 @@ impl LlmProvider for GeminiProvider {
                 let Ok(chunk_json) = serde_json::from_str::<serde_json::Value>(data) else { continue };
 
                 // candidates[0].content.parts[]：thought:true 部分走 thinking delta
+                // functionCall 部分走 tool call 组装
                 if let Some(parts) = chunk_json
                     .pointer("/candidates/0/content/parts")
                     .and_then(|p| p.as_array())
                 {
                     for part in parts {
+                        // Tool call (functionCall)
+                        if let Some(fc) = part.get("functionCall") {
+                            let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                            let args = fc.get("args");
+                            let tc_idx = tool_call_counter;
+                            tool_call_counter += 1;
+
+                            let id = format!("call_{}", tc_idx);
+                            tc_collector.on_tool_call_start(tc_idx, Some(&id), Some(name), &tx);
+
+                            if let Some(args_val) = args {
+                                let args_str = serde_json::to_string(args_val).unwrap_or_default();
+                                tc_collector.on_tool_call_args(tc_idx, &args_str, &tx);
+                            }
+                            tc_collector.on_tool_call_end(tc_idx, &tx);
+                            continue;
+                        }
+
+                        // Text / Thinking
                         let is_thought = part.get("thought").and_then(|t| t.as_bool()).unwrap_or(false);
                         if let Some(t) = part.get("text").and_then(|s| s.as_str()) {
                             if is_thought {
@@ -621,7 +734,7 @@ impl LlmProvider for GeminiProvider {
                 role: MessageRole::Assistant,
                 content: Some(MessageContent::Text(full_text)),
                 name: None,
-                tool_calls: None,
+                tool_calls: tc_collector.finish(),
                 tool_call_id: None,
                 reasoning_content: thinking_opt.clone(),
                 prefix: false,
@@ -787,8 +900,8 @@ mod tests {
             candidates: vec![GeminiCandidate {
                 content: GeminiResponseContent {
                     parts: vec![
-                        GeminiResponsePart { text: Some("inner thought".into()), thought: Some(true) },
-                        GeminiResponsePart { text: Some("final answer".into()), thought: None },
+                        GeminiResponsePart { text: Some("inner thought".into()), thought: Some(true), ..Default::default() },
+                        GeminiResponsePart { text: Some("final answer".into()), thought: None, ..Default::default() },
                     ],
                     role: Some("model".into()),
                 },
@@ -820,7 +933,7 @@ mod tests {
         let resp = GeminiResponse {
             candidates: vec![GeminiCandidate {
                 content: GeminiResponseContent {
-                    parts: vec![GeminiResponsePart { text: Some("hi".into()), thought: None }],
+                    parts: vec![GeminiResponsePart { text: Some("hi".into()), thought: None, ..Default::default() }],
                     role: Some("model".into()),
                 },
                 finish_reason: None,

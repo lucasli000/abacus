@@ -117,6 +117,8 @@ pub enum ToolProvider {
     Mcp { server_id: String },
     Plugin { plugin_id: String },
     Skill { skill_id: String },
+    /// 外部 Agent 暴露的工具
+    ExternalAgent { agent_id: String, endpoint: String },
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]

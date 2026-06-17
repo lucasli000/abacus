@@ -263,3 +263,152 @@ pub struct TeamTaskInfo {
     pub status: String,             // "pending" / "running" / "done" / "failed"
     pub output_preview: Option<String>,  // 前 100 字符结果预览
 }
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// StreamingToolCallCollector — 统一流式工具调用组装器
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 统一流式工具调用组装器
+///
+/// ## 设计意图
+/// 各家 LLM 的流式 tool_calls 格式不同，但最终都要组装成统一的 `Vec<ToolCall>`。
+/// 本结构体提供通用的 index→id 映射、参数累积、StreamEvent 发射，
+/// 让各 provider 只需做格式解析，组装逻辑复用。
+///
+/// ## 使用方式
+/// ```rust
+/// let mut collector = StreamingToolCallCollector::new();
+///
+/// // 收到第一个 chunk（含 id + name）
+/// collector.on_tool_call_start(index, id, name, &tx);
+///
+/// // 收到参数 delta
+/// collector.on_tool_call_args(index, args_delta, &tx);
+///
+/// // 流结束时获取组装结果
+/// let tool_calls = collector.finish();
+/// ```
+pub struct StreamingToolCallCollector {
+    /// index → id 映射（OpenAI/DeepSeek 流式只在第一个 chunk 发 id）
+    index_to_id: std::collections::HashMap<u32, String>,
+    /// 已发射 ToolCallStart 的 index 集合（防重复）
+    started_indices: std::collections::HashSet<u32>,
+    /// index → 工具名
+    index_to_name: std::collections::HashMap<u32, String>,
+    /// index → 累积的参数 JSON 字符串
+    index_to_args: std::collections::HashMap<u32, String>,
+}
+
+impl StreamingToolCallCollector {
+    pub fn new() -> Self {
+        Self {
+            index_to_id: std::collections::HashMap::new(),
+            started_indices: std::collections::HashSet::new(),
+            index_to_name: std::collections::HashMap::new(),
+            index_to_args: std::collections::HashMap::new(),
+        }
+    }
+
+    /// 处理工具调用开始事件
+    ///
+    /// - `index`: 工具调用在本批次中的序号（0-based）
+    /// - `id`: 工具调用唯一 ID（可能只在第一个 chunk 出现）
+    /// - `name`: 工具名（可能只在第一个 chunk 出现）
+    /// - `tx`: StreamEvent 发送通道
+    pub fn on_tool_call_start(
+        &mut self,
+        index: u32,
+        id: Option<&str>,
+        name: Option<&str>,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) {
+        if let Some(id) = id {
+            self.index_to_id.insert(index, id.to_string());
+        }
+        if let Some(name) = name {
+            if !name.is_empty() {
+                self.index_to_name.insert(index, name.to_string());
+            }
+        }
+
+        // 只在第一次见到完整 id+name 时发射 ToolCallStart
+        if !self.started_indices.contains(&index) {
+            if let (Some(id), Some(name)) = (self.index_to_id.get(&index), self.index_to_name.get(&index)) {
+                self.started_indices.insert(index);
+                let _ = tx.send(StreamEvent::ToolCallStart {
+                    id: id.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+
+    /// 处理工具调用参数增量
+    ///
+    /// - `index`: 工具调用序号
+    /// - `delta`: 参数 JSON 增量片段
+    /// - `tx`: StreamEvent 发送通道
+    pub fn on_tool_call_args(
+        &mut self,
+        index: u32,
+        delta: &str,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        self.index_to_args
+            .entry(index)
+            .or_insert_with(String::new)
+            .push_str(delta);
+
+        if let Some(id) = self.index_to_id.get(&index) {
+            let _ = tx.send(StreamEvent::ToolCallArgDelta {
+                id: id.clone(),
+                delta: delta.to_string(),
+            });
+        }
+    }
+
+    /// 处理工具调用结束事件
+    pub fn on_tool_call_end(
+        &mut self,
+        index: u32,
+        tx: &tokio::sync::mpsc::UnboundedSender<StreamEvent>,
+    ) {
+        if let Some(id) = self.index_to_id.get(&index) {
+            let _ = tx.send(StreamEvent::ToolCallEnd { id: id.clone() });
+        }
+    }
+
+    /// 完成组装，返回统一的 ToolCall 列表
+    ///
+    /// 按 index 排序，返回 `Some(Vec<ToolCall>)`，无工具调用时返回 `None`
+    pub fn finish(&self) -> Option<Vec<crate::llm::provider::ToolCall>> {
+        if self.index_to_id.is_empty() {
+            return None;
+        }
+
+        let mut calls: Vec<(u32, crate::llm::provider::ToolCall)> = self
+            .index_to_id
+            .iter()
+            .filter_map(|(&idx, id)| {
+                let name = self.index_to_name.get(&idx)?.clone();
+                let args = self.index_to_args.get(&idx).cloned().unwrap_or_default();
+                Some((idx, crate::llm::provider::ToolCall {
+                    id: id.clone(),
+                    type_: "function".to_string(),
+                    function: crate::llm::provider::ToolFunction { name, arguments: args },
+                }))
+            })
+            .collect();
+
+        calls.sort_by_key(|(idx, _)| *idx);
+        Some(calls.into_iter().map(|(_, c)| c).collect())
+    }
+
+    /// 是否有正在组装的工具调用
+    pub fn has_pending(&self) -> bool {
+        !self.index_to_id.is_empty()
+    }
+}

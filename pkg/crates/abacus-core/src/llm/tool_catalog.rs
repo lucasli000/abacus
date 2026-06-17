@@ -51,6 +51,10 @@ pub fn generate_catalog(tools: &[ToolHandle]) -> String {
             ToolProvider::Skill { skill_id } => {
                 skills.entry(skill_id.as_str()).or_default().push(name);
             }
+            ToolProvider::ExternalAgent { agent_id, .. } => {
+                // 外部 Agent 工具归类到 MCP 组（同为远程工具）
+                mcp.entry(agent_id.as_str()).or_default().push(name);
+            }
         }
     }
 

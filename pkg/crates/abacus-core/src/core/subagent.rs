@@ -33,11 +33,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use abacus_types::ToolOutput;
+use crate::tool::cluster::ClusterRegistry;
 
 /// ToolAgent 定义 — 描述一种可自动委托的工具执行模式
 ///
 /// ## 触发条件
 /// 当一批 tool_calls 的所有 tool_id 都在 `tool_filter` 内时触发
+///
+/// ## Cluster 集成
+/// `cluster_refs` 引用 ClusterRegistry 中的 cluster ID，
+/// 初始化时自动展开为 `tool_filter`，避免重复维护工具列表。
 ///
 /// ## 引用关系
 /// - 注册: ToolAgentRegistry.register()
@@ -45,7 +50,7 @@ use abacus_types::ToolOutput;
 /// - 执行: ToolAgentRunner.execute_batch()
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolAgentDef {
-    /// 唯一标识（如 "explorer", "analyzer", "researcher"）
+    /// 唯一标识（如 "explorer", "researcher", "coder"）
     pub id: String,
     /// 显示名（消息流中展示）
     pub name: String,
@@ -54,16 +59,16 @@ pub struct ToolAgentDef {
     /// 该 subagent 可以执行的工具集合
     /// 当一批 tool_calls 全部在此集合内时触发委托
     pub tool_filter: HashSet<String>,
+    /// 引用的 Cluster 组 ID（初始化时展开为 tool_filter）
+    /// 如 ["fs_read", "db_read", "kb"] → 展开为所有 cluster 内工具
+    #[serde(default)]
+    pub cluster_refs: Vec<String>,
     /// 匹配优先级（多个 ToolAgent 都匹配时取最高优先级）
     /// 0 = 最高
     pub priority: u32,
     /// 结果汇总模板
-    /// {count} = 工具调用次数, {tools} = 工具名列表, {summary} = 结果摘要
     pub summary_template: String,
     /// 是否将多条 tool_result 压缩为一条摘要返回给 LLM
-    /// true: LLM 只看到一条聚合摘要（省 token，适合大批量只读查询）
-    /// false: LLM 看到每条 tool_result 的完整内容（推理精度最高）
-    /// 默认 false（保守——不降级推理质量）
     #[serde(default)]
     pub summarize_results: bool,
     /// 是否启用
@@ -96,79 +101,99 @@ impl ToolAgentRegistry {
         self.agents.sort_by_key(|a| a.priority);
     }
 
+    /// 展开所有 agent 的 cluster_refs 为 tool_filter
+    ///
+    /// 在 CoreLoop 初始化时调用，将 cluster ID 引用展开为实际工具列表。
+    /// 展开后的 tool_filter 与 cluster_refs 中的工具取并集。
+    pub fn expand_cluster_refs(&mut self, cluster_reg: &ClusterRegistry) {
+        for agent in &mut self.agents {
+            if agent.cluster_refs.is_empty() {
+                continue;
+            }
+            for cluster_id in &agent.cluster_refs {
+                for cluster in cluster_reg.all_clusters() {
+                    if cluster.id == cluster_id.as_str() {
+                        for member in &cluster.members {
+                            agent.tool_filter.insert(member.tool_id.to_string());
+                        }
+                    }
+                }
+            }
+            if agent.tool_filter.is_empty() {
+                tracing::warn!(
+                    "subagent '{}': cluster_refs {:?} resolved to empty tool_filter",
+                    agent.id, agent.cluster_refs
+                );
+            }
+        }
+    }
+
     /// 注册所有内置 ToolAgent
     ///
     /// ## 内置类型
-    /// - Explorer: 只读文件/代码查询（idempotent 读操作聚合）
-    /// - Researcher: 网络检索（web_search/fetch 聚合）
-    /// - Coder: 代码编写/修改（fs_write/fs_edit/bash 聚合）
-    /// - Mathematician: 数学计算/推导（compute/eval 聚合）
+    /// - Explorer: 只读文件/代码查询（引用 fs_read, db_read, kb, lsp, cg clusters）
+    /// - Researcher: 网络检索（引用 web_io cluster）
+    /// - Coder: 代码编写/修改（引用 fs_write, fs_read, shell, lsp clusters）
+    /// - Mathematician: 数学计算（引用 shell, db_read clusters）
     ///
-    /// ## 成长机制
-    /// 用户可通过 ~/.abacus/subagents.yaml 添加自定义类型，
-    /// 也可通过 `/subagent disable <id>` 禁用内置类型
+    /// ## Cluster 集成
+    /// 通过 `cluster_refs` 引用 ClusterRegistry 中的 cluster ID，
+    /// 运行时由 `expand_cluster_refs()` 展开为完整 tool_filter。
     pub fn register_builtins(&mut self) {
-        // Explorer — 只读查询聚合（消息流不刷屏 + 摘要返回省 token）
+        // Explorer — 只读查询聚合
         self.register(ToolAgentDef {
             id: "explorer".into(),
             name: "Explorer".into(),
             icon: "▸".into(),
-            tool_filter: [
-                "fs_read", "fs_list", "fs_search", "fs_tree", "fs_info",
-                "grep", "cg_query", "cg_search", "cg_list",
-                "db_query", "db_read_records", "db_list_tables", "db_table_schema",
-                "kb_query", "retrieval_search",
-                "lsp_symbols", "lsp_definition", "lsp_references",
-            ].iter().map(|s| s.to_string()).collect(),
+            tool_filter: HashSet::new(), // 由 cluster_refs 展开填充
+            cluster_refs: vec![
+                "fs_read".into(), "db_read".into(), "kb".into(),
+                "lsp".into(), "cg".into(),
+            ],
             priority: 0,
             summary_template: "{icon} {name} · 查阅了 {count} 处 → {summary}".into(),
-            summarize_results: true,  // 只读场景：摘要返回，省 ~2000 tok/batch
+            summarize_results: true,
             enabled: true,
         });
 
-        // Researcher — 网络检索聚合（摘要返回：网页内容通常很长）
+        // Researcher — 网络检索聚合
         self.register(ToolAgentDef {
             id: "researcher".into(),
             name: "Researcher".into(),
             icon: "◆".into(),
-            tool_filter: [
-                "web_search", "web_fetch", "web_readable",
-            ].iter().map(|s| s.to_string()).collect(),
+            tool_filter: HashSet::new(),
+            cluster_refs: vec!["web_io".into()],
             priority: 1,
             summary_template: "{icon} {name} · 检索了 {count} 条 → {summary}".into(),
-            summarize_results: true,  // 网页内容长，摘要省大量 token
+            summarize_results: true,
             enabled: true,
         });
 
-        // Coder — 代码编写/修改聚合（文件写入 + 编辑 + bash 编译/测试）
+        // Coder — 代码编写/修改聚合
         self.register(ToolAgentDef {
             id: "coder".into(),
             name: "Coder".into(),
             icon: "⚙".into(),
-            tool_filter: [
-                "fs_write", "fs_edit", "fs_read", "fs_search", "fs_list",
-                "bash_exec", "grep",
-                "lsp_symbols", "lsp_definition", "lsp_references",
-            ].iter().map(|s| s.to_string()).collect(),
+            tool_filter: HashSet::new(),
+            cluster_refs: vec![
+                "fs_write".into(), "fs_read".into(), "shell".into(), "lsp".into(),
+            ],
             priority: 10,
             summary_template: "{icon} {name} · 修改了 {count} 处 → {summary}".into(),
-            summarize_results: false,  // 代码修改需要 LLM 看到完整结果（编译错误等）
+            summarize_results: false,
             enabled: true,
         });
 
-        // Mathematician — 数学计算/推导/数据分析
+        // Mathematician — 数学计算/推导
         self.register(ToolAgentDef {
             id: "mathematician".into(),
             name: "Math".into(),
             icon: "∑".into(),
-            tool_filter: [
-                "compute_eval", "compute_symbolic", "compute_matrix",
-                "db_query",  // SQL 统计计算
-                "bash_exec", // python/R 脚本执行
-            ].iter().map(|s| s.to_string()).collect(),
+            tool_filter: HashSet::new(),
+            cluster_refs: vec!["shell".into(), "db_read".into()],
             priority: 5,
             summary_template: "{icon} {name} · 计算了 {count} 步 → {summary}".into(),
-            summarize_results: false,  // 计算结果需要精确值
+            summarize_results: false,
             enabled: true,
         });
     }
@@ -334,13 +359,21 @@ impl ToolAgentBatchResult {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_builtin_explorer_matches_read_batch() {
+    /// 创建已展开 cluster_refs 的 registry（测试用）
+    fn expanded_registry() -> ToolAgentRegistry {
+        let cluster_reg = ClusterRegistry::builtin();
         let mut reg = ToolAgentRegistry::new();
         reg.register_builtins();
+        reg.expand_cluster_refs(&cluster_reg);
+        reg
+    }
+
+    #[test]
+    fn test_builtin_explorer_matches_read_batch() {
+        let reg = expanded_registry();
 
         // 全读操作 → 匹配 Explorer
-        let tools = vec!["fs_read", "grep", "fs_search"];
+        let tools = vec!["fs_read", "fs_grep", "fs_search"];
         let matched = reg.match_batch(&tools);
         assert!(matched.is_some());
         assert_eq!(matched.unwrap().id, "explorer");
@@ -348,10 +381,9 @@ mod tests {
 
     #[test]
     fn test_mixed_batch_matches_coder() {
-        let mut reg = ToolAgentRegistry::new();
-        reg.register_builtins();
+        let reg = expanded_registry();
 
-        // 读写混合 → 匹配 Coder（其 tool_filter 含 fs_read + fs_write）
+        // 读写混合 → 匹配 Coder（cluster_refs 展开后含 fs_read + fs_write）
         let tools = vec!["fs_read", "fs_write"];
         let matched = reg.match_batch(&tools);
         assert!(matched.is_some());
@@ -360,8 +392,7 @@ mod tests {
 
     #[test]
     fn test_unknown_tool_no_match() {
-        let mut reg = ToolAgentRegistry::new();
-        reg.register_builtins();
+        let reg = expanded_registry();
 
         // 含未知工具 → 无 subagent 匹配
         let tools = vec!["fs_read", "unknown_tool"];
@@ -371,8 +402,7 @@ mod tests {
 
     #[test]
     fn test_web_batch_matches_researcher() {
-        let mut reg = ToolAgentRegistry::new();
-        reg.register_builtins();
+        let reg = expanded_registry();
 
         let tools = vec!["web_search", "web_fetch"];
         let matched = reg.match_batch(&tools);
@@ -382,8 +412,7 @@ mod tests {
 
     #[test]
     fn test_empty_batch_no_match() {
-        let mut reg = ToolAgentRegistry::new();
-        reg.register_builtins();
+        let reg = expanded_registry();
 
         let matched = reg.match_batch(&[]);
         assert!(matched.is_none());
@@ -391,11 +420,9 @@ mod tests {
 
     #[test]
     fn test_priority_explorer_over_researcher() {
-        let mut reg = ToolAgentRegistry::new();
-        reg.register_builtins();
+        let reg = expanded_registry();
 
         // Explorer priority=0 比 Researcher priority=1 高
-        // 但 web_search 不在 explorer filter 里所以不会冲突
         let tools = vec!["fs_read"];
         let matched = reg.match_batch(&tools);
         assert_eq!(matched.unwrap().id, "explorer");
@@ -410,6 +437,7 @@ mod tests {
             name: "Analyzer".into(),
             icon: "◇".into(),
             tool_filter: ["ast_parse", "metrics"].iter().map(|s| s.to_string()).collect(),
+            cluster_refs: vec![],
             priority: 2,
             summarize_results: true,
             summary_template: "{icon} analyzed {count} items".into(),

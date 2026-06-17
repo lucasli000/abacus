@@ -21,6 +21,11 @@ use crate::team::AgentRole;
 /// 若未来某 specialist 的 system_prompt 完全独立于会议状态（纯角色定义），
 /// 可考虑在 bridge.rs 处把它注入 `req_ctx.system_prompt_override`，
 /// 让该 specialist 的角色段进入可缓存 system 段。
+/// Meeting 专家配置
+///
+/// ## 传输类型
+/// - 本地: 通过 CoreLoop.process_turn() 执行（LLM 推理）
+/// - 外部: 通过 MCP/HTTP 调用外部 Agent（transport 非 None）
 #[derive(Debug, Clone)]
 pub struct SpecialistConfig {
     pub id: String,
@@ -28,6 +33,52 @@ pub struct SpecialistConfig {
     pub model: String,
     pub system_prompt: String,
     pub role: AgentRole,
+    /// 外部 Agent 传输配置（None = 本地 LLM 专家）
+    #[allow(dead_code)]
+    pub transport: Option<AgentTransport>,
+}
+
+/// 外部 Agent 传输配置
+#[derive(Debug, Clone)]
+pub struct AgentTransport {
+    /// 传输类型: "mcp" | "http"
+    pub transport_type: String,
+    /// 端点地址
+    pub endpoint: String,
+}
+
+impl SpecialistConfig {
+    /// 创建本地 LLM 专家
+    pub fn local(id: &str, name: &str, model: &str, system_prompt: &str, role: AgentRole) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: model.to_string(),
+            system_prompt: system_prompt.to_string(),
+            role,
+            transport: None,
+        }
+    }
+
+    /// 创建外部 Agent 专家
+    pub fn external(id: &str, name: &str, endpoint: &str, transport_type: &str, role: AgentRole) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            model: String::new(),
+            system_prompt: String::new(),
+            role,
+            transport: Some(AgentTransport {
+                transport_type: transport_type.to_string(),
+                endpoint: endpoint.to_string(),
+            }),
+        }
+    }
+
+    /// 是否为外部 Agent
+    pub fn is_external(&self) -> bool {
+        self.transport.is_some()
+    }
 }
 
 /// Orchestrates a live meeting with real LLM-powered specialists.
@@ -126,9 +177,10 @@ impl MeetingManager {
             inputs.push((sp.clone(), target, final_prompt));
         }
 
-        // Phase 2: Concurrent LLM calls with semaphore
+        // Phase 2: Concurrent execution with semaphore
         // 故障隔离：单个 specialist panic 不中止整个 meeting（fail-partial 策略）
-        // catch_unwind 将 panic 转为 Err，tokio JoinError 同样被捕获和降级
+        // 内部 LLM 专家: core.process() + RequestContext::fast()
+        // 外部 Agent 专家: MCP/HTTP 调用（transport 非 None）
         let core = self.core.clone();
         let session = self.session_state.clone();
         let mut handles = Vec::with_capacity(n);
@@ -137,28 +189,42 @@ impl MeetingManager {
             let c = core.clone();
             let s = session.clone();
             handles.push(tokio::spawn(async move {
-                // tokio::spawn 已隐式隔离 panic（任务 panic → JoinError，不传播到主 runtime）
-                // P0 修复：semaphore 被关闭时不 panic，降级为该 specialist 的 partial failure
                 let _permit = match sem.acquire().await {
                     Ok(p) => p,
                     Err(_) => return (sp, None, Some("semaphore closed before acquire".into())),
                 };
-                // P2 修复：单个 specialist 90s timeout，与 bridge.rs 保持一致——
-                // 防止某个 specialist 卡死占用 semaphore permit 导致整个 meeting 死锁
                 const SPECIALIST_TIMEOUT_SECS: u64 = 90;
-                // RequestContext::fast(): specialist 内部调用跳过 preflight/inertia/progressive
-                let work = c.process(&prompt, &s, RequestContext::fast());
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(SPECIALIST_TIMEOUT_SECS),
-                    work,
-                ).await {
-                    Ok(Ok(result)) => (sp, Some(result.response), None),
-                    Ok(Err(e)) => (sp, None, Some(e.to_string())),
-                    Err(_) => {
-                        let id = sp.id.clone();
-                        (sp, None, Some(format!(
-                            "specialist '{id}' timed out after {SPECIALIST_TIMEOUT_SECS}s"
-                        )))
+
+                // 外部 Agent 专家：通过 MCP/HTTP 调用
+                if let Some(ref transport) = sp.transport {
+                    let agent_id = sp.id.clone();
+                    let transport = transport.clone();
+                    let work = call_external_specialist(&transport, &prompt);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(SPECIALIST_TIMEOUT_SECS),
+                        work,
+                    ).await {
+                        Ok(Ok(response)) => (sp, Some(response), None),
+                        Ok(Err(e)) => (sp, None, Some(e)),
+                        Err(_) => (sp, None, Some(format!(
+                            "external agent '{}' timed out after {}s", agent_id, SPECIALIST_TIMEOUT_SECS
+                        ))),
+                    }
+                } else {
+                    // 内部 LLM 专家：core.process()
+                    let work = c.process(&prompt, &s, RequestContext::fast());
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(SPECIALIST_TIMEOUT_SECS),
+                        work,
+                    ).await {
+                        Ok(Ok(result)) => (sp, Some(result.response), None),
+                        Ok(Err(e)) => (sp, None, Some(e.to_string())),
+                        Err(_) => {
+                            let id = sp.id.clone();
+                            (sp, None, Some(format!(
+                                "specialist '{}' timed out after {}s", id, SPECIALIST_TIMEOUT_SECS
+                            )))
+                        }
                     }
                 }
             }));
@@ -245,5 +311,45 @@ impl MeetingManager {
 
     pub fn handle_mut(&mut self) -> Option<&mut MeetingSessionHandle> {
         self.handle.as_mut()
+    }
+}
+
+/// 调用外部 Agent 专家
+///
+/// 通过 MCP 协议向外部 Agent 发送咨询请求，获取专家意见。
+/// 当前实现：HTTP POST /invoke（占位，Phase C 完善 MCP 协议调用）
+async fn call_external_specialist(
+    transport: &AgentTransport,
+    prompt: &str,
+) -> Result<String, String> {
+    match transport.transport_type.as_str() {
+        "http" => {
+            // HTTP REST 调用
+            let client = reqwest::Client::new();
+            let resp = client
+                .post(format!("{}/invoke", transport.endpoint))
+                .json(&serde_json::json!({
+                    "prompt": prompt,
+                    "timeout_secs": 90,
+                }))
+                .timeout(std::time::Duration::from_secs(90))
+                .send()
+                .await
+                .map_err(|e| format!("HTTP call failed: {}", e))?;
+
+            let body: serde_json::Value = resp.json().await
+                .map_err(|e| format!("HTTP response parse failed: {}", e))?;
+
+            body.get("response")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .ok_or_else(|| "Missing 'response' field in agent response".into())
+        }
+        "mcp" => {
+            // MCP 协议调用（复用 McpClient）
+            // TODO: Phase C 实现完整的 MCP 协议调用
+            Err("MCP transport not yet implemented for meeting specialists".into())
+        }
+        other => Err(format!("Unsupported transport type: {}", other)),
     }
 }

@@ -107,6 +107,9 @@ enum Commands {
     /// Manage MCP servers and plugins
     Mcp(McpArgs),
 
+    /// Manage external agents (install/list/remove)
+    Agent(commands::agent::AgentArgs),
+
     /// Team mode — multi-agent orchestration (Mode 2)
     Team(TeamArgs),
 
@@ -205,6 +208,7 @@ async fn main() -> Result<()> {
         Commands::Doctor => commands::doctor::handle_doctor(&mut formatter).await?,
         Commands::Meeting(args) => commands::meeting::handle_meeting(args, &mut formatter).await?,
         Commands::Mcp(args) => commands::mcp::handle_mcp(args, &mut formatter).await?,
+        Commands::Agent(args) => commands::agent::handle_agent(&args.action, &mut formatter).await?,
         Commands::Team(args) => commands::team::handle_team(args, &mut formatter).await?,
         Commands::Turnkey(args) => commands::turnkey::handle_turnkey(args, &mut formatter).await?,
         Commands::Tui(args) => commands::tui::handle_tui(args).await?,

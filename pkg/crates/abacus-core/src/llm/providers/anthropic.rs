@@ -908,6 +908,12 @@ impl LlmProvider for AnthropicProvider {
         let mut prompt_tokens = 0u64;
         let mut completion_tokens = 0u64;
 
+        // 统一流式 tool_calls 组装器（Anthropic 格式：content_block_start + input_json_delta）
+        let mut tc_collector = crate::llm::stream::StreamingToolCallCollector::new();
+        let mut current_block_index: u32 = 0;
+        let mut block_index_to_tc_index: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut next_tc_index: u32 = 0;
+
         // P2: stream idle timeout — 45s 无新 chunk 视为连接死锁，主动断开
         loop {
             let chunk = match tokio::time::timeout(Duration::from_secs(45), byte_stream.next()).await {
@@ -943,6 +949,36 @@ impl LlmProvider for AnthropicProvider {
                         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
                         match event_type {
+                            "content_block_start" => {
+                                // Anthropic 流式：每个 content block 开始时发送 index + 类型
+                                let block_type = event.pointer("/content_block/type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
+                                let block_idx = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                                current_block_index = block_idx;
+
+                                if block_type == "tool_use" {
+                                    let id = event.pointer("/content_block/id")
+                                        .and_then(|i| i.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = event.pointer("/content_block/name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+
+                                    let tc_idx = next_tc_index;
+                                    next_tc_index += 1;
+                                    block_index_to_tc_index.insert(block_idx, tc_idx);
+
+                                    tc_collector.on_tool_call_start(
+                                        tc_idx,
+                                        Some(&id),
+                                        Some(&name),
+                                        &tx,
+                                    );
+                                }
+                            }
                             "content_block_delta" => {
                                 if let Some(delta) = event.get("delta") {
                                     let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -959,8 +995,24 @@ impl LlmProvider for AnthropicProvider {
                                                 let _ = tx.send(StreamEvent::ThinkingDelta(thinking.to_string()));
                                             }
                                         }
+                                        "input_json_delta" => {
+                                            // Anthropic 流式工具参数增量
+                                            if let Some(partial_json) = delta.get("partial_json").and_then(|p| p.as_str()) {
+                                                let block_idx = current_block_index;
+                                                if let Some(&tc_idx) = block_index_to_tc_index.get(&block_idx) {
+                                                    tc_collector.on_tool_call_args(tc_idx, partial_json, &tx);
+                                                }
+                                            }
+                                        }
                                         _ => {}
                                     }
+                                }
+                            }
+                            "content_block_stop" => {
+                                // 当前 block 结束
+                                let block_idx = event.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+                                if let Some(&tc_idx) = block_index_to_tc_index.get(&block_idx) {
+                                    tc_collector.on_tool_call_end(tc_idx, &tx);
                                 }
                             }
                             "message_delta" => {
@@ -992,7 +1044,7 @@ impl LlmProvider for AnthropicProvider {
                 role: MessageRole::Assistant,
                 content: Some(MessageContent::Text(full_text)),
                 name: None,
-                tool_calls: None,
+                tool_calls: tc_collector.finish(),
                 tool_call_id: None,
                 reasoning_content: None,
                 prefix: false,

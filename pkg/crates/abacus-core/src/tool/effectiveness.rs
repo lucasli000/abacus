@@ -55,6 +55,8 @@ pub fn min_samples_for(provider: &ToolProvider) -> u64 {
         ToolProvider::BuiltIn => 10,
         // 扩展工具——网络/动态加载/远端，给更长冷启动期
         ToolProvider::Mcp { .. } | ToolProvider::Plugin { .. } | ToolProvider::Skill { .. } => 30,
+        // 外部 Agent 与 MCP 同等待遇
+        ToolProvider::ExternalAgent { .. } => 30,
     }
 }
 

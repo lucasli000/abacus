@@ -1,0 +1,35 @@
+[package]
+name = "abacus-bridge"
+version = "2.6.1"
+edition = "2021"
+description = "Abacus NAPI-RS bridge — exposes core engine to TypeScript/Bun"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# NAPI-RS bindings
+napi = { version = "3", default-features = false, features = ["async", "tokio_rt", "napi8", "serde"] }
+napi-derive = "3"
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Async runtime (shared with napi)
+tokio = { workspace = true }
+
+# Abacus crates
+abacus-types = { path = "../abacus-types" }
+abacus-core = { path = "../abacus-core" }
+abacus-orchestrator = { path = "../abacus-orchestrator" }
+
+# Logging
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
+
+[lints]
+workspace = true

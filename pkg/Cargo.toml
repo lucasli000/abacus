@@ -7,6 +7,7 @@ members = [
     "crates/abacus-ui-kit",
     "crates/abacus-cli",
     "crates/abacus-server",
+    "crates/abacus-bridge",
 ]
 
 [workspace.package]

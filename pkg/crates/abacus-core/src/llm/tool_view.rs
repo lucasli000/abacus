@@ -148,6 +148,7 @@ fn provenance_prefix_for(provider: &ToolProvider) -> String {
         ToolProvider::Mcp { server_id } => format!("[External MCP server: {server_id}] "),
         ToolProvider::Plugin { plugin_id } => format!("[WASM plugin: {plugin_id}] "),
         ToolProvider::Skill { skill_id } => format!("[Skill workflow step from '{skill_id}'] "),
+        ToolProvider::ExternalAgent { agent_id, .. } => format!("[External Agent: {agent_id}] "),
     }
 }
 

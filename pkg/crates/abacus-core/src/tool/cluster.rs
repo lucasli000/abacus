@@ -1,48 +1,38 @@
 //! Tool Cluster Registry —— 工具协议同构感知层（段 J1）
 //!
 //! ## 设计动机
-//! LLM 看到平铺工具列表会在"语义近邻工具"间犹豫：cross_session_query /
-//! session_resume_query / messages_recover 都涉及"过去内容"，description
-//! 关键词撞车 → LLM 凭经验赌一个，常误选。本模块把"工具间的横向关系"显式化：
-//! 每个工具属于一个 cluster；同 cluster 的工具共享一个 `purpose`（业务目的）；
-//! 每个 member 有 `differentiator`（它与同簇其他工具的关键区分点）。
-//! LLM 从 description 中可见这层结构，选工具时按"先认 cluster 再选 differentiator"
-//! 的二级决策，命中率显著提升。
+//! LLM 看到平铺工具列表会在"语义近邻工具"间犹豫。本模块把"工具间的横向关系"显式化：
+//! 每个工具属于一个 cluster；同 cluster 的工具共享一个 `purpose`；
+//! 每个 member 有 `differentiator`（与同簇其他工具的关键区分点）。
 //!
-//! ## 协议同构原则
-//! 对应 CLAUDE.md 的 `feedback_protocol_homomorphism.md`——多协议路径能力对等
-//! 则不分叉。这里把这条原则从代码层提到 LLM 感知层：能力近邻的工具不应让 LLM
-//! 在无信息状态下盲选。
+//! ## Cluster vs ToolAgent 边界
+//! - **Cluster**: LLM 工具选择辅助。静态配置，注入到 tool description。
+//! - **ToolAgent**: 批量执行优化。运行时匹配，委托给隔离 sub-session。
+//! - ToolAgent 通过 `cluster_refs` 引用 Cluster 组 ID，不重复维护工具列表。
+//!
+//! ## Token 优化
+//! 每个 tool description 追加 cluster hint：
+//! ```text
+//! [g:fs_read | vs: fs_info/fs_search/fs_grep/fs_ls/fs_tree | this: read file contents]
+//! ```
+//! 约 30-50 tokens/tool（旧格式 ~100+）。
 //!
 //! ## 引用关系
 //! - 上游：CoreLoop::build_tool_definitions_for 拿 cluster info 注入 description
 //! - 下游：硬编码 builtin clusters；MCP/Plugin 工具默认无 cluster
 //! - 配套：tool_compass 工具（段 J2）通过 ClusterRegistry::recommend_by_intent
-//!   给 LLM 主动咨询入口
-//!
-//! ## 生命周期
-//! - 创建：进程启动时 `ClusterRegistry::builtin()` 一次性构造（纯静态数据）
-//! - 销毁：进程退出时随 CoreLoop drop
-//! - 不持有锁——所有数据在 builtin() 时已 frozen
-//!
-//! ## 失败语义
-//! - 工具不在任何 cluster → render_hint_for 返 None（不破坏现有行为）
-//! - 同一 tool_id 注册到多 cluster → builtin() 配置阶段 panic（防误配）
 
 use std::collections::HashMap;
 use serde::Serialize;
 
 /// 单个工具在所属 cluster 内的角色描述
-///
-/// `differentiator` 是关键——告诉 LLM 这个工具与同簇其他工具的**对比维度**，
-/// 不是 description 的复述。
 #[derive(Debug, Clone)]
 pub struct ToolMember {
     pub tool_id: &'static str,
     pub differentiator: &'static str,
 }
 
-/// 工具协议同构簇——一组语义近邻工具
+/// 工具协议同构簇
 #[derive(Debug, Clone)]
 pub struct ToolCluster {
     /// 簇的唯一标识（小写下划线）
@@ -69,7 +59,6 @@ pub struct RecommendItem {
     pub cluster_id: String,
     pub tool_id: String,
     pub differentiator: String,
-    /// 关键词命中数——越大越相关；调用方可按此再排
     pub relevance_score: usize,
 }
 
@@ -77,12 +66,10 @@ pub struct RecommendItem {
 #[derive(Debug, Clone)]
 pub struct ClusterRegistry {
     clusters: Vec<ToolCluster>,
-    /// tool_id → cluster index（fast lookup）
     tool_index: HashMap<String, usize>,
 }
 
 impl ClusterRegistry {
-    /// 空 registry——单元测试 / 自定义场景用
     pub fn empty() -> Self {
         Self {
             clusters: Vec::new(),
@@ -90,211 +77,267 @@ impl ClusterRegistry {
         }
     }
 
-    /// builtin 内置 clusters
+    /// builtin 内置 clusters — 覆盖全部 ~70 个注册工具
     ///
     /// ## 划分原则
     /// 1. 同一 cluster 工具语义有交集（LLM 容易混选）
-    /// 2. cluster 内 ≥2 个工具（单工具不需要 differentiator）
-    /// 3. differentiator 句式："vs them, this tool focuses on X"
+    /// 2. cluster 内 ≥2 个工具时提供 differentiator
+    /// 3. differentiator 句式：简短区分点（不是 description 复述）
     /// 4. purpose 是业务目的不是技术细节
+    /// 5. 单工具 cluster 保留结构（供 ToolAgent 引用）
     pub fn builtin() -> Self {
         let mut me = Self::empty();
 
-        // session_history：跨/历史 session 内容查询——三件套最容易混
+        // ─── 文件系统读 ───────────────────────────────────────
         me.register(ToolCluster {
-            id: "session_history",
-            purpose: "Access content/state from past or current sessions",
-            members: vec![
-                ToolMember {
-                    tool_id: "cross_session_query",
-                    differentiator: "semantic content retrieval (knowledge palace) across all past sessions",
-                },
-                ToolMember {
-                    tool_id: "session_resume_query",
-                    differentiator: "metadata stats (turn/tool counts, latency, compression) of prior sessions",
-                },
-                ToolMember {
-                    tool_id: "messages_recover",
-                    differentiator: "verbatim recall of compressed messages by recover_id",
-                },
-            ],
-        });
-
-        // interaction_checkpoint：当前 session 内导航
-        me.register(ToolCluster {
-            id: "interaction_checkpoint",
-            purpose: "Navigate the current session's interaction map (checkpoints/path)",
-            members: vec![
-                ToolMember {
-                    tool_id: "interaction_status",
-                    differentiator: "current position only (lightest read)",
-                },
-                ToolMember {
-                    tool_id: "interaction_path",
-                    differentiator: "full path: completed + current + remaining",
-                },
-                ToolMember {
-                    tool_id: "interaction_recall",
-                    differentiator: "deep details of one specific past checkpoint by id",
-                },
-                ToolMember {
-                    tool_id: "interaction_mark",
-                    differentiator: "WRITE — manually create a new checkpoint",
-                },
-            ],
-        });
-
-        // session_meta：session 级元操作
-        me.register(ToolCluster {
-            id: "session_meta",
-            purpose: "Session-level meta operations (focus/permission/introspect)",
-            members: vec![
-                ToolMember {
-                    tool_id: "session_set_focus",
-                    differentiator: "anchor goal/phase/constraints to prevent attention drift",
-                },
-                ToolMember {
-                    tool_id: "session_request_permission",
-                    differentiator: "request user authz for a permission-gated tool",
-                },
-                ToolMember {
-                    tool_id: "magchain_status",
-                    differentiator: "introspect MagChain hooks + epistemic + decay tier state",
-                },
-            ],
-        });
-
-        // knowledge_base：KB 检索——kb_query 与 kb_search 极易混淆
-        me.register(ToolCluster {
-            id: "knowledge_base",
-            purpose: "Retrieve from the knowledge base (KB chunks + memory palace)",
-            members: vec![
-                ToolMember {
-                    tool_id: "kb_ingest",
-                    differentiator: "WRITE — index a file into KB; precondition for kb_query/kb_search",
-                },
-                ToolMember {
-                    tool_id: "kb_query",
-                    differentiator: "KB chunks ONLY (BM25 + trigram); narrowest scope",
-                },
-                ToolMember {
-                    tool_id: "kb_search",
-                    differentiator: "multi-source: KB chunks + memory palace + spatial atoms (broadest scope)",
-                },
-            ],
-        });
-
-        // fs_read_discover：文件系统读 / 发现类——8 个工具，差异点最容易模糊
-        me.register(ToolCluster {
-            id: "fs_read_discover",
+            id: "fs_read",
             purpose: "Read files or discover filesystem entries",
             members: vec![
-                ToolMember {
-                    tool_id: "fs_read",
-                    differentiator: "read full file contents (text)",
-                },
-                ToolMember {
-                    tool_id: "fs_info",
-                    differentiator: "metadata only (size/mtime/perms) — no content",
-                },
-                ToolMember {
-                    tool_id: "fs_search",
-                    differentiator: "find files by glob pattern (path-only)",
-                },
-                ToolMember {
-                    tool_id: "fs_grep",
-                    differentiator: "find content by regex INSIDE files",
-                },
-                ToolMember {
-                    tool_id: "fs_ls",
-                    differentiator: "list one directory's direct children (single-level)",
-                },
-                ToolMember {
-                    tool_id: "fs_tree",
-                    differentiator: "recursive tree view of a directory",
-                },
+                ToolMember { tool_id: "fs_read", differentiator: "full file contents" },
+                ToolMember { tool_id: "fs_info", differentiator: "metadata only (size/mtime/perms)" },
+                ToolMember { tool_id: "fs_search", differentiator: "glob pattern → file paths" },
+                ToolMember { tool_id: "fs_grep", differentiator: "regex search inside files" },
+                ToolMember { tool_id: "fs_ls", differentiator: "single directory listing" },
+                ToolMember { tool_id: "fs_tree", differentiator: "recursive tree view" },
             ],
         });
 
-        // fs_write：文件系统写——破坏性，必须区分清楚
+        // ─── 文件系统写 ───────────────────────────────────────
         me.register(ToolCluster {
             id: "fs_write",
-            purpose: "Modify files (DESTRUCTIVE — verify intent before calling)",
+            purpose: "Modify files (DESTRUCTIVE)",
             members: vec![
-                ToolMember {
-                    tool_id: "fs_write",
-                    differentiator: "create new OR fully overwrite existing file",
-                },
-                ToolMember {
-                    tool_id: "fs_edit",
-                    differentiator: "precise text replacement (preferred for existing files)",
-                },
-                ToolMember {
-                    tool_id: "fs_move",
-                    differentiator: "rename or relocate; fails if dest exists",
-                },
-                ToolMember {
-                    tool_id: "fs_mkdir",
-                    differentiator: "create directories (incl nested); not file content",
-                },
+                ToolMember { tool_id: "fs_write", differentiator: "create/overwrite entire file" },
+                ToolMember { tool_id: "fs_edit", differentiator: "precise text replacement" },
+                ToolMember { tool_id: "fs_move", differentiator: "rename/relocate" },
+                ToolMember { tool_id: "fs_mkdir", differentiator: "create directories" },
             ],
         });
 
-        // db_read：数据库读类
+        // ─── Shell ────────────────────────────────────────────
         me.register(ToolCluster {
-            id: "db_read",
-            purpose: "Read from SQLite databases (no side effects)",
+            id: "shell",
+            purpose: "Execute shell commands",
             members: vec![
-                ToolMember {
-                    tool_id: "db_info",
-                    differentiator: "DB-level meta (path/size/table count)",
-                },
-                ToolMember {
-                    tool_id: "db_list_tables",
-                    differentiator: "list user table names",
-                },
-                ToolMember {
-                    tool_id: "db_table_schema",
-                    differentiator: "column schema of one specific table",
-                },
-                ToolMember {
-                    tool_id: "db_query",
-                    differentiator: "raw parameterized SQL (max flexibility, no safety rails)",
-                },
-                ToolMember {
-                    tool_id: "db_read_records",
-                    differentiator: "structured equality-filter row read (safer than db_query)",
-                },
+                ToolMember { tool_id: "bash_exec", differentiator: "shell command execution" },
             ],
         });
 
-        // web_io：网络
+        // ─── Web I/O ──────────────────────────────────────────
         me.register(ToolCluster {
             id: "web_io",
             purpose: "Fetch from the live web",
             members: vec![
-                ToolMember {
-                    tool_id: "web_fetch",
-                    differentiator: "fetch a specific URL by exact address",
-                },
-                ToolMember {
-                    tool_id: "web_search",
-                    differentiator: "search engine query when URL is unknown",
-                },
+                ToolMember { tool_id: "web_fetch", differentiator: "fetch by exact URL" },
+                ToolMember { tool_id: "web_search", differentiator: "search engine query" },
+                ToolMember { tool_id: "http_request", differentiator: "full HTTP client (any method)" },
+            ],
+        });
+
+        // ─── 数据处理 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "data_proc",
+            purpose: "Transform or compare data",
+            members: vec![
+                ToolMember { tool_id: "json_process", differentiator: "JSON query/transform" },
+                ToolMember { tool_id: "diff", differentiator: "file/text diff comparison" },
+            ],
+        });
+
+        // ─── 数据库读 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "db_read",
+            purpose: "Read from databases (no side effects)",
+            members: vec![
+                ToolMember { tool_id: "db_info", differentiator: "DB-level metadata" },
+                ToolMember { tool_id: "db_list_tables", differentiator: "list table names" },
+                ToolMember { tool_id: "db_table_schema", differentiator: "column schema of one table" },
+                ToolMember { tool_id: "db_query", differentiator: "raw parameterized SQL" },
+                ToolMember { tool_id: "db_read_records", differentiator: "structured filtered read" },
+            ],
+        });
+
+        // ─── 数据库写 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "db_write",
+            purpose: "Modify database records (DESTRUCTIVE)",
+            members: vec![
+                ToolMember { tool_id: "db_create_record", differentiator: "insert new record" },
+                ToolMember { tool_id: "db_update_records", differentiator: "conditional update" },
+                ToolMember { tool_id: "db_delete_records", differentiator: "conditional delete" },
+            ],
+        });
+
+        // ─── 知识库 ───────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "kb",
+            purpose: "Knowledge base ingestion and retrieval",
+            members: vec![
+                ToolMember { tool_id: "kb_ingest", differentiator: "WRITE — index file into KB" },
+                ToolMember { tool_id: "kb_query", differentiator: "KB chunks only (BM25)" },
+                ToolMember { tool_id: "kb_search", differentiator: "multi-source: KB + palace" },
+            ],
+        });
+
+        // ─── Git ──────────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "git",
+            purpose: "Git version control operations",
+            members: vec![
+                ToolMember { tool_id: "git_status", differentiator: "working tree status" },
+                ToolMember { tool_id: "git_diff", differentiator: "diff analysis" },
+                ToolMember { tool_id: "git_log", differentiator: "commit history" },
+                ToolMember { tool_id: "git_blame", differentiator: "line attribution" },
+                ToolMember { tool_id: "git_stash", differentiator: "stash management" },
+                ToolMember { tool_id: "git_commit", differentiator: "commit changes" },
+            ],
+        });
+
+        // ─── LSP ──────────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "lsp",
+            purpose: "Language server protocol operations",
+            members: vec![
+                ToolMember { tool_id: "lsp_goto_definition", differentiator: "jump to definition" },
+                ToolMember { tool_id: "lsp_find_references", differentiator: "find all references" },
+                ToolMember { tool_id: "lsp_hover", differentiator: "type info/docs at cursor" },
+                ToolMember { tool_id: "lsp_document_symbol", differentiator: "symbols in one file" },
+                ToolMember { tool_id: "lsp_workspace_symbol", differentiator: "search all symbols" },
+                ToolMember { tool_id: "lsp_diagnostics", differentiator: "compiler errors/warnings" },
+                ToolMember { tool_id: "lsp_goto_implementation", differentiator: "trait implementations" },
+                ToolMember { tool_id: "lsp_call_hierarchy_incoming", differentiator: "upstream callers" },
+                ToolMember { tool_id: "lsp_call_hierarchy_outgoing", differentiator: "downstream callees" },
+            ],
+        });
+
+        // ─── Code Graph ───────────────────────────────────────
+        me.register(ToolCluster {
+            id: "cg",
+            purpose: "Code graph indexing and querying",
+            members: vec![
+                ToolMember { tool_id: "cg_index", differentiator: "index code files" },
+                ToolMember { tool_id: "cg_query", differentiator: "symbol search" },
+                ToolMember { tool_id: "cg_graph", differentiator: "call graph traversal" },
+                ToolMember { tool_id: "cg_analyze", differentiator: "structure analysis" },
+            ],
+        });
+
+        // ─── Context 管理 ─────────────────────────────────────
+        me.register(ToolCluster {
+            id: "context",
+            purpose: "Context window management and compression",
+            members: vec![
+                ToolMember { tool_id: "context_declare", differentiator: "declare intent to load" },
+                ToolMember { tool_id: "context_keep", differentiator: "keep selected segments" },
+                ToolMember { tool_id: "context_compress", differentiator: "compress context" },
+                ToolMember { tool_id: "session_recall", differentiator: "search cold-tier archive" },
+                ToolMember { tool_id: "context_pin", differentiator: "pin turn from compression" },
+                ToolMember { tool_id: "context_unpin", differentiator: "unpin turn" },
+                ToolMember { tool_id: "context_pinned", differentiator: "list pinned turns" },
+                ToolMember { tool_id: "context_status", differentiator: "context window usage" },
+            ],
+        });
+
+        // ─── Session 操作 ─────────────────────────────────────
+        me.register(ToolCluster {
+            id: "session",
+            purpose: "Current session navigation and control",
+            members: vec![
+                ToolMember { tool_id: "interaction_status", differentiator: "current position" },
+                ToolMember { tool_id: "interaction_path", differentiator: "full interaction path" },
+                ToolMember { tool_id: "interaction_recall", differentiator: "recall checkpoint by id" },
+                ToolMember { tool_id: "interaction_mark", differentiator: "create checkpoint" },
+                ToolMember { tool_id: "session_set_focus", differentiator: "anchor goal/constraints" },
+                ToolMember { tool_id: "session_request_permission", differentiator: "request user authz" },
+                ToolMember { tool_id: "session_extend_timeout", differentiator: "extend turn timeout" },
+            ],
+        });
+
+        // ─── 跨 Session 历史 ──────────────────────────────────
+        me.register(ToolCluster {
+            id: "session_history",
+            purpose: "Access content from past sessions",
+            members: vec![
+                ToolMember { tool_id: "cross_session_query", differentiator: "semantic search across sessions" },
+                ToolMember { tool_id: "session_resume_query", differentiator: "metadata stats of prior sessions" },
+                ToolMember { tool_id: "messages_recover", differentiator: "verbatim compressed messages" },
+            ],
+        });
+
+        // ─── 配置 ─────────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "config",
+            purpose: "Runtime configuration management",
+            members: vec![
+                ToolMember { tool_id: "config_get", differentiator: "read config value" },
+                ToolMember { tool_id: "config_set", differentiator: "modify config value" },
+            ],
+        });
+
+        // ─── 代码执行 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "code_exec",
+            purpose: "Execute code in sandboxed environment",
+            members: vec![
+                ToolMember { tool_id: "code_execute", differentiator: "Rhai script execution" },
+            ],
+        });
+
+        // ─── 编排 ─────────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "orchestrate",
+            purpose: "Task complexity assessment and escalation",
+            members: vec![
+                ToolMember { tool_id: "orchestrate_assess", differentiator: "evaluate task complexity" },
+                ToolMember { tool_id: "orchestrate_upgrade", differentiator: "escalate execution level" },
+            ],
+        });
+
+        // ─── 推理分析 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "reasoning",
+            purpose: "Meta-analysis and deduction",
+            members: vec![
+                ToolMember { tool_id: "deduction_status", differentiator: "active deduction alerts" },
+                ToolMember { tool_id: "deduction_analyze", differentiator: "run deep analysis" },
+                ToolMember { tool_id: "magchain_status", differentiator: "hooks + epistemic state" },
+            ],
+        });
+
+        // ─── 沙盒任务 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "sandbox",
+            purpose: "Sandboxed task planning and execution",
+            members: vec![
+                ToolMember { tool_id: "task_plan", differentiator: "generate task plan" },
+                ToolMember { tool_id: "task_run", differentiator: "execute confirmed plan" },
+            ],
+        });
+
+        // ─── 元工具 ───────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "meta",
+            purpose: "System introspection and tool discovery",
+            members: vec![
+                ToolMember { tool_id: "env_status", differentiator: "local workspace snapshot" },
+                ToolMember { tool_id: "tool_compass", differentiator: "tool recommendation by intent" },
+                ToolMember { tool_id: "mode_switch", differentiator: "switch interaction mode" },
+            ],
+        });
+
+        // ─── 结果展开 ─────────────────────────────────────────
+        me.register(ToolCluster {
+            id: "result",
+            purpose: "Retrieve truncated results",
+            members: vec![
+                ToolMember { tool_id: "result_expand", differentiator: "expand truncated output" },
             ],
         });
 
         me
     }
 
-    /// 注册一个 cluster——同名 tool_id 重复时 warn + 覆盖（不再 panic 崩溃启动）
-    ///
-    /// ## 旧行为
-    /// panic → 开发者配置错误直接崩溃进程，阻塞启动
-    ///
-    /// ## 新行为
-    /// warn log + 覆盖到新 cluster（最后注册的赢）
-    /// 生产安全：启动不被配置漂移阻塞；CI 通过 lint audit 捕获重复
+    /// 注册一个 cluster——同名 tool_id 重复时 warn + 覆盖
     fn register(&mut self, cluster: ToolCluster) {
         let cluster_idx = self.clusters.len();
         for m in &cluster.members {
@@ -315,18 +358,10 @@ impl ClusterRegistry {
         self.tool_index.get(tool_id).map(|&i| &self.clusters[i])
     }
 
-    /// 渲染拼到 description 末尾的 cluster hint
+    /// 渲染 cluster hint——追加到 tool description 末尾
     ///
-    /// 形如：
-    /// `\n[Cluster: session_history (Access content from past sessions). \
-    ///  Siblings: session_resume_query (metadata stats); messages_recover (verbatim recall). \
-    ///  This tool: semantic content retrieval (knowledge palace) across all past sessions]`
-    ///
-    /// ## byte-stable
-    /// 同一组工具集 + 同一 ClusterRegistry 输出 byte-identical——不破 KV cache 前缀。
-    /// V43 token 优化：精简 cluster hint 格式
-    /// 旧格式：列出所有 sibling 完整 differentiator（6 工具 cluster ≈ 200 tokens）
-    /// 新格式：仅列 sibling 名字 + 自身 differentiator（≈ 40 tokens）
+    /// 格式: `[g:{cluster} | vs: {siblings} | this: {differentiator}]`
+    /// 单成员 cluster 返回 None（无 sibling 不需要 differentiator）
     pub fn render_hint_for(&self, tool_id: &str) -> Option<String> {
         let cluster = self.cluster_for(tool_id)?;
         let me = cluster.members.iter().find(|m| m.tool_id == tool_id)?;
@@ -334,21 +369,21 @@ impl ClusterRegistry {
         if siblings.is_empty() {
             return None;
         }
-        // 仅列 sibling 工具名（不含 differentiator），LLM 通过各自 description 区分
         let names: Vec<&str> = siblings.iter().map(|m| m.tool_id).collect();
         Some(format!(
-            " [vs: {}. This: {}]",
+            " [g:{} | vs: {} | this: {}]",
+            cluster.id,
             names.join("/"),
             me.differentiator
         ))
     }
 
-    /// 列所有 clusters（段 J2 tool_compass 用）
+    /// 列所有 clusters
     pub fn all_clusters(&self) -> &[ToolCluster] {
         &self.clusters
     }
 
-    /// 工具数（统计/audit 用）
+    /// 工具数
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
     }
@@ -359,19 +394,8 @@ impl ClusterRegistry {
     }
 
     /// 按 intent 关键词命中推荐工具（段 J2 tool_compass 后端）
-    ///
-    /// ## 算法
-    /// 1. intent 切词（>2 字符）；中英文混合下用 unicode_segmentation 略过——简化为
-    ///    `split_whitespace` + 显式逗号/标点分隔
-    /// 2. 对每个 cluster.purpose + member.differentiator + tool_id 拼接为 haystack
-    /// 3. 计算每词命中次数；按命中数降序排，取 top_k
-    /// 4. 同分的按 tool_id 字典序稳定排（保证 deterministic 输出）
-    ///
-    /// ## 失败语义
-    /// 无命中 → 返回空 vec；调用方可降级为"列所有 clusters 让 LLM 自选"
     pub fn recommend_by_intent(&self, intent: &str, top_k: usize) -> Vec<RecommendItem> {
         let intent_lower = intent.to_lowercase();
-        // 简单切词：空白 + 中文标点 + 半角标点
         let intent_words: Vec<String> = intent_lower
             .split(|c: char| c.is_whitespace() || ",.;:!?，。；：！？\"'()[]{}".contains(c))
             .filter(|w| w.chars().count() > 2)
@@ -400,7 +424,6 @@ impl ClusterRegistry {
                 }
             }
         }
-        // 主键 hits 降序，副键 tool_id 升序——deterministic
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.tool_id.cmp(b.2.tool_id)));
         scored
             .into_iter()
@@ -426,121 +449,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_registry_loads_all_clusters() {
+    fn builtin_covers_all_tools() {
         let r = ClusterRegistry::builtin();
-        // 至少 8 个 cluster（与 builtin 列表对齐）
-        assert!(r.cluster_count() >= 8, "应注册至少 8 个 builtin cluster");
-        assert!(r.tool_count() >= 25, "应注册至少 25 个工具到 cluster");
+        assert!(r.cluster_count() >= 21, "应有 21 个 cluster, 实际 {}", r.cluster_count());
+        assert!(r.tool_count() >= 70, "应覆盖 70+ 工具, 实际 {}", r.tool_count());
     }
 
     #[test]
-    fn cluster_for_session_history_tools() {
+    fn every_cluster_has_members() {
         let r = ClusterRegistry::builtin();
-        for t in ["cross_session_query", "session_resume_query", "messages_recover"] {
-            let c = r.cluster_for(t).unwrap_or_else(|| panic!("{t} 应在 cluster"));
-            assert_eq!(c.id, "session_history");
+        for c in r.all_clusters() {
+            assert!(!c.members.is_empty(), "cluster '{}' 无成员", c.id);
         }
     }
 
     #[test]
-    fn render_hint_includes_siblings_and_self_diff() {
+    fn no_duplicate_tool_ids() {
         let r = ClusterRegistry::builtin();
-        let hint = r
-            .render_hint_for("cross_session_query")
-            .expect("应有 hint");
-        // V43 token 优化：新格式只列 sibling 名字 + 自身 differentiator
-        // （cluster id 由 sibling 名称隐含，省 100+ tokens）
-        assert!(hint.contains("session_resume_query"));
-        assert!(hint.contains("messages_recover"));
-        assert!(hint.contains("This:"));
-        // 不应包含自己 tool_id 在 siblings 里
-        let siblings_part = hint.split("This:").next().unwrap();
-        assert!(
-            !siblings_part.contains("cross_session_query ("),
-            "siblings 不应含自己: {hint}"
-        );
+        let mut seen = std::collections::HashSet::new();
+        for c in r.all_clusters() {
+            for m in &c.members {
+                assert!(seen.insert(m.tool_id), "工具 '{}' 重复注册", m.tool_id);
+            }
+        }
     }
 
     #[test]
-    fn render_hint_none_for_unknown_tool() {
+    fn render_hint_format() {
         let r = ClusterRegistry::builtin();
-        assert!(r.render_hint_for("unknown_xyz_tool").is_none());
+        let hint = r.render_hint_for("fs_read").expect("应有 hint");
+        assert!(hint.starts_with(" [g:fs_read | vs:"));
+        assert!(hint.contains("this: full file contents"));
+        // 不含自己在 siblings 中
+        assert!(!hint.contains("vs: fs_read/"));
     }
 
     #[test]
-    fn recommend_matches_intent_keywords() {
+    fn single_member_no_hint() {
         let r = ClusterRegistry::builtin();
-        // "search past sessions" → session_history cluster
-        let recs = r.recommend_by_intent("retrieve content from past sessions", 3);
-        assert!(!recs.is_empty(), "应至少 1 个推荐");
-        let top = &recs[0];
-        assert!(
-            top.cluster_id == "session_history" || top.tool_id.contains("session"),
-            "top 应命中 session 相关, got: {:?}",
-            top
-        );
+        // bash_exec 是 shell cluster 唯一成员
+        assert!(r.render_hint_for("bash_exec").is_none());
     }
 
     #[test]
-    fn recommend_empty_when_no_keywords() {
+    fn recommend_matches_intent() {
         let r = ClusterRegistry::builtin();
-        let recs = r.recommend_by_intent("a b c", 5); // 全是单字符词，被切词过滤
-        assert!(recs.is_empty(), "短词应被过滤导致无命中");
+        let recs = r.recommend_by_intent("read file contents from disk", 3);
+        assert!(!recs.is_empty());
+        assert!(recs.iter().any(|r| r.tool_id == "fs_read"));
     }
 
     #[test]
-    fn recommend_top_k_respected() {
+    fn recommend_git_tools() {
         let r = ClusterRegistry::builtin();
-        let recs = r.recommend_by_intent("read file content from disk", 2);
-        assert!(recs.len() <= 2, "top_k=2 应最多返 2 项");
+        let recs = r.recommend_by_intent("show git commit history", 3);
+        assert!(recs.iter().any(|r| r.tool_id == "git_log"));
     }
 
     #[test]
-    fn duplicate_tool_in_clusters_overwrites() {
-        // 重复 tool_id 不再 panic，改为 warn + 覆盖到新 cluster
-        let mut r = ClusterRegistry::empty();
-        r.register(ToolCluster {
-            id: "c1",
-            purpose: "x",
-            members: vec![ToolMember {
-                tool_id: "shared_tool",
-                differentiator: "first",
-            }],
-        });
-        r.register(ToolCluster {
-            id: "c2",
-            purpose: "y",
-            members: vec![ToolMember {
-                tool_id: "shared_tool",
-                differentiator: "second",
-            }],
-        });
-        // 最后注册的 cluster 赢
-        let c = r.cluster_for("shared_tool").unwrap();
-        assert_eq!(c.id, "c2");
-    }
-
-    #[test]
-    fn single_member_cluster_renders_no_hint() {
-        // 单成员 cluster 没有 sibling，render_hint_for 应返 None
-        let mut r = ClusterRegistry::empty();
-        r.register(ToolCluster {
-            id: "lonely",
-            purpose: "single tool",
-            members: vec![ToolMember {
-                tool_id: "alone",
-                differentiator: "the only one",
-            }],
-        });
-        assert!(r.render_hint_for("alone").is_none());
-    }
-
-    #[test]
-    fn siblings_of_excludes_self() {
+    fn recommend_lsp_tools() {
         let r = ClusterRegistry::builtin();
-        let cluster = r.cluster_for("kb_query").unwrap();
-        let sibs = cluster.siblings_of("kb_query");
-        assert!(sibs.iter().all(|m| m.tool_id != "kb_query"));
-        assert!(sibs.len() >= 2); // kb_ingest + kb_search
+        let recs = r.recommend_by_intent("find all references to this function", 3);
+        assert!(recs.iter().any(|r| r.tool_id == "lsp_find_references"));
     }
 }

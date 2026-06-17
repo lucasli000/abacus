@@ -6,6 +6,7 @@ pub mod error;
 pub mod engine;
 pub mod sandbox;
 pub mod progressive;
+pub mod agent;
 pub mod user_profile {
     //! UserProfile — 用户单源真相 (Single Source of Truth)
     use serde::{Deserialize, Serialize};

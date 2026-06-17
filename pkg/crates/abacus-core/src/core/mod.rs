@@ -2046,6 +2046,8 @@ impl CoreLoop {
         let mut subagent_registry = subagent::ToolAgentRegistry::new();
         subagent_registry.register_builtins();
         subagent_registry.load_user_definitions();
+        let cluster_registry = Arc::new(crate::tool::cluster::ClusterRegistry::builtin());
+        subagent_registry.expand_cluster_refs(&cluster_registry);
         let mut prompt_assembly = PromptAssembly::new(
             &config.system_prompt,
             "", // auto-load from abacusbr.md
@@ -2176,7 +2178,7 @@ impl CoreLoop {
             tracing::warn!("LlmBudget triggered shed → caller should switch to fallback provider");
             1  // 成功标记
         }).await;
-        let mut core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, event_bus: None, pressure_monitor, knowledge_store: None, triage_engine: None, standby_cache: None, cold_writer: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: Arc::new(crate::tool::cluster::ClusterRegistry::builtin()), model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget, local_model_health: std::sync::RwLock::new(None) };
+        let mut core_loop = Self { registry, skill_engine, capability_hub, context_manager, injector, effectiveness, mcip_gateway, action_classifier, subagent_registry, mag_chain: Arc::new(RwLock::new(crate::mag_chain::MagChain::new())), epistemic_guard, prompt_assembly, adapters: RwLock::new(HashMap::new()), lsp_manager: RwLock::new(None), pipeline_hooks: Arc::new(RwLock::new(Vec::new())), safety_guard, providers: RwLock::new(HashMap::new()), provider_groups: RwLock::new(Vec::new()), config, runtime_overrides, model_override: RwLock::new(None), deduction_engine, sandbox_engine, auto_engine: Arc::new(RwLock::new(crate::auto::AutoEngine::new())), silent_router: SilentRouter::new(), provider_registry: Arc::new(crate::llm::provider_registry::ProviderRegistry::new()), health_registry, event_bus: None, pressure_monitor, knowledge_store: None, triage_engine: None, standby_cache: None, cold_writer: None, memory_palace: None, model_catalog, mcp_clients: RwLock::new(HashMap::new()), skill_workflow_executor: RwLock::new(None), plugin_loader: RwLock::new(None), result_store, tool_last_invoked: Arc::new(RwLock::new(std::collections::BTreeMap::new())), tool_result_dedup, _process_registration: process_registration, cluster_registry: cluster_registry, model_preference: Arc::new(RwLock::new(abacus_types::ModelPreference::default())), code_graph_manager: Arc::new(RwLock::new(None)), token_budget: token_budget_monitor, llm_budget: core_loop_budget, local_model_health: std::sync::RwLock::new(None) };
         // V29.13 段3c：注入 HookVisibilityMiddleware 让 LLM 在 ToolOutput 层感知 hook 系统
         // 优先级 200（在主要业务 middleware 之后跑），共享 epistemic_guard 实例
         core_loop.add_middleware(200, Arc::new(crate::mag_chain::HookVisibilityMiddleware {
@@ -5584,6 +5586,7 @@ Output JSON:
                         abacus_types::ToolProvider::Mcp { server_id } => format!("mcp:{}", server_id),
                         abacus_types::ToolProvider::Plugin { plugin_id } => format!("plugin:{}", plugin_id),
                         abacus_types::ToolProvider::Skill { skill_id } => format!("skill:{}", skill_id),
+                        abacus_types::ToolProvider::ExternalAgent { agent_id, .. } => format!("agent:{}", agent_id),
                     };
                     by_provider.entry(key).or_default().push(t);
                 }
@@ -6143,15 +6146,14 @@ mod tests {
             .find(|d| d.function.name == "cross_session_query")
             .expect("cross_session_query 应在");
         let desc = xs.function.description.as_ref().expect("desc");
-        // V43 token 优化：新格式为 ` [vs: sibling_a/sibling_b. This: <differentiator>]`
-        // ——只列 sibling 名字 + 自身 differentiator，不再嵌入 cluster id（siblings 名称隐含 cluster 身份）
-        assert!(desc.contains("[vs:"),
-            "应注入 cluster hint 标记 [vs:, got: {desc}");
+        // 新格式: `[g:{cluster} | vs: {siblings} | this: {differentiator}]`
+        assert!(desc.contains("[g:session_history"),
+            "应注入 cluster hint 标记 [g:session_history, got: {desc}");
         assert!(desc.contains("session_resume_query"),
             "应列 sibling, got: {desc}");
         assert!(desc.contains("messages_recover"),
             "应列 sibling, got: {desc}");
-        assert!(desc.contains("This:"),
+        assert!(desc.contains("this:"),
             "应有 this-tool differentiator 标记, got: {desc}");
     }
 

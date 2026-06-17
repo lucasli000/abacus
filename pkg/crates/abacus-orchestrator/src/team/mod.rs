@@ -38,6 +38,8 @@ pub enum AgentRole {
     Advisor,
     /// 执行者：完成具体任务
     Member,
+    /// 外部 Agent：通过 MCP/HTTP 调用的远程 Agent
+    ExternalAgent { agent_id: String },
 }
 
 impl std::fmt::Display for AgentRole {
@@ -47,6 +49,7 @@ impl std::fmt::Display for AgentRole {
             Self::PM => write!(f, "PM"),
             Self::Advisor => write!(f, "Advisor"),
             Self::Member => write!(f, "Member"),
+            Self::ExternalAgent { agent_id } => write!(f, "Agent({})", agent_id),
         }
     }
 }
@@ -171,6 +174,28 @@ pub enum TeamMessage {
     DependencyBlocked { task_id: String, waiting_on: Vec<String> },
     /// PM → All: 依赖解除通知
     DependencyResolved { task_id: String },
+    // ─── Agent 扩展消息 ───
+    /// Leader → ExternalAgent: 调用 Agent 技能/工具
+    AgentInvoke {
+        target_agent: String,
+        skill_id: Option<String>,
+        tool_id: Option<String>,
+        params: serde_json::Value,
+    },
+    /// ExternalAgent → Leader: Agent 执行结果
+    AgentResult {
+        source_agent: String,
+        skill_id: Option<String>,
+        success: bool,
+        output: serde_json::Value,
+        latency_ms: u64,
+    },
+    /// Any → All: Agent 健康状态变化
+    AgentHealth {
+        agent_id: String,
+        reachable: bool,
+        latency_ms: u64,
+    },
 }
 
 // ─── Context Pools ──────────────────────────────────────────────────────
@@ -414,6 +439,7 @@ impl TeamSession {
             AgentRole::PM => "You are the Project Manager. Focus on organization, dependencies, and review.",
             AgentRole::Advisor => "You are an Advisor. Provide expert guidance and recommendations.",
             AgentRole::Member => "You are a team Member. Execute the task as specified.",
+            AgentRole::ExternalAgent { .. } => "You are an external agent executing a delegated task.",
         };
         let prompt = format!(
             "You are executing a subtask in a team workflow.\n\
@@ -480,6 +506,7 @@ impl TeamSession {
             AgentRole::PM => "You are the Project Manager. Focus on organization, dependencies, and review.",
             AgentRole::Advisor => "You are an Advisor. Provide expert guidance and recommendations.",
             AgentRole::Member => "You are a team Member. Execute the task as specified.",
+            AgentRole::ExternalAgent { .. } => "You are an external agent executing a delegated task.",
         };
         let prompt = format!(
             "You are executing a subtask in a team workflow.\n\

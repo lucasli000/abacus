@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 serde_yaml = { workspace = true }
+reqwest = { workspace = true }
 
 [lints]
 workspace = true

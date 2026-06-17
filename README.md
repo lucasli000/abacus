@@ -6,11 +6,11 @@
 
 <p align="center">
   <strong>Production-grade LLM Agent Kernel</strong><br>
-  Multi-mode orchestration · Mathematical context compression · Built-in safety
+  Multi-mode orchestration · Mathematical context compression · Built-in safety · External Agent System
 </p>
 
 <p align="center">
-  <code>v2.5.5</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; macOS / Linux
+  <code>v2.7.0</code> &nbsp;·&nbsp; MIT License &nbsp;·&nbsp; Rust 1.75+ &nbsp;·&nbsp; Bun + OpenTUI &nbsp;·&nbsp; macOS / Linux
 </p>
 
 ---
@@ -18,6 +18,13 @@
 ## What is Abacus?
 
 Abacus is a terminal-native LLM agent kernel that orchestrates AI reasoning across four collaborative modes. It provides a rich TUI experience with real-time streaming, tool execution, and multi-expert consultation — all from your terminal.
+
+**v2.7.0 New Features:**
+- **TypeScript TUI** — Migrated from Rust ratatui to OpenTUI (Zig-native rendering) + XState + Zustand
+- **External Agent System** — Install and manage external agents via MCP protocol
+- **OKLCH Theme System** — 11 themes with perceptually uniform colors
+- **Scene-Aware UI** — Trading/Coding/Editing scenarios with adaptive layouts
+- **21 Tool Clusters** — Full coverage of 72 tools with intelligent routing
 
 **Clarify Mode** — single-agent deep reasoning:
 
