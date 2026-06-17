@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAME: abacus
 
 jobs:
   build:
@@ -18,23 +17,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS arm64 (Apple Silicon)
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: abacus-aarch64-apple-darwin
             asset_name: abacus-aarch64-apple-darwin.tar.gz
+            node_suffix: darwin-arm64
 
-          # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_name: abacus-x86_64-linux-gnu
             asset_name: abacus-x86_64-linux-gnu.tar.gz
-
-          # Windows x86_64 — 临时禁用（process_group 跨平台问题单独修）
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   artifact_name: abacus-x86_64-windows-msvc
-          #   asset_name: abacus-x86_64-windows-msvc.zip
+            node_suffix: linux-x64
 
     steps:
       - name: Checkout code
@@ -45,24 +38,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux)
+      - name: Install system dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            pkg-config \
-            libssl-dev \
-            protobuf-compiler
+          sudo apt-get install -y protobuf-compiler
 
-      - name: Install protobuf compiler (macOS)
+      - name: Install system dependencies (macOS)
         if: matrix.os == 'macos-latest'
         run: brew install protobuf
 
-      - name: Install protobuf compiler (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install protoc -y
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -75,30 +64,36 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build release binary
+      - name: Build NAPI bridge
         working-directory: pkg
-        run: |
-          cargo build --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_DIR: target
+        run: cargo build --release --package abacus-bridge --target ${{ matrix.target }}
 
-      - name: Strip binary (macOS/Linux)
-        working-directory: pkg
-        if: matrix.os != 'windows-latest'
-        run: |
-          strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+      - name: Install TUI dependencies
+        working-directory: pkg/abacus-tui
+        run: bun install
 
-      - name: Create archive (macOS/Linux)
+      - name: Copy native bridge
         working-directory: pkg
-        if: matrix.os != 'windows-latest'
         run: |
-          tar czf ../${{ matrix.asset_name }} -C target/${{ matrix.target }}/release ${{ env.BINARY_NAME }}
+          BRIDGE_SRC="target/${{ matrix.target }}/release/libabacus_bridge"
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            cp "${BRIDGE_SRC}.dylib" abacus-tui/abacus-bridge.${{ matrix.node_suffix }}.node
+          else
+            cp "${BRIDGE_SRC}.so" abacus-tui/abacus-bridge.${{ matrix.node_suffix }}.node
+          fi
 
-      - name: Create archive (Windows)
-        working-directory: pkg
-        if: matrix.os == 'windows-latest'
+      - name: Build TypeScript TUI
+        working-directory: pkg/abacus-tui
+        run: bun run build.ts
+
+      - name: Package
+        working-directory: pkg/abacus-tui
         run: |
-          7z a ../${{ matrix.asset_name }} target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe
+          mkdir -p dist
+          cp dist/abacus dist/abacus-${{ matrix.target }}
+          cp abacus-bridge.${{ matrix.node_suffix }}.node dist/
+          cd dist
+          tar czf ../../${{ matrix.asset_name }} abacus-${{ matrix.target }} abacus-bridge.${{ matrix.node_suffix }}.node
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -134,56 +129,40 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "AbacusCode ${{ github.ref_name }}"
+          name: "Abacus ${{ github.ref_name }}"
           body: |
-            # AbacusCode v2.5.0
+            # Abacus ${{ github.ref_name }}
 
-            ## 系统提示词架构重构（-62% token）
-            - 稳定前缀从 ~650 tok 压缩到 ~250 tok，prefix cache 命中率大幅提升
-            - 5 层合并为 1 层 Strategy（原 Strategy + Quality Bar + Task Completion + Entropy Guard + Explicit Declaration）
-            - 正向引导重构：命令式约束改为 LLM 权重倾向顺应引导
-            - Awareness Block 移到末尾，Mission Brief 归入稳定前缀
+            ## TypeScript TUI Migration
+            - Migrated from Rust ratatui to OpenTUI + XState + Zustand
+            - OKLCH color system with 11 themes
+            - Responsive layout (4 breakpoints)
+            - Scene-aware UI (Trading/Coding/Editing)
 
-            ## 冷块分层系统（RFC-0001v2）
-            - TriageEngine: 消息分层引擎（Standby/Cold/Inject/Compress 四级）
-            - StandbyCache: 待命缓存（LRU + 语义去重 + TTL）
-            - ColdBuffer: 冷块缓冲（双写 + 批量 flush）
-            - SessionStore ColdTier: message_blocks + FTS5 + union_search
-            - 双轨召回: 热路径 FTS5 + 冷路径向量搜索
+            ## External Agent System
+            - Install and manage external agents via MCP protocol
+            - AgentManifest, AgentRegistry, AgentSkillExecutor
+            - CLI: `abacus agent install/list/remove/info`
 
-            ## Auto Pipeline 并行化
-            - 串行步骤执行器改为并行 DAG 执行器
-            - 独立步骤 tokio::join! 并发执行
-
-            ## Tool View Schema Cache
-            - LRU 缓存（128 cap），全 provider 共享
-
-            ## 锁安全加固
-            - ~55 处嵌套锁修复（clone→drop→acquire 模式）
-            - ContextManager 15 锁排序文档
-
-            ## Clippy 清零
-            - abacus-core: 15 → 0 warnings
-
-            ## KnowledgeStore 增强
-            - FTS5 预过滤（10K→200 候选）
-
-            ## TUI 改进
-            - 模型名修复、context_window_ratio、thinking_depth 同步
+            ## LLM Provider Fixes
+            - Unified StreamingToolCallCollector
+            - Fixed Anthropic/OpenAI streaming tool calls
+            - Complete Gemini tool calling support
 
             ## Downloads
 
             | Platform | Architecture | File |
             |----------|-------------|------|
-            | macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
-            | Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
+| macOS | Apple Silicon (arm64) | `abacus-aarch64-apple-darwin.tar.gz` |
+| Linux | x86_64 | `abacus-x86_64-linux-gnu.tar.gz` |
 
             ## Installation
 
             ```bash
             # macOS/Linux
             tar xzf abacus-*.tar.gz
-            sudo mv abacus /usr/local/bin/
+            sudo mv abacus-* /usr/local/bin/abacus
+            sudo mv abacus-bridge.*.node /usr/local/bin/
             ```
           draft: false
           prerelease: false
